@@ -4962,6 +4962,49 @@ describe('FactoryLoop', () => {
     }
   })
 
+  // Factory admits an issue to dispatch on EITHER the title prefix or the
+  // scope label, but orphan recovery demanded the label alone. An issue
+  // admitted by title could therefore be dispatched and then never un-stuck.
+  // factory#139 is the live instance: title `[factory] ...`, and its only
+  // label is `factory:in-progress`.
+  it('recovers an orphaned in-progress GitHub issue that is in scope by title prefix alone', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-title-scope-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 139)
+      const payload = { title: '[factory-e2e] Title-scoped orphan', labels: ['pear', 'factory:in-progress'] }
+      const mount = new FakeMountClient({ [path]: githubIssueFile(139, payload) })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new RecordingGithubWriteback()
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const issue = parseGithubFactoryIssue(path, githubIssueFile(139, payload))
+      await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), {
+        attempts: 1,
+        inFlight: true,
+        terminal: false,
+        backoffUntilMs: 0,
+      })
+      const restartedFactory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      await restartedFactory.runOnce()
+
+      expect(restartedFactory.status().counters.githubOrphanedInProgressRecovered).toBe(1)
+      expect(githubWriteback.statuses).toContainEqual({ key: '139', status: 'ready' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('releases a dead durable GitHub claim and redispatches the issue', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-dead-lifecycle-claim-'))
     try {
