@@ -485,4 +485,36 @@ describe('work-unit claim authority', () => {
     expect(rows.get(legacyKey)?.lease).toMatchObject({ owner: 'dispatcher-b' })
     expect(rows.get(legacyKey)?.migrationAliasOf).toBeUndefined()
   })
+
+  // CodeRabbit, PR #329: `owner` was interpolated into a RegExp, so a mirror
+  // declaring a regex metacharacter as its owner threw and took triage and
+  // dispatch down with it.
+  it('survives an origin owner containing regex metacharacters', () => {
+    const hostile: IssueRef = {
+      key: 'AR-9',
+      uuid: 'uuid-9',
+      path: '/linear/issues/AR-9__uuid-9.json',
+      origin: { provider: 'github', owner: '[', repo: 'pear', number: 9 },
+    }
+    expect(() => dispatchIssueIdentity(hostile)).not.toThrow()
+    expect(dispatchIssueIdentity(hostile)).toBe('github:[/pear#9')
+  })
+
+  // CodeRabbit, PR #329: the surface key strips `origin`, so a mirror that
+  // resolves ONLY through its origin threw while planning the migration and
+  // rejected a claim whose canonical key was fine.
+  it('plans a migration for a seed that resolves only through its origin', () => {
+    const originOnly: IssueRef = {
+      key: '',
+      uuid: '   ',
+      path: '/linear/issues/orphan.json',
+      origin: { provider: 'github', owner: 'AgentWorkforce', repo: 'factory', number: 448 },
+    }
+    const canonicalKey = dispatchIssueIdentity(originOnly)
+    expect(canonicalKey).toBe('github:agentworkforce/factory#448')
+
+    expect(() => planLifecycleMigration([], canonicalKey, { issue: originOnly }, 1_000)).not.toThrow()
+    expect(planLifecycleMigration([], canonicalKey, { issue: originOnly }, 1_000))
+      .toEqual({ outcome: 'canonical', aliases: [] })
+  })
 })

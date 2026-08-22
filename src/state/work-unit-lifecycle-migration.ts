@@ -25,6 +25,20 @@ export const legacyCompositeLifecycleKey = (issue: IssueRef): string =>
 export const surfaceLifecycleKey = (issue: IssueRef): string =>
   dispatchIssueIdentity({ uuid: issue.uuid, key: issue.key, path: issue.path })
 
+/**
+ * The surface key, or undefined when the surface ALONE cannot produce an
+ * identity — a mirror that resolves only through its origin has nothing left
+ * once the origin is stripped. Without this guard such a seed throws here and
+ * rejects a claim whose canonical key resolved perfectly well.
+ */
+const surfaceLifecycleKeyOrUndefined = (issue: IssueRef): string | undefined => {
+  try {
+    return surfaceLifecycleKey(issue)
+  } catch {
+    return undefined
+  }
+}
+
 export type LifecycleMigration =
   /** Nothing to move: either the canonical row exists already, or there is no row at all. */
   | { outcome: 'canonical'; aliases: string[] }
@@ -58,9 +72,10 @@ export const planLifecycleMigration = (
   seed: Pick<DispatchLifecycle, 'issue'>,
   nowMs: number,
 ): LifecycleMigration => {
+  const surfaceKey = surfaceLifecycleKeyOrUndefined(seed.issue)
   const legacyKeys = new Set([
     legacyCompositeLifecycleKey(seed.issue),
-    surfaceLifecycleKey(seed.issue),
+    ...(surfaceKey ? [surfaceKey] : []),
   ])
   legacyKeys.delete(canonicalKey)
 

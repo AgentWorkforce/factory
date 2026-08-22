@@ -61,8 +61,12 @@ export function dispatchAgentIdentityKey(
 const githubOriginIdentity = (origin: WorkUnitOrigin | undefined): string | undefined => {
   if (origin?.provider !== 'github') return undefined
   const owner = origin.owner.trim().toLowerCase()
-  // Some providers spell the origin repo `owner/repo`; the identity wants the bare name.
-  const repo = origin.repo.trim().toLowerCase().replace(new RegExp(`^${owner}/`, 'u'), '')
+  // Some providers spell the origin repo `owner/repo`; the identity wants the
+  // bare name. Trimmed by prefix rather than by a regex built from `owner`,
+  // which would throw on an owner containing a regex metacharacter and take
+  // triage and dispatch down with it.
+  const rawRepo = origin.repo.trim().toLowerCase()
+  const repo = rawRepo.startsWith(`${owner}/`) ? rawRepo.slice(owner.length + 1) : rawRepo
   if (!owner || !repo || repo.includes('/')) return undefined
   if (!Number.isSafeInteger(origin.number) || origin.number <= 0) return undefined
   return `${owner}/${repo}#${origin.number}`
