@@ -65,7 +65,7 @@ import { containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsT
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { dispatchRelayflowForChangeEvent } from '../dispatch/relayflow-registry'
-import { dispatchAgentIdentityKey } from '../dispatch/work-unit-identity'
+import { dispatchAgentIdentityKey, dispatchIssueIdentity, mirrorWorkUnitOrigin } from '../dispatch/work-unit-identity'
 import {
   deriveDescriptorsFromMount,
   prescriptiveInstructions,
@@ -1093,7 +1093,7 @@ export class FactoryLoop implements Factory {
    * row to wait on, or the wait ended because Factory is stopping.
    */
   async waitForDispatchTerminal(issue: IssueRef): Promise<TerminalDispatchLifecyclePhase | undefined> {
-    const key = issueKey(issue)
+    const key = dispatchLifecycleKey(issue)
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     // No durable row means this dispatch never claimed a lifecycle: a
     // dependency park, a triage escalation, and a label refusal all return
@@ -2159,7 +2159,7 @@ export class FactoryLoop implements Factory {
     try {
       const batch = await this.#batch()
       const records = batch.inFlight
-        .filter((record) => !record.dryRun && !this.#completionInFlight.has(issueKey(record.issue)))
+        .filter((record) => !record.dryRun && !this.#completionInFlight.has(dispatchLifecycleKey(record.issue)))
       if (records.length === 0) {
         return
       }
@@ -2315,7 +2315,7 @@ export class FactoryLoop implements Factory {
   async #orphanedPrMetaPaths(record: InFlightIssue): Promise<string[]> {
     const wanted: Array<{ repo: string; prNumber: number }> = []
     if (this.#usesDurableDispatchLifecycle()) {
-      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       const receipts = lifecycle?.pullRequests ?? (lifecycle?.pullRequest ? [lifecycle.pullRequest] : [])
       for (const receipt of receipts) wanted.push({ repo: receipt.repo, prNumber: receipt.number })
     }
@@ -3714,7 +3714,7 @@ export class FactoryLoop implements Factory {
     identity: string,
     candidate: { key: string; lifecycle: DispatchLifecycle },
   ): Promise<boolean> {
-    let key = candidate.key
+    const key = candidate.key
     let lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     if (!lifecycle) return true
     if (
@@ -3772,7 +3772,6 @@ export class FactoryLoop implements Factory {
           })
           return false
         }
-        key = claim.key ?? key
         lifecycle = claim.lifecycle
         epoch = claim.lease.epoch
         this.#dispatchLifecycleEpochs.set(key, epoch)
@@ -3942,7 +3941,7 @@ export class FactoryLoop implements Factory {
     const record = batch.start(decision, false)
     if (!record) {
       if (durableAdoption) {
-        const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(decision.issue))
+        const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(decision.issue))
         if (durable) {
           this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(durable))
           this.#increment('githubOrphanedPullRequestsAdopted')
@@ -4291,7 +4290,9 @@ export class FactoryLoop implements Factory {
   async dispatch(decision: TriageDecision, opts: { dryRun?: boolean; labelsValidated?: boolean } = {}): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const phase = triageEscalationReason(decision) ? 'escalation' : 'dispatch'
-    const key = `${issueStateKey(decision.issue)}:${dryRun ? 'dry-run' : 'live'}:${phase}`
+    // The dispatch concurrency gate is per work unit: a mirror of an issue
+    // already being dispatched must join that call, not start a second one.
+    const key = `${dispatchLifecycleKey(decision.issue)}:${dryRun ? 'dry-run' : 'live'}:${phase}`
     const inFlight = this.#dispatchInFlight.get(key)
     if (inFlight) {
       this.#increment('dispatchDuplicateSuppressed')
@@ -4319,9 +4320,9 @@ export class FactoryLoop implements Factory {
       return existingRecord.result
     }
     if (!dryRun && this.#usesDurableDispatchLifecycle()) {
-      const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(decision.issue))
+      const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(decision.issue))
       if (durable && !isTerminalDispatchLifecycle(durable)) {
-        if (durable.result && this.#dispatchLifecycleEpochs.has(issueKey(decision.issue))) {
+        if (durable.result && this.#dispatchLifecycleEpochs.has(dispatchLifecycleKey(decision.issue))) {
           return durable.result
         }
         if (this.#startMode === 'dispatch-owner') {
@@ -4581,7 +4582,7 @@ export class FactoryLoop implements Factory {
           state: 'pending',
           updatedAtMs: this.#clock.now(),
         }
-        this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+        this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
       }
       await this.#writeInFlightRegistry()
 
@@ -4756,7 +4757,7 @@ export class FactoryLoop implements Factory {
           ...(tracked.result?.node ? { node: tracked.result.node } : {}),
         })),
         claim: {
-          ...(record.dispatchClaim ?? this.#dispatchClaimStatuses.get(issueKey(record.issue)) ?? {
+          ...(record.dispatchClaim ?? this.#dispatchClaimStatuses.get(dispatchLifecycleKey(record.issue)) ?? {
             state: 'pending' as const,
             updatedAtMs: nowMs,
           }),
@@ -5012,7 +5013,7 @@ export class FactoryLoop implements Factory {
           this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(claim.lifecycle))
           continue
         }
-        this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
+        this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
         this.#hydrateCostLedger(claim.lifecycle)
         if (claim.lifecycle.phase === 'waiting-for-human') continue
         const durableRecord = inFlightRecordFromLifecycle(claim.lifecycle)
@@ -5074,7 +5075,7 @@ export class FactoryLoop implements Factory {
           this.#ticketDispatchNotificationIsPending(claim.lifecycle)
         ) {
           if (!liveIssue) {
-            this.#dispatchLifecycleEpochs.delete(claim.key ?? key)
+            this.#dispatchLifecycleEpochs.delete(key)
             this.#scheduleDispatchLifecycleRetry(restored)
             throw new Error(`Unable to recover ticket-dispatch notification ${restored.issue.key}: issue is not currently readable`)
           }
@@ -5434,7 +5435,7 @@ export class FactoryLoop implements Factory {
       // never-placed — which also excludes its agents from the release below,
       // leaking live workers (#303 review, CodeRabbit).
       let effective = deadline
-      const key = issueKey(record.issue)
+      const key = dispatchLifecycleKey(record.issue)
       if (this.#abandonedDispatchReasons.has(key)) continue
       if (this.#usesDurableDispatchLifecycle()) {
         const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
@@ -5530,7 +5531,7 @@ export class FactoryLoop implements Factory {
       pullRequest?: GithubPublishPullRequestResult
     } = {},
   ): Promise<{ created: boolean; lifecycle: DispatchLifecycle }> {
-    const key = issueKey(decision.issue)
+    const key = dispatchLifecycleKey(decision.issue)
     const seed: DispatchLifecycle = {
       runId: preparedRunId ?? randomUUID(),
       issue: { ...decision.issue },
@@ -5562,7 +5563,7 @@ export class FactoryLoop implements Factory {
         `Refusing to dispatch ${decision.issue.key}: ${reason}`,
       )
     }
-    this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
+    this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
     this.#hydrateCostLedger(claim.lifecycle)
     this.#scheduleDispatchLifecycleRenewal()
     if (claim.created) {
@@ -5636,7 +5637,7 @@ export class FactoryLoop implements Factory {
     options: { releaseReason?: string } = {},
   ): Promise<void> {
     const lifecycle = await this.#state
-      .getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      .getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       .catch(() => undefined)
     if (!lifecycle) return
     await this.#report({
@@ -5664,7 +5665,7 @@ export class FactoryLoop implements Factory {
 
   async #handleAgentUsage(usage: AgentUsage, key: string): Promise<void> {
     const record = (await this.#batch()).getIssueByAgent(usage.name)
-    const activeRecord = record && issueKey(record.issue) === key ? record : undefined
+    const activeRecord = record && dispatchLifecycleKey(record.issue) === key ? record : undefined
     let tracked = activeRecord?.agents.get(usage.name)
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     // Completion removes the in-memory batch record immediately after the
@@ -5779,7 +5780,7 @@ export class FactoryLoop implements Factory {
 
   async #dispatchLifecycleKeyForAgent(name: string): Promise<string | undefined> {
     const record = (await this.#batch()).getIssueByAgent(name)
-    if (record?.agents.has(name)) return issueKey(record.issue)
+    if (record?.agents.has(name)) return dispatchLifecycleKey(record.issue)
     return (await this.#findDispatchLifecycleAgent(name))?.key
   }
 
@@ -5932,7 +5933,7 @@ export class FactoryLoop implements Factory {
     else record.slotHeldSinceAtMs = undefined
     if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
     if (isTerminalDispatchPhase(phase)) await this.#drainAgentUsage()
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     return this.#serializeDispatchLifecyclePersistence(key, async () => {
       const epoch = this.#dispatchLifecycleEpochs.get(key)
       if (epoch === undefined) {
@@ -6035,7 +6036,7 @@ export class FactoryLoop implements Factory {
   // after release could see it cleared, or see the next dispatch for the same
   // issue, and classify the wrong run.
   #resolveDispatchTerminalWaiters(issue: IssueRef, phase: TerminalDispatchLifecyclePhase): void {
-    const key = issueKey(issue)
+    const key = dispatchLifecycleKey(issue)
     for (const resolve of this.#dispatchTerminalWaiters.get(key) ?? []) resolve(phase)
     this.#dispatchTerminalWaiters.delete(key)
   }
@@ -6170,7 +6171,7 @@ export class FactoryLoop implements Factory {
   }
 
   #scheduleDispatchLifecycleRetry(record: InFlightIssue, delayMs = DISPATCH_LIFECYCLE_RETRY_MS): void {
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
@@ -6218,7 +6219,7 @@ export class FactoryLoop implements Factory {
       this.#scheduleDispatchLifecycleRetry(record)
       return
     }
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
@@ -6260,7 +6261,7 @@ export class FactoryLoop implements Factory {
       if (!claim.acquired || !claim.lease) {
         throw new DispatchLifecycleOwnedElsewhereError(claim.lifecycle.lease?.leaseUntilMs)
       }
-      this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
+      this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
       this.#hydrateCostLedger(claim.lifecycle)
       this.#scheduleDispatchLifecycleRenewal()
       lifecycle = claim.lifecycle
@@ -6522,7 +6523,7 @@ export class FactoryLoop implements Factory {
         state: 'pending',
         updatedAtMs: this.#clock.now(),
       }
-      this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+      this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
     }
     await this.#writeInFlightRegistry()
     if (!record.dryRun) {
@@ -6663,7 +6664,7 @@ export class FactoryLoop implements Factory {
   async #finishDurableRelease(record: InFlightIssue, releaseReason?: string): Promise<boolean> {
     const batch = await this.#batch()
     const reason = releaseReason ?? (this.#config.terminalState === 'human-review' ? 'issue-human-review' : 'issue-done')
-    const releaseKey = issueKey(record.issue)
+    const releaseKey = dispatchLifecycleKey(record.issue)
     // Terminal writeback has already been acknowledged before this method is
     // entered. Remove externally reachable routes first so a stuck agent
     // release cannot leave a preview live after Human Review or Done.
@@ -6734,7 +6735,7 @@ export class FactoryLoop implements Factory {
 
   async #assertIssueDispatchLifecycleOwner(issue: IssueRef): Promise<boolean> {
     if (!this.#usesDurableDispatchLifecycle()) return true
-    const key = issueKey(issue)
+    const key = dispatchLifecycleKey(issue)
     const epoch = this.#dispatchLifecycleEpochs.get(key)
     if (epoch === undefined) return false
     const renewed = await this.#state.renewDispatchLifecycle(
@@ -6902,7 +6903,7 @@ export class FactoryLoop implements Factory {
       state: 'verified',
       updatedAtMs: this.#clock.now(),
     }
-    this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+    this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
     await this.#writeDispatchClaimRegistry(record.issue)
     return implementingStateId
   }
@@ -6936,7 +6937,7 @@ export class FactoryLoop implements Factory {
           ...(deadLettered ? { deadLettered: true } : {}),
           updatedAtMs: this.#clock.now(),
         }
-        this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+        this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
         await this.#writeDispatchClaimRegistry(record.issue)
 
         if (deadLettered) {
@@ -8160,7 +8161,7 @@ export class FactoryLoop implements Factory {
         this.#logger.warn?.(`[factory] failed to release ${agentName} during ${context}`, error)
         if (record) {
           const lifecycle = await this.#state
-            .getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+            .getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
             .catch(() => undefined)
           if (lifecycle) {
             await this.#reportLifecycle(lifecycle, 'factory.failure', {
@@ -8361,7 +8362,7 @@ export class FactoryLoop implements Factory {
         }
       }
       const fleetTracked = this.#fleet.trackedAgents?.().get(agentName)
-      const dispatchClaim = this.#dispatchClaimStatuses.get(issueKey(issue))
+      const dispatchClaim = this.#dispatchClaimStatuses.get(dispatchLifecycleKey(issue))
       agents.push({
         name: agentName,
         role: tracked.spec.role,
@@ -8385,7 +8386,7 @@ export class FactoryLoop implements Factory {
       for (const record of (await this.#batch()).inFlight) {
         if (record.dryRun) continue
         if (record.dispatchClaim) {
-          this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+          this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
         }
         for (const [agentName, tracked] of record.agents) {
           await appendAgent(record.issue, agentName, tracked, record)
@@ -8523,7 +8524,7 @@ export class FactoryLoop implements Factory {
    * durable row, which is authoritative when another owner terminalized it.
    */
   async #dispatchLifecycleStillOwned(record: InFlightIssue): Promise<boolean> {
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     if (this.#abandonedDispatchReasons.has(key)) return false
     if (!this.#usesDurableDispatchLifecycle()) return true
     const epoch = this.#dispatchLifecycleEpochs.get(key)
@@ -8642,7 +8643,7 @@ export class FactoryLoop implements Factory {
     if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit telemetry completed', { issue: record.issue.key, name })
 
     if (this.#usesDurableDispatchLifecycle()) {
-      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       if (lifecycle?.phase === 'parking') {
         this.#increment('clarificationParkingExitsSuppressed')
         return
@@ -8828,7 +8829,7 @@ export class FactoryLoop implements Factory {
       // subsequent no-PR implementer exit is terminal and frees the slot.
       const recoveryLifecycle = await this.#state.getDispatchLifecycle(
         this.#workspaceId,
-        issueKey(record.issue),
+        dispatchLifecycleKey(record.issue),
       )
       const recoveryRunIdentity = recoveryLifecycle?.runId
         ?? tracked.spec.branch
@@ -9041,7 +9042,7 @@ export class FactoryLoop implements Factory {
         `Refusing to publish ${record.issue.key}: branch ${expectedHeadRef} belongs to a different issue`,
       )
     }
-    const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
     const cached = this.#publishedPullRequests.get(key)
     if (cached) {
       if (cached.headRef !== expectedHeadRef) {
@@ -9745,7 +9746,7 @@ export class FactoryLoop implements Factory {
   }
 
   #scheduleAbandonedDispatchRetry(record: InFlightIssue, reason: string): void {
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
@@ -9783,7 +9784,7 @@ export class FactoryLoop implements Factory {
           ? githubIssuePathParts(record.issue.path)?.owner
           : undefined
         const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org ?? sourceOwner)
-        const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+        const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
         if (publishedPullRequests(lifecycle).some((receipt) =>
           receipt.repo.toLowerCase() === repo.toLowerCase()
         )) return true
@@ -12050,7 +12051,7 @@ export class FactoryLoop implements Factory {
     const records = onlyRecord ? [onlyRecord] : (await this.#batch()).inFlight
     for (const record of records) {
       if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) continue
-      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       // Babysitter sessions are independently durable and restore only after
       // their mounted PR metadata passes the open/draft/issue-identity guard.
       // Fold those validated receipts back into the lifecycle on takeover.
@@ -12731,7 +12732,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #suspendBabysitterWakeForHuman(state: BabysitterWakeState): Promise<boolean> {
-    const key = issueKey(state.issue)
+    const key = dispatchLifecycleKey(state.issue)
     const [lifecycle, clarification] = await Promise.all([
       this.#usesDurableDispatchLifecycle()
         ? this.#state.getDispatchLifecycle(this.#workspaceId, key)
@@ -13383,7 +13384,7 @@ export class FactoryLoop implements Factory {
   // after opening its PR (an event, not a poll).
   async #ensureBabysitterForIssue(record: InFlightIssue): Promise<void> {
     if (this.#usesDurableDispatchLifecycle()) {
-      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       const receipts = lifecycle?.pullRequests ?? (lifecycle?.pullRequest ? [lifecycle.pullRequest] : [])
       if (receipts.length > 0) {
         for (const receipt of receipts) {
@@ -13627,7 +13628,7 @@ export class FactoryLoop implements Factory {
     prRef: Pick<BabysitterPrRef, 'repo' | 'prNumber'>,
   ): Promise<boolean> {
     const wanted = githubPrIdentity(prRef.repo, prRef.prNumber)
-    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
     const trackedAgents = new Map([
       ...(lifecycle?.agents ?? [])
         .filter((agent) => agent.releasedAtMs === undefined)
@@ -13674,7 +13675,7 @@ export class FactoryLoop implements Factory {
       })
     }
     if (superseded.length > 0) {
-      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       if (latest && !await this.#saveDispatchLifecycle(record, latest.phase)) {
         throw new Error(`Failed to persist superseded babysitter cleanup for ${record.issue.key}`)
       }
@@ -13684,7 +13685,7 @@ export class FactoryLoop implements Factory {
 
   async #retireBabysittersOutsideCurrentRoutes(record: InFlightIssue): Promise<void> {
     const wantedRepos = new Set(record.decision.implementers.map((implementer) => implementer.repo.toLowerCase()))
-    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
     const trackedAgents = new Map([
       ...(lifecycle?.agents ?? [])
         .filter((agent) => agent.releasedAtMs === undefined)
@@ -13730,7 +13731,7 @@ export class FactoryLoop implements Factory {
       })
     }
     if (unrouted.length > 0) {
-      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       if (latest && !await this.#saveDispatchLifecycle(record, latest.phase)) {
         throw new Error(`Failed to persist unrouted babysitter cleanup for ${record.issue.key}`)
       }
@@ -13744,7 +13745,7 @@ export class FactoryLoop implements Factory {
   // guards on the PR's OWN webhook-fed meta (still open, not a draft, not already
   // merged) before flipping the issue to Human Review. No `gh` call.
   async #maybeAdvanceToHumanReview(record: InFlightIssue, agentName: string): Promise<void> {
-    if (this.#completionInFlight.has(issueKey(record.issue))) {
+    if (this.#completionInFlight.has(dispatchLifecycleKey(record.issue))) {
       return
     }
 
@@ -13891,7 +13892,7 @@ export class FactoryLoop implements Factory {
       mergedPullRequest?: SlackPullRequestRef
     } = {},
   ): Promise<void> {
-    const completionKey = issueKey(record.issue)
+    const completionKey = dispatchLifecycleKey(record.issue)
     if (this.#completionInFlight.has(completionKey)) {
       return
     }
@@ -14037,7 +14038,7 @@ export class FactoryLoop implements Factory {
       // Cancellation must see the subscription identity so it can issue the
       // idempotent Relayfile DELETE before clearing the local owner maps.
       await this.#cancelBabysittersForIssue(record.issue)
-      const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue)).catch(() => undefined)
+      const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue)).catch(() => undefined)
       if (!this.#usesDurableDispatchLifecycle() || (durable && isTerminalDispatchLifecycle(durable))) {
         for (const publishedKey of this.#publishedPullRequests.keys()) {
           if (publishedKey.startsWith(`${completionKey}:`)) this.#publishedPullRequests.delete(publishedKey)
@@ -14138,7 +14139,7 @@ export class FactoryLoop implements Factory {
 
   async #claimTicketDispatchNotification(record: InFlightIssue): Promise<boolean> {
     if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     return this.#serializeDispatchLifecyclePersistence(key, async () => {
       const epoch = this.#dispatchLifecycleEpochs.get(key)
       if (epoch === undefined) {
@@ -14212,7 +14213,7 @@ export class FactoryLoop implements Factory {
     void (async () => {
       try {
         const lifecycle = issue
-          ? await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(issue)).catch(() => undefined)
+          ? await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(issue)).catch(() => undefined)
           : undefined
         if (lifecycle) {
           await this.#reportLifecycle(lifecycle, 'factory.failure', {
@@ -14507,7 +14508,7 @@ export class FactoryLoop implements Factory {
     additional: SlackPullRequestRef[] = [],
   ): Promise<SlackPullRequestRef[]> {
     const lifecycle = await this.#state
-      .getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      .getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       .catch(() => undefined)
     const lifecycleRefs = publishedPullRequests(lifecycle).map((receipt) => ({
       repo: receipt.repo,
@@ -14908,7 +14909,7 @@ export class FactoryLoop implements Factory {
 
   async #ownsActiveSlackConversationIssue(issue: IssueRef): Promise<boolean> {
     if (!(await this.#batch()).getIssue(issue)) return false
-    const key = issueKey(issue)
+    const key = dispatchLifecycleKey(issue)
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     if (!lifecycle) return true
     if (lifecycle.phase === 'releasing' || isTerminalDispatchLifecycle(lifecycle)) return false
@@ -16455,7 +16456,7 @@ export class FactoryLoop implements Factory {
       if (!waiting.dryRun && this.#usesDurableDispatchLifecycle()) {
         try {
           const claim = await this.#claimDispatchLifecycle(waiting.decision, false)
-          const lifecycleKey = issueKey(waiting.issue)
+          const lifecycleKey = dispatchLifecycleKey(waiting.issue)
           const epoch = this.#dispatchLifecycleEpochs.get(lifecycleKey)
           if (
             claim.lifecycle.phase === 'waiting-for-human' &&
@@ -17379,7 +17380,26 @@ const issueRefFromPath = (path: string): IssueRef => {
   return { uuid: uuidFromPath(path) ?? key, key, path }
 }
 
-const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
+const issueRef = (issue: LinearIssue): IssueRef => {
+  const origin = mirrorWorkUnitOrigin(issue)
+  return { uuid: issue.uuid, key: issue.key, path: issue.path, ...(origin ? { origin } : {}) }
+}
+
+/**
+ * The claim/dedup/lifecycle authority key: the work unit, not the surface it
+ * arrived through.
+ *
+ * `issueKey()` composes the Relayfile sense path, so the same issue reaching
+ * Factory GitHub-native and through its own Linear mirror hashed to two keys
+ * and the lease never saw a conflict — both dispatched (#211, AR-448). Every
+ * durable lifecycle read and write goes through this instead.
+ *
+ * `issueKey()` deliberately stays as-is for the surface-scoped correlation
+ * maps — waiting clarifications, babysitter sessions, Slack threads, preview
+ * ownership — which are keyed by surface on disk and would be orphaned by a
+ * global redefinition.
+ */
+const dispatchLifecycleKey = (issue: IssueRef): string => dispatchIssueIdentity(issue)
 
 // Preserve the historical Linear state namespace while keeping GitHub-native
 // issue numbers independent across repositories in the same workspace.

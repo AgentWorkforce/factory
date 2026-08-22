@@ -471,10 +471,30 @@ export interface LinearIssue {
   raw: Record<string, unknown>
 }
 
+/**
+ * Where the work unit actually lives, when the surface that offered it is a
+ * mirror rather than the origin.
+ *
+ * A `[factory]` Linear mirror of a GitHub issue has Linear's uuid, key and
+ * sense path but is the same unit of work as the GitHub issue it mirrors.
+ * Without the origin recorded structurally, the mirror and the GitHub-native
+ * row derive different work-unit identities and both dispatch — the AR-448
+ * shape. The surface fields stay authoritative for writeback; this is only
+ * for identity.
+ */
+export interface WorkUnitOrigin {
+  provider: 'github'
+  owner: string
+  repo: string
+  number: number
+}
+
 export interface IssueRef {
   uuid: string
   key: string
   path: string
+  /** Provider-native origin when this ref came from a mirror. Absent for a native surface. */
+  origin?: WorkUnitOrigin
 }
 
 export interface IterationReport {

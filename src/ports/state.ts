@@ -314,16 +314,40 @@ export type DispatchLifecycle = {
    * whenever the row stops occupying a slot.
    */
   slotHeldSinceAtMs?: number
+  /**
+   * Set only on a row left behind by the #211 rekey, naming the canonical
+   * work-unit key that superseded it.
+   *
+   * A row carrying this is audit evidence of the migration and nothing else:
+   * it holds no lease, occupies no dispatch slot, and is never returned as a
+   * claim. It is typed rather than inferred from `phase === 'abandoned'` so
+   * genuinely abandoned work stays distinguishable from a rekeyed alias.
+   */
+  migrationAliasOf?: string
   updatedAtMs: number
 }
 
 export type DispatchLifecycleClaim = {
-  /** Actual persisted key. It may be an older GitHub alias adopted atomically. */
-  key?: string
   acquired: boolean
   lifecycle: DispatchLifecycle
   lease?: DispatchLifecycleLease
   created: boolean
+}
+
+/**
+ * Thrown when more than one key for the same work unit holds a live, unexpired
+ * lease. Two live leases mean two dispatchers may each believe they own this
+ * work; picking one could abandon the other's in-flight run. Dispatch blocks
+ * until an operator reconciles.
+ */
+export class DispatchLifecycleMigrationConflictError extends Error {
+  constructor(readonly canonicalKey: string, readonly conflictingKeys: string[]) {
+    super(
+      `Refusing to claim ${canonicalKey}: ${conflictingKeys.length} keys for this work unit hold a live lease ` +
+      `(${conflictingKeys.join(', ')}). Reconcile them before dispatch can continue.`,
+    )
+    this.name = 'DispatchLifecycleMigrationConflictError'
+  }
 }
 
 export type GithubIssueCommentWatchPending = {

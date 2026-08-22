@@ -33,6 +33,7 @@ import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
+import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
@@ -3570,8 +3571,8 @@ describe('FactoryLoop', () => {
       await state.claimDispatchLifecycle(
         'factory-test', issueKey(staleDecision.issue), lifecycle(staleDecision, 'stale-run'), 'expired-owner', 0, 1,
       )
-      // Simulate a document written before alias-aware claims were atomic. A
-      // current store would adopt the first row instead of creating this one.
+      // Simulate a document written before the #211 rekey, under the legacy
+      // composite keys, with both rows still carrying an expired lease.
       const legacyDocument = JSON.parse(await readFile(watchStatePath, 'utf8')) as {
         workspaces: Record<string, { dispatchLifecycles: Record<string, unknown> }>
       }
@@ -3593,7 +3594,7 @@ describe('FactoryLoop', () => {
         .listDispatchLifecycles('factory-test')
       expect(lifecycles).toHaveLength(1)
       expect(lifecycles[0]).toMatchObject([
-        issueKey(stableDecision.issue),
+        dispatchIssueIdentity(stableDecision.issue),
         { runId: 'stable-run', issue: { path: stablePath } },
       ])
       expect(restarted.status().counters.dispatchLifecycleGithubAliasesCollapsed).toBe(1)
@@ -5000,7 +5001,7 @@ describe('FactoryLoop', () => {
       ]
       await stateStore.claimDispatchLifecycle(
         'factory-test',
-        issueKey(issue),
+        dispatchIssueIdentity(issue),
         {
           runId: 'crashed-run-242',
           issue: { uuid: issue.uuid, key: issue.key, path: issue.path },
@@ -5047,7 +5048,7 @@ describe('FactoryLoop', () => {
       ])
       expect(factory.status().counters.githubOrphanedLifecycleClaimsReleased).toBe(1)
       expect(factory.status().counters.githubOrphanedLifecycleAgentReleaseFailures).toBe(2)
-      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(issue))).resolves.toMatchObject({
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(issue))).resolves.toMatchObject({
         phase: 'running',
         runId: expect.not.stringMatching(/^crashed-run-242$/u),
       })
@@ -5664,7 +5665,7 @@ describe('FactoryLoop', () => {
         expect(factory.status().counters.githubOrphanRecoveriesBlockedOpenPr).toBe(1)
         expect(factory.status().counters.githubOrphanedPullRequestsAdopted).toBe(1)
         expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['53'])
-        expect(await stateStore.getDispatchLifecycle('factory-test', issueKey({
+        expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity({
           uuid: 'AgentWorkforce/pear#53',
           key: '53',
           path,
@@ -5865,7 +5866,7 @@ describe('FactoryLoop', () => {
 
       expect(firstFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-54-impl-pear', 'ar-54-review-pear'])
       const adoptedRef = { uuid: 'AgentWorkforce/pear#53', key: '53', path: adoptedPath }
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(adoptedRef))).toMatchObject({
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(adoptedRef))).toMatchObject({
         phase: 'queued',
         pullRequest: {
           repo: 'AgentWorkforce/pear',
@@ -5878,7 +5879,7 @@ describe('FactoryLoop', () => {
       await first.stop()
       clock.advance(5 * 60_000)
       const runningRef = { uuid: 'AgentWorkforce/pear#54', key: '54', path: runningPath }
-      const runningKey = issueKey(runningRef)
+      const runningKey = dispatchIssueIdentity(runningRef)
       const running = await stateStore.getDispatchLifecycle('factory-test', runningKey)
       expect(running).toBeDefined()
       const completion = await stateStore.claimDispatchLifecycle(
@@ -6021,7 +6022,7 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.legacyLocalWorkersAdopted).toBe(3)
       expect(factory.status().counters.githubOrphanedPullRequestsAdopted).toBe(1)
       expect(factory.status().inFlight.map((inFlight) => inFlight.key)).toEqual(['55'])
-      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(issue))).resolves.toMatchObject({
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(issue))).resolves.toMatchObject({
         phase: 'running',
         pullRequest: {
           repo: 'AgentWorkforce/pear',
@@ -7626,7 +7627,7 @@ describe('FactoryLoop', () => {
 
     await expect(factory.dispatch(decision)).rejects.toThrow('daemon crashed immediately after lifecycle claim')
 
-    const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+    const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
     const implementerTask = lifecycle?.decision.implementers[0]?.task
     const reviewerTask = lifecycle?.decision.reviewer.task
     expect(implementerTask).toContain('Full Linear issue description:')
@@ -7675,7 +7676,7 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(path, issue))
 
     await expect(factory.dispatch(decision)).rejects.toThrow('ownership lost before spawning')
-    const key = issueKey(decision.issue)
+    const key = dispatchIssueIdentity(decision.issue)
     const beforeStop = await stateStore.getDispatchLifecycle('factory-test', key)
     expect(beforeStop?.lease?.leaseUntilMs).toBeGreaterThan(Date.now())
     expect(fleet.previewStarts).toHaveLength(1)
@@ -7784,12 +7785,12 @@ describe('FactoryLoop', () => {
       await restarted.start({ mode: 'dispatch-owner' })
 
       expect(cleanupFleet.previewRemovals).toHaveLength(1)
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'running' })
 
       await vi.waitFor(() => expect(cleanupFleet.previewRemovals).toHaveLength(2), { timeout: 4_000 })
       await vi.waitFor(async () => expect(
-        await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)),
+        await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)),
       ).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
       expect(cleanupFleet.spawns).toEqual([])
     } finally {
@@ -7837,7 +7838,7 @@ describe('FactoryLoop', () => {
     let restarted: ReturnType<typeof createFactory> | undefined
     try {
       const decision = await first.triageIssue(parseLinearIssue(path, issue))
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
 
       await expect(first.dispatch(decision)).rejects.toThrow('terminal spawn failure')
       await expect(state().getDispatchLifecycle('factory-test', key)).resolves.toMatchObject({
@@ -7904,7 +7905,7 @@ describe('FactoryLoop', () => {
       const decision = await first.triageIssue(parseLinearIssue(issuePath(85), issueFile(85)))
       const originalResult = await first.dispatch(decision)
 
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       const crashedState = new FileStateStore({ batchSize: 2, watchStatePath })
       const beforeCrash = await crashedState.getDispatchLifecycle('factory-test', key)
       expect(beforeCrash?.phase).toBe('running')
@@ -8029,7 +8030,7 @@ describe('FactoryLoop', () => {
       releasePublish()
       await start
 
-      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({ phase: 'complete', pullRequest: { number: 86 } })
     } finally {
       releasePublish()
@@ -8094,12 +8095,12 @@ describe('FactoryLoop', () => {
 
       expect(restarted.status().counters.startupAgentExitDrainTimeouts).toBe(1)
       expect(restarted.status().counters.liveStartupBackfills).toBe(1)
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'publishing' })
 
       releasePublish()
       await vi.waitFor(async () => {
-        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
         expect(lifecycle).toMatchObject({ pullRequest: { number: 87 } })
         expect(['published', 'complete']).toContain(lifecycle?.phase)
       })
@@ -8173,7 +8174,7 @@ describe('FactoryLoop', () => {
         // nominal foreign-lease window an ungraceful crash would expose.
         await first.stop()
         const persisted = state()
-        const key = issueKey(decision.issue)
+        const key = dispatchIssueIdentity(decision.issue)
         const waitingLifecycle = await persisted.getDispatchLifecycle('factory-test', key)
         expect(waitingLifecycle).toMatchObject({ phase: 'waiting-for-human' })
         const crashLease = await persisted.claimDispatchLifecycle(
@@ -8210,7 +8211,7 @@ describe('FactoryLoop', () => {
       // Both waiters report the phase the row settled in, not `undefined` and
       // not each other's opposite.
       expect(await Promise.all([terminal, secondWaiter])).toEqual(['complete', 'complete'])
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'complete' })
       expect(attachedFleet.spawns).toEqual([])
       expect(attached.status().counters.githubPullRequestsPublished).toBeUndefined()
@@ -8311,7 +8312,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(queued)
       expect(firstFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-985-impl-pear', 'ar-985-review'])
       expect(firstFleet.previewStarts.map((preview) => preview.issueKey)).toEqual(['AR-985'])
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(queued.issue))).toMatchObject({ phase: 'queued' })
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(queued.issue))).toMatchObject({ phase: 'queued' })
 
       clock.advance(5 * 60_000 + 1)
       const restartedFleet = new RemoteLifecycleFleetClient()
@@ -8370,7 +8371,7 @@ describe('FactoryLoop', () => {
 
       expect(firstFleet.spawns).toHaveLength(2)
       expect(secondFleet.spawns).toEqual([])
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(secondDecision.issue))).toMatchObject({ phase: 'queued' })
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(secondDecision.issue))).toMatchObject({ phase: 'queued' })
     } finally {
       await second.stop()
       await first.stop()
@@ -8410,19 +8411,19 @@ describe('FactoryLoop', () => {
       })
       await firstFleet.clarificationReleaseStarted
       await vi.waitFor(async () => {
-        expect(await state().getDispatchLifecycle('factory-test', issueKey(firstDecision.issue)))
+        expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(firstDecision.issue)))
           .toMatchObject({ phase: 'parking' })
       })
 
       await second.dispatch(secondDecision)
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(secondDecision.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(secondDecision.issue)))
         .toMatchObject({ phase: 'queued' })
       await new Promise((resolve) => setTimeout(resolve, 1_200))
       expect(secondFleet.spawns).toEqual([])
 
       firstFleet.allowClarificationRelease()
       await vi.waitFor(async () => {
-        expect(await state().getDispatchLifecycle('factory-test', issueKey(firstDecision.issue)))
+        expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(firstDecision.issue)))
           .toMatchObject({ phase: 'waiting-for-human' })
       })
       await vi.waitFor(() => expect(secondFleet.spawns.map((spawn) => spawn.name))
@@ -8465,12 +8466,12 @@ describe('FactoryLoop', () => {
       })
       await vi.waitFor(() => expect(first.status().counters.clarificationParkReleasePending).toBe(1))
       await vi.waitFor(async () => {
-        expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
           .toMatchObject({ phase: 'parking' })
       })
       const queuedDecision = await first.triageIssue(parseLinearIssue(issuePath(992), issueFile(992)))
       await first.dispatch(queuedDecision)
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(queuedDecision.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(queuedDecision.issue)))
         .toMatchObject({ phase: 'queued' })
       await first.stop()
 
@@ -8488,13 +8489,13 @@ describe('FactoryLoop', () => {
       expect(restartedFleet.resumes).toEqual([])
       expect(restartedFleet.spawns).toEqual([])
       expect(restarted.status().counters.exitPrPublishSkipped).toBeUndefined()
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'parking' })
 
       restartedFleet.allowClarificationRelease()
       await starting
       await vi.waitFor(async () => {
-        expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
           .toMatchObject({ phase: 'waiting-for-human' })
       })
       expect(restartedFleet.releases.map((release) => release.name).sort())
@@ -8598,7 +8599,7 @@ describe('FactoryLoop', () => {
       const decision = await first.triageIssue(parseLinearIssue(issuePath(590), issue))
       await first.dispatch(decision)
       const names = ['ar-590-impl-pear', 'ar-590-review']
-      await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).resolves.toMatchObject({
         phase: 'running',
         agents: names.map((name) => expect.objectContaining({
           name,
@@ -8672,7 +8673,7 @@ describe('FactoryLoop', () => {
         'ar-595-impl-pear',
         'ar-595-review',
       ])
-      await expect(state().getDispatchLifecycle(factoryConfig.workspaceId, issueKey(decision.issue)))
+      await expect(state().getDispatchLifecycle(factoryConfig.workspaceId, dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({ phase: 'running' })
       expect(restarted.status().counters.startupRosterMissingExitsSynthesized).toBe(synthesizedCount)
     } finally {
@@ -8787,12 +8788,12 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(591), issue))
 
     await factory.dispatch(decision)
-    branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+    branch = (await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))!
       .decision.implementers[0]!.branch!
     fleet.emitAgentExit('ar-591-impl-pear', 'reconciled-missing')
 
     await vi.waitFor(async () => {
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).toMatchObject({
         phase: 'running',
         pullRequest: {
           repo: 'AgentWorkforce/pear',
@@ -8845,12 +8846,12 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(597), issue))
 
     await factory.dispatch(decision)
-    branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+    branch = (await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))!
       .decision.implementers[0]!.branch!
     fleet.emitAgentExit('ar-597-impl-pear', 'reconciled-missing')
 
     await vi.waitFor(async () => {
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).toMatchObject({
         pullRequest: {
           repo: 'AgentWorkforce/pear',
           number: 1597,
@@ -8891,12 +8892,12 @@ describe('FactoryLoop', () => {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(585), issueFile(585)))
       await expect(factory.dispatch(decision)).rejects.toThrow('owner crashed after remote spawn ack')
       await vi.waitFor(async () => expect(await new FileStateStore({ batchSize: 2, watchStatePath })
-        .getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({ phase: 'running' }), { timeout: 4_000 })
+        .getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).toMatchObject({ phase: 'running' }), { timeout: 4_000 })
 
       expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-585-impl-pear')).toHaveLength(1)
       expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-585-review')).toHaveLength(1)
       expect((await new FileStateStore({ batchSize: 2, watchStatePath })
-        .getDispatchLifecycle('factory-test', issueKey(decision.issue)))?.agents
+        .getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))?.agents
         .find((agent) => agent.name === 'ar-585-impl-pear')?.tracked.result?.node).toBe('sf-mini')
     } finally {
       await factory.stop()
@@ -8972,7 +8973,7 @@ describe('FactoryLoop', () => {
           ? 'owner crashed after durable lifecycle claim'
           : 'owner crashed after remote spawn ack',
       )
-      await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({
           phase: persistedPhase,
           agents: persistedPhase === 'retryable'
@@ -9001,7 +9002,7 @@ describe('FactoryLoop', () => {
 
       if (liveState === 'unreadable') {
         await new Promise((resolve) => setTimeout(resolve, 1_200))
-        await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
           .resolves.toMatchObject({ phase: persistedPhase })
         expect(fleet.spawns).toEqual([])
         expect(fleet.releases).toEqual([])
@@ -9011,7 +9012,7 @@ describe('FactoryLoop', () => {
 
       await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
         'factory-test',
-        issueKey(decision.issue),
+        dispatchIssueIdentity(decision.issue),
       )).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
       await vi.waitFor(() => expect(restarted?.status().counters.dispatchLifecycleStaleIssuesAbandoned).toBe(1))
       expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(
@@ -9084,7 +9085,7 @@ describe('FactoryLoop', () => {
 
       await expect(first.dispatch(decision)).rejects.toThrow('owner crashed after remote spawn ack')
       expect(githubRead.getIssue).toHaveBeenCalledWith('AgentWorkforce/pear', number)
-      await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({ phase: 'retryable' })
       await first.stop()
 
@@ -9104,7 +9105,7 @@ describe('FactoryLoop', () => {
 
       await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
         'factory-test',
-        issueKey(decision.issue),
+        dispatchIssueIdentity(decision.issue),
       )).toMatchObject({ phase: 'running' }), { timeout: 4_000 })
 
       expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
@@ -9181,7 +9182,7 @@ describe('FactoryLoop', () => {
       // The read inside #publishImplementerPullRequest succeeds here too —
       // still the same process, the cache warmed during dispatch covers it.
       await vi.waitFor(() => expect(attempts).toBe(1))
-      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'publishing' }))
       await first.stop()
 
@@ -9215,7 +9216,7 @@ describe('FactoryLoop', () => {
       // The lifecycle can race straight past 'published' to 'complete' by
       // the time this polls — either proves the read (and publish) succeeded.
       await vi.waitFor(async () => {
-        const lifecycle = await state().getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        const lifecycle = await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
         expect(['published', 'complete']).toContain(lifecycle?.phase)
       }, { timeout: 4_000 })
     } finally {
@@ -9305,7 +9306,7 @@ describe('FactoryLoop', () => {
     try {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(186), issueFile(186)))
       await factory.dispatch(decision)
-      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
       expect(lifecycle?.decision.implementers[0]?.branch)
         .toEqual(expect.stringMatching(/^factory\/ar-186-agentworkforce-pear-[0-9a-f]{8}$/u))
 
@@ -9526,7 +9527,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
       firstFleet.emitAgentExit('ar-485-impl-pear', 'exited')
       await vi.waitFor(() => expect(attempts).toBe(1))
-      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'publishing' }))
       await first.stop()
 
@@ -9674,7 +9675,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
       firstFleet.emitAgentExit('ar-785-impl-pear', 'exited')
       await vi.waitFor(async () => {
-        const lifecycle = await state().getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        const lifecycle = await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
         expect(lifecycle).toMatchObject({ phase: 'releasing' })
         expect(lifecycle?.agents.find((agent) => agent.name === 'ar-785-review')?.releasedAtMs)
           .toEqual(expect.any(Number))
@@ -9690,7 +9691,7 @@ describe('FactoryLoop', () => {
         probePrResolver: async () => undefined,
       })
       await restarted.start({ mode: 'dispatch-owner' })
-      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'complete' }), { timeout: 4_000 })
       // The reviewer acknowledgement was fenced before the first owner
       // stopped, so takeover retries only the failed implementer release.
@@ -10952,7 +10953,7 @@ describe('FactoryLoop', () => {
         { name: 'ar-252-review', reason: 'held-past-deadline' },
       ]), { timeout: 4_000 })
       await vi.waitFor(async () => expect(
-        await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)),
+        await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)),
       ).toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 4_000 })
       expect(factory.status().heldAgents).toEqual([])
       await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith(
@@ -11009,7 +11010,7 @@ describe('FactoryLoop', () => {
         invocationIds: [],
         updatedAtMs: 0,
       }
-      const wedgedKey = issueKey(wedgedDecision.issue)
+      const wedgedKey = dispatchIssueIdentity(wedgedDecision.issue)
       await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
       const seeded = await state().getDispatchLifecycle('factory-test', wedgedKey)
       expect(seeded?.phase).toBe('dispatching')
@@ -11109,7 +11110,7 @@ describe('FactoryLoop', () => {
         invocationIds: [],
         updatedAtMs: 0,
       }
-      const wedgedKey = issueKey(wedgedDecision.issue)
+      const wedgedKey = dispatchIssueIdentity(wedgedDecision.issue)
       await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
       const seeded = await state().getDispatchLifecycle('factory-test', wedgedKey)
       expect(seeded).toMatchObject({ phase: 'running' })
@@ -11197,7 +11198,7 @@ describe('FactoryLoop', () => {
       invocationIds: [],
       updatedAtMs: 0,
     }
-    const wedgedKey = issueKey(wedgedDecision.issue)
+    const wedgedKey = dispatchIssueIdentity(wedgedDecision.issue)
     await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
 
     // relayfile sheds this row's issue read for the whole run.
@@ -11274,7 +11275,7 @@ describe('FactoryLoop', () => {
       invocationIds: [],
       updatedAtMs: 0,
     }
-    const wedgedKey = issueKey(wedgedDecision.issue)
+    const wedgedKey = dispatchIssueIdentity(wedgedDecision.issue)
     await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
 
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
@@ -11328,7 +11329,7 @@ describe('FactoryLoop', () => {
     await seed.stop()
 
     const plannedSpec = decision.implementers[0]!
-    const key = issueKey(decision.issue)
+    const key = dispatchIssueIdentity(decision.issue)
     const wedged: DispatchLifecycle = {
       runId: 'lagging-run',
       issue: { ...decision.issue },
@@ -11514,10 +11515,10 @@ describe('FactoryLoop', () => {
       },
     }], Date.now())
     const nowMs = Date.now()
-    await state().claimDispatchLifecycle('factory-test', issueKey(holder.issue), holder, 'dead-owner', nowMs, 1)
+    await state().claimDispatchLifecycle('factory-test', dispatchIssueIdentity(holder.issue), holder, 'dead-owner', nowMs, 1)
     for (const number of [315, 316]) {
       const queued = lifecycleFor(number, 'queued', [])
-      await state().claimDispatchLifecycle('factory-test', issueKey(queued.issue), queued, 'dead-owner', nowMs, 1)
+      await state().claimDispatchLifecycle('factory-test', dispatchIssueIdentity(queued.issue), queued, 'dead-owner', nowMs, 1)
     }
 
     // AR-316's source went terminal while it sat queued. Its read is delayed so
@@ -11549,10 +11550,10 @@ describe('FactoryLoop', () => {
       await factory.start({ mode: 'dispatch-owner' })
 
       await vi.waitFor(async () => expect(
-        await state().getDispatchLifecycle('factory-test', issueKey(decisions.get(316)!.issue)),
+        await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decisions.get(316)!.issue)),
       ).toMatchObject({ phase: 'abandoned' }), { timeout: 15_000 })
       // AR-314 still holds the only slot, so nothing was freed.
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(decisions.get(314)!.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decisions.get(314)!.issue)))
         .toMatchObject({ phase: 'running' })
       // Establishes that a waiter really was parked at that moment — without
       // this the assertion below passes vacuously.
@@ -11595,7 +11596,7 @@ describe('FactoryLoop', () => {
     })
     try {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(317), issueFile(317)))
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       // Nothing else is in flight, so no other record's deadline can sweep
       // this one in by side effect.
       const dispatched = factory.dispatch(decision).catch(() => undefined)
@@ -11666,7 +11667,7 @@ describe('FactoryLoop', () => {
     })
     try {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(318), issueFile(318)))
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       const dispatched = factory.dispatch(decision)
 
       const claimed = await vi.waitFor(async () => {
@@ -11721,7 +11722,7 @@ describe('FactoryLoop', () => {
     }), { mount, fleet, stateStore: state(), triage: new StaticTriage() })
     try {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(305), issueFile(305)))
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       const dispatched = factory.dispatch(decision)
 
       // `recordPlanned` writes the spec before the spawn returns, so the row
@@ -11785,7 +11786,7 @@ describe('FactoryLoop', () => {
       const waiting = await factory.triageIssue(parseLinearIssue(issuePath(307), issueFile(307)))
       await factory.dispatch(running)
       await factory.dispatch(waiting)
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(waiting.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(waiting.issue)))
         .toMatchObject({ phase: 'queued' })
 
       // Deliverable 2: the wait escalates instead of going silent after one
@@ -13985,7 +13986,7 @@ describe('FactoryLoop', () => {
       // placement is gone.
       await stateStore.claimDispatchLifecycle(
         'factory-test',
-        issueKey(decision.issue),
+        dispatchIssueIdentity(decision.issue),
         {
           runId: 'released-run-2291',
           issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
@@ -14017,7 +14018,7 @@ describe('FactoryLoop', () => {
       // agent name nor the id can tell the generations apart. The durable row
       // must still not carry the dead generation's release stamp forward:
       // every consumer that filters on it would treat the live worker as gone.
-      const persisted = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+      const persisted = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
       const respawned = persisted?.agents.find((agent) => agent.name === implementer.name)
       expect(respawned?.tracked.result?.name).toBe(implementer.name)
       expect(respawned?.releasedAtMs).toBeUndefined()
@@ -14045,7 +14046,7 @@ describe('FactoryLoop', () => {
       fleet.hydrateTracked([{ name: implementer.name, invocationId: plannedInvocationId, node: 'sf-mini' }])
       await stateStore.claimDispatchLifecycle(
         'factory-test',
-        issueKey(decision.issue),
+        dispatchIssueIdentity(decision.issue),
         {
           runId: 'planned-run-2292',
           issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
@@ -14067,7 +14068,7 @@ describe('FactoryLoop', () => {
       await factory.dispatch(decision)
 
       expect(fleet.spawns.filter((spawn) => spawn.name === implementer.name)).toEqual([])
-      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({
           agents: expect.arrayContaining([expect.objectContaining({
             name: implementer.name,
@@ -14234,7 +14235,7 @@ describe('FactoryLoop', () => {
 
       expect(stateStore.runningSaveAttempts).toBe(1)
       expect(notifications).toEqual([])
-      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({ phase: 'dispatching' })
 
       await vi.advanceTimersByTimeAsync(1_000)
@@ -14245,7 +14246,7 @@ describe('FactoryLoop', () => {
         agent: { name: 'ar-125-impl-pear' },
         sessionOwner: null,
       })
-      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
       expect(lifecycle).toMatchObject({
         phase: 'running',
         ticketDispatchNotification: { workUnitId: lifecycle?.runId },
@@ -14313,7 +14314,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
 
       expect(notifications).toHaveLength(1)
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       const running = await firstState.getDispatchLifecycle('factory-test', key)
       expect(running).toMatchObject({
         phase: 'running',
@@ -14431,7 +14432,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
 
       expect(notifications).toHaveLength(1)
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       const notified = await firstState.getDispatchLifecycle('factory-test', key)
       expect(notified).toMatchObject({
         phase: 'running',
@@ -15315,7 +15316,7 @@ describe('FactoryLoop', () => {
       'AgentWorkforce/hoopsheet',
       'AgentWorkforce/pear',
     ])
-    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+    await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).resolves.toMatchObject({
       pullRequest: { repo: 'AgentWorkforce/pear', number: 126 },
       pullRequests: expect.arrayContaining([
         expect.objectContaining({ repo: 'AgentWorkforce/pear', number: 126 }),
@@ -15830,7 +15831,7 @@ describe('FactoryLoop', () => {
     // resume forever.
     fleet.emitAgentExit('ar-803-impl-pear-resumed-1', 'crash')
     await vi.waitFor(async () => {
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'abandoned' })
     })
 
@@ -15858,7 +15859,7 @@ describe('FactoryLoop', () => {
     ).toHaveLength(2))
     fleet.emitAgentExit('ar-806-impl-pear', 'crash')
     await vi.waitFor(async () => expect(
-      await stateStore.getDispatchLifecycle('factory-test', issueKey({
+      await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity({
         uuid: 'uuid-806', key: 'AR-806', path: issuePath(806),
       })),
     ).toMatchObject({ phase: 'abandoned' }))
@@ -15895,7 +15896,7 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(first)
     await factory.dispatch(second)
-    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(second.issue)))
+    await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(second.issue)))
       .resolves.toMatchObject({ phase: 'queued' })
 
     fleet.emitAgentExit('ar-804-impl-pear', 'crash')
@@ -15907,9 +15908,9 @@ describe('FactoryLoop', () => {
     // count exactly like a session resume so the next exit frees capacity.
     fleet.emitAgentExit('ar-804-impl-pear', 'crash')
     await vi.waitFor(async () => {
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(first.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(first.issue)))
         .toMatchObject({ phase: 'abandoned' })
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(second.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(second.issue)))
         .toMatchObject({ phase: 'running' })
     }, { timeout: 4_000 })
 
@@ -15944,9 +15945,9 @@ describe('FactoryLoop', () => {
     fleet.emitAgentExit('ar-807-impl-pear', 'crash')
 
     await vi.waitFor(async () => {
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(first.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(first.issue)))
         .toMatchObject({ phase: 'abandoned' })
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(second.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(second.issue)))
         .toMatchObject({ phase: 'running' })
     }, { timeout: 4_000 })
     expect(stateStore.abandonedSaveFailures).toBe(1)
@@ -21308,7 +21309,7 @@ describe('FactoryLoop', () => {
       ])
       restartedFleet.emitAgentExit('ar-955-review', 'completed')
       await terminal
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({ phase: 'complete' })
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).toMatchObject({ phase: 'complete' })
       await restarted.stop()
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -22442,7 +22443,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(495), issue))
       await factory.dispatch(decision)
-      branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+      branch = (await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))!
         .decision.implementers[0]!.branch!
 
       const stalePrPath = '/github/repos/AgentWorkforce/pear/pulls/1495/metadata.json'
@@ -22458,7 +22459,7 @@ describe('FactoryLoop PR babysitter', () => {
       fleet.emitAgentExit('ar-495-impl-pear', 'reconciled-missing')
 
       await vi.waitFor(async () => {
-        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
         expect(lifecycle).toMatchObject({
           phase: 'running',
           pullRequest: { repo: 'AgentWorkforce/pear', number: 1595, headRef: branch },
@@ -22510,7 +22511,10 @@ describe('FactoryLoop PR babysitter', () => {
       await first.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       const decision = await first.triageIssue(parseLinearIssue(issuePath(496), issue))
       await first.dispatch(decision)
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
+      // Babysitter ownership stayed on the surface composite when lifecycles
+      // moved to the work-unit identity (#211).
+      const ownershipKey = issueKey(decision.issue)
       const branch = (await state().getDispatchLifecycle('factory-test', key))!
         .decision.implementers[0]!.branch!
 
@@ -22558,8 +22562,8 @@ describe('FactoryLoop PR babysitter', () => {
       if (exact.tracked.spec.invocationId) lifecycle.invocationIds.push(exact.tracked.spec.invocationId)
       await writeFile(watchStatePath, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8')
 
-      await state().clearBabysitterSession('factory-test', `${key}:agentworkforce/pear#1496`)
-      await state().setBabysitterSession('factory-test', `${key}:agentworkforce/pear#1596`, {
+      await state().clearBabysitterSession('factory-test', `${ownershipKey}:agentworkforce/pear#1496`)
+      await state().setBabysitterSession('factory-test', `${ownershipKey}:agentworkforce/pear#1596`, {
         issue: decision.issue,
         repo: 'AgentWorkforce/pear',
         prNumber: 1596,
@@ -22644,7 +22648,9 @@ describe('FactoryLoop PR babysitter', () => {
       mount.emit(changeEvent(prPath, 'remote-pr-493-open'))
       await vi.waitFor(() => expect(first.status().counters.babysitterSpawnFailures).toBe(1))
 
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
+      // Babysitter ownership stayed on the surface composite (#211).
+      const ownershipKey = issueKey(decision.issue)
       await vi.waitFor(async () => {
         const lifecycle = await state().getDispatchLifecycle('factory-test', key)
         expect(lifecycle?.phase).toBe('dispatching')
@@ -22670,7 +22676,7 @@ describe('FactoryLoop PR babysitter', () => {
         ]),
       }), { timeout: 4_000 })
       await vi.waitFor(async () => expect(await state().listBabysitterSessions('factory-test')).toEqual([
-        [`${key}:agentworkforce/pear#493`, expect.objectContaining({ agentName: 'ar-493-babysit', repo: 'AgentWorkforce/pear', prNumber: 493 })],
+        [`${ownershipKey}:agentworkforce/pear#493`, expect.objectContaining({ agentName: 'ar-493-babysit', repo: 'AgentWorkforce/pear', prNumber: 493 })],
       ]))
 
       expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-493-babysit')).toHaveLength(1)
@@ -24606,7 +24612,7 @@ describe('FactoryLoop PR babysitter', () => {
     const stateStore = new InMemoryStateStore({ batchSize: 2 })
     await stateStore.claimDispatchLifecycle(
       'factory-test',
-      issueKey(decision.issue),
+      dispatchIssueIdentity(decision.issue),
       {
         runId: 'durable-waiting-run',
         issue: decision.issue,
@@ -25684,7 +25690,7 @@ describe('FactoryLoop PR babysitter', () => {
       expect(nextGenerationSpawns[3]?.continueFrom).toBe('session-ar-426-babysit')
       expect(nextGenerationSpawns[4]?.continueFrom).toBeUndefined()
       expect(harness.releases.filter((release) => release.name === 'ar-426-babysit')).toHaveLength(4)
-      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(parsedIssue))
+      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(parsedIssue))
       const invocationId = lifecycle?.agents
         .find((agent) => agent.name === 'ar-426-babysit')
         ?.tracked.spec.invocationId
@@ -26346,7 +26352,7 @@ describe('FactoryLoop PR babysitter', () => {
       await restarted.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       await vi.waitFor(async () => expect(await stateStore().getDispatchLifecycle(
         'factory-test',
-        issueKey(decision.issue),
+        dispatchIssueIdentity(decision.issue),
       )).toMatchObject({ phase: 'complete' }))
       await expect(stateStore().listBabysitterSessions('factory-test')).resolves.toEqual([])
       expect(states).toContainEqual({ key: 'AR-425', stateId: done })
