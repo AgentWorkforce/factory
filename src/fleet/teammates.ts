@@ -99,11 +99,16 @@ export interface AskTeammateResult {
  * Asks that are currently waiting on a reply, keyed by the identity the reply
  * will be addressed to plus the teammate being asked.
  *
- * A backend that drops `SendInput.data` cannot carry `requestId` to the
- * teammate, so the teammate cannot echo it and a reply is indistinguishable
- * from the reply to any other question in the same pair. Rather than resolve a
- * waiter with an answer that may belong to a different question, refuse the
- * overlap. Correlated backends (those that preserve `data`) are exempt.
+ * `AgentMessage` carries no echoed request field on ANY backend -- there is no
+ * reply-to, and `SendInput.data` is not reflected back -- so a reply can never
+ * be attributed to one of two open questions to the same teammate. That makes
+ * every backend uncorrelatable today, not just the ones that drop `data`, so
+ * the claim is unconditional. It is keyed on the RESOLVED teammate and taken
+ * after discovery, because two callers passing the same skill query resolve to
+ * the same teammate and must contend for the same key.
+ *
+ * When `AgentMessage` grows an echoed correlation field, this should become a
+ * real requestId check and the claim can be dropped.
  */
 const inFlightAsks = new Set<string>()
 
@@ -121,34 +126,19 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
   const requestId = randomUUID()
   const from = requiredText(input.from, 'askTeammate.from')
   const question = requiredText(input.question, 'askTeammate.question')
-  // Whoever the teammate will actually reply to. Falls back to `from` on a
-  // backend that carries the requested sender faithfully.
-  const replyTarget = fleet.effectiveSender?.() ?? from
-  const correlatable = sameAgent(replyTarget, from)
   const query = normalizeQuery({ skill: input.skill, tag: input.tag, q: input.q })
   if (!input.teammate && !query.skill && !query.tag && !query.q) {
     throw new Error('askTeammate requires a discovered teammate or a skill/tag/query')
   }
   const deadline = Date.now() + timeoutMs
 
-  // Claimed for the whole wait, including the discovery leg, so two overlapping
-  // asks cannot both arm a listener that would accept the same reply.
-  const askKey = `${replyTarget.toLowerCase()}\u0000${teammateKey(input.teammate)}`
-  const guarded = !correlatable && Boolean(input.teammate)
-  if (guarded && inFlightAsks.has(askKey)) {
-    throw new Error(
-      `askTeammate already has an unanswered question to this teammate as "${replyTarget}". ` +
-      'This backend cannot carry a correlation id, so a reply cannot be attributed to one ' +
-      'of two open questions; await the first before asking again.',
-    )
-  }
-  if (guarded) inFlightAsks.add(askKey)
-
   return await new Promise<AskTeammateResult>((resolve, reject) => {
     let settled = false
     let unsubscribe = () => {}
+    let claimed: string | undefined
     const release = () => {
-      if (guarded) inFlightAsks.delete(askKey)
+      if (claimed) inFlightAsks.delete(claimed)
+      claimed = undefined
     }
     const finish = (result: AskTeammateResult) => {
       if (settled) return
@@ -171,6 +161,11 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
     }, timeoutMs)
 
     void (async () => {
+      // Whoever the teammate will actually reply to. Resolved before the
+      // listener is armed, and awaited because a backend may need an auth round
+      // trip to know its own name. Falls back to `from` on a backend that
+      // carries the requested sender faithfully.
+      const replyTarget = (await fleet.effectiveSender?.()) ?? from
       const teammate = input.teammate ?? (await fleet.discoverTeammates(query))[0]
       if (settled) return
       if (!teammate) {
@@ -179,6 +174,19 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       if (!fleet.onAgentMessage) {
         throw new Error('This fleet backend cannot observe teammate replies')
       }
+      // Claimed against the RESOLVED teammate, so a discovery-based ask
+      // contends with an explicit one for the same target. Taken before the
+      // listener is armed so two waiters can never both accept one reply.
+      const askKey = `${replyTarget.toLowerCase()}\u0000${teammateKey(teammate)}`
+      if (inFlightAsks.has(askKey)) {
+        throw new Error(
+          `askTeammate already has an unanswered question to "${teammate.name}" as "${replyTarget}". ` +
+          'A reply carries no correlation id, so it cannot be attributed to one of two open ' +
+          'questions; await the first before asking again.',
+        )
+      }
+      inFlightAsks.add(askKey)
+      claimed = askKey
       unsubscribe = fleet.onAgentMessage((message) => {
         if (!sameAgent(message.from, teammate.address) && !sameAgent(message.from, teammate.name)) return
         if (!sameAgent(message.target, replyTarget)) return
@@ -296,8 +304,8 @@ function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/u, '')
 }
 
-function teammateKey(teammate: TeammateAgent | undefined): string {
-  return teammate ? `${teammate.kind}:${teammate.address.toLowerCase()}` : ''
+function teammateKey(teammate: TeammateAgent): string {
+  return `${teammate.kind}:${teammate.address.toLowerCase()}`
 }
 
 function sameAgent(left: string, right: string): boolean {

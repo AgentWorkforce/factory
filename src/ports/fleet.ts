@@ -194,8 +194,13 @@ export interface FleetClient {
    * `SendInput.from`. A teammate replies to that identity, not to the caller's
    * requested `from`, so a reply waiter must match against this instead.
    * Backends that faithfully carry `from` leave it undefined.
+   *
+   * Async because the real identity may only be knowable after an
+   * authentication round trip: a configured name can differ from the one the
+   * server actually authenticated, and matching on the pre-auth guess would
+   * reject every reply.
    */
-  effectiveSender?(): string | undefined
+  effectiveSender?(): Promise<string | undefined>
   waitForInjected?(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }>
   sendInput?(name: string, data: string): Promise<void>
   markAgentTerminal?(name: string, reason?: string): void

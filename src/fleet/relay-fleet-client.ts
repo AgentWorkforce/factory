@@ -521,7 +521,17 @@ export class RelayFleetClient implements FleetClient {
   // That identity is also the `target` stamped on every inbound message (see
   // `#emitAgentMessage`), so a reply waiter must match against it rather than
   // against the `from` its caller asked to send as.
-  effectiveSender(): string | undefined {
+  //
+  // `#authenticatedAgentName` starts life as the CONFIGURED `agentName` and is
+  // only replaced with the server's answer once something has called
+  // `agents.me()`. Returning it synchronously would hand out that pre-auth
+  // guess, which is wrong whenever an injected `messaging` or an existing
+  // `agentToken` authenticates as a different name. Resolve it for real.
+  async effectiveSender(): Promise<string | undefined> {
+    const messaging = await this.#ensureMessaging()
+    const identity = await messaging.agents.me()
+    const resolved = identity.name?.trim()
+    if (resolved) this.#authenticatedAgentName = resolved
     return this.#authenticatedAgentName
   }
 

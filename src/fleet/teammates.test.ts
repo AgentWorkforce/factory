@@ -134,7 +134,7 @@ describe('askTeammate', () => {
   // `from` would discard every valid reply and time out. (#178 review, codex P1)
   const relayLike = () => {
     const fleet = new FakeFleetClient()
-    Object.assign(fleet, { effectiveSender: () => 'factory-app' })
+    Object.assign(fleet, { effectiveSender: async () => 'factory-app' })
     fleet.teammates.push({
       name: 'infra-agent',
       address: 'infra-agent',
@@ -182,7 +182,7 @@ describe('askTeammate', () => {
       question: 'And the database?',
       teammate: fleet.teammates[0],
       timeoutMs: 1_000,
-    })).rejects.toThrow(/already has an unanswered question to this teammate/u)
+    })).rejects.toThrow(/already has an unanswered question to "infra-agent" as "factory-app"/u)
 
     fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-app', body: 'All systems green.' })
     await expect(first).resolves.toMatchObject({ reply: { body: 'All systems green.' } })
@@ -201,9 +201,8 @@ describe('askTeammate', () => {
     await expect(third).resolves.toMatchObject({ reply: { body: 'Healthy.' } })
   })
 
-  it('leaves a faithful backend uncorrelated-guard-free', async () => {
-    // FakeFleetClient carries `from`, so effectiveSender() is undefined and two
-    // concurrent asks stay legal -- the guard must not punish a correct backend.
+  it('keeps distinct requesters to one teammate independent', async () => {
+    // Different reply targets are separate keys, so these must not contend.
     const fleet = new FakeFleetClient()
     fleet.teammates.push({
       name: 'infra-agent',
@@ -224,5 +223,86 @@ describe('askTeammate', () => {
     fleet.emitAgentMessage({ from: 'infra-agent', target: 'worker-b', body: 'answer-b' })
     await expect(a).resolves.toMatchObject({ reply: { body: 'answer-a' } })
     await expect(b).resolves.toMatchObject({ reply: { body: 'answer-b' } })
+  })
+
+  // `AgentMessage` echoes no request field on ANY backend, so the SAME
+  // requester asking one teammate twice is ambiguous even where `from` is
+  // carried faithfully. An earlier version of this guard exempted such
+  // backends; the exemption was wrong. (#178 review, codex P2 second pass)
+  it('refuses a same-requester overlap even on a backend that carries `from`', async () => {
+    const fleet = new FakeFleetClient()
+    fleet.teammates.push({
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native',
+    })
+    const first = askTeammate(fleet, {
+      from: 'factory-worker', question: 'q1', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })).rejects.toThrow(/already has an unanswered question to "infra-agent"/u)
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answer-1' })
+    await expect(first).resolves.toMatchObject({ reply: { body: 'answer-1' } })
+  })
+
+  // Two callers passing the same query resolve to the same teammate, so the
+  // claim has to be taken against the RESOLVED target, not against a
+  // caller-supplied one. (#178 review, codex P2 second pass)
+  it('claims a discovered teammate, so query-based asks contend too', async () => {
+    const fleet = new FakeFleetClient()
+    fleet.teammates.push({
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native',
+    })
+    const first = askTeammate(fleet, {
+      from: 'factory-worker', question: 'q1', skill: 'infra-watch', timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker', question: 'q2', skill: 'infra-watch', timeoutMs: 1_000,
+    })).rejects.toThrow(/already has an unanswered question to "infra-agent"/u)
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answer-1' })
+    await expect(first).resolves.toMatchObject({ reply: { body: 'answer-1' } })
+  })
+
+  // A backend whose authenticated identity is only knowable after a round trip
+  // must be awaited; matching on a pre-auth guess rejects every reply.
+  // (#178 review, codex P1 second pass)
+  it('awaits an asynchronously resolved sender before matching replies', async () => {
+    const fleet = new FakeFleetClient()
+    let resolveIdentity = () => {}
+    const identityKnown = new Promise<void>((r) => { resolveIdentity = r })
+    Object.assign(fleet, {
+      effectiveSender: async () => {
+        await identityKnown
+        return 'authenticated-name'
+      },
+    })
+    fleet.teammates.push({
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native',
+    })
+    const asked = askTeammate(fleet, {
+      from: 'configured-guess', question: 'q', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })
+    // Nothing may be sent until the real identity is known.
+    expect(fleet.messages).toHaveLength(0)
+    resolveIdentity()
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'authenticated-name', body: 'answered' })
+    await expect(asked).resolves.toMatchObject({ reply: { body: 'answered' } })
   })
 })
