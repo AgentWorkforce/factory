@@ -4601,18 +4601,22 @@ export class FactoryLoop implements Factory {
           // finished quickly tore down its own completed work and reported
           // RETRYABLE to its supervisor (factory#319).
           //
-          // A third party mutating the issue cannot advance *our* record's
-          // lifecycle phase, so the phase is what separates the two. Losing
-          // the row to another owner is a different condition and is still
-          // caught where it always was — #saveDispatchLifecycle returning
-          // false.
-          if (!ownLifecycleMovedPastDispatch(record.lifecyclePhase)) {
+          // Only THIS dispatch's own confirmed issue writeback may excuse the
+          // change. Lifecycle phases are not enough: `publishing` is entered
+          // before the PR is published and `parking` before anything touches
+          // the issue, so a phase records local progress, not authorship — and
+          // a foreign park landing during those awaits would be misread as
+          // ours (codex review on #321). Losing the row to another owner is a
+          // different condition and is still caught where it always was, by
+          // #saveDispatchLifecycle returning false.
+          if (record.issueWritebackConfirmedAtMs === undefined) {
             throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
           }
           // The claim is moot and would be wrong to write: it would drag an
           // issue our own lifecycle has already parked back to `implementing`.
         } else {
           implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
+          record.issueWritebackConfirmedAtMs = this.#clock.now()
           this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
         }
       }
@@ -13956,6 +13960,7 @@ export class FactoryLoop implements Factory {
           await this.#linear.setState(issue, targetState)
           await this.#recordCanonicalIssueState({ ...record.issue, stateId: targetState })
         }
+        record.issueWritebackConfirmedAtMs = this.#clock.now()
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
         if (!humanReview) await this.#markDependencyTerminalAndReconcile(issue)
       }
@@ -20224,31 +20229,6 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
  * turns it into a distinct exit code — can recognize it by type rather than by
  * matching on `error.name`, and so tests can construct a genuine instance.
  */
-/**
- * Phases a dispatch record only reaches by its *own* lifecycle progressing past
- * dispatch setup.
- *
- * `queued`/`dispatching` mean setup is still running, and `retryable`,
- * `abandoning` and `abandoned` are failure states — none of them imply this
- * record wrote to the issue. Everything here does, so an issue that stopped
- * being ready while the record sits in one of these phases stopped because of
- * us (factory#319).
- */
-const SELF_ADVANCED_DISPATCH_PHASES: ReadonlySet<DispatchLifecyclePhase> = new Set([
-  'running',
-  'parking',
-  'waiting-for-human',
-  'publishing',
-  'published',
-  'writeback-applied',
-  'releasing',
-  'complete',
-])
-
-function ownLifecycleMovedPastDispatch(phase: DispatchLifecyclePhase | undefined): boolean {
-  return phase !== undefined && SELF_ADVANCED_DISPATCH_PHASES.has(phase)
-}
-
 export class LiveDispatchStateChangedError extends Error {
   readonly issueKey: string
 
