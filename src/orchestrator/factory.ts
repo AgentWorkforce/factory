@@ -7180,7 +7180,16 @@ export class FactoryLoop implements Factory {
         !labels.every((label) => typeof label === 'string')) {
         return undefined
       }
-      if (state !== 'open' || !labels.some((label) => label.trim().toLowerCase() === requiredLabel)) {
+      // Retain Factory's own lifecycle rows even when they lack the scope
+      // label. The index carries no title, so a title-scoped issue cannot be
+      // recognised here — and dropping it means its file is never read and the
+      // orphan-recovery sweep never sees it. `factory:in-progress` is a label
+      // only Factory applies, so a row carrying it is by definition
+      // Factory-touched and worth reading; `isInFactoryScope` downstream
+      // remains the authority on whether anything may be done with it.
+      const rowLabels = labels.map((label) => label.trim().toLowerCase())
+      if (state !== 'open' ||
+        !(rowLabels.includes(requiredLabel) || rowLabels.includes('factory:in-progress'))) {
         continue
       }
       paths.push(`${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues/by-id/${number}.json`)

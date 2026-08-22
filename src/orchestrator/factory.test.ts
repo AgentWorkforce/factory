@@ -4970,9 +4970,25 @@ describe('FactoryLoop', () => {
   it('recovers an orphaned in-progress GitHub issue that is in scope by title prefix alone', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-title-scope-'))
     try {
-      const path = githubIssuePath('AgentWorkforce', 'pear', 139)
+      const path = githubIssueCompactPath('AgentWorkforce', 'pear', 139)
       const payload = { title: '[factory-e2e] Title-scoped orphan', labels: ['pear', 'factory:in-progress'] }
-      const mount = new FakeMountClient({ [path]: githubIssueFile(139, payload) })
+      // Go through the Relayfile issue index, which is what indexed production
+      // deployments use. The index carries no title, so a title-scoped row can
+      // only be retained via its `factory:in-progress` lifecycle label — fixing
+      // the recovery gate alone leaves this issue unread and still stranded.
+      const mount = new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/_index.json': [
+          {
+            id: '139',
+            number: 139,
+            title: '[factory-e2e] Title-scoped orphan',
+            updated: '2026-08-17T10:00:00Z',
+            state: 'open',
+            labels: ['pear', 'factory:in-progress'],
+          },
+        ],
+        [path]: githubIssueFile(139, payload),
+      })
       mount.setSubRoot('/linear/issues', 'absent')
       const fleet = new FakeFleetClient()
       const githubWriteback = new RecordingGithubWriteback()
