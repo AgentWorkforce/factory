@@ -40,6 +40,7 @@ import type {
   BabysitterSessionState,
   DispatchLifecycleAgentUsage,
   DispatchLifecycle,
+  DispatchLifecycleClaim,
   DispatchLifecycleLease,
   DispatchLifecyclePhase,
   DiscoveryCheckpoint,
@@ -109,6 +110,7 @@ import type {
   TriageEngine,
   WorkUnitOrigin,
 } from '../types'
+import { DispatchLifecycleMigrationConflictError } from '../ports/state'
 import { AppGithubWriteback, FACTORY_GITHUB_STATUS_LABELS, GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
 import { parseSlackThreadReply, slackThreadReplyGlob, type SlackThreadReply } from '../subscriptions/slack-filter'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
@@ -5013,14 +5015,30 @@ export class FactoryLoop implements Factory {
         ])
         if (previews.length > 0) this.#previewReferences.set(issueKey(lifecycle.issue), previews)
         hasNonterminalDurableLifecycle = true
-        const claim = await this.#state.claimDispatchLifecycle(
-          this.#workspaceId,
-          key,
-          lifecycle,
-          this.#dispatchLifecycleOwner,
-          this.#clock.now(),
-          DISPATCH_LIFECYCLE_LEASE_MS,
-        )
+        // A work unit whose keys cannot be reconciled must not strand the rows
+        // behind it — #315 is the same lesson from the shed-read path. Retain
+        // the conflicting rows, leave that one unit blocked for an operator,
+        // and carry on adopting the rest.
+        let claim: DispatchLifecycleClaim
+        try {
+          claim = await this.#state.claimDispatchLifecycle(
+            this.#workspaceId,
+            key,
+            lifecycle,
+            this.#dispatchLifecycleOwner,
+            this.#clock.now(),
+            DISPATCH_LIFECYCLE_LEASE_MS,
+          )
+        } catch (error) {
+          if (!(error instanceof DispatchLifecycleMigrationConflictError)) throw error
+          this.#increment('dispatchLifecycleMigrationConflicts')
+          this.#logger.error?.('[factory] dispatch is blocked for one work unit until its keys are reconciled', {
+            issue: lifecycle.issue.key,
+            canonicalKey: error.canonicalKey,
+            conflictingKeys: error.conflictingKeys,
+          })
+          continue
+        }
         if (!claim.acquired || !claim.lease) {
           // The other process may have crashed while its nominal lease is
           // still live. Keep this process attached so it reclaims the row

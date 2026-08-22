@@ -27264,6 +27264,73 @@ describe('work-unit identity at the triage boundary (#211)', () => {
     }
   })
 
+  // CodeRabbit, PR #329: the fail-closed conflict is thrown from inside
+  // claimDispatchLifecycle, so an unreconcilable unit was aborting adoption of
+  // every row behind it — the #315 failure mode, reintroduced.
+  it('blocks only the unreconcilable work unit, not every row behind it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-migration-conflict-'))
+    const watchStatePath = join(root, 'state.json')
+    const conflicted = { uuid: 'uuid-700', key: 'AR-700', path: issuePath(700) }
+    const healthy = { uuid: 'uuid-701', key: 'AR-701', path: issuePath(701) }
+    const row = (issue: typeof conflicted, runId: string, decision: TriageDecision, leaseUntilMs: number) => ({
+      runId,
+      issue,
+      decision: { ...decision, issue },
+      dryRun: false,
+      phase: 'running',
+      agents: [],
+      invocationIds: [],
+      updatedAtMs: 1_000,
+      lease: { owner: `owner-${runId}`, epoch: 1, leaseUntilMs },
+    })
+    const conflictedDecision = await new StaticTriage().triage(parseLinearIssue(issuePath(700), issueFile(700)))
+    const healthyDecision = await new StaticTriage().triage(parseLinearIssue(issuePath(701), issueFile(701)))
+
+    // Seed through the store so the document shape stays valid, then add the
+    // second live-leased key by hand: two live leases for ONE work unit is a
+    // state the store's own claim path will not produce, which is the point.
+    const seeder = new FileStateStore({ batchSize: 4, watchStatePath })
+    await seeder.claimDispatchLifecycle(
+      'factory-test', dispatchIssueIdentity(conflicted),
+      row(conflicted, 'a', conflictedDecision, 9_000_000_000_000) as never,
+      'owner-a', 1_000, 9_000_000_000_000,
+    )
+    await seeder.claimDispatchLifecycle(
+      'factory-test', dispatchIssueIdentity(healthy),
+      row(healthy, 'healthy', healthyDecision, 1) as never,
+      'owner-healthy', 1_000, 1,
+    )
+    const document = JSON.parse(await readFile(watchStatePath, 'utf8')) as {
+      workspaces: Record<string, { dispatchLifecycles: Record<string, unknown> }>
+    }
+    const lifecycles = document.workspaces['factory-test']!.dispatchLifecycles
+    lifecycles[`${conflicted.key}:${conflicted.uuid}:${conflicted.path}`] =
+      row(conflicted, 'b', conflictedDecision, 9_000_000_000_000)
+    await writeFile(watchStatePath, JSON.stringify(document), 'utf8')
+
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [issuePath(700)]: issueFile(700), [issuePath(701)]: issueFile(701) }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: new FileStateStore({ batchSize: 4, watchStatePath }),
+      triage: new StaticTriage(),
+    })
+    try {
+      await factory.start({ mode: 'dispatch-owner' })
+      // One unit is blocked for an operator; the row behind it is still adopted,
+      // and the conflicting rows are retained rather than resolved by guesswork.
+      // Both rows of the pair are visited, so each reports the conflict.
+      await vi.waitFor(() => expect(factory.status().counters.dispatchLifecycleMigrationConflicts).toBe(2))
+      const after = new FileStateStore({ batchSize: 4, watchStatePath })
+      const healthyRow = await after.getDispatchLifecycle('factory-test', dispatchIssueIdentity(healthy))
+      expect(healthyRow?.lease?.owner, 'the row behind the conflict is adopted').not.toBe('owner-healthy')
+      expect((await after.listDispatchLifecycles('factory-test')).map(([, l]) => l.runId).sort())
+        .toEqual(['a', 'b', 'healthy'])
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('re-attaches the mirror origin a triage engine dropped', async () => {
     // StaticTriage returns only { uuid, key, path } — the same shape
     // TriageDecisionSchema.parse leaves behind, so this covers LlmTriage and any
