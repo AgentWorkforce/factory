@@ -670,7 +670,8 @@ export class RelayFleetClient implements FleetClient {
   // closed the rotate path to workspace keys, so a conflict stopped being
   // recoverable. Because the methods still *exist*, an optional-chain fallback
   // never fires — the client just kept re-registering into 409 forever
-  // (factory#316). Call `register` directly and make the conflict loud.
+  // (factory#316). Call `register` directly, and reclaim the name by audited
+  // takeover when it is already held.
   async #registerFactoryAgent(workspaceKey: string): Promise<string> {
     this.#registrationAttempts += 1
     if (this.#registrationAttempts > MAX_REGISTRATION_ATTEMPTS) {
@@ -689,9 +690,8 @@ export class RelayFleetClient implements FleetClient {
       this.#registrationAttempts = 0
       return registration.token
     } catch (error) {
-      // A conflict is terminal: no primitive reachable on this SDK surface can
-      // reclaim a name we hold no token for. Retrying is precisely the silent
-      // loop this guard exists to end.
+      // Re-registering is what looped for six days. The only way out is to
+      // reclaim the record we collided with — or to fail by name.
       if (isAgentNameConflictError(error)) {
         return await this.#reclaimFactoryAgent(workspaceKey, agents, error)
       }
@@ -807,14 +807,6 @@ export class RelayFleetClient implements FleetClient {
     })
   }
 
-  /**
-   * Poll an invocation to a terminal status inside `deadlineAtMs`.
-   *
-   * Callers that already spent part of the budget — `spawn` burns some on
-   * bootstrap and placement — pass their own deadline so the total stays
-   * bounded. A caller that omits it is starting a fresh operation (`release`,
-   * the preview paths) and gets a full budget of its own.
-   */
   // The name exists and we hold no token for it. `recover` cannot help: its
   // three authorities are agent-token, origin-node and work-unit-proof, and a
   // workspace key establishes none of them. `/takeover` is the engine's own
@@ -923,6 +915,14 @@ export class RelayFleetClient implements FleetClient {
     return token
   }
 
+  /**
+   * Poll an invocation to a terminal status inside `deadlineAtMs`.
+   *
+   * Callers that already spent part of the budget — `spawn` burns some on
+   * bootstrap and placement — pass their own deadline so the total stays
+   * bounded. A caller that omits it is starting a fresh operation (`release`,
+   * the preview paths) and gets a full budget of its own.
+   */
   async #awaitInvocation(
     actionName: string,
     ack: RelayActionInvocationAck,
