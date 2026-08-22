@@ -44,6 +44,10 @@ export interface RelayFleetClientOptions {
   agentToken?: string
   /** Workspace agent identity the factory registers/rotates for itself. */
   agentName?: string
+  /** Recorded on the takeover audit row; set it to the real node where known. */
+  nodeId?: string
+  /** Injectable for tests; the takeover endpoint is not on the SDK surface. */
+  fetch?: typeof globalThis.fetch
   /** Stable workspace action used for durable agent lifecycle reports. */
   lifecycleActionName?: string
   /** Engine base URL override. Absent means the SDK default (cast.agentrelay.com). */
@@ -74,6 +78,18 @@ const knownCapabilities = new Set<NodeCapability>(['spawn:claude', 'spawn:codex'
 const openStatuses = new Set(['pending', 'dispatched', 'invoked'])
 const terminalStatuses = new Set(['completed', 'failed', 'denied'])
 const DEFAULT_AGENT_NAME = 'factory'
+// A backstop against an unbounded re-registration loop, not a tight retry
+// budget: a name conflict already fails immediately, so this only bounds
+// *consecutive* transient failures and is deliberately forgiving of a cold
+// start against a slow relay.
+export const MAX_REGISTRATION_ATTEMPTS = 10
+// Matches the default @agent-relay/sdk resolves when no baseUrl is configured,
+// so a takeover always targets the host the register went to.
+const DEFAULT_RELAY_BASE_URL = 'https://cast.agentrelay.com'
+// Every engine status that means somebody is holding the identity. `offline` is
+// the only one that is not here, and `unknown` is what the SDK substitutes when
+// status is missing — so an absent status never reads as safe.
+const LIVE_AGENT_STATUSES = new Set(['online', 'active', 'idle', 'blocked', 'waiting', 'unknown'])
 export const DEFAULT_LIFECYCLE_ACTION_NAME = 'factory.lifecycle'
 const DEFAULT_SPAWN_ACK_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_POLL_INTERVAL_MS = 1_000
@@ -132,6 +148,11 @@ export class RelayFleetClient implements FleetClient {
   readonly lifecycleActionName: string
   readonly #options: RelayFleetClientOptions
   readonly #agentName: string
+  // The token minted by this process's own registration. Reused across
+  // bootstrap retries so a failure *after* registration never re-registers
+  // the same name — see #registerFactoryAgent (factory#316).
+  #registeredAgentToken?: string
+  #registrationAttempts = 0
   readonly #spawnAckTimeoutMs: number
   readonly #pollIntervalMs: number
   readonly #exitWatchIntervalMs: number
@@ -627,8 +648,14 @@ export class RelayFleetClient implements FleetClient {
     if (!workspaceKey && !agentToken) {
       throw new Error('RelayFleetClient requires a workspace key (rk_live_…) or agent token (at_live_…); set RELAY_WORKSPACE_KEY or RELAY_AGENT_TOKEN')
     }
+    // Registration is not idempotent: the engine answers a repeat of a name it
+    // already holds with 409 agent_already_exists. Reusing the token this
+    // process already minted is what keeps a post-registration bootstrap
+    // failure from colliding with our own record (factory#316).
+    agentToken ??= this.#registeredAgentToken
     if (!agentToken) {
       agentToken = await this.#registerFactoryAgent(workspaceKey as string)
+      this.#registeredAgentToken = agentToken
     }
     const relay = this.#createRelay({
       ...(workspaceKey ? { workspaceKey } : {}),
@@ -639,17 +666,41 @@ export class RelayFleetClient implements FleetClient {
     return this.#messaging
   }
 
-  // Rotate-on-start is idempotent and leaves nothing secret on disk: the
-  // factory adopts its standing workspace identity and mints a fresh token.
+  // Mints this process's agent identity from the workspace key.
+  //
+  // `registerOrRotate`/`registerOrGet` used to recover from a name conflict by
+  // rotating the existing agent's token. In @relaycast/sdk 8.2.0 both became
+  // deprecated aliases for plain `register`, and the engine simultaneously
+  // closed the rotate path to workspace keys, so a conflict stopped being
+  // recoverable. Because the methods still *exist*, an optional-chain fallback
+  // never fires — the client just kept re-registering into 409 forever
+  // (factory#316). Call `register` directly, and reclaim the name by audited
+  // takeover when it is already held.
   async #registerFactoryAgent(workspaceKey: string): Promise<string> {
+    this.#registrationAttempts += 1
+    if (this.#registrationAttempts > MAX_REGISTRATION_ATTEMPTS) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        `gave up after ${MAX_REGISTRATION_ATTEMPTS} registration attempts`,
+      )
+    }
     const bootstrap = this.#createRelay({
       workspaceKey,
       ...(this.#options.baseUrl ? { baseUrl: this.#options.baseUrl } : {}),
     })
     const agents = bootstrap.messaging.agents
-    const register = agents.registerOrRotate?.bind(agents) ?? agents.register.bind(agents)
-    const registration = await register({ name: this.#agentName })
-    return registration.token
+    try {
+      const registration = await agents.register({ name: this.#agentName })
+      this.#registrationAttempts = 0
+      return registration.token
+    } catch (error) {
+      // Re-registering is what looped for six days. The only way out is to
+      // reclaim the record we collided with — or to fail by name.
+      if (isAgentNameConflictError(error)) {
+        return await this.#reclaimFactoryAgent(workspaceKey, agents, error)
+      }
+      throw error
+    }
   }
 
   /** The wall-clock instant one placement operation must be finished by. */
@@ -758,6 +809,153 @@ export class RelayFleetClient implements FleetClient {
       if (!outcome.ok) return
       await this.#releaseLatePlacement(name, outcome.value)
     })
+  }
+
+  // The name exists and we hold no token for it. `recover` cannot help: its
+  // three authorities are agent-token, origin-node and work-unit-proof, and a
+  // workspace key establishes none of them. `/takeover` is the engine's own
+  // workspace-admin escape hatch for exactly this, and it is gated by
+  // requireWorkspaceKey — the credential we already have. It is absent from the
+  // `@agent-relay/sdk` agents surface, so this calls the endpoint directly.
+  async #reclaimFactoryAgent(
+    workspaceKey: string,
+    agents: RelayMessaging['agents'],
+    conflict: unknown,
+  ): Promise<string> {
+    let lastError: unknown = conflict
+    // The engine rejects a stale `expected_agent_id` with 409
+    // agent_identity_conflict; that means the record moved under us, so re-read
+    // it and try once more rather than treating it as terminal.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const existing = asRecord(await agents.get(this.#agentName).catch(() => undefined))
+      const agentId = readString(existing, 'id', 'agent_id', 'agentId')
+      if (!agentId) {
+        throw new FactoryAgentRegistrationError(
+          this.#agentName,
+          `name is taken but the record could not be read back: ${errorMessage(lastError)}`,
+          { cause: lastError },
+        )
+      }
+      await this.#assertAgentNotLive(agents, existing)
+      try {
+        return await this.#takeOverAgent(workspaceKey, agentId)
+      } catch (error) {
+        lastError = error
+        if (isIdentityMovedError(error) && attempt === 0) continue
+        if (error instanceof FactoryAgentRegistrationError) throw error
+        throw new FactoryAgentRegistrationError(
+          this.#agentName,
+          `could not reclaim the existing identity: ${errorMessage(error)}`,
+          { cause: error },
+        )
+      }
+    }
+    throw new FactoryAgentRegistrationError(
+      this.#agentName,
+      `could not reclaim the existing identity: ${errorMessage(lastError)}`,
+      { cause: lastError },
+    )
+  }
+
+  // Seizing a name from a LIVE agent would strand its credential. Our case is a
+  // collision with our own dead record, but the guard is coded rather than
+  // assumed — the situation is not a safety property.
+  async #assertAgentNotLive(
+    agents: RelayMessaging['agents'],
+    existing: Record<string, unknown> | undefined,
+  ): Promise<void> {
+    // Allow-list, not a deny-list. The engine also has active/idle/blocked/
+    // waiting, all of which mean someone is holding this identity, and
+    // `unknown` is what the SDK substitutes when status is missing. Only a
+    // record that says offline gets as far as the presence check.
+    const status = readString(existing, 'status')
+    if (status !== 'offline') {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        `refusing to take over agent in status "${status ?? 'unknown'}"; another factory may still hold this identity`,
+      )
+    }
+
+    // Presence is the canonical liveness signal, and the agent record can be
+    // stale. Everything below fails CLOSED: only a presence row we actually
+    // read, for this agent, carrying a status we recognise as not-live, may
+    // authorise a seizure. A request that failed, a body we cannot parse, or a
+    // missing row is absence of evidence — not evidence of death.
+    //
+    // This asymmetry is deliberate. Refusing to boot costs us a recoverable
+    // outage of our own; seizing a live agent's credential strands another
+    // running process and takes the very token it would need to recover.
+    let presence: unknown
+    try {
+      presence = await agents.presence()
+    } catch (error) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        `could not read presence to confirm the agent is not live: ${errorMessage(error)}`,
+        { cause: error },
+      )
+    }
+    if (!Array.isArray(presence)) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        'presence did not return a list, so the agent cannot be confirmed offline',
+      )
+    }
+    const entry = presence
+      .map((row) => asRecord(row))
+      .find((row) => readString(row, 'agentName', 'agent_name', 'name') === this.#agentName)
+    if (!entry) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        'presence does not list this agent, so it cannot be confirmed offline',
+      )
+    }
+    const seenStatus = readString(entry, 'status')
+    if (seenStatus === undefined) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        'presence reported no status for this agent, so it cannot be confirmed offline',
+      )
+    }
+    if (LIVE_AGENT_STATUSES.has(seenStatus)) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        `presence reports this agent as "${seenStatus}"; another factory may still hold this identity`,
+      )
+    }
+  }
+
+  async #takeOverAgent(workspaceKey: string, expectedAgentId: string): Promise<string> {
+    const base = (this.#options.baseUrl ?? DEFAULT_RELAY_BASE_URL).replace(/\/+$/, '')
+    const url = `${base}/v1/agents/${encodeURIComponent(this.#agentName)}/takeover`
+    const doFetch = this.#options.fetch ?? globalThis.fetch
+    // Every field lands in the audit row, so make them all say something.
+    const response = await doFetch(url, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${workspaceKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expected_agent_id: expectedAgentId,
+        actor: `factory:${this.#agentName}`,
+        reason: 'factory bootstrap reclaiming its own workspace identity after a registration conflict (factory#316)',
+        session_ref: `factory-bootstrap-${this.#now()}`,
+        node_id: this.#options.nodeId ?? 'factory-cloud-container',
+      }),
+    })
+    const payload = asRecord(await response.json().catch(() => undefined))
+    if (!response.ok) {
+      const failure = asRecord(payload?.error)
+      const error = new Error(
+        readString(failure, 'message') ?? `takeover failed with HTTP ${response.status}`,
+      ) as Error & { code?: string; statusCode?: number }
+      error.code = readString(failure, 'code')
+      error.statusCode = response.status
+      throw error
+    }
+    const data = asRecord(payload?.data) ?? payload
+    const token = readString(data, 'token')
+    if (!token) throw new Error('takeover succeeded but returned no agent token')
+    this.#registrationAttempts = 0
+    return token
   }
 
   /**
@@ -1269,6 +1467,44 @@ function previewReference(value: unknown, placementNode?: string): PreviewRefere
     ...(process ? { process } : {}),
     ...(node ? { node } : {}),
   }
+}
+
+/**
+ * Registration could not converge on a usable agent identity. Named so a
+ * six-day silent 409 loop surfaces as one actionable failure instead.
+ */
+export class FactoryAgentRegistrationError extends Error {
+  readonly agentName: string
+
+  constructor(agentName: string, detail: string, options?: { cause?: unknown }) {
+    super(`Factory agent "${agentName}" could not register with the relay workspace: ${detail}`)
+    this.name = 'FactoryAgentRegistrationError'
+    this.agentName = agentName
+    if (options && 'cause' in options) {
+      ;(this as Error & { cause?: unknown }).cause = options.cause
+    }
+  }
+}
+
+// The SDK reports the engine's 409 agent_already_exists as a RelayError with
+// `code: 'name_conflict'` and `rawCode: 'agent_already_exists'`. Match on the
+// structured fields first and keep the message probe for stubs and older SDKs.
+function isAgentNameConflictError(error: unknown): boolean {
+  const record = asRecord(error)
+  if (record) {
+    if (record.rawCode === 'agent_already_exists' || record.code === 'name_conflict') return true
+    if (record.statusCode === 409 || record.status === 409) return true
+  }
+  return /already exists|name[ _]conflict|agent_already_exists/i.test(errorMessage(error))
+}
+
+// 409 agent_identity_conflict means the record moved between our read and the
+// takeover — retryable once, unlike agent_already_exists which is the conflict
+// we are already handling.
+function isIdentityMovedError(error: unknown): boolean {
+  const record = asRecord(error)
+  if (record?.code === 'agent_identity_conflict') return true
+  return /agent_identity_conflict|no longer has expected id/i.test(errorMessage(error))
 }
 
 function isUnknownRecipientError(error: unknown): boolean {
