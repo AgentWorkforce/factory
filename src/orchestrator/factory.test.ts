@@ -23644,10 +23644,7 @@ describe('FactoryLoop PR babysitter', () => {
       'has an active agent. Please continue on the linked issue or pull request.'
     const starting = factory.start({ mode: 'dispatch-owner' })
     try {
-      for (let tick = 0; tick < 200 && !mount.receiptWriteEntered; tick += 1) {
-        await vi.advanceTimersByTimeAsync(1)
-      }
-      expect(mount.receiptWriteEntered).toBe(true)
+      await vi.waitFor(() => expect(mount.receiptWriteEntered).toBe(true), { timeout: 4_000 })
 
       // Slack writeback budgets 90s for the confirm alone, so a write that runs
       // longer than the 60s lease is inside spec, not pathological. Push past
@@ -23722,10 +23719,7 @@ describe('FactoryLoop PR babysitter', () => {
     })
     const starting = factory.start({ mode: 'dispatch-owner' })
     try {
-      for (let tick = 0; tick < 200 && !mount.receiptWriteEntered; tick += 1) {
-        await vi.advanceTimersByTimeAsync(1)
-      }
-      expect(mount.receiptWriteEntered).toBe(true)
+      await vi.waitFor(() => expect(mount.receiptWriteEntered).toBe(true), { timeout: 4_000 })
 
       // Inside the renewal ceiling the claim still belongs to the write: a
       // writeback that runs past the 60s idle lease is inside spec, and this is
@@ -23808,10 +23802,7 @@ describe('FactoryLoop PR babysitter', () => {
     const starting = factory.start({ mode: 'dispatch-owner' })
     let stopping: Promise<void> | undefined
     try {
-      for (let tick = 0; tick < 200 && !mount.receiptWriteEntered; tick += 1) {
-        await vi.advanceTimersByTimeAsync(1)
-      }
-      expect(mount.receiptWriteEntered).toBe(true)
+      await vi.waitFor(() => expect(mount.receiptWriteEntered).toBe(true), { timeout: 4_000 })
 
       // A stopping daemon has no standing to keep holding a claim on work it is
       // walking away from; the successor must find the receipt free.
