@@ -868,19 +868,24 @@ export class RelayFleetClient implements FleetClient {
     agents: RelayMessaging['agents'],
     existing: Record<string, unknown> | undefined,
   ): Promise<void> {
-    let live = readString(existing, 'status') === 'online'
+    // Allow-list, not a deny-list. The engine also has active/idle/blocked/
+    // waiting, all of which mean someone is holding this identity, and
+    // `unknown` is what the SDK substitutes when status is missing. Only a
+    // record that says offline is safe to seize.
+    const status = readString(existing, 'status')
+    let live = status !== 'offline'
     if (!live) {
       const presence = await agents.presence().catch(() => undefined)
       live = Array.isArray(presence) && presence.some((entry) => {
         const seen = asRecord(entry)
         return readString(seen, 'agentName', 'agent_name', 'name') === this.#agentName
-          && readString(seen, 'status') === 'online'
+          && readString(seen, 'status') !== 'offline'
       })
     }
     if (live) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
-        'refusing to take over an agent that is currently online; another factory may still hold this identity',
+        `refusing to take over agent in status "${status ?? 'unknown'}"; another factory may still hold this identity`,
       )
     }
   }

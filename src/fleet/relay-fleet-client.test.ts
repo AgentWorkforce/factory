@@ -1282,10 +1282,37 @@ describe('RelayFleetClient', () => {
 
     const error = await fleet.roster().then(() => undefined, (err: unknown) => err)
     expect((error as Error).name).toBe('FactoryAgentRegistrationError')
-    expect((error as Error).message).toMatch(/currently online/)
+    expect((error as Error).message).toMatch(/refusing to take over/)
     // The guard must fire BEFORE the seizure, not report it afterwards.
     expect(takeovers).toBe(0)
   })
+
+  it.each(['online', 'active', 'idle', 'blocked', 'waiting', 'unknown'])(
+    'refuses takeover for a %s agent, not just an online one',
+    async (status) => {
+      const messaging = new FakeMessaging()
+      const { agents, agentStatus } = deprecatedAliasAgents()
+      await (agents.register as (i: { name: string }) => Promise<unknown>)({ name: 'factory' })
+      agentStatus.value = status
+      const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+      let takeovers = 0
+      const fleet = new RelayFleetClient({
+        workspaceKey: 'rk_live_test',
+        env: {},
+        sleep: immediateSleep,
+        pollIntervalMs: 0,
+        fetch: (async () => {
+          takeovers += 1
+          return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+        }) as unknown as typeof globalThis.fetch,
+        createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+      })
+
+      const error = await fleet.roster().then(() => undefined, (err: unknown) => err)
+      expect((error as Error).name).toBe('FactoryAgentRegistrationError')
+      expect(takeovers).toBe(0)
+    },
+  )
 
   it('re-reads the agent id and retries once when the identity moved mid-takeover', async () => {
     const messaging = new FakeMessaging()
