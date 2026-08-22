@@ -74,6 +74,11 @@ const knownCapabilities = new Set<NodeCapability>(['spawn:claude', 'spawn:codex'
 const openStatuses = new Set(['pending', 'dispatched', 'invoked'])
 const terminalStatuses = new Set(['completed', 'failed', 'denied'])
 const DEFAULT_AGENT_NAME = 'factory'
+// A backstop against an unbounded re-registration loop, not a tight retry
+// budget: a name conflict already fails immediately, so this only bounds
+// *consecutive* transient failures and is deliberately forgiving of a cold
+// start against a slow relay.
+export const MAX_REGISTRATION_ATTEMPTS = 10
 export const DEFAULT_LIFECYCLE_ACTION_NAME = 'factory.lifecycle'
 const DEFAULT_SPAWN_ACK_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_POLL_INTERVAL_MS = 1_000
@@ -132,6 +137,11 @@ export class RelayFleetClient implements FleetClient {
   readonly lifecycleActionName: string
   readonly #options: RelayFleetClientOptions
   readonly #agentName: string
+  // The token minted by this process's own registration. Reused across
+  // bootstrap retries so a failure *after* registration never re-registers
+  // the same name — see #registerFactoryAgent (factory#316).
+  #registeredAgentToken?: string
+  #registrationAttempts = 0
   readonly #spawnAckTimeoutMs: number
   readonly #pollIntervalMs: number
   readonly #exitWatchIntervalMs: number
@@ -627,8 +637,14 @@ export class RelayFleetClient implements FleetClient {
     if (!workspaceKey && !agentToken) {
       throw new Error('RelayFleetClient requires a workspace key (rk_live_…) or agent token (at_live_…); set RELAY_WORKSPACE_KEY or RELAY_AGENT_TOKEN')
     }
+    // Registration is not idempotent: the engine answers a repeat of a name it
+    // already holds with 409 agent_already_exists. Reusing the token this
+    // process already minted is what keeps a post-registration bootstrap
+    // failure from colliding with our own record (factory#316).
+    agentToken ??= this.#registeredAgentToken
     if (!agentToken) {
       agentToken = await this.#registerFactoryAgent(workspaceKey as string)
+      this.#registeredAgentToken = agentToken
     }
     const relay = this.#createRelay({
       ...(workspaceKey ? { workspaceKey } : {}),
@@ -639,17 +655,41 @@ export class RelayFleetClient implements FleetClient {
     return this.#messaging
   }
 
-  // Rotate-on-start is idempotent and leaves nothing secret on disk: the
-  // factory adopts its standing workspace identity and mints a fresh token.
+  // Mints this process's agent identity from the workspace key.
+  //
+  // `registerOrRotate`/`registerOrGet` used to recover from a name conflict by
+  // rotating the existing agent's token. In @relaycast/sdk 8.2.0 both became
+  // deprecated aliases for plain `register`, and the engine simultaneously
+  // closed the rotate path to workspace keys, so a conflict stopped being
+  // recoverable. Because the methods still *exist*, an optional-chain fallback
+  // never fires — the client just kept re-registering into 409 forever
+  // (factory#316). Call `register` directly and make the conflict loud.
   async #registerFactoryAgent(workspaceKey: string): Promise<string> {
+    this.#registrationAttempts += 1
+    if (this.#registrationAttempts > MAX_REGISTRATION_ATTEMPTS) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        `gave up after ${MAX_REGISTRATION_ATTEMPTS} registration attempts`,
+      )
+    }
     const bootstrap = this.#createRelay({
       workspaceKey,
       ...(this.#options.baseUrl ? { baseUrl: this.#options.baseUrl } : {}),
     })
     const agents = bootstrap.messaging.agents
-    const register = agents.registerOrRotate?.bind(agents) ?? agents.register.bind(agents)
-    const registration = await register({ name: this.#agentName })
-    return registration.token
+    try {
+      const registration = await agents.register({ name: this.#agentName })
+      this.#registrationAttempts = 0
+      return registration.token
+    } catch (error) {
+      // A conflict is terminal: no primitive reachable on this SDK surface can
+      // reclaim a name we hold no token for. Retrying is precisely the silent
+      // loop this guard exists to end.
+      if (isAgentNameConflictError(error)) {
+        throw new FactoryAgentRegistrationError(this.#agentName, errorMessage(error), { cause: error })
+      }
+      throw error
+    }
   }
 
   /** The wall-clock instant one placement operation must be finished by. */
@@ -1269,6 +1309,35 @@ function previewReference(value: unknown, placementNode?: string): PreviewRefere
     ...(process ? { process } : {}),
     ...(node ? { node } : {}),
   }
+}
+
+/**
+ * Registration could not converge on a usable agent identity. Named so a
+ * six-day silent 409 loop surfaces as one actionable failure instead.
+ */
+export class FactoryAgentRegistrationError extends Error {
+  readonly agentName: string
+
+  constructor(agentName: string, detail: string, options?: { cause?: unknown }) {
+    super(`Factory agent "${agentName}" could not register with the relay workspace: ${detail}`)
+    this.name = 'FactoryAgentRegistrationError'
+    this.agentName = agentName
+    if (options && 'cause' in options) {
+      ;(this as Error & { cause?: unknown }).cause = options.cause
+    }
+  }
+}
+
+// The SDK reports the engine's 409 agent_already_exists as a RelayError with
+// `code: 'name_conflict'` and `rawCode: 'agent_already_exists'`. Match on the
+// structured fields first and keep the message probe for stubs and older SDKs.
+function isAgentNameConflictError(error: unknown): boolean {
+  const record = asRecord(error)
+  if (record) {
+    if (record.rawCode === 'agent_already_exists' || record.code === 'name_conflict') return true
+    if (record.statusCode === 409 || record.status === 409) return true
+  }
+  return /already exists|name[ _]conflict|agent_already_exists/i.test(errorMessage(error))
 }
 
 function isUnknownRecipientError(error: unknown): boolean {

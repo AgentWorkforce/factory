@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
+import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
 import { runFleetCli } from '../cli/fleet'
 
 import type {
@@ -1045,7 +1045,7 @@ describe('RelayFleetClient', () => {
     const bootstrap: RelayClientLike = {
       messaging: {
         agents: {
-          registerOrRotate: async (input: { name: string }) => {
+          register: async (input: { name: string }) => {
             registered.push(input)
             return { id: 'agent-1', name: input.name, token: 'at_live_rotated', status: 'online' }
           },
@@ -1070,6 +1070,152 @@ describe('RelayFleetClient', () => {
       { workspaceKey: 'rk_live_test' },
       { workspaceKey: 'rk_live_test', agentToken: 'at_live_rotated' },
     ])
+  })
+
+  // A stub with @relaycast/sdk 8.2.0's REAL semantics: `registerOrRotate` and
+  // `registerOrGet` are deprecated aliases that just call `register`, and the
+  // engine answers a name it already holds with 409 agent_already_exists.
+  // Asserting at this boundary — not on a helper in isolation — is what the
+  // last regression got past (factory#316).
+  function deprecatedAliasAgents(): {
+    agents: Record<string, unknown>
+    registerCalls: Array<{ name: string }>
+    deprecatedCalls: string[]
+  } {
+    const existing = new Set<string>()
+    const registerCalls: Array<{ name: string }> = []
+    const deprecatedCalls: string[] = []
+    const register = async (input: { name: string }) => {
+      registerCalls.push(input)
+      if (existing.has(input.name)) {
+        const conflict = new Error(`Agent "${input.name}" already exists in this workspace`) as Error & {
+          code?: string
+          rawCode?: string
+          statusCode?: number
+        }
+        conflict.code = 'name_conflict'
+        conflict.rawCode = 'agent_already_exists'
+        conflict.statusCode = 409
+        throw conflict
+      }
+      existing.add(input.name)
+      return { id: 'agent-1', name: input.name, token: 'at_live_minted', status: 'online' }
+    }
+    const agents = {
+      register,
+      // Present, so an optional-chain fallback never fires — the exact shape
+      // that made the outage invisible.
+      registerOrRotate: async (input: { name: string }) => {
+        deprecatedCalls.push('registerOrRotate')
+        return register(input)
+      },
+      registerOrGet: async (input: { name: string }) => {
+        deprecatedCalls.push('registerOrGet')
+        return register(input)
+      },
+    }
+    return { agents, registerCalls, deprecatedCalls }
+  }
+
+  it('converges when a bootstrap step fails after the agent was already registered', async () => {
+    const messaging = new FakeMessaging()
+    const { agents, registerCalls } = deprecatedAliasAgents()
+    const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+    let agentClientAttempts = 0
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: (options) => {
+        if (!options.agentToken) return bootstrap
+        agentClientAttempts += 1
+        // The first post-registration step fails, which is what clears the
+        // memoised messaging promise and drives a second bootstrap.
+        if (agentClientAttempts === 1) throw new Error('transient relay client failure')
+        return { messaging: messaging.asMessaging() }
+      },
+    })
+
+    await expect(fleet.roster()).rejects.toThrow(/transient relay client failure/)
+
+    // Against the pre-fix client this re-registers the same name and the engine
+    // answers 409 forever. It must reuse the token already minted instead.
+    await expect(fleet.roster()).resolves.toBeDefined()
+    expect(registerCalls).toEqual([{ name: 'factory' }])
+  })
+
+  it('never calls the deprecated registerOrRotate/registerOrGet aliases', async () => {
+    const messaging = new FakeMessaging()
+    const { agents, deprecatedCalls } = deprecatedAliasAgents()
+    const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+    })
+
+    await fleet.roster()
+
+    expect(deprecatedCalls).toEqual([])
+  })
+
+  it('fails loudly with a named error when the agent name is already taken', async () => {
+    const messaging = new FakeMessaging()
+    const { agents, registerCalls } = deprecatedAliasAgents()
+    // Someone else already holds the name and we hold no token for it.
+    await (agents.register as (input: { name: string }) => Promise<unknown>)({ name: 'factory' })
+    registerCalls.length = 0
+    const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+    })
+
+    // Assert on the error's own identity, not the imported class: against a
+    // build that lacks the export the import is `undefined`, and
+    // `toThrow(undefined)` would match any error at all.
+    const error = await fleet.roster().then(() => undefined, (err: unknown) => err)
+    expect(error).toBeInstanceOf(FactoryAgentRegistrationError)
+    expect((error as Error).name).toBe('FactoryAgentRegistrationError')
+    expect((error as { agentName?: string }).agentName).toBe('factory')
+    expect((error as Error).message).toMatch(/already exists/)
+    expect(registerCalls.length).toBeGreaterThan(0)
+  })
+
+  it('stops retrying registration once the bounded attempt budget is spent', async () => {
+    let attempts = 0
+    const agents = {
+      register: async () => {
+        attempts += 1
+        throw new Error('relay unavailable')
+      },
+    }
+    const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: () => bootstrap,
+    })
+
+    const names: string[] = []
+    for (let i = 0; i < MAX_REGISTRATION_ATTEMPTS + 3; i += 1) {
+      await fleet.roster().catch((error: unknown) => {
+        names.push(error instanceof Error ? error.name : String(error))
+      })
+    }
+
+    // Transient failures are retried, but only so many times: the budget is
+    // what turns an endless retry into one named, actionable failure.
+    expect(names).toContain('FactoryAgentRegistrationError')
+    expect(attempts).toBe(MAX_REGISTRATION_ATTEMPTS)
   })
 
   it('uses a configured at_live_ token without registering', async () => {
