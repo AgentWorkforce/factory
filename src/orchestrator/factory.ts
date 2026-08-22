@@ -13112,7 +13112,7 @@ export class FactoryLoop implements Factory {
     const owned = await this.#babysitterOwnerFor(repo, snapshot.number)
     if (owned) {
       if (prMetaShowsMerged(snapshot)) {
-        if (owned.record) await this.#advanceMergedPrToDone(snapshot, repo, owned.record, { authoritative: true })
+        if (owned.record) await this.#advanceMergedPrToDone(snapshot, repo, owned.record)
         else await this.#cancelBabysitterWake(owned.key)
         return
       }
@@ -13231,7 +13231,6 @@ export class FactoryLoop implements Factory {
     snapshot: PullSnapshot,
     repo: string,
     record?: InFlightIssue,
-    opts: { authoritative?: boolean } = {},
   ): Promise<void> {
     const mergedPullRequest = { repo, number: snapshot.number, url: snapshot.url }
     if (record) {
@@ -13242,9 +13241,13 @@ export class FactoryLoop implements Factory {
       //
       // What it does honour is an explicit disclaimer: a merged PR that says in
       // its own body that it does not fix this issue is taken at its word. That
-      // is the exact shape of #313 (`Diagnostic for #155`), and it costs the
-      // normal path nothing.
-      if (!opts.authoritative && prBodyDisclaimsClosing(
+      // is the exact shape of #313 (`Diagnostic for #155`).
+      //
+      // Ownership does NOT exempt a PR from this. Ownership settles which issue
+      // the PR belongs to; it says nothing about whether the merge completed
+      // that issue. Skipping the check for owned PRs would mean the same merged
+      // body is refused before ownership is established and accepted after.
+      if (prBodyDisclaimsClosing(
         { headRef: snapshot.headRef, body: snapshot.body, repo },
         record.issue.key,
       )) {
@@ -13255,6 +13258,33 @@ export class FactoryLoop implements Factory {
           repo,
         })
         return
+      }
+      // The protected-label gate has to cover the tracked paths too, or an
+      // incident issue that Factory itself dispatched is still auto-closed by
+      // its own merge and `neverAutoCloseLabels` guarantees nothing.
+      const tracked = await this.#readIssue(record.issue.path)
+      const trackedBlockingLabel = tracked ? this.#neverAutoCloseLabel(tracked) : undefined
+      if (tracked && trackedBlockingLabel) {
+        await this.#declineMergeClosure(
+          tracked,
+          snapshot,
+          repo,
+          `it carries the \`${trackedBlockingLabel}\` label, which Factory never auto-closes`,
+          'label',
+        )
+        return
+      }
+      if (!tracked) {
+        // Proceed rather than block. The disclaimer check above already ran on
+        // the merged body; wedging every completion behind a transient mount
+        // read would strand dispatches far more often than it would protect an
+        // incident, and stranded dispatches are what generate incidents here.
+        this.#logger.warn?.('[factory] could not read issue to apply the never-auto-close label gate', {
+          issue: record.issue.key,
+          prNumber: snapshot.number,
+          repo,
+        })
+        this.#increment('mergedPrLabelGateUnverified')
       }
       await this.#completeIssue(record, {
         targetState: 'done',
@@ -13370,29 +13400,33 @@ export class FactoryLoop implements Factory {
       reason,
       kind,
     })
-    if (!isGithubIssue(issue)) return
     const marker = `factory-merge-close-declined:${repo}#${snapshot.number}`
+    const body = [
+      `Factory observed pull request ${repo}#${snapshot.number} merge, and did **not** close this issue.`,
+      '',
+      `Reason: ${reason}.`,
+      '',
+      'A merged pull request closes an issue only when it carries a GitHub closing keyword'
+        + ' (`closes`/`fixes`/`resolves`) for it, or when its head is that issue\'s own'
+        + ' implementation branch. A bare reference is an association, not a completion.',
+      '',
+      'If this pull request really did complete the issue, close it by hand.',
+      '',
+      `<!-- ${marker} -->`,
+    ].join('\n')
     try {
+      // A Linear-backed candidate reaches this path too, and a refusal that is
+      // invisible on the system of record is barely better than the silent
+      // closure it replaces.
+      if (!isGithubIssue(issue)) {
+        await this.#linear.postComment(issue, body)
+        return
+      }
       // Merge events can redeliver. Skip a repeat only on a positive
       // confirmation that the note already landed; an unavailable check must
       // not be read as "already commented".
       if (await this.#githubWriteback.hasCommentMarker?.(issue, marker)) return
-      await this.#githubWriteback.postComment(
-        issue,
-        [
-          `Factory observed pull request ${repo}#${snapshot.number} merge, and did **not** close this issue.`,
-          '',
-          `Reason: ${reason}.`,
-          '',
-          'A merged pull request closes an issue only when it carries a GitHub closing keyword'
-            + ' (`closes`/`fixes`/`resolves`) for it, or when its head is Factory\'s own dispatch'
-            + ' branch for it. A bare reference is an association, not a completion.',
-          '',
-          'If this pull request really did complete the issue, close it by hand.',
-          '',
-          `<!-- ${marker} -->`,
-        ].join('\n'),
-      )
+      await this.#githubWriteback.postComment(issue, body)
     } catch (error) {
       this.#error(error, issueRef(issue))
     }

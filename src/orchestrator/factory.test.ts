@@ -26968,10 +26968,11 @@ describe('FactoryLoop PR babysitter', () => {
       expect(githubWriteback.comments).toHaveLength(1)
       expect(githubWriteback.comments[0]!.key).toBe('155')
       expect(githubWriteback.comments[0]!.body).toContain('did **not** close this issue')
-      // This body is refused by the disclaimer guard ("Diagnostic for #155"),
-      // not merely by the absence of a keyword. Assert the mechanism that
-      // actually fired, so a regression cannot pass on the other one.
-      expect(githubWriteback.comments[0]!.body).toContain('disclaims closing 155')
+      // This body carries no closing keyword AND describes itself as
+      // preparatory ("Diagnostic for #155"), so it is refused by the descriptor
+      // branch specifically. Assert the mechanism that actually fired, so a
+      // regression cannot pass on one of the other two.
+      expect(githubWriteback.comments[0]!.body).toContain('describes itself as preparatory for 155')
     } finally {
       await factory.stop()
     }
@@ -27137,6 +27138,46 @@ describe('FactoryLoop PR babysitter', () => {
       await vi.waitFor(() => expect(factory.status().counters.mergedPrClosureRefused).toBe(1))
       expect(factory.status().counters.done ?? 0).toBe(0)
       expect(mount.writes).not.toContainEqual({ path: issuePath(415), content: { stateId: done } })
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  // Reported by codex on #326. The protected-label gate must cover the tracked
+  // path too, or an incident issue Factory itself dispatched is still closed by
+  // its own merge and `neverAutoCloseLabels` guarantees nothing.
+  it('does not complete an in-flight issue carrying a never-auto-close label (#313)', async () => {
+    const issue = realIssueFile(416, ready, {
+      title: 'Real incident in flight',
+      labels: [{ name: 'pear' }, { name: 'incident' }],
+    })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/416/metadata.json'
+    const mount = new FakeMountClient({
+      [issuePath(416)]: issue,
+      [prPath]: prFile(416, {
+        title: 'Real incident in flight',
+        body: 'Linear: AR-416',
+        head_ref: 'ar-416-fix',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(416), issue)))
+      mount.emit(changeEvent(prPath, 'pr-416-merged'))
+
+      await vi.waitFor(() => expect(factory.status().counters.mergedPrClosureBlockedByLabel).toBe(1))
+      expect(factory.status().counters.done ?? 0).toBe(0)
+      expect(mount.writes).not.toContainEqual({ path: issuePath(416), content: { stateId: done } })
     } finally {
       await factory.stop()
     }

@@ -69,22 +69,35 @@ export const factoryBranchBelongsToIssue = (headRef: string, issueKey: string): 
 const CLOSING_KEYWORD = String.raw`(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)`
 
 /**
- * Phrases that revoke closure authority. Matched only on the line that carries
- * the issue reference — a body-wide match would let "this does not fix #B"
- * block a legitimate close of #A.
+ * An explicit denial that this pull request closes the issue. This OUTRANKS a
+ * closing keyword: a body carrying both `Fixes #155` and "does not fix #155" is
+ * refused, because the prose is the more deliberate statement.
  */
-const CLOSURE_NEGATION =
-  new RegExp(
-    [
-      String.raw`\b(?:does|do|did|will|would|can|could|is|are)\s+(?:n[o']?t|not)\s+(?:\w+\s+){0,2}${CLOSING_KEYWORD}\b`,
-      String.raw`\b(?:doesn|don|didn|won|wouldn|can|couldn|isn|aren)'?t\s+(?:\w+\s+){0,2}${CLOSING_KEYWORD}\b`,
-      String.raw`\bno[nt]?[-\s]?(?:a\s+)?(?:${CLOSING_KEYWORD})\b`,
-      String.raw`\bdiagnostic\s+for\b`,
-      String.raw`\bgroundwork\s+for\b`,
-      String.raw`\bpartial(?:ly)?\s+(?:${CLOSING_KEYWORD})\b`,
-    ].join('|'),
-    'iu',
-  )
+const CLOSURE_DENIAL = new RegExp(
+  [
+    String.raw`\b(?:does|do|did|will|would|can|could|is|are)\s+(?:n[o']?t|not)\s+(?:\w+\s+){0,2}${CLOSING_KEYWORD}\b`,
+    String.raw`\b(?:doesn|don|didn|won|wouldn|couldn|isn|aren|can)'?t\s+(?:\w+\s+){0,2}${CLOSING_KEYWORD}\b`,
+    String.raw`\bno[nt]?[-\s]?(?:a\s+)?(?:${CLOSING_KEYWORD})\b`,
+  ].join('|'),
+  'iu',
+)
+
+/**
+ * Weaker prose that merely *describes* the change rather than denying closure.
+ *
+ * Consulted only when no closing keyword is present. These words appear
+ * innocently in bodies that genuinely do close their issue — "Fixes #155 by
+ * adding a diagnostic for timeouts", "Fixes #155 and lays groundwork for
+ * retries" — so treating them as denials would strand ordinary work.
+ */
+const CLOSURE_DESCRIPTOR = new RegExp(
+  [
+    String.raw`\bdiagnostic\s+for\b`,
+    String.raw`\bgroundwork\s+for\b`,
+    String.raw`\bpartial(?:ly)?\s+(?:${CLOSING_KEYWORD})\b`,
+  ].join('|'),
+  'iu',
+)
 
 /**
  * Whether `headRef` is the implementation branch for `issueKey`.
@@ -167,47 +180,88 @@ const referencingLines = (body: string, issueKey: string, repo: string | undefin
  * wrong close marks a live outage COMPLETED and hides it (#313, #155).
  */
 /**
- * Whether the pull request body explicitly disclaims closing `issueKey`.
+ * How the body of a merged pull request speaks about `issueKey`.
  *
- * This is the weaker half of `prClosureAuthority`, for the in-flight path where
- * Factory's own dispatch already established the association and only an
- * explicit denial should stop completion.
+ * Shared by both callers so the in-flight path and the merge-advance scan can
+ * never disagree about what a body says.
+ */
+const readClosureSignals = (
+  input: ClosureAuthorityInput,
+  issueKey: string,
+): { lines: string[]; denial?: string; keyword?: string; descriptor?: string } => {
+  const lines = referencingLines(input.body ?? '', issueKey, input.repo)
+  const patterns = referencePatterns(issueKey, input.repo)
+  const keyworded = patterns.length > 0
+    ? new RegExp(
+        String.raw`(^|[^A-Za-z0-9-])${CLOSING_KEYWORD}\s*:?\s+(?:${patterns.join('|')})`,
+        'iu',
+      )
+    : undefined
+  return {
+    lines,
+    denial: lines.find((line) => CLOSURE_DENIAL.test(line)),
+    keyword: keyworded ? lines.find((line) => keyworded.test(line)) : undefined,
+    descriptor: lines.find((line) => CLOSURE_DESCRIPTOR.test(line)),
+  }
+}
+
+/**
+ * Whether the pull request body disclaims closing `issueKey`.
+ *
+ * The weaker half of `prClosureAuthority`, for the in-flight path where
+ * Factory's own dispatch already established the association and only the body
+ * saying so should stop completion. A bare descriptor counts only when no
+ * closing keyword is present, so `Fixes #155 by adding a diagnostic for
+ * timeouts` still completes.
  */
 export const prBodyDisclaimsClosing = (
   input: ClosureAuthorityInput,
   issueKey: string,
-): boolean =>
-  referencingLines(input.body ?? '', issueKey, input.repo)
-    .some((line) => CLOSURE_NEGATION.test(line))
+): boolean => {
+  const signals = readClosureSignals(input, issueKey)
+  return Boolean(signals.denial ?? (signals.keyword ? undefined : signals.descriptor))
+}
 
+/**
+ * Whether a merged pull request may close `issueKey`.
+ *
+ * Authority comes from exactly two sources, and neither is a prose mention:
+ *
+ * - `factory-branch` — the head is this issue's implementation branch. Factory
+ *   cut that branch to implement that issue, which outranks any text.
+ * - `closing-keyword` — a real GitHub closing keyword bound to a reference to
+ *   this issue, in the body.
+ *
+ * Fail-closed by construction: anything unrecognised, denied, or merely
+ * referential leaves the issue open. A missed close costs a stale label; a
+ * wrong close marks a live outage COMPLETED and hides it (#313, #155).
+ */
 export const prClosureAuthority = (
   input: ClosureAuthorityInput,
   issueKey: string,
 ): ClosureAuthority => {
-  const body = input.body ?? ''
-  const lines = referencingLines(body, issueKey, input.repo)
+  const { lines, denial, keyword, descriptor } = readClosureSignals(input, issueKey)
 
-  const negated = lines.find((line) => CLOSURE_NEGATION.test(line))
-  if (negated) {
+  if (denial) {
     return {
       authorised: false,
-      evidence: `the pull request body disclaims closing ${issueKey}: "${negated.trim().slice(0, 200)}"`,
+      evidence: `the pull request body disclaims closing ${issueKey}: "${denial.trim().slice(0, 200)}"`,
     }
   }
 
-  const patterns = referencePatterns(issueKey, input.repo)
-  if (patterns.length > 0) {
-    const keyworded = new RegExp(
-      String.raw`(^|[^A-Za-z0-9-])${CLOSING_KEYWORD}\s*:?\s+(?:${patterns.join('|')})`,
-      'iu',
-    )
-    const line = lines.find((candidate) => keyworded.test(candidate))
-    if (line) {
-      return {
-        authorised: true,
-        source: 'closing-keyword',
-        evidence: `pull request body closes ${issueKey} via "${line.trim().slice(0, 200)}"`,
-      }
+  if (keyword) {
+    return {
+      authorised: true,
+      source: 'closing-keyword',
+      evidence: `pull request body closes ${issueKey} via "${keyword.trim().slice(0, 200)}"`,
+    }
+  }
+
+  // Only meaningful once no keyword was found — see CLOSURE_DESCRIPTOR.
+  if (descriptor) {
+    return {
+      authorised: false,
+      evidence: `the pull request describes itself as preparatory for ${issueKey}: "${descriptor.trim().slice(0, 200)}"`,
     }
   }
 

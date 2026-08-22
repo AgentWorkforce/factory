@@ -123,6 +123,22 @@ describe('pull request closure authority', () => {
 
   // A disclaimer about a different issue must not block a legitimate close,
   // which is why negation is scoped to the referencing line.
+  // Reported by codex on #326. A descriptor word is not a denial: these bodies
+  // carry a valid closing keyword and merely happen to use the word later on
+  // the same line. Treating them as disclaimers would strand ordinary work.
+  it('does not read a descriptor word as a denial when a closing keyword is present', () => {
+    expect(prClosureAuthority({ body: 'Fixes #155 by adding a diagnostic for timeouts.' }, '155').authorised).toBe(true)
+    expect(prClosureAuthority({ body: 'Fixes #155 and lays groundwork for retries.' }, '155').authorised).toBe(true)
+    expect(prBodyDisclaimsClosing({ body: 'Fixes #155 by adding a diagnostic for timeouts.' }, '155')).toBe(false)
+  })
+
+  // An explicit denial still outranks the keyword — that is a deliberate
+  // statement, not an incidental word.
+  it('lets an explicit denial outrank a closing keyword', () => {
+    expect(prClosureAuthority({ body: 'Fixes #155 — actually this does not fix #155.' }, '155').authorised).toBe(false)
+    expect(prBodyDisclaimsClosing({ body: 'Fixes #155 — actually this does not fix #155.' }, '155')).toBe(true)
+  })
+
   it('scopes a disclaimer to the issue it names', () => {
     const body = 'Fixes #143\nThis does not fix #155.'
     expect(prClosureAuthority({ body }, '143').authorised).toBe(true)
