@@ -867,26 +867,60 @@ export class RelayFleetClient implements FleetClient {
     // Allow-list, not a deny-list. The engine also has active/idle/blocked/
     // waiting, all of which mean someone is holding this identity, and
     // `unknown` is what the SDK substitutes when status is missing. Only a
-    // record that says offline is safe to seize.
+    // record that says offline gets as far as the presence check.
     const status = readString(existing, 'status')
-    let live = status !== 'offline'
-    if (!live) {
-      // `/v1/agents/presence` lists the whole workspace, offline rows included,
-      // and always carries an explicit status. Match on the live statuses
-      // rather than "not offline" so a row that somehow omits status cannot
-      // lock recovery out forever — the record check above is the strict gate.
-      const presence = await agents.presence().catch(() => undefined)
-      live = Array.isArray(presence) && presence.some((entry) => {
-        const seen = asRecord(entry)
-        if (readString(seen, 'agentName', 'agent_name', 'name') !== this.#agentName) return false
-        const seenStatus = readString(seen, 'status')
-        return seenStatus !== undefined && LIVE_AGENT_STATUSES.has(seenStatus)
-      })
-    }
-    if (live) {
+    if (status !== 'offline') {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
         `refusing to take over agent in status "${status ?? 'unknown'}"; another factory may still hold this identity`,
+      )
+    }
+
+    // Presence is the canonical liveness signal, and the agent record can be
+    // stale. Everything below fails CLOSED: only a presence row we actually
+    // read, for this agent, carrying a status we recognise as not-live, may
+    // authorise a seizure. A request that failed, a body we cannot parse, or a
+    // missing row is absence of evidence — not evidence of death.
+    //
+    // This asymmetry is deliberate. Refusing to boot costs us a recoverable
+    // outage of our own; seizing a live agent's credential strands another
+    // running process and takes the very token it would need to recover.
+    let presence: unknown
+    try {
+      presence = await agents.presence()
+    } catch (error) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        `could not read presence to confirm the agent is not live: ${errorMessage(error)}`,
+        { cause: error },
+      )
+    }
+    if (!Array.isArray(presence)) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        'presence did not return a list, so the agent cannot be confirmed offline',
+      )
+    }
+    const entry = presence
+      .map((row) => asRecord(row))
+      .find((row) => readString(row, 'agentName', 'agent_name', 'name') === this.#agentName)
+    if (!entry) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        'presence does not list this agent, so it cannot be confirmed offline',
+      )
+    }
+    const seenStatus = readString(entry, 'status')
+    if (seenStatus === undefined) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        'presence reported no status for this agent, so it cannot be confirmed offline',
+      )
+    }
+    if (LIVE_AGENT_STATUSES.has(seenStatus)) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        `presence reports this agent as "${seenStatus}"; another factory may still hold this identity`,
       )
     }
   }

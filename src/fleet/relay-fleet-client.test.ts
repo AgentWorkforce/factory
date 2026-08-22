@@ -1082,11 +1082,13 @@ describe('RelayFleetClient', () => {
     registerCalls: Array<{ name: string }>
     deprecatedCalls: string[]
     agentStatus: { value: string }
+    presenceImpl: { value?: () => unknown }
   } {
     const existing = new Set<string>()
     const registerCalls: Array<{ name: string }> = []
     const deprecatedCalls: string[] = []
     const agentStatus = { value: 'offline' }
+    const presenceImpl: { value?: () => unknown } = {}
     const register = async (input: { name: string }) => {
       registerCalls.push(input)
       if (existing.has(input.name)) {
@@ -1106,7 +1108,10 @@ describe('RelayFleetClient', () => {
     const agents = {
       register,
       get: async (name: string) => ({ id: 'agent-1', name, status: agentStatus.value }),
-      presence: async () => [{ agentName: 'factory', status: agentStatus.value }],
+      presence: async () => {
+        if (presenceImpl.value) return presenceImpl.value()
+        return [{ agentName: 'factory', status: agentStatus.value }]
+      },
       // Present, so an optional-chain fallback never fires — the exact shape
       // that made the outage invisible.
       registerOrRotate: async (input: { name: string }) => {
@@ -1118,7 +1123,7 @@ describe('RelayFleetClient', () => {
         return register(input)
       },
     }
-    return { agents, registerCalls, deprecatedCalls, agentStatus }
+    return { agents, registerCalls, deprecatedCalls, agentStatus, presenceImpl }
   }
 
   it('converges when a bootstrap step fails after the agent was already registered', async () => {
@@ -1313,6 +1318,44 @@ describe('RelayFleetClient', () => {
       expect(takeovers).toBe(0)
     },
   )
+
+  // A stale `offline` record plus an unreadable presence must never authorise a
+  // seizure: the cost of being wrong is stranding a LIVE factory's credential,
+  // and the token taken is the one it would have needed to recover.
+  it.each([
+    ['presence request throws', () => { throw new Error('presence unavailable') }],
+    ['presence returns a non-list', () => ({ not: 'a list' })],
+    ['presence omits this agent', () => [{ agentName: 'someone-else', status: 'offline' }]],
+    ['presence entry carries no status', () => [{ agentName: 'factory' }]],
+  ])('fails closed and does not take over when %s', async (_label, impl) => {
+    const messaging = new FakeMessaging()
+    const { agents, presenceImpl } = deprecatedAliasAgents()
+    await (agents.register as (i: { name: string }) => Promise<unknown>)({ name: 'factory' })
+    // The record still claims offline — only presence can contradict it.
+    presenceImpl.value = impl as () => unknown
+    const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+    let takeovers = 0
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      fetch: (async () => {
+        takeovers += 1
+        return new Response(
+          JSON.stringify({ ok: true, data: { agent_id: 'agent-1', name: 'factory', token: 'at_live_seized' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }) as unknown as typeof globalThis.fetch,
+      createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+    })
+
+    const error = await fleet.roster().then(() => undefined, (err: unknown) => err)
+    expect((error as Error).name).toBe('FactoryAgentRegistrationError')
+    expect((error as Error).message).toMatch(/cannot be confirmed offline|could not read presence/)
+    // The seizure must never have been attempted.
+    expect(takeovers).toBe(0)
+  })
 
   it('re-reads the agent id and retries once when the identity moved mid-takeover', async () => {
     const messaging = new FakeMessaging()
