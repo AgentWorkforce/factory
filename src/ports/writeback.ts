@@ -1,8 +1,22 @@
 import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } from './mount'
 import type { LinearIssue, PrSummary } from '../types'
 
+/**
+ * Notification that the *state-defining* write has landed.
+ *
+ * A writeback call does more than change state: it confirms readbacks, clears
+ * the previous label, posts comments. The issue becomes observably not-ready
+ * the moment the state write resolves, which is well before the call returns —
+ * so a caller that needs to know "is this state change mine?" cannot wait for
+ * the promise. `onApplied` fires synchronously at that instant, before any
+ * confirmation or cleanup await (factory#319).
+ */
+export interface WritebackApplyHooks {
+  onApplied?: () => void
+}
+
 export interface LinearWriteback {
-  setState(issue: LinearIssue, stateId: string): Promise<void>
+  setState(issue: LinearIssue, stateId: string, hooks?: WritebackApplyHooks): Promise<void>
   postComment(issue: LinearIssue, body: string): Promise<void>
   createIssue(payload: Record<string, unknown>): Promise<{ path: string }>
   verify(issue: LinearIssue, expect: { stateId?: string; commentName?: string }): Promise<boolean>
@@ -29,6 +43,6 @@ export interface GithubWriteback {
   postComment(issue: LinearIssue, body: string): Promise<void>
   /** Provider-authoritative lookup used to reconcile ambiguous comment writes. */
   hasCommentMarker?(issue: LinearIssue, marker: string): Promise<boolean>
-  setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void>
+  setStatus(issue: LinearIssue, status: GithubIssueStatus, hooks?: WritebackApplyHooks): Promise<void>
   closeIssue(issue: LinearIssue, body: string): Promise<void>
 }

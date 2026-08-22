@@ -1984,6 +1984,111 @@ describe('fleet CLI runtime', () => {
   // "keeps relay dispatch ownership …" above, which failed ~50% of runs on
   // main and is deterministic with the fix; this control pins the other half
   // of the contract — that a park this dispatch did NOT make still aborts.
+  // factory#319 MUST-FIRE. Deterministic, and it only became writable once
+  // codex pointed out that the writeback keeps awaiting AFTER the state is
+  // visible: that trailing await is an injectable seam. `setState` writes the
+  // parked state, then awaits its readback confirmation before returning, so
+  // holding that readback open pins the dispatch's post-spawn re-read inside
+  // the window every single run.
+  //
+  // Against a build that stamps the marker only when `setState` RETURNS, the
+  // re-read sees a parked issue with no marker, calls its own write foreign,
+  // and abandons — tearing down agents that had already finished. Exit 3.
+  it('does not abandon when its own park is visible but the writeback has not returned', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-park-inflight-'))
+    try {
+      const configPath = await writeConfig(root, {
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+          heartbeatStaleMs: 10_000,
+        },
+      })
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number: 79,
+          url: 'https://github.com/AgentWorkforce/pear/pull/79',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }),
+        closePullRequest: async () => undefined,
+      }
+      // `setState` writes `stateId` at the top level of the record; the initial
+      // fixture carries it under `payload`. Read either.
+      const stateOf = (entry: { content: unknown } | undefined): string | undefined => {
+        const content = entry?.content as { stateId?: string; payload?: { stateId?: string } } | undefined
+        return content?.stateId ?? content?.payload?.stateId
+      }
+
+      class ParkConfirmBlockingMount extends FakeMountClient {
+        parkWritten = false
+        releaseConfirm?: () => void
+        reReadSeen = false
+
+        override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+          await super.writeFile(path, content, opts)
+          if (path === issuePath && stateOf(this.files.get(path)) === TEST_STATE_IDS.humanReview) {
+            this.parkWritten = true
+          }
+        }
+
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === issuePath && this.parkWritten) {
+            if (!this.releaseConfirm) {
+              // First issue read after the park is `setState`'s own readback
+              // confirmation. Hold it, so `setState` cannot return. Bounded so
+              // a wrong assumption about ordering fails loudly rather than
+              // hanging the suite.
+              await new Promise<void>((resolve) => {
+                this.releaseConfirm = resolve
+                setTimeout(resolve, 400)
+              })
+            } else if (!this.reReadSeen) {
+              // Second is the dispatch's post-spawn re-read: the one under
+              // test. Let it observe the parked issue, then unblock setState.
+              this.reReadSeen = true
+              queueMicrotask(() => this.releaseConfirm?.())
+            }
+          }
+          return super.readFile(path)
+        }
+      }
+
+      const mount = new ParkConfirmBlockingMount({
+        [issuePath]: issueFile,
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+      const fleet = new CompletingRemoteFleetClient()
+      const output = buffer()
+
+      const code = await runFleetCli([
+        'dispatch',
+        'AR-77',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        stdout: output,
+        stderr: buffer(),
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      // Both must hold or the test is not exercising the window at all.
+      expect(mount.parkWritten).toBe(true)
+      expect(mount.reReadSeen).toBe(true)
+      // Against main this is 3 — FACTORY_EXIT.RETRYABLE — the same
+      // `expected 3 to be +0` signature as the original flake.
+      expect(code).toBe(0)
+      // Abandoning releases with this reason; completing must not.
+      expect(fleet.releases.map((release) => release.reason)).not.toContain('live dispatch state changed')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('still aborts when a third party parks the issue and this dispatch did not', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-foreign-park-'))
     try {

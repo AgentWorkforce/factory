@@ -45,6 +45,7 @@ export type {
   GithubWriteback,
   LinearWriteback,
   SlackWriteback,
+  WritebackApplyHooks,
 } from './writeback'
 export type {
   Clock,

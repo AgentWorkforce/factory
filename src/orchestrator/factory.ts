@@ -13942,10 +13942,15 @@ export class FactoryLoop implements Factory {
       if (issue) {
         if (githubIssue) {
           if (humanReview) {
-            await this.#githubWriteback.setStatus(issue, 'human-review')
-            // Confirmed the instant the write lands. The post-spawn re-read
-            // can observe this state during any later await in this method, so
-            // the marker must not trail the write by one (CodeRabbit on #321).
+            // Stamped from inside setStatus, the instant the human-review label
+            // lands: `#isIssueReady` returns false on that label alone, while
+            // setStatus still has its previous-label removal outstanding. A
+            // stamp after setStatus returns leaves the issue readable as
+            // not-ready with the marker unset — the self-abandonment window
+            // (codex review on #322).
+            await this.#githubWriteback.setStatus(issue, 'human-review', {
+              onApplied: () => { record.issueWritebackConfirmedAtMs ??= this.#clock.now() },
+            })
             record.issueWritebackConfirmedAtMs ??= this.#clock.now()
             await this.#githubWriteback.postComment(
               issue,
@@ -13962,7 +13967,12 @@ export class FactoryLoop implements Factory {
           const targetState = humanReview
             ? this.#states.idFor(issueTeam, 'humanReview')
             : this.#states.idFor(issueTeam, 'done')
-          await this.#linear.setState(issue, targetState)
+          // Same window on the Linear path, and this is the one the original
+          // flake exercises: `setState` makes the state visible on writeFile,
+          // then keeps awaiting its readback confirmation before returning.
+          await this.#linear.setState(issue, targetState, {
+            onApplied: () => { record.issueWritebackConfirmedAtMs ??= this.#clock.now() },
+          })
           record.issueWritebackConfirmedAtMs ??= this.#clock.now()
           await this.#recordCanonicalIssueState({ ...record.issue, stateId: targetState })
         }

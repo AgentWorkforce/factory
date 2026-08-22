@@ -826,6 +826,67 @@ describe('AppGithubWriteback', () => {
     },
   }
 
+  // factory#319: `onApplied` exists so a caller can attribute a state change
+  // the instant it lands. Two properties matter, and they pull opposite ways —
+  // fire early enough to close the self-abandonment window, but never for a
+  // write that did not happen.
+  it('fires onApplied as soon as the status label lands, before the previous label is cleared', async () => {
+    const order: string[] = []
+    const connection: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number: 1,
+        url: 'u',
+        headRef: input.headRef ?? 'h',
+      }),
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel: vi.fn(async (input: { operation: string; label: string }) => {
+        order.push(`${input.operation}:${input.label}`)
+      }),
+      updateIssue: async () => undefined,
+    }
+    const app = new AppGithubWriteback(connection)
+
+    await app.setStatus(appIssue, 'human-review', { onApplied: () => order.push('applied') })
+
+    // The target label alone decides readiness, so `applied` must land between
+    // the add and the cleanup removal — not after both.
+    expect(order).toEqual([
+      'add:factory:human-review',
+      'applied',
+      'remove:factory:in-progress',
+    ])
+  })
+
+  it('never fires onApplied when the status write itself rejects', async () => {
+    const connection: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number: 1,
+        url: 'u',
+        headRef: input.headRef ?? 'h',
+      }),
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel: async (input: { operation: string }) => {
+        if (input.operation === 'add') throw new Error('label add rejected')
+      },
+      updateIssue: async () => undefined,
+    }
+    const app = new AppGithubWriteback(connection)
+    const onApplied = vi.fn()
+
+    await expect(app.setStatus(appIssue, 'human-review', { onApplied }))
+      .rejects.toThrow(/label add rejected/)
+
+    // Claiming authorship of a write that never landed is the failure mode on
+    // the other side: it would let a foreign change be excused as ours.
+    expect(onApplied).not.toHaveBeenCalled()
+  })
+
   it('delegates PRs and lifecycle writes to the app connection without exposing read methods', async () => {
     const publishPullRequest: GithubConnectionWrite['publishPullRequest'] = vi.fn(async (input) => ({
       repo: input.repo,
