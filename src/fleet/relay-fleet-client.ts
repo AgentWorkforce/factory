@@ -86,6 +86,10 @@ export const MAX_REGISTRATION_ATTEMPTS = 10
 // Matches the default @agent-relay/sdk resolves when no baseUrl is configured,
 // so a takeover always targets the host the register went to.
 const DEFAULT_RELAY_BASE_URL = 'https://cast.agentrelay.com'
+// Every engine status that means somebody is holding the identity. `offline` is
+// the only one that is not here, and `unknown` is what the SDK substitutes when
+// status is missing — so an absent status never reads as safe.
+const LIVE_AGENT_STATUSES = new Set(['online', 'active', 'idle', 'blocked', 'waiting', 'unknown'])
 export const DEFAULT_LIFECYCLE_ACTION_NAME = 'factory.lifecycle'
 const DEFAULT_SPAWN_ACK_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_POLL_INTERVAL_MS = 1_000
@@ -867,11 +871,16 @@ export class RelayFleetClient implements FleetClient {
     const status = readString(existing, 'status')
     let live = status !== 'offline'
     if (!live) {
+      // `/v1/agents/presence` lists the whole workspace, offline rows included,
+      // and always carries an explicit status. Match on the live statuses
+      // rather than "not offline" so a row that somehow omits status cannot
+      // lock recovery out forever — the record check above is the strict gate.
       const presence = await agents.presence().catch(() => undefined)
       live = Array.isArray(presence) && presence.some((entry) => {
         const seen = asRecord(entry)
-        return readString(seen, 'agentName', 'agent_name', 'name') === this.#agentName
-          && readString(seen, 'status') !== 'offline'
+        if (readString(seen, 'agentName', 'agent_name', 'name') !== this.#agentName) return false
+        const seenStatus = readString(seen, 'status')
+        return seenStatus !== undefined && LIVE_AGENT_STATUSES.has(seenStatus)
       })
     }
     if (live) {
