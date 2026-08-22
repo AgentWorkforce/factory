@@ -31,11 +31,16 @@ async function measureTornReads(
   let done = false
 
   const writer = (async () => {
-    for (let iteration = 1; iteration <= opts.writes; iteration++) {
-      if (done) break
-      await write(path, document(iteration))
+    try {
+      for (let iteration = 1; iteration <= opts.writes; iteration++) {
+        if (done) break
+        await write(path, document(iteration))
+      }
+    } finally {
+      // Release the reader even if a write throws, or it spins until the
+      // test times out and reports a hang instead of the real error.
+      done = true
     }
-    done = true
   })()
 
   const reader = (async () => {
