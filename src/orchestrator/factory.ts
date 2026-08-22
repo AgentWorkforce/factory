@@ -4616,7 +4616,7 @@ export class FactoryLoop implements Factory {
           // issue our own lifecycle has already parked back to `implementing`.
         } else {
           implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
-          record.issueWritebackConfirmedAtMs = this.#clock.now()
+          record.issueWritebackConfirmedAtMs ??= this.#clock.now()
           this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
         }
       }
@@ -13943,6 +13943,10 @@ export class FactoryLoop implements Factory {
         if (githubIssue) {
           if (humanReview) {
             await this.#githubWriteback.setStatus(issue, 'human-review')
+            // Confirmed the instant the write lands. The post-spawn re-read
+            // can observe this state during any later await in this method, so
+            // the marker must not trail the write by one (CodeRabbit on #321).
+            record.issueWritebackConfirmedAtMs ??= this.#clock.now()
             await this.#githubWriteback.postComment(
               issue,
               `Factory agents completed; this issue is awaiting human review. The pull request remains open.\n\nMerge policy: ${this.#config.mergePolicy}`,
@@ -13952,15 +13956,17 @@ export class FactoryLoop implements Factory {
               issue,
               'Factory observed the linked pull request merge and completed this issue.',
             )
+            record.issueWritebackConfirmedAtMs ??= this.#clock.now()
           }
         } else {
           const targetState = humanReview
             ? this.#states.idFor(issueTeam, 'humanReview')
             : this.#states.idFor(issueTeam, 'done')
           await this.#linear.setState(issue, targetState)
+          record.issueWritebackConfirmedAtMs ??= this.#clock.now()
           await this.#recordCanonicalIssueState({ ...record.issue, stateId: targetState })
         }
-        record.issueWritebackConfirmedAtMs = this.#clock.now()
+        record.issueWritebackConfirmedAtMs ??= this.#clock.now()
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
         if (!humanReview) await this.#markDependencyTerminalAndReconcile(issue)
       }
