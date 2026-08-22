@@ -1081,10 +1081,12 @@ describe('RelayFleetClient', () => {
     agents: Record<string, unknown>
     registerCalls: Array<{ name: string }>
     deprecatedCalls: string[]
+    agentStatus: { value: string }
   } {
     const existing = new Set<string>()
     const registerCalls: Array<{ name: string }> = []
     const deprecatedCalls: string[] = []
+    const agentStatus = { value: 'offline' }
     const register = async (input: { name: string }) => {
       registerCalls.push(input)
       if (existing.has(input.name)) {
@@ -1103,6 +1105,8 @@ describe('RelayFleetClient', () => {
     }
     const agents = {
       register,
+      get: async (name: string) => ({ id: 'agent-1', name, status: agentStatus.value }),
+      presence: async () => [{ agentName: 'factory', status: agentStatus.value }],
       // Present, so an optional-chain fallback never fires — the exact shape
       // that made the outage invisible.
       registerOrRotate: async (input: { name: string }) => {
@@ -1114,7 +1118,7 @@ describe('RelayFleetClient', () => {
         return register(input)
       },
     }
-    return { agents, registerCalls, deprecatedCalls }
+    return { agents, registerCalls, deprecatedCalls, agentStatus }
   }
 
   it('converges when a bootstrap step fails after the agent was already registered', async () => {
@@ -1174,6 +1178,11 @@ describe('RelayFleetClient', () => {
       env: {},
       sleep: immediateSleep,
       pollIntervalMs: 0,
+      // The workspace key is not accepted for this name, so nothing converges.
+      fetch: (async () => new Response(
+        JSON.stringify({ ok: false, error: { code: 'agent_recovery_not_authorized', message: 'not authorized' } }),
+        { status: 403, headers: { 'content-type': 'application/json' } },
+      )) as unknown as typeof globalThis.fetch,
       createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
     })
 
@@ -1184,7 +1193,7 @@ describe('RelayFleetClient', () => {
     expect(error).toBeInstanceOf(FactoryAgentRegistrationError)
     expect((error as Error).name).toBe('FactoryAgentRegistrationError')
     expect((error as { agentName?: string }).agentName).toBe('factory')
-    expect((error as Error).message).toMatch(/already exists/)
+    expect((error as Error).message).toMatch(/could not reclaim/)
     expect(registerCalls.length).toBeGreaterThan(0)
   })
 
@@ -1216,6 +1225,97 @@ describe('RelayFleetClient', () => {
     // what turns an endless retry into one named, actionable failure.
     expect(names).toContain('FactoryAgentRegistrationError')
     expect(attempts).toBe(MAX_REGISTRATION_ATTEMPTS)
+  })
+
+  it('reclaims its own dead identity by audited takeover when the name is taken', async () => {
+    const messaging = new FakeMessaging()
+    const { agents } = deprecatedAliasAgents()
+    await (agents.register as (i: { name: string }) => Promise<unknown>)({ name: 'factory' })
+    const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = []
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      nodeId: 'node_test_1',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      fetch: (async (url: string, init: { body: string }) => {
+        calls.push({ url, body: JSON.parse(init.body) as Record<string, unknown> })
+        return new Response(
+          JSON.stringify({ ok: true, data: { agent_id: 'agent-1', name: 'factory', token: 'at_live_seized', audit_id: 'aud-1' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }) as unknown as typeof globalThis.fetch,
+      createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+    })
+
+    await expect(fleet.roster()).resolves.toBeDefined()
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.url).toBe('https://cast.agentrelay.com/v1/agents/factory/takeover')
+    // Every field is an audit record, so every field must carry meaning.
+    expect(calls[0]?.body.expected_agent_id).toBe('agent-1')
+    expect(calls[0]?.body.node_id).toBe('node_test_1')
+    expect(calls[0]?.body.actor).toBe('factory:factory')
+    expect(String(calls[0]?.body.reason)).toMatch(/reclaiming its own workspace identity/)
+    expect(String(calls[0]?.body.session_ref)).toMatch(/^factory-bootstrap-/)
+  })
+
+  it('refuses to take over an agent that is still online', async () => {
+    const messaging = new FakeMessaging()
+    const { agents, agentStatus } = deprecatedAliasAgents()
+    await (agents.register as (i: { name: string }) => Promise<unknown>)({ name: 'factory' })
+    agentStatus.value = 'online'
+    const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+    let takeovers = 0
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      fetch: (async () => {
+        takeovers += 1
+        return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+      }) as unknown as typeof globalThis.fetch,
+      createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+    })
+
+    const error = await fleet.roster().then(() => undefined, (err: unknown) => err)
+    expect((error as Error).name).toBe('FactoryAgentRegistrationError')
+    expect((error as Error).message).toMatch(/currently online/)
+    // The guard must fire BEFORE the seizure, not report it afterwards.
+    expect(takeovers).toBe(0)
+  })
+
+  it('re-reads the agent id and retries once when the identity moved mid-takeover', async () => {
+    const messaging = new FakeMessaging()
+    const { agents } = deprecatedAliasAgents()
+    await (agents.register as (i: { name: string }) => Promise<unknown>)({ name: 'factory' })
+    const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+    let attempts = 0
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      fetch: (async () => {
+        attempts += 1
+        if (attempts === 1) {
+          return new Response(
+            JSON.stringify({ ok: false, error: { code: 'agent_identity_conflict', message: 'no longer has expected id' } }),
+            { status: 409, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        return new Response(
+          JSON.stringify({ ok: true, data: { agent_id: 'agent-1', name: 'factory', token: 'at_live_seized' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }) as unknown as typeof globalThis.fetch,
+      createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+    })
+
+    await expect(fleet.roster()).resolves.toBeDefined()
+    expect(attempts).toBe(2)
   })
 
   it('uses a configured at_live_ token without registering', async () => {
