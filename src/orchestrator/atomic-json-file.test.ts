@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -120,6 +120,41 @@ describe('writeJsonFileAtomically (#323)', () => {
       // rename is not. Anything left in the target directory other than the
       // target itself means the temp escaped or survived.
       expect(await readdir(join(root, 'nested'))).toEqual(['factory-loop-heartbeat.json'])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('publishes under the destination\'s existing mode, not the umask default', async () => {
+    // `rename` publishes a NEW inode, where `writeFile` truncated the existing
+    // one and kept its mode. Without carrying the mode across, a heartbeat
+    // chmodded for a differently-UID `/healthz` reader would be republished at
+    // `0o666 & ~umask` and silently lock that reader out — a behaviour change
+    // beyond atomicity, which this change is not allowed to make.
+    const root = await mkdtemp(join(tmpdir(), 'factory-atomic-mode-'))
+    try {
+      const path = join(root, 'factory-loop-heartbeat.json')
+      await writeJsonFileAtomically(path, heartbeatDocument(1))
+      await chmod(path, 0o640)
+
+      await writeJsonFileAtomically(path, heartbeatDocument(2))
+
+      expect((await stat(path)).mode & 0o777).toBe(0o640)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('matches the mode the non-atomic write would have produced for a new file', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-atomic-newmode-'))
+    try {
+      const atomicPath = join(root, 'atomic.json')
+      const legacyPath = join(root, 'legacy.json')
+
+      await writeJsonFileAtomically(atomicPath, heartbeatDocument(1))
+      await writeFile(legacyPath, `${JSON.stringify(heartbeatDocument(1), null, 2)}\n`, 'utf8')
+
+      expect((await stat(atomicPath)).mode & 0o777).toBe((await stat(legacyPath)).mode & 0o777)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
