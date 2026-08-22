@@ -9,10 +9,15 @@ import { dirname } from 'node:path'
  * reader that opens the file inside that window sees a partially-written
  * document, and every reader of the daemon's state files collapses a parse
  * failure into `undefined` — so a torn read is indistinguishable from *the
- * file does not exist*. Measured at ~28-30% of concurrent reads. The crash
- * reaper then sees a healthy daemon as dead, and `/healthz`, which the
- * deployed container serves straight out of the loop heartbeat, blips with
- * nothing logged to explain it.
+ * file does not exist*. The crash reaper then sees a healthy daemon as dead,
+ * and `/healthz`, which the deployed container serves straight out of the loop
+ * heartbeat, blips with nothing logged to explain it.
+ *
+ * A tight reader/writer instrument put this at ~28-30% of reads, but that
+ * figure describes the instrument — it reads in a loop with no delay. The real
+ * rate for any consumer depends on its read cadence against the daemon's write
+ * cadence, which is not measured. The mechanism is the point; the number is
+ * not transferable to `/healthz` or to anything else.
  *
  * Writing a temp file and renaming over the target gives the write an atomic
  * publication point: a reader observes either the whole previous document or
