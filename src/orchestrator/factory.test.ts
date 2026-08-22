@@ -26910,8 +26910,160 @@ describe('FactoryLoop PR babysitter', () => {
 
       await vi.waitFor(() => expect(factory.status().counters.mergedPrAdvancedDone).toBe(1))
       expect(githubWriteback.closes).toEqual([
-        { key: '222', body: 'Factory observed pull request #250 merge and completed this issue.' },
+        {
+          key: '222',
+          body: 'Factory observed pull request #250 merge and completed this issue.\n\n'
+            + 'Closing authority: pull request body closes 222 via "Fixes #222".',
+        },
       ])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  // Reproduces the #313 defect against the real relayfile-cloud#155 outage:
+  // a merged PR that only *references* an issue must never complete it.
+  it('refuses to close an issue that a merged PR merely references (#313)', async () => {
+    const issue155 = githubIssuePath('AgentWorkforce', 'factory', 155)
+    const prPath = '/github/repos/AgentWorkforce/factory/pulls/172/metadata.json'
+    const mount = new FakeMountClient({
+      [issue155]: githubIssueFile(155, {
+        owner: 'AgentWorkforce',
+        repo: 'factory',
+        state: 'open',
+        labels: ['factory', 'factory:human-review'],
+      }),
+      [prPath]: prFile(172, {
+        title: 'chore: connection diagnostic',
+        body: 'Diagnostic for #155. No credential behaviour changes — nothing about token minting,'
+          + ' refresh, or connection selection moves here.',
+        head_ref: 'chore/connection-diagnostic',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(babysitterConfig({
+      issueSource: 'github',
+      repos: {
+        byLabel: { factory: 'AgentWorkforce/factory' },
+        clonePaths: { 'AgentWorkforce/factory': '/work/factory' },
+        default: 'AgentWorkforce/factory',
+      },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      mount.emit(changeEvent(prPath, 'pr-factory-172-merged'))
+
+      await vi.waitFor(() => expect(factory.status().counters.mergedPrClosureRefused).toBe(1))
+      expect(githubWriteback.closes).toEqual([])
+      expect(factory.status().counters.mergedPrAdvancedDone ?? 0).toBe(0)
+      // The refusal is announced, not silent — that is the whole point.
+      expect(githubWriteback.comments).toHaveLength(1)
+      expect(githubWriteback.comments[0]!.key).toBe('155')
+      expect(githubWriteback.comments[0]!.body).toContain('did **not** close this issue')
+      // This body is refused by the disclaimer guard ("Diagnostic for #155"),
+      // not merely by the absence of a keyword. Assert the mechanism that
+      // actually fired, so a regression cannot pass on the other one.
+      expect(githubWriteback.comments[0]!.body).toContain('disclaims closing 155')
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  // The disclaimer guard and the missing-keyword guard are separate mechanisms.
+  // This body carries no disclaimer at all, so only the keyword rule can refuse it.
+  it('refuses a bare reference that carries no disclaimer either (#313)', async () => {
+    const issuePathRef = githubIssuePath('AgentWorkforce', 'factory', 155)
+    const prPath = '/github/repos/AgentWorkforce/factory/pulls/174/metadata.json'
+    const mount = new FakeMountClient({
+      [issuePathRef]: githubIssueFile(155, {
+        owner: 'AgentWorkforce',
+        repo: 'factory',
+        state: 'open',
+        labels: ['factory', 'factory:human-review'],
+      }),
+      [prPath]: prFile(174, {
+        title: 'chore: unrelated cleanup',
+        body: 'Background context lives in #155.',
+        head_ref: 'chore/unrelated-cleanup',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(babysitterConfig({
+      issueSource: 'github',
+      repos: {
+        byLabel: { factory: 'AgentWorkforce/factory' },
+        clonePaths: { 'AgentWorkforce/factory': '/work/factory' },
+        default: 'AgentWorkforce/factory',
+      },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      mount.emit(changeEvent(prPath, 'pr-factory-174-merged'))
+
+      await vi.waitFor(() => expect(factory.status().counters.mergedPrClosureRefused).toBe(1))
+      expect(githubWriteback.closes).toEqual([])
+      expect(githubWriteback.comments[0]!.body).toContain('no closing keyword')
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('never auto-closes an issue carrying an incident label, even with a closing keyword (#313)', async () => {
+    const incidentIssue = githubIssuePath('AgentWorkforce', 'factory', 155)
+    const prPath = '/github/repos/AgentWorkforce/factory/pulls/173/metadata.json'
+    const mount = new FakeMountClient({
+      [incidentIssue]: githubIssueFile(155, {
+        owner: 'AgentWorkforce',
+        repo: 'factory',
+        state: 'open',
+        labels: ['factory', 'incident', 'factory:human-review'],
+      }),
+      [prPath]: prFile(173, {
+        title: 'fix: repoint installation',
+        body: 'Fixes #155',
+        head_ref: 'factory/155-repoint',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(babysitterConfig({
+      issueSource: 'github',
+      repos: {
+        byLabel: { factory: 'AgentWorkforce/factory' },
+        clonePaths: { 'AgentWorkforce/factory': '/work/factory' },
+        default: 'AgentWorkforce/factory',
+      },
+    }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      mount.emit(changeEvent(prPath, 'pr-factory-173-merged'))
+
+      await vi.waitFor(() => expect(factory.status().counters.mergedPrClosureBlockedByLabel).toBe(1))
+      expect(githubWriteback.closes).toEqual([])
+      expect(githubWriteback.comments[0]!.body).toContain('incident')
     } finally {
       await factory.stop()
     }
@@ -26948,6 +27100,43 @@ describe('FactoryLoop PR babysitter', () => {
       expect(factory.status().counters.humanReview).toBeUndefined()
       expect(factory.status().inFlight).toEqual([])
       expect(fleet.releases.map((release) => release.reason)).toEqual(['issue-done', 'issue-done'])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  // The in-flight path completes on Factory's own dispatch, not on prose, so it
+  // deliberately does not demand a closing keyword. It does still take an
+  // explicit denial at its word — the #313 shape, on the tracked path.
+  it('does not complete an in-flight issue whose merged PR disclaims fixing it (#313)', async () => {
+    const issue = realIssueFile(415, ready, { title: 'Real merged but disclaimed' })
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/415/metadata.json'
+    const mount = new FakeMountClient({
+      [issuePath(415)]: issue,
+      [prPath]: prFile(415, {
+        title: 'Real merged but disclaimed',
+        body: 'Linear: AR-415 — this does not fix AR-415, it is groundwork only.',
+        head_ref: 'ar-415-fix',
+        state: 'MERGED',
+        merged: true,
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: stateOnlyLinear(mount),
+    })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(415), issue)))
+      mount.emit(changeEvent(prPath, 'pr-415-merged'))
+
+      await vi.waitFor(() => expect(factory.status().counters.mergedPrClosureRefused).toBe(1))
+      expect(factory.status().counters.done ?? 0).toBe(0)
+      expect(mount.writes).not.toContainEqual({ path: issuePath(415), content: { stateId: done } })
     } finally {
       await factory.stop()
     }

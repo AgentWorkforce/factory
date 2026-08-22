@@ -384,6 +384,11 @@ const safetySchema = z.object({
   requireTitlePrefix: z.string().min(1).default('[factory-e2e]'),
   requireLabel: z.string().default('factory'),
   requireTeamKey: z.string().min(1).default('AR'),
+  // Issues carrying one of these labels are never closed by an observed PR
+  // merge, however strong the closing evidence. An incident stays open until a
+  // human closes it; Factory comments instead. #313.
+  neverAutoCloseLabels: z.array(z.string().trim().min(1).toLowerCase())
+    .default(['incident', 'outage', 'sev1', 'sev2']),
 }).default({})
 
 const environmentsSchema = z.object({
