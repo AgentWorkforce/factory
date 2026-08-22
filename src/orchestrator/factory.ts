@@ -106,6 +106,7 @@ import type {
   ProbePrResolver,
   TriageDecision,
   TriageEngine,
+  WorkUnitOrigin,
 } from '../types'
 import { AppGithubWriteback, FACTORY_GITHUB_STATUS_LABELS, GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
 import { parseSlackThreadReply, slackThreadReplyGlob, type SlackThreadReply } from '../subscriptions/slack-filter'
@@ -4281,10 +4282,23 @@ export class FactoryLoop implements Factory {
   }
 
   async triageIssue(issue: LinearIssue): Promise<TriageDecision> {
-    return this.#triage.triage(issue, {
+    return await this.#triageWithOrigin(issue)
+  }
+
+  /**
+   * The mirror origin is a property of the issue Factory fed in, not of the
+   * engine's answer, so it is re-attached here rather than trusted from the
+   * engine. `TriageDecisionSchema` drops unknown keys, so `LlmTriage` returns a
+   * decision that has lost it, and a custom `TriageEngine` never set it at all
+   * — either way a Linear mirror would fall back to `linear:<uuid>` and
+   * duplicate its own GitHub-native arrival, which is the defect #211 fixes.
+   */
+  async #triageWithOrigin(issue: LinearIssue): Promise<TriageDecision> {
+    const decision = await this.#triage.triage(issue, {
       config: this.#config,
       repoMap: repoMapFromConfig(this.#config),
     })
+    return decisionWithMirrorOrigin(decision, issue)
   }
 
   async dispatch(decision: TriageDecision, opts: { dryRun?: boolean; labelsValidated?: boolean } = {}): Promise<DispatchResult> {
@@ -7796,7 +7810,9 @@ export class FactoryLoop implements Factory {
     await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
   }
 
-  async #recordCanonicalIssueState(issue: Pick<LinearIssue, 'uuid' | 'key' | 'path' | 'stateId'>): Promise<void> {
+  async #recordCanonicalIssueState(
+    issue: Pick<LinearIssue, 'uuid' | 'key' | 'path' | 'stateId'> & { raw?: unknown; origin?: WorkUnitOrigin },
+  ): Promise<void> {
     const key = issueStateKey(issue)
     const previousStateId = await this.#state.getCanonicalState(this.#workspaceId, key)
     const previousRole = this.#states.roleOf(previousStateId)
@@ -7811,10 +7827,18 @@ export class FactoryLoop implements Factory {
         await this.#state.recordDispatchAttempt(this.#workspaceId, key, dispatchState)
         this.#increment('dispatchTerminalReopened')
       }
-      for (const [key, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
-        if (lifecycle.issue.key !== issue.key || !isTerminalDispatchLifecycle(lifecycle)) continue
-        await this.#state.clearDispatchLifecycle(this.#workspaceId, key)
-        this.#dispatchLifecycleEpochs.delete(key)
+      // Match on the work unit, not the surface key: a completed Linear mirror
+      // persists `AR-448` while the GitHub-native arrival of the same issue is
+      // `448`, and comparing surface keys would leave that terminal row in
+      // place to refuse the reopened work forever.
+      const reopenedIdentity = safeDispatchLifecycleKey(issueRefForState(issue))
+      for (const [lifecycleKey, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
+        if (!isTerminalDispatchLifecycle(lifecycle)) continue
+        const matches = reopenedIdentity !== undefined &&
+          safeDispatchLifecycleKey(lifecycle.issue) === reopenedIdentity
+        if (!matches && lifecycle.issue.key !== issue.key) continue
+        await this.#state.clearDispatchLifecycle(this.#workspaceId, lifecycleKey)
+        this.#dispatchLifecycleEpochs.delete(lifecycleKey)
       }
     }
     await this.#state.recordCanonicalState(this.#workspaceId, key, issue.stateId)
@@ -11564,10 +11588,7 @@ export class FactoryLoop implements Factory {
     }
 
     const clarifiedIssue = issueWithGithubClarification(issue, text)
-    const decision = await this.#triage.triage(clarifiedIssue, {
-      config: this.#config,
-      repoMap: repoMapFromConfig(this.#config),
-    })
+    const decision = await this.#triageWithOrigin(clarifiedIssue)
     const escalationReason = triageEscalationReason(decision)
     if (escalationReason) {
       if (hasDispatchableRoute(decision)) {
@@ -16756,10 +16777,7 @@ export class FactoryLoop implements Factory {
     }
 
     const clarifiedIssue = issueWithSlackClarification(issue, text)
-    const decision = await this.#triage.triage(clarifiedIssue, {
-      config: this.#config,
-      repoMap: repoMapFromConfig(this.#config),
-    })
+    const decision = await this.#triageWithOrigin(clarifiedIssue)
     const escalationReason = triageEscalationReason(decision)
     if (escalationReason) {
       if (hasDispatchableRoute(decision)) {
@@ -17383,6 +17401,38 @@ const issueRefFromPath = (path: string): IssueRef => {
 const issueRef = (issue: LinearIssue): IssueRef => {
   const origin = mirrorWorkUnitOrigin(issue)
   return { uuid: issue.uuid, key: issue.key, path: issue.path, ...(origin ? { origin } : {}) }
+}
+
+/**
+ * An `IssueRef` for a canonical-state record, carrying the mirror origin from
+ * whichever shape the caller had — a full `LinearIssue`, or an `IssueRef` that
+ * already resolved one.
+ */
+const issueRefForState = (
+  issue: Pick<LinearIssue, 'uuid' | 'key' | 'path'> & { raw?: unknown; origin?: WorkUnitOrigin },
+): IssueRef => {
+  const origin = issue.origin ??
+    (issue.raw === undefined ? undefined : mirrorWorkUnitOrigin({ path: issue.path, raw: issue.raw }))
+  return { uuid: issue.uuid, key: issue.key, path: issue.path, ...(origin ? { origin } : {}) }
+}
+
+/** Work-unit key, or undefined for a row with no derivable provider identity. */
+const safeDispatchLifecycleKey = (issue: IssueRef): string | undefined => {
+  try {
+    return dispatchLifecycleKey(issue)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Re-attaches the provider origin a triage engine did not carry through.
+ * Only fills a gap — an engine that already resolved an origin keeps it.
+ */
+const decisionWithMirrorOrigin = (decision: TriageDecision, issue: LinearIssue): TriageDecision => {
+  if (decision.issue.origin) return decision
+  const origin = mirrorWorkUnitOrigin(issue)
+  return origin ? { ...decision, issue: { ...decision.issue, origin } } : decision
 }
 
 /**

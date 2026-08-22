@@ -86,6 +86,15 @@ export const planLifecycleMigration = (
   ]
   if (live.length > 1) return { outcome: 'conflict', keys: live.map(([key]) => key).sort() }
 
+  // A canonical row already exists and the ONLY live lease is on a legacy row.
+  // Demoting that row would strip a lease its owner may still be renewing, and
+  // moving it onto the canonical key would overwrite the row already there.
+  // Neither is safe, so refuse rather than pick — a rolling upgrade can produce
+  // exactly this state.
+  if (canonical && live.length === 1 && live[0]![0] !== canonicalKey) {
+    return { outcome: 'conflict', keys: [canonicalKey, live[0]![0]].sort() }
+  }
+
   if (canonical) return { outcome: 'canonical', aliases: candidates.map(([key]) => key) }
 
   const ranked = [...candidates].sort(compareCandidates(nowMs))
@@ -247,9 +256,14 @@ export const migrateDispatchLifecycleKeys = (
     if (rows.length === 1 && rows[0]![0] === canonicalKey) continue
     // Cannot tell an expired lease from a live one here, so any two leased rows
     // are left for the claim path to refuse or resolve.
-    if (rows.filter(([, lifecycle]) => lifecycle.lease).length > 1) continue
+    const leased = rows.filter(([, lifecycle]) => lifecycle.lease)
+    if (leased.length > 1) continue
 
     const existing = rows.find(([key]) => key === canonicalKey)
+    // Never demote a leased row in favour of the canonical one: the lease may
+    // still be live and its owner still working. Leave it for the claim path.
+    if (leased.length === 1 && existing && leased[0]![0] !== canonicalKey) continue
+
     const winner = existing ?? [...rows].sort(compareLoadCandidates)[0]!
     if (!existing) {
       move(winner[0], canonicalKey)

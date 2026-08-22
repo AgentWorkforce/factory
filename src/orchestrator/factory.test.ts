@@ -27106,6 +27106,126 @@ const expectSlackConversationResume = async (
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 
+describe('work-unit identity at the triage boundary (#211)', () => {
+  // A `[factory]` Linear mirror of a GitHub issue: Linear's uuid, key and sense
+  // path, with the GitHub issue it mirrors declared in its provider payload.
+  const mirrorFile = {
+    provider: 'linear',
+    objectType: 'issue',
+    objectId: 'uuid-448',
+    payload: {
+      identifier: 'AR-448',
+      id: 'uuid-448',
+      url: 'https://linear.app/agent-relay/issue/AR-448/mirror-of-a-github-issue',
+      title: '[factory] mirror of a GitHub issue',
+      description: 'Mirror body. '.repeat(12),
+      state: { name: 'Ready for Agent', id: ready },
+      labels: [{ name: 'pear' }],
+      source: {
+        provider: 'github',
+        owner: 'AgentWorkforce',
+        repo: 'pear',
+        number: 448,
+        url: 'https://github.com/AgentWorkforce/pear/issues/448',
+      },
+    },
+  }
+  const mirrorPath = '/linear/issues/AR-448__uuid-448.json'
+
+  // Codex review, PR #329: once lifecycle authority is the work unit, a terminal
+  // row persisted from ONE surface must be cleared when the SAME work unit
+  // reopens on the OTHER. Comparing `lifecycle.issue.key` missed that — the
+  // GitHub-native row stores `448` while the reopening mirror is `AR-448` — and
+  // left the terminal row to refuse the reopened work permanently.
+  it('clears a terminal lifecycle persisted under another surface when the work unit reopens', async () => {
+    const githubRef = {
+      uuid: 'AgentWorkforce/pear#448',
+      key: '448',
+      path: githubIssuePath('AgentWorkforce', 'pear', 448),
+    }
+    const mirrorIssue = parseLinearIssue(mirrorPath, mirrorFile)
+    const mirrorRef = {
+      uuid: mirrorIssue.uuid,
+      key: mirrorIssue.key,
+      path: mirrorIssue.path,
+      origin: { provider: 'github' as const, owner: 'AgentWorkforce', repo: 'pear', number: 448 },
+    }
+
+    // One work unit, two surfaces, two different surface keys.
+    expect(dispatchIssueIdentity(mirrorRef)).toBe(dispatchIssueIdentity(githubRef))
+    expect(mirrorRef.key).not.toBe(githubRef.key)
+
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const decision = await new StaticTriage().triage(mirrorIssue)
+    // A completed run recorded from the GitHub-native surface, keyed on the unit.
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      dispatchIssueIdentity(githubRef),
+      {
+        runId: 'github-run',
+        issue: githubRef,
+        decision: { ...decision, issue: githubRef },
+        dryRun: false,
+        phase: 'complete',
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 1_000,
+      },
+      'previous-owner',
+      1_000,
+      1,
+    )
+    // The mirror itself was Done and is now back at Ready.
+    await stateStore.recordCanonicalState('factory-test', mirrorRef.key, done)
+
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [mirrorPath]: mirrorFile }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    const run = await factory.runOnce()
+
+    // The completed row from the other surface was cleared, so the reopened unit
+    // could claim afresh rather than being refused by it forever.
+    const current = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(githubRef))
+    expect(current?.runId, 'the terminal row must not survive the reopen').not.toBe('github-run')
+    expect(current?.phase).not.toBe('complete')
+    // And the reopened unit actually gets worked, rather than being skipped as
+    // "dispatch lifecycle already terminal".
+    expect(run.skipped).toEqual([])
+    expect(run.dispatched.map((result) => result.issue.key)).toEqual(['AR-448'])
+  })
+
+  it('re-attaches the mirror origin a triage engine dropped', async () => {
+    // StaticTriage returns only { uuid, key, path } — the same shape
+    // TriageDecisionSchema.parse leaves behind, so this covers LlmTriage and any
+    // custom TriageEngine as well as the heuristic path.
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [mirrorPath]: mirrorFile }),
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      logger: {},
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(mirrorPath, mirrorFile))
+
+    expect(decision.issue.origin).toEqual({
+      provider: 'github',
+      owner: 'AgentWorkforce',
+      repo: 'pear',
+      number: 448,
+    })
+    // The mirror and its GitHub-native counterpart are one work unit.
+    expect(dispatchIssueIdentity(decision.issue)).toBe('github:agentworkforce/pear#448')
+    expect(dispatchIssueIdentity(decision.issue)).toBe(dispatchIssueIdentity({
+      uuid: 'AgentWorkforce/pear#448',
+      key: '448',
+      path: githubIssuePath('AgentWorkforce', 'pear', 448),
+    }))
+  })
+})
+
 describe('changeEventPath (resource-less event tolerance)', () => {
   it('returns the path for a well-formed event', () => {
     const event = { resource: { path: '/linear/issues/AR-1__u.json' } } as unknown as ChangeEvent

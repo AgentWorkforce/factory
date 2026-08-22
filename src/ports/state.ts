@@ -343,8 +343,9 @@ export type DispatchLifecycleClaim = {
 export class DispatchLifecycleMigrationConflictError extends Error {
   constructor(readonly canonicalKey: string, readonly conflictingKeys: string[]) {
     super(
-      `Refusing to claim ${canonicalKey}: ${conflictingKeys.length} keys for this work unit hold a live lease ` +
-      `(${conflictingKeys.join(', ')}). Reconcile them before dispatch can continue.`,
+      `Refusing to claim ${canonicalKey}: this work unit has irreconcilable rows under ` +
+      `${conflictingKeys.join(', ')} — rekeying would drop a live lease. ` +
+      `Reconcile them before dispatch can continue.`,
     )
     this.name = 'DispatchLifecycleMigrationConflictError'
   }

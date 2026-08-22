@@ -9,7 +9,12 @@ import type { DispatchLifecycle } from '../ports/state'
 import { HeuristicTriage } from '../triage/heuristic'
 import type { IssueRef, LinearIssue, TriageContext } from '../types'
 import { FileStateStore } from './file-state-store'
-import { legacyCompositeLifecycleKey, prunableMigrationAliases } from './work-unit-lifecycle-migration'
+import {
+  legacyCompositeLifecycleKey,
+  migrateDispatchLifecycleKeys,
+  planLifecycleMigration,
+  prunableMigrationAliases,
+} from './work-unit-lifecycle-migration'
 import { InMemoryStateStore } from './in-memory-state-store'
 
 /**
@@ -334,7 +339,7 @@ describe('work-unit claim authority', () => {
 
     await expect(store.claimDispatchLifecycle(
       'ws', canonicalKey, seedFor(GITHUB_NATIVE, 'run-c'), 'dispatcher-c', 1_500, 60_000,
-    )).rejects.toThrow(/hold a live lease/u)
+    )).rejects.toThrow(/irreconcilable/u)
 
     // Fail closed: neither live row was touched and no new claim exists.
     expect(await store.getDispatchLifecycle('ws', canonicalKey)).toBeUndefined()
@@ -409,5 +414,75 @@ describe('work-unit claim authority', () => {
       alias('a2', 2_000),
     ]
     expect(prunableMigrationAliases(terminal, 10_000).sort()).toEqual(['a1', 'a2'])
+  })
+
+  // Codex review, PR #329: with a canonical row already present, the sole live
+  // lease sitting on a legacy row was being demoted to an alias — stripping the
+  // lease out from under an owner that may still be renewing it. Driven through
+  // the pure planner, because seeding two rows via claimDispatchLifecycle would
+  // itself migrate them.
+  it('refuses rather than demote the only live lease when a canonical row already exists', () => {
+    const canonicalKey = dispatchIssueIdentity(GITHUB_NATIVE)
+    const legacyKey = legacyCompositeLifecycleKey(GITHUB_NATIVE)
+    const stale: DispatchLifecycle = { ...seedFor(GITHUB_NATIVE, 'run-stale'), updatedAtMs: 1_000 }
+    const live: DispatchLifecycle = {
+      ...seedFor(GITHUB_NATIVE, 'run-live'),
+      updatedAtMs: 1_000,
+      lease: { owner: 'dispatcher-b', epoch: 1, leaseUntilMs: 60_000 },
+    }
+
+    expect(planLifecycleMigration(
+      [[canonicalKey, stale], [legacyKey, live]],
+      canonicalKey,
+      { issue: GITHUB_NATIVE },
+      5_000,
+    )).toEqual({ outcome: 'conflict', keys: [canonicalKey, legacyKey].sort() })
+  })
+
+  it('still adopts the sole live legacy row when no canonical row is in the way', () => {
+    const canonicalKey = dispatchIssueIdentity(GITHUB_NATIVE)
+    const legacyKey = legacyCompositeLifecycleKey(GITHUB_NATIVE)
+    const live: DispatchLifecycle = {
+      ...seedFor(GITHUB_NATIVE, 'run-live'),
+      lease: { owner: 'dispatcher-b', epoch: 1, leaseUntilMs: 60_000 },
+    }
+
+    expect(planLifecycleMigration(
+      [[legacyKey, live]],
+      canonicalKey,
+      { issue: GITHUB_NATIVE },
+      5_000,
+    )).toEqual({ outcome: 'adopt', from: legacyKey, aliases: [] })
+  })
+
+  it('never demotes a leased row to an alias on the load path either', () => {
+    const canonicalKey = dispatchIssueIdentity(GITHUB_NATIVE)
+    const legacyKey = legacyCompositeLifecycleKey(GITHUB_NATIVE)
+    const rows = new Map<string, DispatchLifecycle>([
+      [canonicalKey, { ...seedFor(GITHUB_NATIVE, 'run-stale'), updatedAtMs: 1_000 }],
+      [legacyKey, {
+        ...seedFor(GITHUB_NATIVE, 'run-live'),
+        updatedAtMs: 1_000,
+        lease: { owner: 'dispatcher-b', epoch: 1, leaseUntilMs: 60_000 },
+      }],
+    ])
+
+    // The load pass has no clock and must not judge expiry, so it leaves this
+    // for the claim path to refuse precisely.
+    const changed = migrateDispatchLifecycleKeys(
+      () => [...rows],
+      (from, to) => {
+        rows.set(to, rows.get(from)!)
+        rows.delete(from)
+      },
+      (key, canonical) => {
+        rows.set(key, { ...rows.get(key)!, migrationAliasOf: canonical })
+      },
+    )
+
+    expect(changed).toBe(false)
+    expect(rows.get(legacyKey)?.runId).toBe('run-live')
+    expect(rows.get(legacyKey)?.lease).toMatchObject({ owner: 'dispatcher-b' })
+    expect(rows.get(legacyKey)?.migrationAliasOf).toBeUndefined()
   })
 })
