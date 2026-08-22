@@ -381,16 +381,27 @@ function publicOccupants(occupants: unknown, reapMs: number): FactoryPublicDispa
   return occupants.flatMap((entry, index) => {
     const occupant = plainRecord(entry)
     if (!occupant) return []
-    const placedAgents = finiteNumber(occupant.placedAgents) ?? 0
+    // An ABSENT `placedAgents` is not a reported zero (#318 review,
+    // CodeRabbit). `countAgentlessOccupants` compares
+    // `finiteNumber(placedAgents) === 0`, which is false when the field is
+    // missing, precisely so that a producer who cannot answer the question is
+    // not read as answering "wedged". Defaulting to 0 here would have made the
+    // two disagree inside one payload — and worse, the reader folds
+    // `pastReapDeadline` into its wedge count, so an occupant that merely
+    // omitted the field would have forced `status: 'degraded'`: the false
+    // alarm the #303 comment exists to prevent.
+    const reportedPlacedAgents = finiteNumber(occupant.placedAgents)
     const slotHeldForMs = finiteNumber(occupant.slotHeldForMs)
-    const pastReapDeadline = placedAgents === 0 &&
+    const pastReapDeadline = reportedPlacedAgents === 0 &&
       slotHeldForMs !== undefined &&
       slotHeldForMs >= reapMs
     return [{
       // A record re-projected from an already-public one carries its id
       // forward; only the writer, which holds the issue key, mints one.
       id: typeof occupant.id === 'string' ? occupant.id : occupantId(occupant.issue, index),
-      placedAgents,
+      // Omitted rather than defaulted: publishing `0` for a count nobody
+      // reported states a fact the producer never gave us.
+      ...(reportedPlacedAgents === undefined ? {} : { placedAgents: reportedPlacedAgents }),
       ...optionalDuration('slotHeldForMs', slotHeldForMs),
       ...(pastReapDeadline ? { pastReapDeadline } : {}),
     }]

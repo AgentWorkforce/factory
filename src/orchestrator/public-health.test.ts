@@ -257,6 +257,35 @@ describe('dispatch capacity health (#303)', () => {
     expect(new Set(ids).size).toBe(2)
   })
 
+  // #318 review (CodeRabbit): an occupant that OMITS `placedAgents` must not be
+  // read as a reported zero. `countAgentlessOccupants` already refuses to guess
+  // from an absence; the per-occupant projection has to agree, or one payload
+  // contradicts itself — and because the reader folds `pastReapDeadline` into
+  // its wedge count, a mere omission would have published `status: 'degraded'`.
+  it('does not read an absent placedAgents as a reported zero', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        waiting: 0,
+        longestWaitMs: undefined,
+        waitingIssues: [],
+        occupants: [{ issue: 'AR-319', phase: 'running', agents: 1, slotHeldForMs: 40 * 60_000 }] as never,
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    // All three readings of the same payload agree that nothing is claimed.
+    expect(health.dispatchCapacity?.agentlessOccupants).toBeUndefined()
+    expect(health.dispatchCapacity?.occupants?.[0]?.pastReapDeadline).toBeUndefined()
+    expect(health.dispatchCapacity?.occupants?.[0]?.placedAgents).toBeUndefined()
+    expect(health.dispatchCapacity?.state).toBe('healthy')
+    expect(health.degradedSubsystems).not.toContain('dispatchCapacity')
+
+    // And the same record survives a round trip without acquiring a wedge.
+    const normalized = normalizePublicHealth(health)
+    expect(normalized?.dispatchCapacity?.state).toBe('healthy')
+    expect(normalized?.status).toBe('ok')
+  })
+
   it('keeps issue keys behind the authenticated surface', () => {
     const health = publicHealthFromHeartbeat(capacity(), { nowMs: BOOT_MS + 1_000 })
 

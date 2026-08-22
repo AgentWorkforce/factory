@@ -312,8 +312,12 @@ export interface FactoryPublicDispatchCapacityHealth {
 export interface FactoryPublicDispatchSlotOccupant {
   /** Boot-scoped opaque identity. Never an issue key. */
   id: string
-  /** Entries that actually reached a spawn result; 0 is the wedge signature. */
-  placedAgents: number
+  /**
+   * Entries that actually reached a spawn result; a reported 0 is the wedge
+   * signature. Omitted when the producer did not report it — an absent count
+   * is not a zero, and reading it as one publishes a wedge nobody claimed.
+   */
+  placedAgents?: number
   /** Since the row took the batch slot, whether or not it ever placed an agent. */
   slotHeldForMs?: number
   /** True once this occupant is past `agentlessHoldTimeoutMs` with no placement. */
