@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
 
 import { DEFAULT_READINESS_RECONCILE_TIMEOUT_MS, FactoryConfigSchema, type FactoryConfig } from '../config/schema'
@@ -126,6 +126,7 @@ import {
 } from './dependencies'
 import { CoalescedTaskQueue } from './coalesced-task-queue'
 import { findAgentProcessByName, readProcessIdentity, type AgentProcessFinder } from './process-identity'
+import { writeJsonFileAtomically } from './atomic-json-file'
 import { readFactoryInFlightRegistry, terminatePids } from './reaper'
 import {
   createFactoryCloudEventV1,
@@ -7861,8 +7862,10 @@ export class FactoryLoop implements Factory {
         error: describeError(error).errorMessage,
       })
     }
-    await mkdir(dirname(path), { recursive: true })
-    await writeFile(path, `${JSON.stringify(heartbeat, null, 2)}\n`, 'utf8')
+    // Atomic publish (#323): `/healthz` and the crash reaper read this file
+    // while it is being rewritten, and a torn read reaches them as a missing
+    // heartbeat, i.e. as a dead daemon.
+    await writeJsonFileAtomically(path, heartbeat)
     await this.#writeInFlightRegistry(registryPath, path)
     const batch = this.#batchView
     await this.#report({
@@ -8400,8 +8403,10 @@ export class FactoryLoop implements Factory {
       updatedAtMs,
       agents,
     }
-    await mkdir(dirname(path), { recursive: true })
-    await writeFile(path, `${JSON.stringify(registry, null, 2)}\n`, 'utf8')
+    // Atomic publish (#323): the crash reaper reads this file in the same
+    // sweep as the heartbeat, so leaving it torn keeps the reaper racy even
+    // with an atomic heartbeat.
+    await writeJsonFileAtomically(path, registry)
   }
 
   async #spawnAgent(record: InFlightIssue, spec: AgentSpec, dryRun: boolean): Promise<{ name: string }> {
