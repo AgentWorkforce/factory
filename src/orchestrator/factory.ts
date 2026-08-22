@@ -61,7 +61,7 @@ import {
   dispatchLifecycleOccupiesSlot,
   dispatchPhaseOccupiesSlot,
 } from '../state/dispatch-lifecycle-slot'
-import { containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue } from '../issue-key-match'
+import { branchImplementsIssue, containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue, prBodyDisclaimsClosing, prClosureAuthority } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { dispatchRelayflowForChangeEvent } from '../dispatch/relayflow-registry'
@@ -13232,9 +13232,65 @@ export class FactoryLoop implements Factory {
     return best?.record
   }
 
-  async #advanceMergedPrToDone(snapshot: PullSnapshot, repo: string, record?: InFlightIssue): Promise<void> {
+  async #advanceMergedPrToDone(
+    snapshot: PullSnapshot,
+    repo: string,
+    record?: InFlightIssue,
+  ): Promise<void> {
     const mergedPullRequest = { repo, number: snapshot.number, url: snapshot.url }
     if (record) {
+      // An in-flight record's association comes from Factory's own dispatch,
+      // not from the PR's prose, so closure here does NOT require a closing
+      // keyword — requiring one would strand every ordinary dispatch whose PR
+      // links its issue with a bare `Linear: AR-411`.
+      //
+      // What it does honour is an explicit disclaimer: a merged PR that says in
+      // its own body that it does not fix this issue is taken at its word. That
+      // is the exact shape of #313 (`Diagnostic for #155`).
+      //
+      // Ownership does NOT exempt a PR from this. Ownership settles which issue
+      // the PR belongs to; it says nothing about whether the merge completed
+      // that issue. Skipping the check for owned PRs would mean the same merged
+      // body is refused before ownership is established and accepted after.
+      if (prBodyDisclaimsClosing(
+        { headRef: snapshot.headRef, body: snapshot.body, repo },
+        record.issue.key,
+      )) {
+        this.#increment('mergedPrClosureRefused')
+        this.#logger.warn?.('[factory] merged PR disclaims completing the issue it references', {
+          issue: record.issue.key,
+          prNumber: snapshot.number,
+          repo,
+        })
+        return
+      }
+      // The protected-label gate has to cover the tracked paths too, or an
+      // incident issue that Factory itself dispatched is still auto-closed by
+      // its own merge and `neverAutoCloseLabels` guarantees nothing.
+      const tracked = await this.#readIssue(record.issue.path)
+      const trackedBlockingLabel = tracked ? this.#neverAutoCloseLabel(tracked) : undefined
+      if (tracked && trackedBlockingLabel) {
+        await this.#declineMergeClosure(
+          tracked,
+          snapshot,
+          repo,
+          `it carries the \`${trackedBlockingLabel}\` label, which Factory never auto-closes`,
+          'label',
+        )
+        return
+      }
+      if (!tracked) {
+        // Proceed rather than block. The disclaimer check above already ran on
+        // the merged body; wedging every completion behind a transient mount
+        // read would strand dispatches far more often than it would protect an
+        // incident, and stranded dispatches are what generate incidents here.
+        this.#logger.warn?.('[factory] could not read issue to apply the never-auto-close label gate', {
+          issue: record.issue.key,
+          prNumber: snapshot.number,
+          repo,
+        })
+        this.#increment('mergedPrLabelGateUnverified')
+      }
       await this.#completeIssue(record, {
         targetState: 'done',
         runMergeGate: false,
@@ -13254,6 +13310,24 @@ export class FactoryLoop implements Factory {
       this.#increment('mergedPrAdvanceDuplicatesSuppressed')
       return
     }
+
+    // A merged PR that merely *references* this issue has no authority to
+    // complete it, and an incident issue is never closed by a merge at all.
+    // Both refusals comment instead of closing, so the decision is auditable
+    // rather than silent. #313.
+    const authority = prClosureAuthority(
+      { headRef: snapshot.headRef, body: snapshot.body, repo },
+      issue.key,
+    )
+    const blockingLabel = this.#neverAutoCloseLabel(issue)
+    if (!authority.authorised || blockingLabel) {
+      const reason = blockingLabel
+        ? `it carries the \`${blockingLabel}\` label, which Factory never auto-closes`
+        : authority.evidence
+      await this.#declineMergeClosure(issue, snapshot, repo, reason, blockingLabel ? 'label' : 'authority')
+      return
+    }
+
     this.#postMergeDoneAdvances.add(advanceKey)
 
     try {
@@ -13261,7 +13335,7 @@ export class FactoryLoop implements Factory {
       if (githubIssue) {
         await this.#githubWriteback.closeIssue(
           issue,
-          `Factory observed pull request #${snapshot.number} merge and completed this issue.`,
+          `Factory observed pull request #${snapshot.number} merge and completed this issue.\n\nClosing authority: ${authority.evidence}.`,
         )
       } else {
         const doneStateId = this.#states.idFor(issue.team, 'done')
@@ -13276,6 +13350,7 @@ export class FactoryLoop implements Factory {
         issue: issue.key,
         prNumber: snapshot.number,
         url: snapshot.url,
+        closureAuthority: authority.source,
       })
 
       if (this.#slack && this.#config.slack && !await this.#shouldSkipSlackWriteback('merge-done-thread')) {
@@ -13298,6 +13373,66 @@ export class FactoryLoop implements Factory {
       }
     } catch (error) {
       this.#postMergeDoneAdvances.delete(advanceKey)
+      this.#error(error, issueRef(issue))
+    }
+  }
+
+  /** The configured label, if any, that bars this issue from ever auto-closing. */
+  #neverAutoCloseLabel(issue: LinearIssue): string | undefined {
+    const blocked = this.#config.safety.neverAutoCloseLabels
+    if (!blocked || blocked.length === 0) return undefined
+    const carried = new Set((issue.labels ?? []).map((label) => label.trim().toLowerCase()))
+    return blocked.find((label) => carried.has(label))
+  }
+
+  /**
+   * Leave the issue open and say why. A refusal has to be *louder* than a
+   * closure, not quieter: the failure this replaces marked a live outage
+   * COMPLETED and dropped it out of every open-issue view.
+   */
+  async #declineMergeClosure(
+    issue: LinearIssue,
+    snapshot: PullSnapshot,
+    repo: string,
+    reason: string,
+    kind: 'authority' | 'label',
+  ): Promise<void> {
+    this.#increment(kind === 'label' ? 'mergedPrClosureBlockedByLabel' : 'mergedPrClosureRefused')
+    this.#logger.warn?.('[factory] declined to close issue on merged PR', {
+      issue: issue.key,
+      prNumber: snapshot.number,
+      repo,
+      reason,
+      kind,
+    })
+    const marker = `factory-merge-close-declined:${repo}#${snapshot.number}`
+    const body = [
+      `Factory observed pull request ${repo}#${snapshot.number} merge, and did **not** close this issue.`,
+      '',
+      `Reason: ${reason}.`,
+      '',
+      'A merged pull request closes an issue only when it carries a GitHub closing keyword'
+        + ' (`closes`/`fixes`/`resolves`) for it, or when its head is that issue\'s own'
+        + ' implementation branch. A bare reference is an association, not a completion.',
+      '',
+      'If this pull request really did complete the issue, close it by hand.',
+      '',
+      `<!-- ${marker} -->`,
+    ].join('\n')
+    try {
+      // A Linear-backed candidate reaches this path too, and a refusal that is
+      // invisible on the system of record is barely better than the silent
+      // closure it replaces.
+      if (!isGithubIssue(issue)) {
+        await this.#linear.postComment(issue, body)
+        return
+      }
+      // Merge events can redeliver. Skip a repeat only on a positive
+      // confirmation that the note already landed; an unavailable check must
+      // not be read as "already commented".
+      if (await this.#githubWriteback.hasCommentMarker?.(issue, marker)) return
+      await this.#githubWriteback.postComment(issue, body)
+    } catch (error) {
       this.#error(error, issueRef(issue))
     }
   }
@@ -18793,10 +18928,10 @@ const issuePrMatchScore = (
 const hasTitlePrefix = (title: string, marker: string): boolean =>
   title === marker || title.startsWith(`${marker} `)
 
-const factoryBranchMatchesIssue = (headRef: string, issueKey: string): boolean =>
-  /^\d+$/u.test(issueKey)
-    ? factoryBranchBelongsToIssue(headRef, issueKey)
-    : containsIssueKey(headRef, issueKey)
+// Single definition shared with closure authority, so the branch rule that
+// grants a score-30 association and the one that authorises a close can never
+// drift apart.
+const factoryBranchMatchesIssue = branchImplementsIssue
 
 // Legacy Factory runs created GitHub-native branches as `<issue-number>-*`
 // before the current `factory/<issue>-*` convention. Keep this matcher out of

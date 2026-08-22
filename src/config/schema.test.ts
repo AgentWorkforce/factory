@@ -229,6 +229,7 @@ describe('FactoryConfigSchema', () => {
       requireTitlePrefix: '[factory-e2e]',
       requireLabel: 'factory',
       requireTeamKey: 'AR',
+      neverAutoCloseLabels: ['incident', 'outage', 'sev1', 'sev2'],
     })
     expect(parsed.dryRun).toBe(false)
     expect(parsed.environments).toEqual({})
