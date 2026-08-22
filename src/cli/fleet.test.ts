@@ -1980,6 +1980,84 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  // factory#319 regression guard. The self-race itself is exercised by
+  // "keeps relay dispatch ownership …" above, which failed ~50% of runs on
+  // main and is deterministic with the fix; this control pins the other half
+  // of the contract — that a park this dispatch did NOT make still aborts.
+  it('still aborts when a third party parks the issue and this dispatch did not', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-foreign-park-'))
+    try {
+      const configPath = await writeConfig(root, {
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+          heartbeatStaleMs: 10_000,
+        },
+      })
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number: 78,
+          url: 'https://github.com/AgentWorkforce/pear/pull/78',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }),
+        closePullRequest: async () => undefined,
+      }
+      // No agent ever exits here, so this record's lifecycle never advances
+      // past `dispatching` — the park below is somebody else's.
+      class ForeignParkMountClient extends FakeMountClient {
+        parked = false
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === issuePath && this.armedForPark && !this.parked) {
+            this.parked = true
+            const existing = this.files.get(issuePath)
+            const content = existing?.content as { payload: Record<string, unknown> }
+            this.files.set(issuePath, {
+              ...existing,
+              content: { ...content, payload: { ...content.payload, stateId: TEST_STATE_IDS.humanReview } },
+            })
+          }
+          return super.readFile(path)
+        }
+
+        armedForPark = false
+      }
+      const mount = new ForeignParkMountClient({
+        [issuePath]: issueFile,
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+      const fleet = new FakeFleetClient()
+      const spawn = fleet.spawn.bind(fleet)
+      fleet.spawn = async (input: SpawnInput): Promise<SpawnResult> => {
+        const result = await spawn(input)
+        mount.armedForPark = true
+        return result
+      }
+
+      const code = await runFleetCli([
+        'dispatch',
+        'AR-77',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        stdout: buffer(),
+        stderr: buffer(),
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      // The guard must still fire for a change this dispatch did not make.
+      // If this ever returns 0, the fix has stopped distinguishing writers and
+      // has simply deleted the protection.
+      expect(code).not.toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('keeps relay dispatch ownership until the remote PR is published and the issue is parked', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-relay-owner-'))
     try {

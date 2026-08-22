@@ -4589,10 +4589,32 @@ export class FactoryLoop implements Factory {
       if (!dryRun) {
         const issue = await this.#readIssue(dispatchDecision.issue.path)
         if (!issue || !this.#isIssueReady(issue)) {
-          throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
+          // The agents spawned a few lines above can reach terminal before we
+          // get here. Their completion writeback parks the issue — Linear
+          // `humanReview`, or the GitHub human-review label — and stamps
+          // *this same record's* lifecycle on the way past. Re-reading the
+          // issue then shows "not ready", but the writer was us.
+          //
+          // Treating that as a foreign change is not a cosmetic misreport: the
+          // catch below classifies LiveDispatchStateChangedError as terminal
+          // and calls #releaseAndTerminateAgents, so a dispatch whose agents
+          // finished quickly tore down its own completed work and reported
+          // RETRYABLE to its supervisor (factory#319).
+          //
+          // A third party mutating the issue cannot advance *our* record's
+          // lifecycle phase, so the phase is what separates the two. Losing
+          // the row to another owner is a different condition and is still
+          // caught where it always was — #saveDispatchLifecycle returning
+          // false.
+          if (!ownLifecycleMovedPastDispatch(record.lifecyclePhase)) {
+            throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
+          }
+          // The claim is moot and would be wrong to write: it would drag an
+          // issue our own lifecycle has already parked back to `implementing`.
+        } else {
+          implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
+          this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
         }
-        implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
-        this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
       }
 
       const result = {
@@ -20202,6 +20224,31 @@ const triageEscalationReason = (decision: TriageDecision): string | undefined =>
  * turns it into a distinct exit code — can recognize it by type rather than by
  * matching on `error.name`, and so tests can construct a genuine instance.
  */
+/**
+ * Phases a dispatch record only reaches by its *own* lifecycle progressing past
+ * dispatch setup.
+ *
+ * `queued`/`dispatching` mean setup is still running, and `retryable`,
+ * `abandoning` and `abandoned` are failure states — none of them imply this
+ * record wrote to the issue. Everything here does, so an issue that stopped
+ * being ready while the record sits in one of these phases stopped because of
+ * us (factory#319).
+ */
+const SELF_ADVANCED_DISPATCH_PHASES: ReadonlySet<DispatchLifecyclePhase> = new Set([
+  'running',
+  'parking',
+  'waiting-for-human',
+  'publishing',
+  'published',
+  'writeback-applied',
+  'releasing',
+  'complete',
+])
+
+function ownLifecycleMovedPastDispatch(phase: DispatchLifecyclePhase | undefined): boolean {
+  return phase !== undefined && SELF_ADVANCED_DISPATCH_PHASES.has(phase)
+}
+
 export class LiveDispatchStateChangedError extends Error {
   readonly issueKey: string
 
