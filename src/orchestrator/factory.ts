@@ -4995,7 +4995,26 @@ export class FactoryLoop implements Factory {
           claim.lifecycle.phase !== 'writeback-applied' &&
           claim.lifecycle.phase !== 'releasing'
         ) {
-          liveIssue = await this.#readIssue(durableRecord.issue.path)
+          // `#readIssue` swallows every read failure except a relayfile 429,
+          // which it rethrows so callers can back off. On this path that
+          // rethrow aborted the whole adoption: this row was never restored
+          // into the batch, every later row was skipped, and no hold deadline
+          // was armed for any of them (#315). Startup already degrades safely
+          // when the issue is simply unreadable — it treats the row as not
+          // externally terminal and lets the retry driver carry it — so a shed
+          // read must degrade the same way rather than strand the batch.
+          try {
+            liveIssue = await this.#readIssue(durableRecord.issue.path)
+          } catch (error) {
+            const overload = relayfileOverload(error)
+            if (!overload) throw error
+            this.#increment('startupIssueReadsShed')
+            this.#logger.warn?.('[factory] startup issue read was shed; adopting without it', {
+              issue: durableRecord.issue.key,
+              status: overload.status,
+              reason: relayfileOverloadReasonLabel(overload.reason),
+            })
+          }
           // A babysat Linear issue already at Done may have merged while this
           // process was down. Let authoritative PR restoration drive the
           // normal `complete` path so merged work is not mislabeled abandoned.
@@ -5138,9 +5157,25 @@ export class FactoryLoop implements Factory {
           })
         }
       }
-      this.#rescheduleHeldAgentDeadlineSweep()
     } catch (error) {
       this.#logger.warn?.('[factory] failed to re-adopt durable in-flight agents', { error })
+    } finally {
+      // Arming has to survive everything above it (#315).
+      //
+      // This is the only thing that arms a hold deadline for a row that
+      // survived a restart, and it used to be the last statement of the `try`.
+      // Two fleet awaits sit above it — `reconcileTrackedAgents`, which is not
+      // circuit-proxied and so reaches the transport, and the guarded `roster`,
+      // which throws outright once the circuit is open. With the broker down
+      // either one throws, the catch logs, and no hold deadline is armed for
+      // that boot: the #304 reaper is present in the build and was never
+      // scheduled. That is the failure mode reaping exists to clear, so the
+      // arming must not be reachable only along the happy path.
+      //
+      // A `dispatching` row is additionally armed by the per-row retry driver
+      // below, which is why the wedge shows up on a `running` row: `running` is
+      // the one slot-occupying phase that never gets a retry scheduled here.
+      this.#rescheduleHeldAgentDeadlineSweep()
     }
   }
 

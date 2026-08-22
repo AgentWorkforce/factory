@@ -289,6 +289,39 @@ export interface FactoryPublicDispatchCapacityHealth {
    * dispatch is still here.
    */
   agentlessOccupants?: number
+  /**
+   * Per-occupant age and identity, redacted (#315).
+   *
+   * `agentlessOccupants` is a COUNT, and a count cannot tell one permanently
+   * stuck occupant from a rapid reap-and-reacquire cycle: both read `1` on
+   * every sample forever. Distinguishing them took 34 samples over 40 minutes
+   * of watching a number that never moved. `slotHeldForMs` settles it in one
+   * request — it grows monotonically for a stuck row and resets for a
+   * churning one.
+   *
+   * `id` is a boot-scoped digest, salted per process, so entries can be
+   * followed across samples while an occupant lasts. It is deliberately NOT
+   * stable across restarts and deliberately not derivable back to an issue
+   * key: those carry project and repository names, which is why this surface
+   * redacts them in the first place (#303).
+   */
+  occupants?: FactoryPublicDispatchSlotOccupant[]
+}
+
+/** One occupied batch slot, safe to serve unauthenticated (#315). */
+export interface FactoryPublicDispatchSlotOccupant {
+  /** Boot-scoped opaque identity. Never an issue key. */
+  id: string
+  /**
+   * Entries that actually reached a spawn result; a reported 0 is the wedge
+   * signature. Omitted when the producer did not report it — an absent count
+   * is not a zero, and reading it as one publishes a wedge nobody claimed.
+   */
+  placedAgents?: number
+  /** Since the row took the batch slot, whether or not it ever placed an agent. */
+  slotHeldForMs?: number
+  /** True once this occupant is past `agentlessHoldTimeoutMs` with no placement. */
+  pastReapDeadline?: boolean
 }
 
 export interface FactoryPublicEventListenerHealth {
