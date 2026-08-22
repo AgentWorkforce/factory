@@ -40,6 +40,7 @@ import type {
   BabysitterSessionState,
   DispatchLifecycleAgentUsage,
   DispatchLifecycle,
+  DispatchLifecycleLease,
   DispatchLifecyclePhase,
   DiscoveryCheckpoint,
   DiscoverySweepClaim,
@@ -5057,6 +5058,14 @@ export class FactoryLoop implements Factory {
               reason: relayfileOverloadReasonLabel(overload.reason),
             })
           }
+          // A row persisted before #211 has no `origin`, so a Linear mirror
+          // still resolves to `linear:<uuid>` and a GitHub-native arrival for
+          // the same work unit would claim alongside it — the rolling-upgrade
+          // form of the duplicate this change removes. Nothing on the row links
+          // it to its upstream, but the issue we just read does, so backfill it
+          // here under the lease this process already holds. The next claim or
+          // load then recognises the row by identity and re-keys it.
+          if (liveIssue) await this.#backfillMirrorOrigin(key, claim, liveIssue)
           // A babysat Linear issue already at Done may have merged while this
           // process was down. Let authoritative PR restoration drive the
           // normal `complete` path so merged work is not mislabeled abandoned.
@@ -5503,6 +5512,45 @@ export class FactoryLoop implements Factory {
         )
       }
     }
+  }
+
+  /**
+   * Records the upstream origin on an adopted lifecycle that predates it.
+   * Best-effort: a failed write leaves the row exactly as it was, and the next
+   * startup tries again.
+   */
+  async #backfillMirrorOrigin(
+    key: string,
+    claim: { lifecycle: DispatchLifecycle; lease?: DispatchLifecycleLease },
+    liveIssue: LinearIssue,
+  ): Promise<void> {
+    const epoch = claim.lease?.epoch
+    if (epoch === undefined || claim.lifecycle.issue.origin) return
+    const origin = mirrorWorkUnitOrigin(liveIssue)
+    if (!origin) return
+    const issue = { ...claim.lifecycle.issue, origin }
+    const enriched: DispatchLifecycle = {
+      ...claim.lifecycle,
+      issue,
+      decision: { ...claim.lifecycle.decision, issue },
+    }
+    const saved = await this.#state.saveDispatchLifecycle(
+      this.#workspaceId,
+      key,
+      this.#dispatchLifecycleOwner,
+      epoch,
+      this.#clock.now(),
+      enriched,
+    ).catch((error: unknown) => {
+      this.#logger.warn?.('[factory] could not backfill mirror origin on an adopted lifecycle', {
+        issue: claim.lifecycle.issue.key,
+        error: describeError(error).errorMessage,
+      })
+      return false
+    })
+    if (!saved) return
+    claim.lifecycle = enriched
+    this.#increment('dispatchLifecycleMirrorOriginsBackfilled')
   }
 
   async #renewDispatchLifecycles(): Promise<void> {

@@ -27198,6 +27198,72 @@ describe('work-unit identity at the triage boundary (#211)', () => {
     expect(run.dispatched.map((result) => result.issue.key)).toEqual(['AR-448'])
   })
 
+  // Codex review, PR #329: a lifecycle persisted BEFORE this change has no
+  // `origin`, so a mirror row still resolves to linear:<uuid> and a later
+  // GitHub-native arrival for the same unit would claim alongside it — the
+  // rolling-upgrade form of the duplicate. Nothing on the row links it upstream,
+  // but the issue read during startup adoption does.
+  it('backfills the mirror origin onto a pre-upgrade lifecycle so a native claim finds it', async () => {
+    const githubRef = {
+      uuid: 'AgentWorkforce/pear#448',
+      key: '448',
+      path: githubIssuePath('AgentWorkforce', 'pear', 448),
+    }
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const mirrorIssue = parseLinearIssue(mirrorPath, mirrorFile)
+    // Exactly what a pre-#211 store holds: the surface ref, no origin.
+    const legacyRef = { uuid: mirrorIssue.uuid, key: mirrorIssue.key, path: mirrorIssue.path }
+    const decision = await new StaticTriage().triage(mirrorIssue)
+
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      dispatchIssueIdentity(legacyRef),
+      {
+        runId: 'pre-upgrade-run',
+        issue: legacyRef,
+        decision: { ...decision, issue: legacyRef },
+        dryRun: false,
+        phase: 'running',
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 1_000,
+      },
+      'previous-owner',
+      1_000,
+      1,
+    )
+    // The pre-upgrade row is unreachable from the native identity.
+    expect(dispatchIssueIdentity(legacyRef)).toBe(`linear:${mirrorIssue.uuid}`)
+    expect(dispatchIssueIdentity(legacyRef)).not.toBe(dispatchIssueIdentity(githubRef))
+
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [mirrorPath]: mirrorFile }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    await factory.start({ mode: 'dispatch-owner' })
+    try {
+      // Startup adoption read the mirrored issue, so the row can now be
+      // recognised by the work unit it belongs to.
+      await vi.waitFor(async () => {
+        const rows = await stateStore.listDispatchLifecycles('factory-test')
+        const row = rows.find(([, lifecycle]) => lifecycle.runId === 'pre-upgrade-run')
+        expect(row?.[1].issue.origin).toEqual({
+          provider: 'github',
+          owner: 'AgentWorkforce',
+          repo: 'pear',
+          number: 448,
+        })
+        // And it is reachable from the GitHub-native identity, so a native
+        // arrival adopts it instead of opening a second claim.
+        expect(dispatchIssueIdentity(row![1].issue)).toBe(dispatchIssueIdentity(githubRef))
+      })
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('re-attaches the mirror origin a triage engine dropped', async () => {
     // StaticTriage returns only { uuid, key, path } — the same shape
     // TriageDecisionSchema.parse leaves behind, so this covers LlmTriage and any
