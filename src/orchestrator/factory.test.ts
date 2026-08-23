@@ -30,6 +30,7 @@ import {
 } from '../index'
 import { LatePlacementReleasedError, changeEventPath } from './factory'
 import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
+import { RelayfileOperationTimeoutError } from '../mount/relayfile-operation-timeout'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
@@ -13386,6 +13387,209 @@ describe('FactoryLoop', () => {
         // Drain the abandoned pass before teardown. It is still running by
         // design — the deadline rejects the wait, not the sweep — and this
         // coalesces onto it rather than leaking it into the next test.
+        await factory.runOnce().catch(() => undefined)
+        await factory.stop()
+      }
+    })
+
+    // #351: the sweep deadline above cannot reach a call that never returns.
+    // It is 90 minutes in production — sized above #36's cold-mirror
+    // measurement on purpose — and it rejects only the WAIT, leaving
+    // `runOnce()` holding its discovery lease so the next cycle coalesces onto
+    // the same wedged promise. On 2026-08-23 one relayfile read stopped
+    // answering and the loop sat for 22 minutes with `consecutiveFailures: 0`.
+    // Only a bound on the CALL ends the pass, and ending it is what releases
+    // the lease and lets the next cycle actually run.
+    class HangingListTreeMount extends CountingEventsMount {
+      readonly hangStarted: Promise<void>
+      hangListTree = false
+      #signalHangStarted: () => void = () => undefined
+      readonly #releases: Array<() => void> = []
+
+      constructor() {
+        super()
+        this.hangStarted = new Promise((resolve) => { this.#signalHangStarted = resolve })
+        this.setSubRoot('/linear/issues', 'absent')
+      }
+
+      /** Frees every parked read so teardown never inherits the wedge. */
+      release(): void {
+        this.hangListTree = false
+        while (this.#releases.length > 0) this.#releases.pop()?.()
+      }
+
+      override async listTree(prefix: string): Promise<string[]> {
+        if (this.hangListTree) {
+          this.#signalHangStarted()
+          // Never settles: the shape of a relayfile fetch() issued with no
+          // AbortSignal, which is what the SDK does when no caller supplies one.
+          await new Promise<void>((resolve) => { this.#releases.push(resolve) })
+        }
+        return super.listTree(prefix)
+      }
+    }
+
+    it('aborts a cycle whose relayfile read never returns, names it, and starts the next cycle', async () => {
+      const mount = new HangingListTreeMount()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: {
+          transport: 'subscribe',
+          reconcileIntervalMs: 20,
+          // Far past this test's horizon, so the sweep deadline cannot be what
+          // ends the pass. Whatever recovers here is the per-call bound.
+          reconcileTimeoutMs: 60_000,
+          relayfileOperationTimeoutMs: 50,
+        },
+      })
+      try {
+        mount.hangListTree = true
+        await mount.hangStarted
+        const sweepsWhileHung = factory.status().counters.readinessReconcileSweeps ?? 0
+
+        await vi.waitFor(() => {
+          const status = factory.status()
+          // Loud: a counter an operator can alert on, not a silent `stalled`.
+          expect(status.readinessReconcile?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(1)
+          // Named: which call it was waiting on. During the outage `lastError`
+          // was absent entirely, which gave the operator nothing to act on.
+          expect(status.readinessReconcile?.lastError)
+            .toMatch(/relayfile listTree did not respond within \d+ms/u)
+          expect(status.readinessReconcile?.lastErrorClass).toBe('RelayfileOperationTimeoutError')
+          // Self-healing: a later cycle STARTED while the dependency is still
+          // hung. This is the number that stayed frozen for 22 minutes.
+          expect(status.counters.readinessReconcileSweeps ?? 0).toBeGreaterThan(sweepsWhileHung)
+        }, { timeout: 5_000 })
+
+        // And it recovers on its own once the dependency answers again — no
+        // restart, which is the only thing that cleared this in production.
+        mount.release()
+        await vi.waitFor(() => {
+          const readiness = factory.status().readinessReconcile
+          expect(readiness?.consecutiveFailures).toBe(0)
+          expect(readiness?.lastCompletedAtMs ?? 0)
+            .toBeGreaterThan(readiness?.lastFailureAtMs ?? Number.POSITIVE_INFINITY)
+        }, { timeout: 5_000 })
+      } finally {
+        mount.release()
+        await factory.stop()
+      }
+      // Two sequential `vi.waitFor` windows do not fit the suite's 5s default.
+    }, 20_000)
+
+    // With the real cloud mount the TRANSPORT deadline wins the race by design,
+    // and the mount does not know which phase it was serving — so without the
+    // orchestrator enriching it, `lastError` names the call but not the context
+    // and an operator cannot tell one of many list/read sites from another
+    // (codex on #354).
+    it('names the phase on a timeout the transport raised, not just its own', async () => {
+      class TransportTimeoutMount extends CountingEventsMount {
+        readonly hangStarted: Promise<void>
+        failListTree = false
+        #signalHangStarted: () => void = () => undefined
+
+        constructor() {
+          super()
+          this.hangStarted = new Promise((resolve) => { this.#signalHangStarted = resolve })
+          this.setSubRoot('/linear/issues', 'absent')
+        }
+
+        override async listTree(prefix: string): Promise<string[]> {
+          if (this.failListTree) {
+            this.#signalHangStarted()
+            // Exactly what RelayfileCloudMountClient raises when its own signal
+            // fires: named operation, no phase.
+            throw new RelayfileOperationTimeoutError('listTree', 300_000)
+          }
+          return super.listTree(prefix)
+        }
+      }
+
+      const mount = new TransportTimeoutMount()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: {
+          transport: 'subscribe',
+          reconcileIntervalMs: 20,
+          reconcileTimeoutMs: 60_000,
+          // Out of reach: the orchestrator's own race must not be what produces
+          // the error, or this would not test the transport path at all.
+          relayfileOperationTimeoutMs: 60_000,
+        },
+      })
+      try {
+        mount.failListTree = true
+        await mount.hangStarted
+
+        await vi.waitFor(() => {
+          const readiness = factory.status().readinessReconcile
+          expect(readiness?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(1)
+          expect(readiness?.lastErrorClass).toBe('RelayfileOperationTimeoutError')
+          // The parenthesised phase is the part the transport could not supply.
+          expect(readiness?.lastError)
+            .toMatch(/relayfile listTree did not respond within \d+ms \(.+\)/u)
+        }, { timeout: 5_000 })
+      } finally {
+        mount.failListTree = false
+        await factory.stop()
+      }
+    }, 20_000)
+
+    // The control for the test above. Same fixture, same hang, only the
+    // per-call bound moved out past the test horizon: the cycle must then NOT
+    // abort. Without this, a test that passed because of something else in the
+    // loop would look like proof of the abort.
+    it('control: with the per-call bound out of reach the same hang freezes the loop', async () => {
+      const mount = new HangingListTreeMount()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: {
+          transport: 'subscribe',
+          reconcileIntervalMs: 20,
+          reconcileTimeoutMs: 60_000,
+          // The pre-#351 behaviour: no reachable bound on the call.
+          relayfileOperationTimeoutMs: 60_000,
+        },
+      })
+      try {
+        mount.hangListTree = true
+        await mount.hangStarted
+        const sweepsWhileHung = factory.status().counters.readinessReconcileSweeps ?? 0
+
+        // ~12 reconcile intervals. Long enough that a working abort would have
+        // fired many times over.
+        await new Promise<void>((resolve) => { setTimeout(resolve, 250) })
+
+        const status = factory.status()
+        expect(status.counters.readinessReconcileSweeps ?? 0).toBe(sweepsWhileHung)
+        expect(status.readinessReconcile?.consecutiveFailures).toBe(0)
+        expect(status.readinessReconcile?.lastError).toBeUndefined()
+      } finally {
+        mount.release()
         await factory.runOnce().catch(() => undefined)
         await factory.stop()
       }
