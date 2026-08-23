@@ -95,6 +95,7 @@ import {
   resolveHostedCloudApiUrl,
 } from '../mount/relayfile-cloud-mount-client'
 import { resolveRelayWorkspaceKey } from '../fleet/relay-workspace-key'
+import type { RelayClientFactoryOptions, RelayClientLike } from '../fleet/relay-fleet-client'
 import {
   isMeaningfullyBehind,
   readFactoryVersionInfo,
@@ -162,6 +163,14 @@ export interface FleetCliDeps {
   cloudReporterFetch?: typeof fetch
   /** Hermetic deployed-instance transport for `diagnose --deployed` tests. */
   diagnoseFetch?: typeof fetch
+  /**
+   * Hermetic relay engine transport for CLI integration tests.
+   *
+   * Unlike `fleet`/`createFleet`, this stubs only the network under a REAL
+   * `RelayFleetClient`, so a test can assert what the production client does —
+   * including that a read-only command never registers an agent.
+   */
+  createRelay?: (options: RelayClientFactoryOptions) => RelayClientLike
   isInteractive?: () => boolean
   confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
   openIntegrationUrl?: (url: string) => void | Promise<void>
@@ -399,7 +408,11 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           ),
         })
       : undefined
-    fleet = await buildFleet(globals, loaded, deps)
+    // Decided once, ahead of both the fleet client and the Factory, so the two
+    // halves of the guarantee cannot disagree: a read-only command gets a client
+    // that refuses to register and a Factory that never asks it to.
+    const readOnly = isReadOnlyFactoryCommand(command, globals)
+    fleet = await buildFleet(globals, loaded, deps, readOnly)
 
     switch (command.kind) {
       case 'spawn': {
@@ -557,6 +570,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           logger,
           reporter,
           worktrees: globals.backend === 'internal' ? new GitAgentWorktreeManager() : undefined,
+          readOnly,
         })
         return await runFactoryCommand(
           command,
@@ -1769,6 +1783,7 @@ async function buildFleet(
   globals: GlobalOptions,
   loaded: LoadedConfig | undefined,
   deps: FleetCliDeps,
+  readOnly = false,
 ): Promise<FleetClient> {
   if (deps.fleet) return deps.fleet
   // fixtureFiles are an explicit hermetic harness opt-in. Keep both backend
@@ -1796,6 +1811,7 @@ async function buildFleet(
         connectionPath,
         previewConfig: loaded?.config.preview,
         relayAgentName: loaded?.config.relay.agentName,
+        readOnly,
       },
       { ownedBrokerAgentExitTimeoutMs: globals.agentExitTimeoutMs },
     )
@@ -1840,8 +1856,9 @@ async function buildFleet(
       connectionPath,
       previewConfig: loaded?.config.preview,
       relayAgentName: loaded?.config.relay.agentName,
+      readOnly,
     },
-    { env: deps.env },
+    { env: deps.env, createRelay: deps.createRelay },
   )
 }
 
@@ -2042,6 +2059,52 @@ function requiredIntegrationsForCommand(
     return config?.issueSource === 'linear' ? ['linear', 'github'] : ['github']
   }
   return []
+}
+
+/**
+ * Commands that observe the workspace without changing it.
+ *
+ * These construct a `Factory` (and therefore, before this existed, a live relay
+ * identity) purely to read: `status` renders in-memory counters, the dry-run
+ * sweeps triage and report but dispatch nothing, `triage` classifies one issue.
+ * Two of them are the cloud container's mandatory pre-daemon preflight
+ * (`container/entrypoint.mjs` runs `status` on every boot and
+ * `run-once --dry-run` when start is disabled), so a side effect here lands
+ * ahead of the live daemon and outlives the process that caused it.
+ *
+ * `loop-status` and `kill-loop` never touch the `Factory` at all — they read a
+ * heartbeat file — but they reach the same construction site, so they are
+ * classified with the rest rather than left to register by accident.
+ *
+ * Deliberately NOT read-only: `start`, a live `run-once`/`loop`, and any live
+ * `dispatch`. Those spawn agents and must hold a real identity. `reap-orphans`
+ * is not read-only either — it releases agents — and like `factory babysit` it
+ * returns before the construction site below, so it never reached the bug this
+ * guards; it keeps a registering client because it genuinely needs one.
+ */
+export function isReadOnlyFactoryCommand(command: ParsedCommand, globals: GlobalOptions): boolean {
+  if (command.kind === 'factory-canary') return true
+  if (command.kind === 'factory-triage') return true
+  // Only the dry run. A non-relay dispatch skips the relay branch's
+  // `start({ mode: 'dispatch-owner' })` but still reaches
+  // `factory.dispatch(decision, { dryRun: false })`, which spawns a real team —
+  // it needs both an identity and the exit wiring.
+  if (command.kind === 'factory-dispatch') return globals.dryRun
+  if (command.kind !== 'factory') return false
+  switch (command.action) {
+    case 'status':
+    case 'loop-status':
+    case 'kill-loop':
+      return true
+    case 'run-once':
+    case 'loop':
+      return globals.dryRun
+    default:
+      // `start` and anything added later default to live. A new command that is
+      // genuinely read-only must opt in here, so the failure mode of forgetting
+      // is a wasted identity, not a dispatch that cannot spawn.
+      return false
+  }
 }
 
 function commandUsesIssueSource(command: ParsedCommand): boolean {

@@ -934,8 +934,10 @@ export class FactoryLoop implements Factory {
   #started = false
   #startMode?: FactoryStartOptions['mode']
   #stopping = false
+  readonly #readOnly: boolean
 
   constructor(config: FactoryConfig, ports: FactoryPorts) {
+    this.#readOnly = ports.readOnly ?? false
     this.#config = config
     this.#mount = ports.mount
     // Resolved role<->state mapping. The CLI injects a name-resolved, per-team
@@ -1021,7 +1023,13 @@ export class FactoryLoop implements Factory {
         }
       },
     })
-    this.#wireFleetEvents()
+    // Read-only commands consume no fleet events, and subscribing is not free:
+    // the relay client mints this process's workspace identity to open the
+    // socket. Wiring it here unconditionally is what made `factory status`
+    // register an agent it then abandoned before presence (factory-cloud#55).
+    // The live paths wire in `#start()` instead, where the subscription is
+    // actually used and the identity is meant to persist.
+    if (!this.#readOnly) this.#wireFleetEvents()
   }
 
   async #resolveIntegrationInstructions(): Promise<string | undefined> {
@@ -1180,6 +1188,13 @@ export class FactoryLoop implements Factory {
   }
 
   async start(opts: FactoryStartOptions = {}): Promise<void> {
+    // A read-only instance was built with no fleet event wiring and, in the
+    // CLI, with a fleet client that cannot register. Starting one would be a
+    // half-live daemon; refuse rather than let a future caller reintroduce the
+    // side effect this mode exists to remove.
+    if (this.#readOnly) {
+      throw new Error('Factory was constructed read-only and cannot be started')
+    }
     if (this.#started) {
       return
     }

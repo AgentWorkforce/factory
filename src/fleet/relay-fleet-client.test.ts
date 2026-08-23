@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
+import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, ReadOnlyFleetIdentityError, RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
 import { runFleetCli } from '../cli/fleet'
 
 import type {
@@ -1070,6 +1070,65 @@ describe('RelayFleetClient', () => {
       { workspaceKey: 'rk_live_test' },
       { workspaceKey: 'rk_live_test', agentToken: 'at_live_rotated' },
     ])
+  })
+
+  // The must-not-fire half of the test above, at the site that does the write.
+  //
+  // Registration is the only workspace mutation in this client's bootstrap, so
+  // a read-only client that reaches it has already caused the outage: the row
+  // exists, the process exits before presence, and the live daemon that boots
+  // next under the same name can never reclaim it (factory-cloud#55). Asserting
+  // on the register call rather than on `roster()`'s rejection is deliberate —
+  // the requirement is "no agent row", not "the call failed".
+  it('refuses to register an identity when the client is read-only', async () => {
+    const messaging = new FakeMessaging()
+    const registered: Array<{ name: string }> = []
+    const bootstrap: RelayClientLike = {
+      messaging: {
+        agents: {
+          register: async (input: { name: string }) => {
+            registered.push(input)
+            return { id: 'agent-1', name: input.name, token: 'at_live_rotated', status: 'online' }
+          },
+        },
+      } as unknown as RelayMessaging,
+    }
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      readOnly: true,
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+    })
+
+    const outcome = await fleet.roster().then(() => 'resolved' as const, (error: unknown) => error)
+
+    // Asserted first, and on the recorded call rather than on the rejection, so
+    // a regression reports the thing that matters: an agent row was created.
+    expect(registered).toEqual([])
+    expect(outcome).toBeInstanceOf(ReadOnlyFleetIdentityError)
+  })
+
+  // A read-only client is not an offline one. Handed an identity it did not
+  // have to create, it reads the fleet normally — which is what keeps the mode
+  // safe to apply to every read-only command rather than only to `status`.
+  it('reads the fleet read-only when an agent token is already supplied', async () => {
+    const messaging = new FakeMessaging()
+    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    const registered: Array<{ name: string }> = []
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      agentToken: 'at_live_supplied',
+      readOnly: true,
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: () => ({ messaging: messaging.asMessaging() }),
+    })
+
+    await expect(fleet.roster()).resolves.toBeDefined()
+    expect(registered).toEqual([])
   })
 
   // A stub with @relaycast/sdk 8.2.0's REAL semantics: `registerOrRotate` and
