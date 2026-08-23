@@ -332,10 +332,11 @@ describe('askTeammate', () => {
   })
 
   // A reply to an abandoned question is indistinguishable from a reply to a
-  // fresh one, so the pair cannot reopen on a timer. It becomes safe only when
-  // the old reply is observed and consumed by the quarantine drain.
+  // fresh one, and an unrelated DM cannot prove which message is the old
+  // answer. A confirmed timed-out send therefore stays quarantined for this
+  // client until the protocol supplies correlation.
   // (#178 review, codex P2 third pass)
-  it('quarantines a timed-out pair until its late reply is consumed, regardless of age', async () => {
+  it('keeps a confirmed timed-out pair quarantined across time and unrelated messages', async () => {
     vi.useFakeTimers()
     try {
       const fleet = new FakeFleetClient()
@@ -365,16 +366,71 @@ describe('askTeammate', () => {
         from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 20,
       })).rejects.toThrow(/quarantining "infra-agent" for "factory-worker" after a timed-out question/u)
 
-      fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'late answer to q1' })
-      const third = askTeammate(fleet, {
+      fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'unrelated proactive DM' })
+      await expect(askTeammate(fleet, {
         from: 'factory-worker', question: 'q3', teammate: fleet.teammates[0], timeoutMs: 20,
+      })).rejects.toThrow(/quarantining "infra-agent" for "factory-worker" after a timed-out question/u)
+
+      fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'late answer to q1' })
+      await expect(askTeammate(fleet, {
+        from: 'factory-worker', question: 'q4', teammate: fleet.teammates[0], timeoutMs: 20,
+      })).rejects.toThrow(/quarantining "infra-agent" for "factory-worker" after a timed-out question/u)
+      expect(fleet.messages).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('releases a timed-out quarantine after the pending delivery definitively fails', async () => {
+    vi.useFakeTimers()
+    try {
+      let rejectFirstDelivery = (_error: Error) => {}
+      let firstDelivery = true
+      class LateFailingFleetClient extends FakeFleetClient {
+        override async waitForInjected(input: Parameters<FakeFleetClient['waitForInjected']>[0]): Promise<{ eventId: string; targets: string[] }> {
+          if (!firstDelivery) return await super.waitForInjected(input)
+          firstDelivery = false
+          this.messages.push(input)
+          return await new Promise((_, reject) => { rejectFirstDelivery = reject })
+        }
+      }
+      const fleet = new LateFailingFleetClient()
+      fleet.teammates.push({
+        name: 'infra-agent',
+        address: 'infra-agent',
+        skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+        tags: [],
+        url: 'https://relay.example/a2a/rpc',
+        kind: 'native',
+      })
+      const first = askTeammate(fleet, {
+        from: 'factory-worker', question: 'q1', teammate: fleet.teammates[0], timeoutMs: 20,
+      })
+      const rejected = expect(first).rejects.toThrow(/Timed out waiting for a reply/u)
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(fleet.messages).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(20)
+      await rejected
+
+      await expect(askTeammate(fleet, {
+        from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 1_000,
+      })).rejects.toThrow(/quarantining "infra-agent"/u)
+
+      rejectFirstDelivery(new Error('delivery definitively rejected'))
+      await Promise.resolve()
+      await Promise.resolve()
+
+      const retry = askTeammate(fleet, {
+        from: 'factory-worker', question: 'q3', teammate: fleet.teammates[0], timeoutMs: 1_000,
       })
       await Promise.resolve()
       await Promise.resolve()
       await Promise.resolve()
       expect(fleet.messages).toHaveLength(2)
       fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answer to q3' })
-      await expect(third).resolves.toMatchObject({ reply: { body: 'answer to q3' } })
+      await expect(retry).resolves.toMatchObject({ reply: { body: 'answer to q3' } })
     } finally {
       vi.useRealTimers()
     }

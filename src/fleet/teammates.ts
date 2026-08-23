@@ -103,20 +103,21 @@ export interface AskTeammateResult {
  * be attributed to one of two questions to the same teammate. Two devices
  * follow from that:
  *
- * - While an ask is waiting, the pair is claimed with `Infinity`. A second ask
+ * - While an ask is waiting, the pair is claimed. A second ask
  *   is refused rather than resolved with an answer that may not be its own.
  *   The key uses the RESOLVED teammate and is taken after discovery, so two
  *   callers passing the same skill query contend for one key.
- * - After a TIMEOUT the pair stays quarantined until the abandoned question's
- *   reply is observed and discarded. There is no safe time-based expiry: the
- *   transport places no upper bound on a late reply, so even a very old answer
- *   could satisfy a fresh waiter. When `AgentMessage` grows an observable
- *   correlation field, this registry can be replaced by a requestId check.
+ * - After a TIMEOUT a confirmed send stays quarantined for this client. There
+ *   is no safe time- or message-based release: the transport places no upper
+ *   bound on a late answer, and an unrelated DM cannot be distinguished from
+ *   that answer. Only a definitive late delivery failure frees the pair. When
+ *   `AgentMessage` grows an observable correlation field, this registry can be
+ *   replaced by a requestId check.
  *
  * Scoped per `FleetClient` because two clients in one process address
  * different workspaces, where identical names cannot collide.
  */
-type AskClaim = 'waiting' | 'draining-late-reply'
+type AskClaim = 'waiting' | 'timed-out-uncorrelated'
 
 const inFlightAsks = new WeakMap<FleetClient, Map<string, AskClaim>>()
 
@@ -151,15 +152,25 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
 
   return await new Promise<AskTeammateResult>((resolve, reject) => {
     let settled = false
-    let deliveryStarted = false
+    let deliveryState: 'not-started' | 'pending' | 'confirmed' = 'not-started'
     let unsubscribe = () => {}
     let claimed: string | undefined
-    const release = (nextClaim?: AskClaim) => {
+    let timedOutClaim: string | undefined
+    const release = () => {
       if (!claimed) return
-      const claims = claimsFor(fleet)
-      if (nextClaim === undefined) claims.delete(claimed)
-      else claims.set(claimed, nextClaim)
+      claimsFor(fleet).delete(claimed)
       claimed = undefined
+    }
+    const quarantine = () => {
+      if (!claimed) return
+      claimsFor(fleet).set(claimed, 'timed-out-uncorrelated')
+      timedOutClaim = claimed
+      claimed = undefined
+    }
+    const releaseTimedOutClaim = () => {
+      if (!timedOutClaim) return
+      claimsFor(fleet).delete(timedOutClaim)
+      timedOutClaim = undefined
     }
     const finish = (result: AskTeammateResult) => {
       if (settled) return
@@ -180,15 +191,9 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
     const timeout = setTimeout(() => {
       if (settled) return
       settled = true
-      if (deliveryStarted && claimed) {
-        // Keep the original listener armed as a drain. It is the only safe way
-        // to know when the uncorrelated abandoned reply can no longer poison a
-        // later ask on this pair.
-        release('draining-late-reply')
-      } else {
-        unsubscribe()
-        release()
-      }
+      unsubscribe()
+      if (deliveryState === 'not-started') release()
+      else quarantine()
       reject(new Error(`Timed out waiting for a reply from a teammate after ${timeoutMs}ms`))
     }, timeoutMs)
 
@@ -220,7 +225,7 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
               'questions; await the first before asking again.'
             : `askTeammate is quarantining "${teammate.name}" for "${replyTarget}" after a timed-out ` +
               'question. Replies carry no correlation id and have no maximum delay, so retry is ' +
-              'unsafe until the abandoned reply is observed and discarded.',
+              'unsafe for this client until the protocol supplies correlation.',
         )
       }
       claims.set(askKey, 'waiting')
@@ -231,13 +236,6 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       unsubscribe = fleet.onAgentMessage((message) => {
         if (!sameAgent(message.from, teammate.address) && !sameAgent(message.from, teammate.name)) return
         if (!sameAgent(message.target, replyTarget)) return
-        if (settled) {
-          // This is the late reply to the timed-out ask. Consume it without
-          // exposing it to any caller, then make the pair reusable.
-          unsubscribe()
-          claimsFor(fleet).delete(askKey)
-          return
-        }
         finish({ requestId, teammate, reply: message })
       })
       const send = {
@@ -253,11 +251,23 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       }
       await fleet.whenMessagesObservable?.()
       if (settled) return
-      deliveryStarted = true
-      if (fleet.waitForInjected) {
-        await fleet.waitForInjected(send, { timeoutMs: Math.max(1, deadline - Date.now()) })
-      } else {
-        await fleet.sendMessage(send)
+      deliveryState = 'pending'
+      try {
+        if (fleet.waitForInjected) {
+          await fleet.waitForInjected(send, { timeoutMs: Math.max(1, deadline - Date.now()) })
+        } else {
+          await fleet.sendMessage(send)
+        }
+        deliveryState = 'confirmed'
+      } catch (error) {
+        // The timeout may win while delivery confirmation is still pending.
+        // A later definitive rejection proves no answer can arrive, so this is
+        // the one safe post-timeout path that releases the permanent claim.
+        if (settled && timedOutClaim) {
+          releaseTimedOutClaim()
+          return
+        }
+        throw error
       }
     })().catch(fail)
   })
