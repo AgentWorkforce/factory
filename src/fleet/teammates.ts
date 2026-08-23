@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 import { A2aSkillSchema } from '@relaycast/a2a'
 
-import type { AgentMessage, FleetClient, TeammateAgent, TeammateQuery } from '../ports/fleet'
+import { FleetDeliveryRejectedError, type AgentMessage, type FleetClient, type TeammateAgent, type TeammateQuery } from '../ports/fleet'
 
 export const DEFAULT_RELAYCAST_BASE_URL = 'https://cast.agentrelay.com'
 export const DEFAULT_TEAMMATE_DIRECTORY_TIMEOUT_MS = 10_000
@@ -261,9 +261,10 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
         deliveryState = 'confirmed'
       } catch (error) {
         // The timeout may win while delivery confirmation is still pending.
-        // A later definitive rejection proves no answer can arrive, so this is
-        // the one safe post-timeout path that releases the permanent claim.
-        if (settled && timedOutClaim) {
+        // Only positive, correlated transport rejection proves no answer can
+        // arrive. An ordinary waitForInjected timeout is ambiguous: the send
+        // may already have landed, so its uncorrelated pair stays quarantined.
+        if (settled && timedOutClaim && error instanceof FleetDeliveryRejectedError) {
           releaseTimedOutClaim()
           return
         }

@@ -9,6 +9,7 @@ import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@a
 
 import type { PreviewConfig } from '../config/schema'
 import type { AgentMessage, AgentPidResolution, AgentUsage, Capability, FleetClient, FleetTrackedAgent, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult, TeammateAgent, TeammateQuery } from '../ports/fleet'
+import { FleetDeliveryRejectedError } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 import { normalizeLogger } from '../logging'
 import { TailscalePreviewManager, type PreviewManager } from '../node/tailscale-preview'
@@ -1030,7 +1031,9 @@ export class InternalFleetClient implements FleetClient {
   }
 
   #rejectInjected(eventId: string, reason?: string): void {
-    const error = new Error(reason ? `Delivery failed for ${eventId}: ${reason}` : `Delivery failed for ${eventId}`)
+    const error = new FleetDeliveryRejectedError(
+      reason ? `Delivery failed for ${eventId}: ${reason}` : `Delivery failed for ${eventId}`,
+    )
     this.#failedDeliveries.set(eventId, error)
     this.#failedDeliveryIds.push(eventId)
     if (this.#failedDeliveryIds.length > 500) {

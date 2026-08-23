@@ -138,6 +138,18 @@ export type SendInput = {
   data?: Record<string, unknown>
   mode?: 'wait' | 'steer'
 }
+
+/**
+ * Positive transport evidence that a correlated message cannot be delivered.
+ * Unlike a delivery-confirmation timeout, this makes an uncorrelated retry safe.
+ */
+export class FleetDeliveryRejectedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'FleetDeliveryRejectedError'
+  }
+}
+
 export type AgentMessage = { from: string; target: string; body: string; threadId?: string; eventId?: string }
 export type AgentLifecycleSignal = {
   name: string

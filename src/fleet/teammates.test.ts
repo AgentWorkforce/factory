@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
+import { FleetDeliveryRejectedError } from '../ports/fleet'
 import { FakeFleetClient } from '../testing/fakes'
 import { askTeammate, RelaycastTeammateDirectory } from './teammates'
 
@@ -418,7 +419,7 @@ describe('askTeammate', () => {
         from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 1_000,
       })).rejects.toThrow(/quarantining "infra-agent"/u)
 
-      rejectFirstDelivery(new Error('delivery definitively rejected'))
+      rejectFirstDelivery(new FleetDeliveryRejectedError('delivery definitively rejected'))
       await Promise.resolve()
       await Promise.resolve()
 
@@ -431,6 +432,48 @@ describe('askTeammate', () => {
       expect(fleet.messages).toHaveLength(2)
       fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answer to q3' })
       await expect(retry).resolves.toMatchObject({ reply: { body: 'answer to q3' } })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps quarantine when pending delivery confirmation times out ambiguously', async () => {
+    vi.useFakeTimers()
+    try {
+      let rejectConfirmation = (_error: Error) => {}
+      class AmbiguousFleetClient extends FakeFleetClient {
+        override async waitForInjected(input: Parameters<FakeFleetClient['waitForInjected']>[0]): Promise<{ eventId: string; targets: string[] }> {
+          this.messages.push(input)
+          return await new Promise((_, reject) => { rejectConfirmation = reject })
+        }
+      }
+      const fleet = new AmbiguousFleetClient()
+      fleet.teammates.push({
+        name: 'infra-agent',
+        address: 'infra-agent',
+        skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+        tags: [],
+        url: 'https://relay.example/a2a/rpc',
+        kind: 'native',
+      })
+      const first = askTeammate(fleet, {
+        from: 'factory-worker', question: 'q1', teammate: fleet.teammates[0], timeoutMs: 20,
+      })
+      const rejected = expect(first).rejects.toThrow(/Timed out waiting for a reply/u)
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(20)
+      await rejected
+
+      rejectConfirmation(new Error('Timed out waiting for delivery_injected for event-1'))
+      await Promise.resolve()
+      await Promise.resolve()
+
+      await expect(askTeammate(fleet, {
+        from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 1_000,
+      })).rejects.toThrow(/quarantining "infra-agent"/u)
+      expect(fleet.messages).toHaveLength(1)
     } finally {
       vi.useRealTimers()
     }
