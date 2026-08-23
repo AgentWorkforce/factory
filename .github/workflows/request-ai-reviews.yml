@@ -1,4 +1,4 @@
-name: Request AI reviews
+name: Request CodeRabbit review
 
 on:
   pull_request_target:
@@ -13,7 +13,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: ai-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  group: coderabbit-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       issues: write
+      pull-requests: write
     steps:
       - name: Request exact-head reviews
         env:
@@ -29,7 +30,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          body=$(printf '@coderabbitai review\n\n@codex review\n\nRequested for exact head `%s`.\n<!-- factory-ai-review-request:%s -->' "$HEAD_SHA" "$HEAD_SHA")
+          body=$(printf '@coderabbitai review\n\nRequested for exact head `%s`.\n<!-- factory-coderabbit-review-request:%s -->' "$HEAD_SHA" "$HEAD_SHA")
           gh api \
             --method POST \
             "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
