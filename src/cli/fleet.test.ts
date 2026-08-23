@@ -2013,6 +2013,18 @@ describe('fleet CLI runtime', () => {
         }),
         closePullRequest: async () => undefined,
       }
+      class ControlledCompletingRemoteFleetClient extends FakeFleetClient {
+        override readonly placementLocality = 'remote' as const
+        implementerName?: string
+        exitEmitted = false
+
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          const result = await super.spawn(input)
+          if (input.name.includes('-impl-')) this.implementerName = input.name
+          return { ...result, node: 'sf-mini', locality: 'remote' }
+        }
+      }
+      const fleet = new ControlledCompletingRemoteFleetClient()
       // `setState` writes `stateId` at the top level of the record; the initial
       // fixture carries it under `payload`. Read either.
       const stateOf = (entry: { content: unknown } | undefined): string | undefined => {
@@ -2033,6 +2045,17 @@ describe('fleet CLI runtime', () => {
         }
 
         override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === issuePath && fleet.implementerName && !fleet.exitEmitted) {
+            // This is the dispatch's post-spawn re-read. Start completion here
+            // instead of hoping a timer wins the race, then hold this read
+            // until completion has made the parked state visible. Completion's
+            // own reads pass through because `exitEmitted` is already true.
+            fleet.exitEmitted = true
+            fleet.emitAgentExit(fleet.implementerName, 'exited')
+            await vi.waitFor(() => expect(this.parkWritten).toBe(true), { timeout: 1_000 })
+            this.reReadSeen = true
+            queueMicrotask(() => this.releaseConfirm?.())
+          }
           if (path === issuePath && this.parkWritten) {
             if (!this.releaseConfirm) {
               // First issue read after the park is `setState`'s own readback
@@ -2043,11 +2066,6 @@ describe('fleet CLI runtime', () => {
                 this.releaseConfirm = resolve
                 setTimeout(resolve, 400)
               })
-            } else if (!this.reReadSeen) {
-              // Second is the dispatch's post-spawn re-read: the one under
-              // test. Let it observe the parked issue, then unblock setState.
-              this.reReadSeen = true
-              queueMicrotask(() => this.releaseConfirm?.())
             }
           }
           return super.readFile(path)
@@ -2058,7 +2076,6 @@ describe('fleet CLI runtime', () => {
         [issuePath]: issueFile,
         '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
       }, githubWrite)
-      const fleet = new CompletingRemoteFleetClient()
       const output = buffer()
 
       const code = await runFleetCli([
