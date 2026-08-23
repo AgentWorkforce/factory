@@ -102,6 +102,7 @@
     "@agent-relay/harness-driver": "^11.6.9",
     "@agent-relay/integration-prompts": "^11.6.9",
     "@agent-relay/sdk": "^11.6.9",
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@agentworkforce/delivery": "^4.1.23",
     "@agentworkforce/persona-kit": "^4.1.43",
     "@agentworkforce/review-kit": "^4.1.34",

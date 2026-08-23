@@ -26,7 +26,9 @@ export function startFactoryNode(options: StartFactoryNodeOptions): RunningFacto
     resolvePublication = resolve
     rejectPublication = reject
   })
-  let registered = false
+  let publicationCompleted = false
+  let publicationInFlight = false
+  let publicationTerminal = false
   const serve = options.serve ?? startServeNode
   const running = serve({
     definition: options.definition,
@@ -42,18 +44,34 @@ export function startFactoryNode(options: StartFactoryNodeOptions): RunningFacto
     ...(options.warn ? { warn: options.warn } : {}),
     onRegistered(info) {
       options.onRegistered?.(info)
-      if (registered) return
-      registered = true
+      if (publicationCompleted || publicationInFlight || publicationTerminal) return
       const card = options.definition.agentCard
       if (!card) {
+        publicationCompleted = true
         resolvePublication(undefined)
         return
       }
       if (!options.cardPublisher) {
+        publicationTerminal = true
         rejectPublication(new Error('Factory persona node came online without an AgentCardPublisher'))
         return
       }
-      void options.cardPublisher.publishAgentCard(card).then(resolvePublication, rejectPublication)
+      publicationInFlight = true
+      void options.cardPublisher.publishAgentCard(card).then((published) => {
+        publicationInFlight = false
+        publicationCompleted = true
+        resolvePublication(published)
+      }, (error) => {
+        // An online edge can recur after a reconnect. Keep cardPublished
+        // pending and allow that later edge to retry a transient Relaycast
+        // failure; only success suppresses future publication attempts.
+        publicationInFlight = false
+        options.warn?.(
+          `Factory persona card publication failed; the next node registration will retry: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      })
     },
   })
   return {

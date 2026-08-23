@@ -108,6 +108,59 @@ describe('Factory persona cards', () => {
     expect(published).toEqual([{ agent_card: definition.agentCard }])
   })
 
+  it('retries a transient card-publication failure on the next registration edge', async () => {
+    const definition = createFactoryNodeDefinition({
+      config: parseFactoryNodeConfig({
+        workspaceId: 'workspace-1',
+        capabilities: ['spawn:codex'],
+        clonePaths: { 'AgentWorkforce/factory': '/work/factory' },
+        dryRun: false,
+      }),
+      name: 'factory-persona-node',
+      persona: {
+        persona,
+        baseUrl: 'https://relay.example',
+        version: '1.0.0',
+      },
+    })
+    let registration: ((info: { name: string; capabilities: string[] }) => void) | undefined
+    let attempts = 0
+    const warn = vi.fn()
+    const running = startFactoryNode({
+      definition,
+      connection: { nodeId: 'node-1', nodeToken: 'nt_live_test' },
+      cardPublisher: {
+        async publishAgentCard() {
+          attempts += 1
+          if (attempts === 1) throw new Error('temporary directory outage')
+          return { name: 'factory-feature-guardian', address: 'ext-factory-feature-guardian-retry' }
+        },
+      },
+      warn,
+      serve(options) {
+        registration = options.onRegistered
+        return { stop: async () => {}, done: Promise.resolve() }
+      },
+    })
+    const info = { name: definition.name, capabilities: Object.keys(definition.capabilities) }
+
+    registration?.(info)
+    await vi.waitFor(() => expect(attempts).toBe(1))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('next node registration will retry'))
+
+    registration?.(info)
+    await expect(running.cardPublished).resolves.toEqual({
+      name: 'factory-feature-guardian',
+      address: 'ext-factory-feature-guardian-retry',
+    })
+    expect(attempts).toBe(2)
+
+    // A later reconnect after success must not publish a duplicate card.
+    registration?.(info)
+    await Promise.resolve()
+    expect(attempts).toBe(2)
+  })
+
   it('verifies an idempotent registration conflict and returns the existing relay address', async () => {
     const definition = createFactoryNodeDefinition({
       config: parseFactoryNodeConfig({

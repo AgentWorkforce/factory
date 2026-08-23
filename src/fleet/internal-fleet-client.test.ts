@@ -298,7 +298,7 @@ describe('InternalFleetClient', () => {
     })).rejects.toThrow(/identity proof cannot be installed/)
   })
 
-  it('resolves the default agent-relay CLI mcp command from node_modules', async () => {
+  it('resolves the Factory-extended Agent Relay MCP command from the packed entrypoint', async () => {
     const harness = new FakeHarnessDriverClient()
     const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
 
@@ -313,8 +313,8 @@ describe('InternalFleetClient', () => {
     if (config?.runtime !== 'pty') throw new Error('expected pty harness config')
     const args = config.args
     expect(args).toContain(`mcp_servers.agent-relay.command=${JSON.stringify(process.execPath)}`)
-    expect(args.join('\n')).toContain('node_modules/agent-relay/dist/cli/index.js')
-    expect(args.join('\n')).toContain('"mcp"')
+    expect(args.join('\n')).toContain('bin/factory.mjs')
+    expect(args.join('\n')).toContain('"teammate-mcp"')
   })
 
   it('resolves an agent PID from the broker roster', async () => {

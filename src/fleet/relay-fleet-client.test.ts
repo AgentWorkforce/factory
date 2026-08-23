@@ -873,6 +873,31 @@ describe('RelayFleetClient', () => {
     expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
   })
 
+  it('lets a worker-side teammate client observe replies without claiming the Factory lifecycle action', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging, { registerLifecycleAction: false })
+    const messages: Array<{ from: string; target: string; body: string }> = []
+    fleet.onAgentMessage((message) => messages.push(message))
+
+    await fleet.whenMessagesObservable()
+    expect(messaging.connected).toBe(1)
+    expect(messaging.commandRegistrations).toEqual([])
+
+    messaging.emit('any', {
+      type: 'dmReceived',
+      message: relayMessage({
+        text: 'answer',
+        from: { name: 'infra-agent' },
+        target: { kind: 'agent', agentName: 'factory-worker' },
+      }),
+    })
+    expect(messages).toEqual([expect.objectContaining({
+      from: 'infra-agent',
+      target: 'factory-worker',
+      body: 'answer',
+    })])
+  })
+
   it('routes durable lifecycle actions through the authenticated identity when factory and broker are absent', async () => {
     const messaging = new FakeMessaging()
     messaging.meName = 'relay-controller-7'

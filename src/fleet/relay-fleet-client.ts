@@ -51,6 +51,8 @@ export interface RelayFleetClientOptions {
   fetch?: typeof globalThis.fetch
   /** Stable workspace action used for durable agent lifecycle reports. */
   lifecycleActionName?: string
+  /** Worker-side teammate clients observe DMs but do not own Factory's lifecycle action. */
+  registerLifecycleAction?: boolean
   /** Engine base URL override. Absent means the SDK default (cast.agentrelay.com). */
   baseUrl?: string
   /** Card-aware directory seam. Defaults to Relaycast GET /v1/a2a/directory. */
@@ -1188,7 +1190,9 @@ export class RelayFleetClient implements FleetClient {
 
   async #subscribeEvents(): Promise<void> {
     const messaging = await this.#ensureMessaging()
-    await this.#ensureLifecycleAction(messaging)
+    if (this.#options.registerLifecycleAction !== false) {
+      await this.#ensureLifecycleAction(messaging)
+    }
     if (this.#disposed) return
     messaging.events.connect()
     this.#eventUnsubscribers.push(messaging.events.on('any', (event) => this.#handleEvent(event)))

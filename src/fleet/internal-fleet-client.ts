@@ -1,9 +1,9 @@
 import { HarnessDriverClient } from '@agent-relay/harness-driver'
 import { AgentRelay } from '@agent-relay/sdk'
 import { accessSync, constants, readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
@@ -14,8 +14,6 @@ import { normalizeLogger } from '../logging'
 import { TailscalePreviewManager, type PreviewManager } from '../node/tailscale-preview'
 import { resolveRelayWorkspaceKey } from './relay-workspace-key'
 import { RelaycastTeammateDirectory, type TeammateDirectory } from './teammates'
-
-const requireForResolve = createRequire(import.meta.url)
 
 type SpawnedHandleLike = { name: string; sessionId?: string; session_ref?: string; sessionRef?: string; pid?: number }
 type HarnessEventListener = (event: BrokerEvent) => void
@@ -1373,10 +1371,12 @@ function spawnResultFrom(handle: SpawnedHandleLike, resolvedPid = handle.pid): S
 
 export function resolveAgentRelayMcpCommand(): AgentRelayMcpCommand | undefined {
   try {
-    const packageJsonPath = requireForResolve.resolve('agent-relay/package.json')
-    const cliPath = join(dirname(packageJsonPath), 'dist', 'cli', 'index.js')
+    // Use Factory's wrapper around the Agent Relay MCP server. It preserves all
+    // existing Relay tools and adds the worker-facing discover/ask tools from
+    // #139. This path exists in both a source checkout and the packed package.
+    const cliPath = fileURLToPath(new URL('../../bin/factory.mjs', import.meta.url))
     accessSync(cliPath, constants.R_OK)
-    return { command: process.execPath, args: [cliPath, 'mcp'] }
+    return { command: process.execPath, args: [cliPath, 'teammate-mcp'] }
   } catch {
     return undefined
   }
