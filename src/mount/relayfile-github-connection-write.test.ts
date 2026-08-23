@@ -234,20 +234,23 @@ describe('RelayfileGithubConnectionWrite', () => {
       description: 'Factory agents are working on this issue.',
       author: 'app',
     })
-    await write.mutateIssueLabel({
+    const addReceipt = await write.mutateIssueLabel({
       repo: 'AgentWorkforce/factory',
       number: 221,
       operation: 'add',
       label: 'factory:in-progress',
       author: 'app',
     })
-    await write.mutateIssueLabel({
+    const removeReceipt = await write.mutateIssueLabel({
       repo: 'AgentWorkforce/factory',
       number: 221,
       operation: 'remove',
       label: 'factory:human-review',
       author: 'app',
     })
+
+    expect(addReceipt).toBe('acknowledged')
+    expect(removeReceipt).toBe('acknowledged')
 
     expect(mount.writes).toEqual([
       {

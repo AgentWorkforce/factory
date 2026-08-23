@@ -1,11 +1,13 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
-import type { GithubConnectionWrite, MountClient } from '../ports'
+import type { GithubConnectionRead, GithubConnectionWrite, MountClient } from '../ports'
 import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } from '../ports/mount'
 import type {
   GithubIssueCloseWriteResult,
   GithubIssueStatus,
+  GithubStatusClaimReceipt,
+  GithubStatusRollbackResult,
   GithubStatusWriteResult,
   GithubWriteback,
 } from '../ports/writeback'
@@ -99,19 +101,21 @@ type AppIssueConnectionWrite = GithubConnectionWrite & Required<Pick<
 
 /**
  * Orchestrator-facing GitHub lifecycle adapter for the connected App writer.
- * Provider-authoritative reads remain intentionally absent until the mount
- * exposes an app-actor read contract; GithubWriteback models those as optional.
+ * Conditional compensation requires both an actor-qualified mutation receipt
+ * and the optional provider-authoritative reader supplied by the mount.
  */
 export class AppGithubWriteback implements GithubWriteback {
   readonly #write: AppIssueConnectionWrite
+  readonly #read?: GithubConnectionRead
 
-  constructor(write: GithubConnectionWrite) {
+  constructor(write: GithubConnectionWrite, read?: GithubConnectionRead) {
     if (!write.postIssueComment || !write.ensureRepositoryLabel || !write.mutateIssueLabel || !write.updateIssue) {
       throw new Error(
         'GitHub App lifecycle writeback requires connected comment, label, and issue-update capabilities',
       )
     }
     this.#write = write as AppIssueConnectionWrite
+    this.#read = read
   }
 
   async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {
@@ -149,7 +153,7 @@ export class AppGithubWriteback implements GithubWriteback {
       ...target,
       author: 'app',
     })
-    await this.#write.mutateIssueLabel({
+    const addReceipt = await this.#write.mutateIssueLabel({
       repo: ref.repo,
       number: ref.number,
       operation: 'add',
@@ -163,11 +167,28 @@ export class AppGithubWriteback implements GithubWriteback {
       label: previous.name,
       author: 'app',
     })
-    // Relayfile confirms that the operation was acknowledged, but the App
-    // writer has no provider-authoritative read/audit receipt proving whether
-    // this idempotent add created the visible label transition. Do not let the
-    // orchestrator claim authorship from acknowledgement alone.
-    return 'acknowledged'
+    // Only the target-label add can prove ownership of the claim that rollback
+    // may later remove. Mutating the obsolete label is not such a receipt.
+    return addReceipt ?? 'acknowledged'
+  }
+
+  async claimStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusClaimReceipt> {
+    // Relayfile's current GitHub label mutation acknowledges provider success
+    // but does not expose an immutable label-event identity. Preserve that
+    // uncertainty explicitly so rejected dispatches fail closed.
+    return { result: await this.setStatus(issue, status) }
+  }
+
+  async rollbackStatusClaim(
+    _issue: LinearIssue,
+    _status: GithubIssueStatus,
+    _claimToken: string,
+  ): Promise<GithubStatusRollbackResult> {
+    // GitHub label mutation has no compare-and-set precondition. A read here
+    // cannot authorize a later remove: an identical newer claim may land in
+    // between. Until the connection exposes an atomic ownership primitive,
+    // preserve the status and make the compensation failure observable.
+    return 'unproven'
   }
 
   async closeIssue(issue: LinearIssue, body: string): Promise<GithubIssueCloseWriteResult> {
@@ -336,6 +357,14 @@ export class GhCliGithubWriteback implements GithubWriteback {
   }
 
   async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult> {
+    return (await this.#setStatusWithClaim(issue, status)).result ?? 'acknowledged'
+  }
+
+  async claimStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusClaimReceipt> {
+    return await this.#setStatusWithClaim(issue, status)
+  }
+
+  async #setStatusWithClaim(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusClaimReceipt> {
     const ref = githubIssueRef(issue)
     if (status === 'ready') {
       const labels = await this.#issueLabels(ref)
@@ -357,10 +386,11 @@ export class GhCliGithubWriteback implements GithubWriteback {
       if (Object.values(FACTORY_GITHUB_STATUS_LABELS).some((label) => confirmed.has(label.name.toLowerCase()))) {
         throw new Error(`GitHub writeback did not confirm removal of Factory status labels on ${ref.repo}#${ref.number}`)
       }
-      if (!editRequired) return 'already-matched'
-      return await this.#hasAuthoredStatusTransition(ref, receiptBaseline, statusBefore, status)
-        ? 'applied'
-        : 'acknowledged'
+      if (!editRequired) return { result: 'already-matched' }
+      const claimToken = await this.#authoredStatusTransitionToken(ref, receiptBaseline, statusBefore, status)
+      return claimToken
+        ? { result: 'applied', claimToken }
+        : { result: 'acknowledged' }
     }
     const target = FACTORY_GITHUB_STATUS_LABELS[status]
     const previous = FACTORY_GITHUB_STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
@@ -403,12 +433,35 @@ export class GhCliGithubWriteback implements GithubWriteback {
       // Removing an obsolete label is a provider mutation, but it does not
       // establish ownership when the requested effective status already won
       // before our first read (notably human-review over in-progress).
-      if (statusBefore === status) return 'already-matched'
-      return await this.#hasAuthoredStatusTransition(ref, receiptBaseline, statusBefore, status)
-        ? 'applied'
-        : 'acknowledged'
+      if (statusBefore === status) return { result: 'already-matched' }
+      const claimToken = await this.#authoredStatusTransitionToken(ref, receiptBaseline, statusBefore, status)
+      return claimToken
+        ? { result: 'applied', claimToken }
+        : { result: 'acknowledged' }
     }
     throw new Error(`GitHub writeback did not confirm ${target.name} on ${ref.repo}#${ref.number}`)
+  }
+
+  async rollbackStatusClaim(
+    issue: LinearIssue,
+    status: GithubIssueStatus,
+    claimToken: string,
+  ): Promise<GithubStatusRollbackResult> {
+    if (status !== 'in-progress') return 'unproven'
+    const ref = githubIssueRef(issue)
+    if (githubStatusFromLabels(await this.#issueLabels(ref)) !== status) return 'superseded'
+    const events = await this.#issueLabelEvents(ref).catch(() => undefined)
+    if (!events) return 'unproven'
+    const claimIndex = events.findIndex((event) => event.id === claimToken)
+    const claimEvent = claimIndex >= 0 ? events[claimIndex] : undefined
+    if (claimEvent?.event !== 'labeled'
+      || claimEvent.label !== FACTORY_GITHUB_STATUS_LABELS['in-progress'].name) return 'unproven'
+    const statusLabels = new Set(Object.values(FACTORY_GITHUB_STATUS_LABELS).map((label) => label.name))
+    if (events.slice(claimIndex + 1).some((event) => statusLabels.has(event.label))) return 'superseded'
+    // `gh issue edit` has no atomic label-event precondition. Even this exact
+    // provider token can become stale after the read, so never turn it into an
+    // unsafe read-then-remove operation.
+    return 'unproven'
   }
 
   async #issueLabels(ref: { repo: string; number: number }): Promise<Set<string>> {
@@ -447,15 +500,15 @@ export class GhCliGithubWriteback implements GithubWriteback {
     }
   }
 
-  async #hasAuthoredStatusTransition(
+  async #authoredStatusTransitionToken(
     ref: { repo: string; number: number },
     baseline: GithubLabelReceiptBaseline | undefined,
     from: GithubIssueStatus,
     to: GithubIssueStatus,
-  ): Promise<boolean> {
-    if (!baseline) return false
+  ): Promise<string | undefined> {
+    if (!baseline) return undefined
     const expected = githubStatusTransitionEvent(from, to)
-    if (!expected) return false
+    if (!expected) return undefined
     const events = await this.#issueLabelEvents(ref).catch(() => [])
     const statusLabels = new Set(Object.values(FACTORY_GITHUB_STATUS_LABELS).map((label) => label.name))
     const newStatusEvents = events.filter((event) =>
@@ -470,12 +523,14 @@ export class GhCliGithubWriteback implements GithubWriteback {
       const after = githubStatusFromLabels(effectiveLabels)
       if (before !== to && after === to) definingEvent = event
     }
-    if (githubStatusFromLabels(effectiveLabels) !== to) return false
+    if (githubStatusFromLabels(effectiveLabels) !== to) return undefined
     // Attribute the event that last made the confirmed effective status true,
     // not later status-label cleanup that leaves the effective status intact.
     return definingEvent?.actor === baseline.actor
       && definingEvent.event === expected.event
       && definingEvent.label === expected.label
+      ? definingEvent.id
+      : undefined
   }
 
   async #issueLabelEvents(ref: { repo: string; number: number }): Promise<GithubLabelEvent[]> {
@@ -599,6 +654,16 @@ const githubStatusFromLabels = (labels: Set<string>): GithubIssueStatus => {
   if (labels.has(FACTORY_GITHUB_STATUS_LABELS['human-review'].name.toLowerCase())) return 'human-review'
   if (labels.has(FACTORY_GITHUB_STATUS_LABELS['in-progress'].name.toLowerCase())) return 'in-progress'
   return 'ready'
+}
+
+const githubLabelsFromContent = (content: unknown): Set<string> => {
+  const payload = wrappedPayload(content)
+  const labels = Array.isArray(payload.labels) ? payload.labels : []
+  return new Set(labels.flatMap((label) => {
+    if (typeof label === 'string' && label.trim()) return [label.trim().toLowerCase()]
+    const name = stringValue(asRecord(label)?.name)?.trim().toLowerCase()
+    return name ? [name] : []
+  }))
 }
 
 const githubStatusTransitionEvent = (

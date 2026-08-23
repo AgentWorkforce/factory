@@ -63,12 +63,20 @@ export class FakeMountClient implements MountClient {
     return { ...entry }
   }
 
-  async writeFile(path: string, content: unknown, _opts?: { guarded?: boolean }): Promise<void> {
+  async writeFile(
+    path: string,
+    content: unknown,
+    opts?: { guarded?: boolean; baseRevision?: string },
+  ): Promise<{ targetRevision: string } | void> {
+    if (opts?.baseRevision !== undefined && this.files.get(path)?.revision !== opts.baseRevision) {
+      throw Object.assign(new Error(`Revision conflict for ${path}`), { status: 409 })
+    }
     const revision = String((Number(this.files.get(path)?.revision ?? 0) || 0) + 1)
     const existing = this.files.get(path)?.content
     const storedContent = mergedLinearIssueContent(existing, content) ?? content
     this.files.set(path, { content: storedContent, revision })
     this.writes.push({ path, content })
+    return { targetRevision: revision }
   }
 
   async deleteFile(path: string): Promise<void> {

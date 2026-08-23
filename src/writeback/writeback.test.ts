@@ -4,7 +4,7 @@ import { FactoryConfigSchema } from '../config/schema'
 import { linearCommentPath } from '../constants/linear'
 import { slackReplyPath } from '../constants/slack'
 import { AppGithubWriteback, createFactory, GhCliGithubWriteback, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
-import type { GithubConnectionWrite, GithubWriteback, MountClient } from '../ports'
+import type { GithubConnectionRead, GithubConnectionWrite, GithubWriteback, MountClient } from '../ports'
 import type { LinearIssue } from '../types'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 
@@ -70,7 +70,7 @@ describe('MountLinearWriteback', () => {
     })
     const linear = MountLinearWriteback(mount)
 
-    await linear.setState(issue, 'implementing-state')
+    await expect(linear.setState(issue, 'implementing-state')).resolves.toEqual({ claimToken: '1' })
 
     expect(mount.writes).toEqual([
       {
@@ -84,6 +84,122 @@ describe('MountLinearWriteback', () => {
       },
     ])
     expect(await linear.verify(issue, { stateId: 'implementing-state' })).toBe(true)
+  })
+
+  it('conditionally restores a Linear state at the exact mounted revision', async () => {
+    const mount = new FakeMountClient()
+    mount.files.set(issuePath, { content: wrappedIssueRecord({ stateId: 'implementing-state' }), revision: '7' })
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.compareAndSetState?.(issue, 'implementing-state', '7', 'ready-state'))
+      .resolves.toBe('applied')
+    expect(mount.writes).toEqual([expect.objectContaining({
+      path: issuePath,
+      content: expect.objectContaining({ stateId: 'ready-state' }),
+    })])
+  })
+
+  it('preserves a newer Linear state when the conditional rollback revision loses', async () => {
+    class RacingMountClient extends FakeMountClient {
+      override async writeFile(
+        path: string,
+        content: unknown,
+        opts?: { guarded?: boolean; baseRevision?: string },
+      ): Promise<void> {
+        if (opts?.baseRevision !== undefined) {
+          this.files.set(path, {
+            content: wrappedIssueRecord({ stateId: 'human-review-state' }),
+            revision: String(Number(opts.baseRevision) + 1),
+          })
+        }
+        await super.writeFile(path, content, opts)
+      }
+    }
+    const mount = new RacingMountClient()
+    mount.files.set(issuePath, { content: wrappedIssueRecord({ stateId: 'implementing-state' }), revision: '7' })
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.compareAndSetState?.(issue, 'implementing-state', '7', 'ready-state'))
+      .resolves.toBe('superseded')
+    expect(mount.writes).toEqual([])
+    expect((mount.files.get(issuePath)?.content as { payload: { stateId: string } }).payload.stateId)
+      .toBe('human-review-state')
+  })
+
+  it('preserves current Linear fields when conditionally restoring the state', async () => {
+    const mount = new FakeMountClient()
+    mount.files.set(issuePath, {
+      content: wrappedIssueRecord({
+        stateId: 'implementing-state',
+        description: 'A newer operator-authored description',
+        priority: 1,
+      }),
+      revision: '7',
+    })
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.compareAndSetState?.(issue, 'implementing-state', '7', 'ready-state'))
+      .resolves.toBe('applied')
+    expect(mount.writes.at(-1)?.content).toEqual(expect.objectContaining({
+      stateId: 'ready-state',
+      description: 'A newer operator-authored description',
+      priority: 1,
+    }))
+  })
+
+  it('fails closed when the exact Linear revision is only a sparse state projection', async () => {
+    const mount = new FakeMountClient()
+    mount.files.set(issuePath, {
+      content: { payload: { stateId: 'implementing-state' } },
+      revision: '7',
+    })
+    // Seed the scope-bearing canonical record through the issue object, while
+    // keeping the mounted compare-and-set target deliberately sparse.
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.compareAndSetState?.(issue, 'implementing-state', '7', 'ready-state'))
+      .resolves.toBe('unproven')
+    expect(mount.writes).toEqual([])
+  })
+
+  it('fails closed for an identical newer Linear state whose revision is not the claim token', async () => {
+    const mount = new FakeMountClient()
+    mount.files.set(issuePath, { content: wrappedIssueRecord({ stateId: 'implementing-state' }), revision: '8' })
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.compareAndSetState?.(issue, 'implementing-state', '7', 'ready-state'))
+      .resolves.toBe('unproven')
+    expect(mount.writes).toEqual([])
+  })
+
+  it('fails closed when an unrelated Linear edit wins the rollback CAS', async () => {
+    class UnrelatedEditRacingMountClient extends FakeMountClient {
+      override async writeFile(
+        path: string,
+        content: unknown,
+        opts?: { guarded?: boolean; baseRevision?: string },
+      ): Promise<void> {
+        if (opts?.baseRevision !== undefined) {
+          this.files.set(path, {
+            content: wrappedIssueRecord({
+              stateId: 'implementing-state',
+              description: 'A concurrent description edit',
+            }),
+            revision: String(Number(opts.baseRevision) + 1),
+          })
+        }
+        await super.writeFile(path, content, opts)
+      }
+    }
+    const mount = new UnrelatedEditRacingMountClient()
+    mount.files.set(issuePath, { content: wrappedIssueRecord({ stateId: 'implementing-state' }), revision: '7' })
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.compareAndSetState?.(issue, 'implementing-state', '7', 'ready-state'))
+      .resolves.toBe('unproven')
+    expect(mount.writes).toEqual([])
+    expect((mount.files.get(issuePath)?.content as { payload: { description: string } }).payload.description)
+      .toBe('A concurrent description edit')
   })
 
   it('builds setState from in-memory writable fields instead of the live mount read', async () => {
@@ -362,7 +478,7 @@ describe('MountLinearWriteback', () => {
     })
 
     await expect(MountLinearWriteback(mount).setState(issue, 'implementing-state'))
-      .resolves.toBeUndefined()
+      .resolves.toEqual({ claimToken: '1' })
     expect(mount.writes).toEqual([
       {
         path: issuePath,
@@ -904,6 +1020,99 @@ describe('AppGithubWriteback', () => {
       closePullRequest: async () => undefined,
     })).toThrow('requires connected comment, label, and issue-update capabilities')
   })
+
+  it('propagates an actor-qualified App label receipt to the status claim', async () => {
+    const mutateIssueLabel: NonNullable<GithubConnectionWrite['mutateIssueLabel']> = vi.fn(async (input) =>
+      input.operation === 'add' ? 'applied' : 'already-matched')
+    const app = new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel,
+      updateIssue: async () => undefined,
+    })
+
+    await expect(app.setStatus(appIssue, 'in-progress')).resolves.toBe('applied')
+  })
+
+  it('refuses to roll back an App claim from acknowledgement alone', async () => {
+    const mutateIssueLabel = vi.fn(async () => undefined)
+    const getIssue = vi.fn<GithubConnectionRead['getIssue']>()
+    const app = new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel,
+      updateIssue: async () => undefined,
+    }, { getIssue })
+
+    await expect(app.rollbackStatusClaim(appIssue, 'in-progress', 'unavailable-token'))
+      .resolves.toBe('unproven')
+    expect(getIssue).not.toHaveBeenCalled()
+    expect(mutateIssueLabel).not.toHaveBeenCalled()
+  })
+
+  it('fails closed instead of read-then-removing an App-backed in-progress claim', async () => {
+    const mutateIssueLabel = vi.fn(async () => undefined)
+    const connection: GithubConnectionWrite = {
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel,
+      updateIssue: async () => undefined,
+    }
+    const read: GithubConnectionRead = {
+      getIssue: async () => ({
+        outcome: 'found',
+        issue: {
+          repo: 'AgentWorkforce/factory',
+          number: 221,
+          path: appIssue.path,
+          content: { payload: { labels: [{ name: 'factory' }, { name: 'factory:in-progress' }] } },
+        },
+      }),
+    }
+    const app = new AppGithubWriteback(connection, read)
+
+    await expect(app.rollbackStatusClaim(appIssue, 'in-progress', 'provider-event-1'))
+      .resolves.toBe('unproven')
+    expect(mutateIssueLabel).not.toHaveBeenCalled()
+  })
+
+  it('preserves a newer App-backed human-review status during claim rollback', async () => {
+    const mutateIssueLabel = vi.fn(async () => undefined)
+    const connection: GithubConnectionWrite = {
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel,
+      updateIssue: async () => undefined,
+    }
+    const read: GithubConnectionRead = {
+      getIssue: async () => ({
+        outcome: 'found',
+        issue: {
+          repo: 'AgentWorkforce/factory',
+          number: 221,
+          path: appIssue.path,
+          content: {
+            payload: {
+              labels: [{ name: 'factory:in-progress' }, { name: 'factory:human-review' }],
+            },
+          },
+        },
+      }),
+    }
+    const app = new AppGithubWriteback(connection, read)
+
+    await expect(app.rollbackStatusClaim(appIssue, 'in-progress', 'provider-event-1'))
+      .resolves.toBe('unproven')
+    expect(mutateIssueLabel).not.toHaveBeenCalled()
+  })
 })
 
 describe('GhCliGithubWriteback', () => {
@@ -1226,7 +1435,7 @@ describe('GhCliGithubWriteback', () => {
     await expect(github.setStatus(githubIssue, 'human-review')).resolves.toBe('acknowledged')
   })
 
-  it('attributes a park when another actor only removes the lower-priority stale label', async () => {
+  it('returns the immutable defining event when another actor only removes a stale label', async () => {
     const labels = new Set(['factory:in-progress'])
     const events: string[] = []
     const github = new GhCliGithubWriteback({
@@ -1246,7 +1455,10 @@ describe('GhCliGithubWriteback', () => {
       },
     })
 
-    await expect(github.setStatus(githubIssue, 'human-review')).resolves.toBe('applied')
+    await expect(github.claimStatus(githubIssue, 'human-review')).resolves.toEqual({
+      result: 'applied',
+      claimToken: '1',
+    })
   })
 
   it('does not attribute ready when another actor recreates the final removal', async () => {
@@ -1312,6 +1524,69 @@ describe('GhCliGithubWriteback', () => {
 
     await expect(github.setStatus(githubIssue, 'human-review')).resolves.toBe('already-matched')
     expect(calls.some((args) => args[0] === 'issue' && args[1] === 'edit')).toBe(true)
+  })
+
+  it('fails closed when GitHub cannot atomically qualify label removal by the claim event', async () => {
+    const calls: string[][] = []
+    const labels = new Set(['factory', 'factory:in-progress'])
+    const events = ['claim-1\tlabeled\tfactory:in-progress\tfactory-bot']
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.rollbackStatusClaim(githubIssue, 'in-progress', 'claim-1'))
+      .resolves.toBe('unproven')
+    expect(calls.some((args) => args[0] === 'issue' && args[1] === 'edit')).toBe(false)
+    expect(labels).toEqual(new Set(['factory', 'factory:in-progress']))
+  })
+
+  it('preserves an identical newer GitHub claim with a different defining event', async () => {
+    const calls: string[][] = []
+    const labels = new Set(['factory:in-progress'])
+    const events = [
+      'claim-1\tlabeled\tfactory:in-progress\tfactory-bot',
+      '2\tunlabeled\tfactory:in-progress\tother-user',
+      'claim-2\tlabeled\tfactory:in-progress\tother-user',
+    ]
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.rollbackStatusClaim(githubIssue, 'in-progress', 'claim-1'))
+      .resolves.toBe('superseded')
+    expect(calls.some((args) => args[0] === 'issue' && args[1] === 'edit')).toBe(false)
+  })
+
+  it('does not roll back a GitHub claim after human review supersedes it', async () => {
+    const calls: string[][] = []
+    const labels = new Set(['factory:in-progress', 'factory:human-review'])
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.rollbackStatusClaim(githubIssue, 'in-progress', 'claim-1'))
+      .resolves.toBe('superseded')
+    expect(calls.some((args) => args[0] === 'issue' && args[1] === 'edit')).toBe(false)
   })
 
   it('rejects an acknowledged lifecycle edit when provider read-back never shows the label', async () => {

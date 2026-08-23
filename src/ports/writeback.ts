@@ -2,7 +2,15 @@ import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } fr
 import type { LinearIssue, PrSummary } from '../types'
 
 export interface LinearWriteback {
-  setState(issue: LinearIssue, stateId: string): Promise<void>
+  /** The immutable provider revision is the ownership token for this exact state write. */
+  setState(issue: LinearIssue, stateId: string): Promise<{ claimToken: string } | void>
+  /** Atomically restore a state only while the provider still matches this exact claim write. */
+  compareAndSetState?(
+    issue: LinearIssue,
+    expectedStateId: string,
+    claimToken: string,
+    stateId: string,
+  ): Promise<'applied' | 'superseded' | 'unproven'>
   postComment(issue: LinearIssue, body: string): Promise<void>
   createIssue(payload: Record<string, unknown>): Promise<{ path: string }>
   verify(issue: LinearIssue, expect: { stateId?: string; commentName?: string }): Promise<boolean>
@@ -27,6 +35,12 @@ export type GithubIssueStatus = 'ready' | 'in-progress' | 'human-review'
  * compatibility with caller-supplied writebacks that predate this receipt.
  */
 export type GithubStatusWriteResult = 'applied' | 'already-matched' | 'acknowledged'
+export type GithubStatusRollbackResult = 'reverted' | 'superseded' | 'unproven'
+export interface GithubStatusClaimReceipt {
+  result: GithubStatusWriteResult | void
+  /** Immutable provider event that created this exact effective status. */
+  claimToken?: string
+}
 
 /**
  * Whether closing an issue provably created the provider's visible transition.
@@ -46,5 +60,18 @@ export interface GithubWriteback {
   /** Provider-authoritative lookup used to reconcile ambiguous comment writes. */
   hasCommentMarker?(issue: LinearIssue, marker: string): Promise<boolean>
   setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult | void>
+  /** Claim a status and return immutable provider evidence when the adapter can prove authorship. */
+  claimStatus?(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusClaimReceipt>
+  /**
+   * Undo one provider status claim without replacing a newer status. The
+   * adapter must atomically qualify the operation with the immutable claim
+   * token. Providers without such a primitive must return `unproven` without
+   * mutating the visible status.
+   */
+  rollbackStatusClaim?(
+    issue: LinearIssue,
+    status: GithubIssueStatus,
+    claimToken: string,
+  ): Promise<GithubStatusRollbackResult>
   closeIssue(issue: LinearIssue, body: string): Promise<GithubIssueCloseWriteResult | void>
 }

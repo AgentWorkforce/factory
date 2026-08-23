@@ -633,12 +633,27 @@ class ReadinessReconcileTimeoutError extends Error {
   }
 }
 
+class PostSpawnDispatchWaitRejectedError extends Error {
+  constructor(
+    readonly issueKey: string,
+    readonly compensationError?: unknown,
+  ) {
+    super(`Post-spawn dispatch waits were rejected for ${issueKey}`)
+    this.name = 'PostSpawnDispatchWaitRejectedError'
+  }
+}
+
 interface PostSpawnDispatchClaimFence {
   completionAtWriteBoundary: boolean
   claimStarted: boolean
   accepted?: boolean
   settled: Promise<boolean>
   settle(accepted: boolean): void
+}
+
+interface AppliedDispatchClaim {
+  implementingStateId?: string
+  reject(): Promise<never>
 }
 
 interface PostSpawnIssueObservation {
@@ -880,6 +895,13 @@ export class FactoryLoop implements Factory {
   // write boundary. A completion arriving first makes dispatch wait and
   // re-read; one arriving after claim entry waits for the claim to finish.
   readonly #postSpawnDispatchClaimFences = new Map<string, PostSpawnDispatchClaimFence>()
+  // Shutdown must not lose a local placement merely because a rejected
+  // provider claim unwinds before #releaseInFlightAgents snapshots the batch.
+  // The capture set makes both interleavings explicit: the dispatch catch may
+  // remove a record only after shutdown has copied its agents, otherwise the
+  // release sweep removes it after the copy is safe.
+  readonly #shutdownReleaseCapturedDispatches = new Set<string>()
+  readonly #postSpawnDispatchesRejectedDuringStop = new Set<string>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   #reconciledAgentExitsActive = 0
   readonly #reconciledAgentExitWaiters: Array<() => void> = []
@@ -1271,6 +1293,12 @@ export class FactoryLoop implements Factory {
   }
 
   async #start(opts: FactoryStartOptions): Promise<void> {
+    // These sets coordinate one stop snapshot with dispatches unwinding during
+    // that same stop. They are not durable lifecycle state: retaining their
+    // keys across a later start would make the next stop mistake a fresh
+    // dispatch for one already captured by the previous shutdown.
+    this.#shutdownReleaseCapturedDispatches.clear()
+    this.#postSpawnDispatchesRejectedDuringStop.clear()
     this.#stopping = false
     this.#startMode = opts.mode ?? 'live'
     const issueSource = await this.#issueSource()
@@ -1393,6 +1421,14 @@ export class FactoryLoop implements Factory {
       ...this.#postSpawnIssueObservations.keys(),
       ...this.#postSpawnDispatchClaimFences.keys(),
     ])
+    const rejectedClaimDispatches = new Set<Promise<DispatchResult>>()
+    for (const [key, fence] of this.#postSpawnDispatchClaimFences) {
+      if (!fence.claimStarted) continue
+      const dispatchKeyPrefix = `${key}:live:`
+      for (const [dispatchKey, dispatch] of this.#dispatchInFlight) {
+        if (dispatchKey.startsWith(dispatchKeyPrefix)) rejectedClaimDispatches.add(dispatch)
+      }
+    }
     for (const key of postSpawnWaitKeys) this.#settlePostSpawnDispatchWaits(key, false, 'stop')
     if (this.#babysitterResourceDeliveryRetryTimer) clearTimeout(this.#babysitterResourceDeliveryRetryTimer)
     this.#babysitterResourceDeliveryRetryTimer = undefined
@@ -1427,6 +1463,12 @@ export class FactoryLoop implements Factory {
     await this.#previewSweepInFlight
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
     try {
+      // Only dispatches that had entered the provider-claim boundary can leave
+      // an external claim behind. Drain those rejected promises before
+      // relinquishing their lifecycle leases or tearing down the fleet/mount.
+      // A pre-claim spawn hang is deliberately absent from this set, so it
+      // cannot hold shutdown open.
+      await Promise.allSettled([...rejectedClaimDispatches])
       // Relinquish durable ownership before waiting on mount-backed lifecycle
       // drives. A slow Relayfile scan must not consume the shutdown deadline
       // while every issue remains fenced to a publisher that is already
@@ -4753,7 +4795,10 @@ export class FactoryLoop implements Factory {
     if (!dryRun) await this.#ensureGithubAgentQuestionWatch(record, liveIssue)
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
-    const observationKey = issueKey(record.issue)
+    // These waits belong to the durable work unit, not the ingestion surface.
+    // Completion and lifecycle ownership use the same identity (#211); using
+    // issueKey here would make every GitHub-native dispatch miss its own fence.
+    const postSpawnKey = dispatchLifecycleKey(record.issue)
     let resolvePostSpawnIssueObservation!: (accepted: boolean) => void
     let postSpawnIssueObservationDidSettle = false
     const postSpawnIssueObservationSettled = new Promise<boolean>((resolve) => {
@@ -4766,12 +4811,12 @@ export class FactoryLoop implements Factory {
         if (postSpawnIssueObservationDidSettle) return
         postSpawnIssueObservationDidSettle = true
         resolvePostSpawnIssueObservation(accepted)
-        if (this.#postSpawnIssueObservations.get(observationKey) === postSpawnIssueObservation) {
-          this.#postSpawnIssueObservations.delete(observationKey)
+        if (this.#postSpawnIssueObservations.get(postSpawnKey) === postSpawnIssueObservation) {
+          this.#postSpawnIssueObservations.delete(postSpawnKey)
         }
       },
     }
-    this.#postSpawnIssueObservations.set(observationKey, postSpawnIssueObservation)
+    this.#postSpawnIssueObservations.set(postSpawnKey, postSpawnIssueObservation)
     let resolvePostSpawnDispatchClaim!: (accepted: boolean) => void
     let postSpawnDispatchClaimSettled = false
     const postSpawnDispatchClaim = new Promise<boolean>((resolve) => {
@@ -4787,14 +4832,15 @@ export class FactoryLoop implements Factory {
         postSpawnDispatchClaimSettled = true
         postSpawnDispatchClaimFence.accepted = accepted
         resolvePostSpawnDispatchClaim(accepted)
-        if (this.#postSpawnDispatchClaimFences.get(observationKey) === postSpawnDispatchClaimFence) {
-          this.#postSpawnDispatchClaimFences.delete(observationKey)
+        if (this.#postSpawnDispatchClaimFences.get(postSpawnKey) === postSpawnDispatchClaimFence) {
+          this.#postSpawnDispatchClaimFences.delete(postSpawnKey)
         }
       },
     }
-    this.#postSpawnDispatchClaimFences.set(observationKey, postSpawnDispatchClaimFence)
+    this.#postSpawnDispatchClaimFences.set(postSpawnKey, postSpawnDispatchClaimFence)
     const settlePostSpawnIssueObservation = postSpawnIssueObservation.settle
     const settlePostSpawnDispatchClaim = postSpawnDispatchClaimFence.settle
+    let rejectDispatchClaim: (() => Promise<never>) | undefined
     try {
       if (!dryRun) {
         const issue = await this.#readIssue(dispatchDecision.issue.path)
@@ -4829,6 +4875,11 @@ export class FactoryLoop implements Factory {
 
       const comment = dispatchComment(dispatchDecision, agents)
       let implementingStateId: string | undefined
+      const rejectDispatchClaimIfCancelled = async (): Promise<void> => {
+        if (postSpawnDispatchClaimFence.accepted !== false) return
+        if (rejectDispatchClaim) await rejectDispatchClaim()
+        throw new PostSpawnDispatchWaitRejectedError(dispatchDecision.issue.key)
+      }
       if (!dryRun) {
         let issue = await this.#readIssue(dispatchDecision.issue.path)
         if (postSpawnDispatchClaimFence.completionAtWriteBoundary) {
@@ -4836,7 +4887,7 @@ export class FactoryLoop implements Factory {
           // dispatch entered the claim boundary. Always re-read after its
           // receipt, even when the first snapshot was ready: the terminal
           // write may have started immediately after that snapshot.
-          const issueWriteback = this.#issueWritebackInFlight.get(issueKey(record.issue))
+          const issueWriteback = this.#issueWritebackInFlight.get(postSpawnKey)
           if (issueWriteback) await issueWriteback
           issue = await this.#readIssue(dispatchDecision.issue.path)
         } else if ((!issue || !this.#isIssueReady(issue)) && record.issueWritebackConfirmedAtMs === undefined) {
@@ -4851,7 +4902,7 @@ export class FactoryLoop implements Factory {
           // succeeds or fails, before Slack/release cleanup. If there is no
           // completion in flight, this is an ordinary foreign state change and
           // the existing abort remains immediate.
-          const issueWriteback = this.#issueWritebackInFlight.get(issueKey(record.issue))
+          const issueWriteback = this.#issueWritebackInFlight.get(postSpawnKey)
           if (issueWriteback) {
             await issueWriteback
             issue = await this.#readIssue(dispatchDecision.issue.path)
@@ -4874,13 +4925,19 @@ export class FactoryLoop implements Factory {
           // check. Completion either arrived first (the branch above) or will
           // now observe claimStarted and wait; no await-sized gap remains.
           postSpawnDispatchClaimFence.claimStarted = true
-          implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
+          const appliedClaim = await this.#applyDispatchClaim(
+            record,
+            issue,
+            comment,
+            postSpawnDispatchClaimFence,
+          )
+          implementingStateId = appliedClaim.implementingStateId
+          rejectDispatchClaim = appliedClaim.reject
+          await rejectDispatchClaimIfCancelled()
           record.issueWritebackConfirmedAtMs ??= this.#clock.now()
           this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
         }
       }
-      settlePostSpawnDispatchClaim(true)
-      settlePostSpawnIssueObservation(true)
 
       const result = {
         issue: dispatchDecision.issue,
@@ -4893,18 +4950,84 @@ export class FactoryLoop implements Factory {
         dryRun,
       }
       record.result = result
-      if (!await this.#saveDispatchLifecycle(record, 'running')) return result
-      this.#increment('dispatched')
-      this.#emit('dispatched', { issue: dispatchDecision.issue, result })
+      const runningSaved = await this.#saveDispatchLifecycle(record, 'running')
+      await rejectDispatchClaimIfCancelled()
+      if (!runningSaved) {
+        settlePostSpawnDispatchClaim(true)
+        settlePostSpawnIssueObservation(true)
+        return result
+      }
       if (!dryRun && this.#config.hooks?.onTicketDispatch) {
         await this.#notifyTicketDispatch(dispatchDecision, liveIssue, record, result)
+        await rejectDispatchClaimIfCancelled()
       }
       if (!dryRun) {
         await this.#ensureSlackDispatchThread(record, result, liveIssue)
+        await rejectDispatchClaimIfCancelled()
       }
+      // Accept without an intervening await only after every durable
+      // publication and post-dispatch side effect has completed. Stop or held
+      // abandonment can therefore reject any still-publishing dispatch.
+      settlePostSpawnDispatchClaim(true)
+      settlePostSpawnIssueObservation(true)
+      this.#increment('dispatched')
+      this.#emit('dispatched', { issue: dispatchDecision.issue, result })
       return result
-    } catch (error) {
+    } catch (caughtError) {
+      // Stop/deadline may reject the fence while any awaited provider or
+      // lifecycle operation is still in flight. If that operation then fails,
+      // its raw error must not fall into ordinary dispatch cleanup: shutdown
+      // still owns the already-spawned placements and needs them retained
+      // until its release snapshot. If the claim receipt is already available,
+      // conditionally reject it before releasing those placements. Without a
+      // receipt the provider outcome is ambiguous, so preserve the original
+      // failure as the compensation detail after the claim boundary began.
+      let error = caughtError
+      if (postSpawnDispatchClaimFence.accepted === false
+        && !(caughtError instanceof PostSpawnDispatchWaitRejectedError)) {
+        if (rejectDispatchClaim) {
+          try {
+            await this.#rejectDispatchClaimAfterOperationError(
+              dispatchDecision.issue.key,
+              caughtError,
+              rejectDispatchClaim,
+            )
+          } catch (rejectionError) {
+            error = rejectionError
+          }
+        } else {
+          error = new PostSpawnDispatchWaitRejectedError(
+            dispatchDecision.issue.key,
+            postSpawnDispatchClaimFence.claimStarted ? caughtError : undefined,
+          )
+        }
+      }
       settlePostSpawnDispatchClaim(false)
+      if (error instanceof PostSpawnDispatchWaitRejectedError) {
+        settlePostSpawnIssueObservation(false)
+        if (error.compensationError !== undefined) {
+          this.#increment('postSpawnDispatchClaimCompensationFailures')
+          this.#logger.error?.('[factory] rejected dispatch claim could not be safely compensated', {
+            issue: decision.issue.key,
+            error: describeError(error.compensationError).errorMessage,
+          })
+        }
+        // External stop/abandonment owns agent and durable-lifecycle cleanup.
+        // Remove only the process-local slot here; running the ordinary
+        // dispatch-failure path would race or duplicate that cleanup. During
+        // stop, however, retain local placements until the shutdown release
+        // sweep has captured them. If it already has, removal is safe now.
+        if (this.#stopping) {
+          this.#postSpawnDispatchesRejectedDuringStop.add(postSpawnKey)
+          if (this.#shutdownReleaseCapturedDispatches.has(postSpawnKey)) {
+            batch.abandon(decision.issue)
+            this.#postSpawnDispatchesRejectedDuringStop.delete(postSpawnKey)
+          }
+        } else {
+          batch.abandon(decision.issue)
+        }
+        throw error
+      }
       settlePostSpawnIssueObservation(!(error instanceof LiveDispatchStateChangedError))
       // A spawn can fail after the broker accepted it but before its ack
       // reached Factory. Include every planned worktree agent, not only the
@@ -6854,7 +6977,7 @@ export class FactoryLoop implements Factory {
       const issue = liveIssue ?? await this.#readIssue(record.issue.path)
       if (!issue) throw new Error(`Unable to recover durable dispatch ${record.issue.key}: issue is no longer readable`)
       await this.#ensureGithubAgentQuestionWatch(record, issue)
-      implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
+      implementingStateId = (await this.#applyDispatchClaim(record, issue, comment)).implementingStateId
     }
     const recoveredPreviews = uniquePreviewReferences([
       ...dispatchSpecs(record.decision).map((spec) => spec.preview),
@@ -7196,31 +7319,86 @@ export class FactoryLoop implements Factory {
     record: InFlightIssue,
     issue: LinearIssue,
     comment: string,
-  ): Promise<string | undefined> {
+    claimFence?: PostSpawnDispatchClaimFence,
+  ): Promise<AppliedDispatchClaim> {
+    const claimWasRejected = (): boolean => claimFence?.accepted === false
+    // stop() can reject this fence after the post-spawn readiness read but
+    // before this method starts. Never begin a provider claim in that state;
+    // shutdown intentionally does not drain dispatches that never crossed the
+    // claim boundary.
+    if (claimWasRejected()) {
+      throw new PostSpawnDispatchWaitRejectedError(record.issue.key)
+    }
     let implementingStateId: string | undefined
+    let rejectClaim: (() => Promise<never>) | undefined
     if (isGithubIssue(issue)) {
+      const statusClaim: { value: Awaited<ReturnType<NonNullable<GithubWriteback['claimStatus']>>> } = {
+        value: { result: undefined },
+      }
       await this.#retryDispatchWriteback(record, issue, 'GitHub label factory:in-progress', async () => {
-        await this.#githubWriteback.setStatus(issue, 'in-progress')
+        statusClaim.value = this.#githubWriteback.claimStatus
+          ? await this.#githubWriteback.claimStatus(issue, 'in-progress')
+          : { result: await this.#githubWriteback.setStatus(issue, 'in-progress') }
       })
+      rejectClaim = async (): Promise<never> => await this.#rejectGithubDispatchClaim(
+        record,
+        issue,
+        statusClaim.value,
+      )
+      if (claimWasRejected()) {
+        await rejectClaim!()
+      }
 
       const commentApplied = this.#githubWriteback.hasCommentMarker
         ? async (): Promise<boolean> => this.#githubWriteback.hasCommentMarker!(issue, comment)
         : undefined
-      await this.#retryDispatchWriteback(
-        record,
-        issue,
-        'GitHub dispatch comment',
-        async () => this.#githubWriteback.postComment(issue, comment),
-        commentApplied,
-      )
+      try {
+        await this.#retryDispatchWriteback(
+          record,
+          issue,
+          'GitHub dispatch comment',
+          async () => {
+            if (claimWasRejected()) await rejectClaim!()
+            await this.#githubWriteback.postComment(issue, comment)
+          },
+          commentApplied,
+        )
+      } catch (error) {
+        if (claimWasRejected() && !(error instanceof PostSpawnDispatchWaitRejectedError)) {
+          await this.#rejectDispatchClaimAfterOperationError(record.issue.key, error, rejectClaim!)
+        }
+        throw error
+      }
+      if (claimWasRejected()) await rejectClaim!()
     } else {
       implementingStateId = this.#states.idFor(issue.team, 'agentImplementing')
+      const readyStateId = issue.stateId
+      let claimToken: string | undefined
       await this.#retryDispatchWriteback(record, issue, `Linear state ${implementingStateId}`, async () => {
-        await this.#linear.setState(issue, implementingStateId!)
+        claimToken = (await this.#linear.setState(issue, implementingStateId!))?.claimToken
       })
-      await this.#retryDispatchWriteback(record, issue, 'Linear dispatch comment', async () => {
-        await this.#linear.postComment(issue, comment)
-      })
+      rejectClaim = async (): Promise<never> => await this.#rejectLinearDispatchClaim(
+        record,
+        issue,
+        implementingStateId!,
+        readyStateId,
+        claimToken,
+      )
+      if (claimWasRejected()) {
+        await rejectClaim!()
+      }
+      try {
+        await this.#retryDispatchWriteback(record, issue, 'Linear dispatch comment', async () => {
+          if (claimWasRejected()) await rejectClaim!()
+          await this.#linear.postComment(issue, comment)
+        })
+      } catch (error) {
+        if (claimWasRejected() && !(error instanceof PostSpawnDispatchWaitRejectedError)) {
+          await this.#rejectDispatchClaimAfterOperationError(record.issue.key, error, rejectClaim!)
+        }
+        throw error
+      }
+      if (claimWasRejected()) await rejectClaim!()
     }
 
     record.dispatchClaim = {
@@ -7229,7 +7407,95 @@ export class FactoryLoop implements Factory {
     }
     this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
     await this.#writeDispatchClaimRegistry(record.issue)
-    return implementingStateId
+    if (claimWasRejected()) await rejectClaim?.()
+    return {
+      ...(implementingStateId ? { implementingStateId } : {}),
+      reject: rejectClaim!,
+    }
+  }
+
+  async #rejectGithubDispatchClaim(
+    record: InFlightIssue,
+    issue: LinearIssue,
+    claim: Awaited<ReturnType<NonNullable<GithubWriteback['claimStatus']>>>,
+  ): Promise<never> {
+    let compensationError: unknown
+    if (claim.result !== 'already-matched') {
+      try {
+        let outcome: Awaited<ReturnType<NonNullable<GithubWriteback['rollbackStatusClaim']>>> = 'unproven'
+        await this.#retryDispatchWriteback(record, issue, 'GitHub rejected dispatch claim rollback', async () => {
+          if (!claim.claimToken) {
+            throw new Error('GitHub rejected dispatch claim has no immutable ownership token')
+          }
+          if (!this.#githubWriteback.rollbackStatusClaim) {
+            throw new Error('GitHub writeback cannot conditionally roll back a rejected dispatch claim')
+          }
+          outcome = await this.#githubWriteback.rollbackStatusClaim(issue, 'in-progress', claim.claimToken)
+          if (outcome === 'unproven') {
+            throw new Error('GitHub rejected dispatch claim rollback could not prove ownership')
+          }
+        })
+      } catch (error) {
+        compensationError = error
+      }
+    }
+    throw new PostSpawnDispatchWaitRejectedError(record.issue.key, compensationError)
+  }
+
+  async #rejectDispatchClaimAfterOperationError(
+    issueKey: string,
+    operationError: unknown,
+    rejectClaim: () => Promise<never>,
+  ): Promise<never> {
+    try {
+      await rejectClaim()
+    } catch (rejectionError) {
+      if (rejectionError instanceof PostSpawnDispatchWaitRejectedError) {
+        if (rejectionError.compensationError === undefined) throw rejectionError
+        throw new PostSpawnDispatchWaitRejectedError(
+          issueKey,
+          new AggregateError(
+            [operationError, rejectionError.compensationError],
+            'Cancelled dispatch operation failed and its claim could not be safely compensated',
+          ),
+        )
+      }
+      throw new PostSpawnDispatchWaitRejectedError(
+        issueKey,
+        new AggregateError(
+          [operationError, rejectionError],
+          'Cancelled dispatch operation failed and its claim rejection threw unexpectedly',
+        ),
+      )
+    }
+    throw new PostSpawnDispatchWaitRejectedError(issueKey)
+  }
+
+  async #rejectLinearDispatchClaim(
+    record: InFlightIssue,
+    issue: LinearIssue,
+    implementingStateId: string,
+    readyStateId: string,
+    claimToken: string | undefined,
+  ): Promise<never> {
+    let compensationError: unknown
+    try {
+      await this.#retryDispatchWriteback(record, issue, `Linear rejected dispatch claim rollback to ${readyStateId}`, async () => {
+        if (!this.#linear.compareAndSetState) {
+          throw new Error('Linear writeback cannot conditionally roll back a rejected dispatch claim')
+        }
+        if (!claimToken) {
+          throw new Error('Linear rejected dispatch claim has no immutable ownership token')
+        }
+        const outcome = await this.#linear.compareAndSetState(issue, implementingStateId, claimToken, readyStateId)
+        if (outcome === 'unproven') {
+          throw new Error('Linear rejected dispatch claim rollback could not prove an atomic provider transition')
+        }
+      })
+    } catch (error) {
+      compensationError = error
+    }
+    throw new PostSpawnDispatchWaitRejectedError(record.issue.key, compensationError)
   }
 
   async #retryDispatchWriteback(
@@ -7249,6 +7515,21 @@ export class FactoryLoop implements Factory {
         }
         return
       } catch (error) {
+        // Claim rejection is terminal for this dispatch. In particular, do not
+        // turn a cancellation discovered between comment attempts into another
+        // provider retry that can publish after shutdown began.
+        if (error instanceof PostSpawnDispatchWaitRejectedError) {
+          if (lastError !== undefined && error.compensationError !== undefined) {
+            throw new PostSpawnDispatchWaitRejectedError(
+              record.issue.key,
+              new AggregateError(
+                [lastError, error.compensationError],
+                'Dispatch writeback failed before cancellation and its claim could not be safely compensated',
+              ),
+            )
+          }
+          throw error
+        }
         lastError = error
         const deadLettered = attempt === DISPATCH_WRITEBACK_MAX_ATTEMPTS
         this.#increment('dispatchWritebackFailures')
@@ -8438,7 +8719,10 @@ export class FactoryLoop implements Factory {
 
   async #releaseInFlightAgents(reason: string, opts: { preserveDurable?: boolean } = {}): Promise<void> {
     const agents = new Map<string, TrackedAgent>()
-    for (const record of (await this.#batch()).inFlight) {
+    const batch = await this.#batch()
+    const records = [...batch.inFlight]
+    for (const record of records) {
+      this.#shutdownReleaseCapturedDispatches.add(dispatchLifecycleKey(record.issue))
       if (record.dryRun) {
         continue
       }
@@ -8451,6 +8735,11 @@ export class FactoryLoop implements Factory {
     }
 
     await this.#releaseAndTerminateAgents([...agents], reason, 'stop')
+    for (const record of records) {
+      const key = dispatchLifecycleKey(record.issue)
+      if (!this.#postSpawnDispatchesRejectedDuringStop.delete(key)) continue
+      batch.abandon(record.issue)
+    }
     await this.#writeInFlightRegistry(undefined, undefined, true)
   }
 
@@ -9996,7 +10285,7 @@ export class FactoryLoop implements Factory {
   // the release-driven exit event so it cannot re-trigger a resume before the
   // record leaves the batch.
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     // A dispatch can be stuck inside a later spawn after an earlier agent has
     // already started completion. Release both post-spawn waits before the
     // first abandonment await so terminal processing cannot remain an
@@ -14463,10 +14752,18 @@ export class FactoryLoop implements Factory {
           // re-read; a claim already entering its provider write finishes
           // before this terminal write begins.
           postSpawnDispatchClaimFence.completionAtWriteBoundary = true
-          if (
-            (postSpawnDispatchClaimFence.claimStarted || postSpawnDispatchClaimFence.accepted !== undefined) &&
-            !(postSpawnDispatchClaimFence.accepted ?? await postSpawnDispatchClaimFence.settled)
-          ) return
+          if (postSpawnDispatchClaimFence.claimStarted || postSpawnDispatchClaimFence.accepted !== undefined) {
+            let claimAccepted = postSpawnDispatchClaimFence.accepted
+            if (claimAccepted === undefined) {
+              // This counter makes the otherwise internal promise boundary
+              // observable in deterministic race regressions and in incident
+              // telemetry. External abandonment/stop settlement must release
+              // every completion counted here.
+              this.#increment('postSpawnDispatchClaimFenceWaits')
+              claimAccepted = await postSpawnDispatchClaimFence.settled
+            }
+            if (!claimAccepted) return
+          }
         }
         // Register only at the provider-write boundary. Work before this point
         // (PR discovery/merge gating) has not changed the issue, so a foreign
@@ -17641,7 +17938,7 @@ const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): Gith
       'GitHub identity "app" requires a connected workspace GitHub App lifecycle write path; refusing to fall back to the local gh user',
     )
   }
-  return new AppGithubWriteback(mount.githubWrite)
+  return new AppGithubWriteback(mount.githubWrite, mount.githubRead)
 }
 
 export function parseLinearIssue(path: string, content: unknown): LinearIssue {
@@ -20946,6 +21243,10 @@ const UNCLASSIFIED_DISPATCH_FAILURE_LIMIT = 5
 const isClassifiedPerItemDispatchFailure = (error: unknown): boolean =>
   error instanceof LiveDispatchStateChangedError ||
   error instanceof DispatchLifecycleClaimRefusedError ||
+  // An external stop/held-agent deadline rejected the post-spawn boundary
+  // while a provider claim was already in flight. That lifecycle's cleanup is
+  // owned by the rejecting path, so the late claim unwind is an expected skip.
+  error instanceof PostSpawnDispatchWaitRejectedError ||
   // #303: the never-placed deadline released this dispatch while its spawn was
   // still in flight. Named, expected and self-healing — the issue goes back to
   // the queue — and it recurs under exactly the slow-spawn conditions the
@@ -20972,7 +21273,8 @@ const isClassifiedPerItemDispatchFailure = (error: unknown): boolean =>
  */
 const mayHaveSpawnedBeforeFailing = (error: unknown): boolean =>
   !(error instanceof LiveDispatchStateChangedError) &&
-  !(error instanceof DispatchLifecycleClaimRefusedError)
+  !(error instanceof DispatchLifecycleClaimRefusedError) &&
+  !(error instanceof PostSpawnDispatchWaitRejectedError)
 
 /**
  * The run-report reason recorded for a work unit the pass could not dispatch.
@@ -20988,6 +21290,7 @@ const perItemDispatchSkipReason = (error: unknown): string => {
   if (overload) return `relayfile overloaded (${relayfileOverloadReasonLabel(overload.reason)})`
   if (error instanceof LiveDispatchStateChangedError) return 'live state changed during dispatch'
   if (error instanceof LatePlacementReleasedError) return 'dispatch released while its agent was still spawning'
+  if (error instanceof PostSpawnDispatchWaitRejectedError) return 'dispatch terminated during post-spawn claim'
   if (error instanceof DispatchLifecycleClaimRefusedError) {
     return error.refusal === 'terminal'
       ? 'dispatch lifecycle already terminal'

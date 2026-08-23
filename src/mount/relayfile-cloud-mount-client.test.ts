@@ -1766,7 +1766,8 @@ describe('RelayfileCloudMountClient', () => {
     })
     const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake, isAllowedDraft: () => true })
 
-    await mount.writeFile('/linear/issues/AR-1.json', { stateId: 'new' })
+    await expect(mount.writeFile('/linear/issues/AR-1.json', { stateId: 'new' }))
+      .resolves.toEqual({ targetRevision: 'next' })
 
     expect(fake.writeFileCalls).toEqual([{
       workspaceId: 'rw_test',
@@ -1775,6 +1776,33 @@ describe('RelayfileCloudMountClient', () => {
       content: '{"stateId":"new"}',
       contentType: 'application/json',
     }])
+  })
+
+  it('does not refresh or retry an explicit baseRevision after a conflict', async () => {
+    const fake = new FakeRelayFileClient()
+    const conflict = Object.assign(new Error('revision conflict'), { status: 409 })
+    const write = vi.spyOn(fake, 'writeFile').mockRejectedValue(conflict)
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(mount.writeFile(
+      '/linear/issues/AR-1.json',
+      { stateId: 'ready' },
+      { baseRevision: '7' },
+    )).rejects.toBe(conflict)
+
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(write).toHaveBeenCalledWith({
+      workspaceId: 'rw_test',
+      path: '/linear/issues/AR-1.json',
+      baseRevision: '7',
+      content: '{"stateId":"ready"}',
+      contentType: 'application/json',
+    })
+    expect(fake.readFileCalls).toEqual([])
   })
 
   it('uses baseRevision 0 for creates and confirms the queued operation', async () => {

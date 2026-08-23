@@ -681,7 +681,11 @@ export class RelayfileCloudMountClient implements MountClient {
     }
   }
 
-  async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+  async writeFile(
+    path: string,
+    content: unknown,
+    opts?: { guarded?: boolean; baseRevision?: string },
+  ): Promise<{ targetRevision: string }> {
     if (isProviderWritebackPath(path) && await this.#isAllowedDraft?.(path, content, opts) !== true) {
       throw new Error(`Refusing provider writeback draft for ${path}: draft predicate rejected or is unset`)
     }
@@ -691,7 +695,16 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#confirmedFailureReasonByPath.delete(path)
 
     const writeAtCurrentRevision = async (): Promise<WriteQueuedResponse> => {
-      let baseRevision = '0'
+      let baseRevision = opts?.baseRevision ?? '0'
+      if (opts?.baseRevision !== undefined) {
+        return this.#client.writeFile({
+          workspaceId: this.workspaceId,
+          path,
+          baseRevision,
+          content: serialized.content,
+          contentType: serialized.contentType,
+        })
+      }
       try {
         baseRevision = (await this.#client.readFile(this.workspaceId, path)).revision
       } catch (error) {
@@ -707,12 +720,15 @@ export class RelayfileCloudMountClient implements MountClient {
       })
     }
 
+    let queued: WriteQueuedResponse
     try {
-      this.#lastOpByPath.set(path, (await writeAtCurrentRevision()).opId)
+      queued = await writeAtCurrentRevision()
     } catch (error) {
-      if (!isHttpStatus(error, 409)) throw error
-      this.#lastOpByPath.set(path, (await writeAtCurrentRevision()).opId)
+      if (opts?.baseRevision !== undefined || !isHttpStatus(error, 409)) throw error
+      queued = await writeAtCurrentRevision()
     }
+    this.#lastOpByPath.set(path, queued.opId)
+    return { targetRevision: queued.targetRevision }
   }
 
   async deleteFile(path: string): Promise<void> {

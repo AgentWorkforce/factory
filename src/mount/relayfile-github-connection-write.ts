@@ -8,6 +8,7 @@ import {
 } from '../github/writeback-paths'
 import type {
   GithubConnectionIssueUpdateInput,
+  GithubConnectionMutationReceipt,
   GithubConnectionWrite,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
@@ -188,7 +189,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     operation: 'add' | 'remove'
     label: string
     author: 'app'
-  }): Promise<void> {
+  }): Promise<GithubConnectionMutationReceipt> {
     const repoRoot = githubRepoRoot(input.repo)
     assertPositiveGithubNumber(input.number, 'issue')
     assertAppAuthor(input.author, 'issue label mutations')
@@ -199,6 +200,10 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
         ? { operation: 'add', labels: [label] }
         : { operation: 'remove', label },
     )
+    // The durable operation proves App authorship and provider success, but
+    // the current adapter receipt does not distinguish a created mutation from
+    // an idempotent no-op. Callers must not infer ownership from it.
+    return 'acknowledged'
   }
 
   async updateIssue(input: GithubConnectionIssueUpdateInput): Promise<void> {
