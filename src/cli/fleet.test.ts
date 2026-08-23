@@ -25,7 +25,7 @@ import {
 import { MountAuthScopeError, mountAuthRemediation } from '../mount/mount-auth-error'
 import { DocumentStateStore, FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
-import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
+import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, GithubWriteback, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import { GhCliGithubWriteback } from '../writeback/github'

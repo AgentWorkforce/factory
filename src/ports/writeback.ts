@@ -21,6 +21,7 @@ export type GithubIssueStatus = 'ready' | 'in-progress' | 'human-review'
 
 /**
  * Whether a lifecycle call provably changed the provider's effective status.
+ * `applied` requires a provider audit event attributed to the writer's actor.
  * `acknowledged` means the provider accepted an idempotent operation but its
  * API did not prove who created the visible transition. `undefined` preserves
  * compatibility with caller-supplied writebacks that predate this receipt.

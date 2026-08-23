@@ -929,6 +929,14 @@ describe('GhCliGithubWriteback', () => {
       },
     },
   }
+  const authenticatedActorCall = ['api', 'user', '--jq', '.login']
+  const issueLabelEventsCall = [
+    'api',
+    '--paginate',
+    'repos/AgentWorkforce/factory/issues/48/events',
+    '--jq',
+    '.[] | select(.event == "labeled" or .event == "unlabeled") | [.id, .event, .label.name, .actor.login] | @tsv',
+  ]
 
   it('pushes a local branch and returns the gh-authenticated PR author', async () => {
     const ghCalls: string[][] = []
@@ -1042,17 +1050,27 @@ describe('GhCliGithubWriteback', () => {
   it('sets the first lifecycle status without removing an absent label, then transitions statuses', async () => {
     const calls: string[][] = []
     const labels = new Set<string>()
+    const events: string[] = []
+    let nextEventId = 1
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
         calls.push(args)
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
         if (args[0] === 'issue' && args[1] === 'view') {
           return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
         }
         if (args[0] === 'issue' && args[1] === 'edit') {
           const added = args[args.indexOf('--add-label') + 1]
           const removed = args[args.indexOf('--remove-label') + 1]
-          if (args.includes('--add-label') && added) labels.add(added)
-          if (args.includes('--remove-label') && removed) labels.delete(removed)
+          if (args.includes('--add-label') && added && !labels.has(added)) {
+            labels.add(added)
+            events.push(`${nextEventId++}\tlabeled\t${added}\tfactory-bot`)
+          }
+          if (args.includes('--remove-label') && removed && labels.has(removed)) {
+            labels.delete(removed)
+            events.push(`${nextEventId++}\tunlabeled\t${removed}\tfactory-bot`)
+          }
         }
         return { stdout: '' }
       },
@@ -1066,21 +1084,31 @@ describe('GhCliGithubWriteback', () => {
       ['issue', 'comment', '48', '--repo', 'AgentWorkforce/factory', '--body', 'Factory dispatch for 48'],
       ['label', 'create', 'factory:in-progress', '--repo', 'AgentWorkforce/factory', '--color', '1d76db', '--description', 'Factory agents are working on this issue.', '--force'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      authenticatedActorCall,
+      issueLabelEventsCall,
       ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:in-progress'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      issueLabelEventsCall,
       ['label', 'create', 'factory:human-review', '--repo', 'AgentWorkforce/factory', '--color', 'fbca04', '--description', 'Factory work is ready for human review.', '--force'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      authenticatedActorCall,
+      issueLabelEventsCall,
       ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:human-review', '--remove-label', 'factory:in-progress'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      issueLabelEventsCall,
     ])
   })
 
   it('clears stale lifecycle labels when returning an orphaned issue to ready', async () => {
     const calls: string[][] = []
     const labels = new Set(['factory-ready', 'factory:in-progress', 'factory:human-review'])
+    const events: string[] = []
+    let nextEventId = 1
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
         calls.push(args)
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
         if (args[0] === 'issue' && args[1] === 'view') {
           return {
             stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }),
@@ -1088,7 +1116,10 @@ describe('GhCliGithubWriteback', () => {
         }
         if (args[0] === 'issue' && args[1] === 'edit' && args.includes('--remove-label')) {
           args.forEach((arg, index) => {
-            if (arg === '--remove-label') labels.delete(args[index + 1]!)
+            const removed = args[index + 1]!
+            if (arg === '--remove-label' && labels.delete(removed)) {
+              events.push(`${nextEventId++}\tunlabeled\t${removed}\tfactory-bot`)
+            }
           })
         }
         return { stdout: '' }
@@ -1099,6 +1130,8 @@ describe('GhCliGithubWriteback', () => {
 
     expect(calls).toEqual([
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      authenticatedActorCall,
+      issueLabelEventsCall,
       [
         'issue',
         'edit',
@@ -1111,7 +1144,52 @@ describe('GhCliGithubWriteback', () => {
         'factory:human-review',
       ],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
+      issueLabelEventsCall,
     ])
+  })
+
+  it('does not attribute a label add won by another actor between read and edit', async () => {
+    const labels = new Set(['factory:in-progress'])
+    const events: string[] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit') {
+          labels.delete('factory:in-progress')
+          labels.add('factory:human-review')
+          events.push('1\tunlabeled\tfactory:in-progress\tother-user')
+          events.push('2\tlabeled\tfactory:human-review\tother-user')
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.setStatus(githubIssue, 'human-review')).resolves.toBe('acknowledged')
+  })
+
+  it('does not attribute a label removal won by another actor between read and edit', async () => {
+    const labels = new Set(['factory:human-review'])
+    const events: string[] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit') {
+          labels.delete('factory:human-review')
+          events.push('1\tunlabeled\tfactory:human-review\tother-user')
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.setStatus(githubIssue, 'ready')).resolves.toBe('acknowledged')
   })
 
   it.each([
