@@ -14,9 +14,9 @@ import type {
   FactoryIntegrationConnections,
   FactoryIntegrationProvider,
   FactoryPorts,
-  createFactory,
 } from '../index'
 import {
+  createFactory,
   FactoryConfigSchema,
   FileFactoryCloudEventOutbox,
   LiveDispatchStateChangedError,
@@ -25,10 +25,11 @@ import {
 import { MountAuthScopeError, mountAuthRemediation } from '../mount/mount-auth-error'
 import { DocumentStateStore, FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
-import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
+import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, GithubWriteback, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import type { RelayMessaging } from '@agent-relay/sdk'
 import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
+import { GhCliGithubWriteback } from '../writeback/github'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, resolveFactoryBrokerConnectionPath, runFleetCli } from './fleet'
 
@@ -1981,10 +1982,656 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  // factory#319 regression guard. The self-race itself is exercised by
-  // "keeps relay dispatch ownership …" above, which failed ~50% of runs on
-  // main and is deterministic with the fix; this control pins the other half
-  // of the contract — that a park this dispatch did NOT make still aborts.
+  // factory#319. The state write becomes locally visible before provider
+  // confirmation returns. Pin the post-spawn read in that interval and test
+  // both outcomes: confirmation lets the completed dispatch converge; a
+  // rejected confirmation MUST NOT excuse the visible park.
+  it.each([
+    { confirmation: 'acked' as const, expectedExit: 0 },
+    { confirmation: 'failed' as const, expectedExit: 3 },
+  ])('waits for its in-flight park confirmation ($confirmation)', async ({ confirmation, expectedExit }) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-park-inflight-'))
+    try {
+      const configPath = await writeConfig(root, {
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+          heartbeatStaleMs: 10_000,
+        },
+      })
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number: 79,
+          url: 'https://github.com/AgentWorkforce/pear/pull/79',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }),
+        closePullRequest: async () => undefined,
+      }
+      class ControlledCompletingRemoteFleetClient extends FakeFleetClient {
+        override readonly placementLocality = 'remote' as const
+        implementerName?: string
+        exitEmitted = false
+
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          const result = await super.spawn(input)
+          if (input.name.includes('-impl-')) this.implementerName = input.name
+          return { ...result, node: 'sf-mini', locality: 'remote' }
+        }
+      }
+      const fleet = new ControlledCompletingRemoteFleetClient()
+      // `setState` writes `stateId` at the top level of the record; the initial
+      // fixture carries it under `payload`. Read either.
+      const stateOf = (entry: { content: unknown } | undefined): string | undefined => {
+        const content = entry?.content as { stateId?: string; payload?: { stateId?: string } } | undefined
+        return content?.stateId ?? content?.payload?.stateId
+      }
+
+      class ParkConfirmBlockingMount extends FakeMountClient {
+        parkWritten = false
+        releaseConfirm?: () => void
+        reReadSeen = false
+
+        override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+          await super.writeFile(path, content, opts)
+          if (path === issuePath && stateOf(this.files.get(path)) === TEST_STATE_IDS.humanReview) {
+            this.parkWritten = true
+          }
+        }
+
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === issuePath && fleet.implementerName && !fleet.exitEmitted) {
+            // This is the dispatch's post-spawn re-read. Start completion here
+            // instead of hoping a timer wins the race, then hold this read
+            // until completion has made the parked state visible. Completion's
+            // own reads pass through because `exitEmitted` is already true.
+            fleet.exitEmitted = true
+            fleet.emitAgentExit(fleet.implementerName, 'exited')
+            await vi.waitFor(() => expect(this.parkWritten).toBe(true), { timeout: 1_000 })
+            this.reReadSeen = true
+            queueMicrotask(() => this.releaseConfirm?.())
+          }
+          if (path === issuePath && this.parkWritten && confirmation === 'acked') {
+            if (!this.releaseConfirm) {
+              // First issue read after the park is `setState`'s own readback
+              // confirmation. Hold it, so `setState` cannot return. Bounded so
+              // a wrong assumption about ordering fails loudly rather than
+              // hanging the suite.
+              await new Promise<void>((resolve) => {
+                this.releaseConfirm = resolve
+                setTimeout(resolve, 400)
+              })
+            }
+          }
+          return super.readFile(path)
+        }
+
+        override async confirmWrite(path: string): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
+          if (path === issuePath && this.parkWritten) return confirmation
+          return super.confirmWrite(path)
+        }
+      }
+
+      const mount = new ParkConfirmBlockingMount({
+        [issuePath]: issueFile,
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+      const output = buffer()
+
+      const code = await runFleetCli([
+        'dispatch',
+        'AR-77',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        stdout: output,
+        stderr: buffer(),
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      // Both must hold or the test is not exercising the window at all.
+      expect(mount.parkWritten).toBe(true)
+      expect(mount.reReadSeen).toBe(true)
+      expect(code).toBe(expectedExit)
+      const releaseReasons = fleet.releases.map((release) => release.reason)
+      if (confirmation === 'acked') {
+        expect(releaseReasons).not.toContain('live dispatch state changed')
+      } else {
+        expect(releaseReasons).toContain('live dispatch state changed')
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    { receipt: 'explicit already-matched' as const, legacyVoid: false },
+    { receipt: 'legacy void' as const, legacyVoid: true },
+  ])('does not attribute a third-party GitHub park from an in-flight $receipt receipt', async ({ legacyVoid }) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-foreign-park-inflight-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+          heartbeatStaleMs: 10_000,
+        },
+      })
+      const githubPath = '/github/repos/AgentWorkforce__pear/issues/by-id/48.json'
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number: 80,
+          url: 'https://github.com/AgentWorkforce/pear/pull/80',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }),
+        closePullRequest: async () => undefined,
+      }
+      class ControlledCompletingGithubFleetClient extends FakeFleetClient {
+        override readonly placementLocality = 'remote' as const
+        implementerName?: string
+        exitEmitted = false
+
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          const result = await super.spawn(input)
+          if (input.name.includes('-impl-')) this.implementerName = input.name
+          return { ...result, node: 'sf-mini', locality: 'remote' }
+        }
+      }
+      const fleet = new ControlledCompletingGithubFleetClient()
+      let thirdPartyParked = false
+      let terminalLabelProvisioned = false
+      let terminalViews = 0
+      let terminalEdits = 0
+      let releaseConfirmation: (() => void) | undefined
+
+      class ThirdPartyGithubParkMount extends FakeMountClient {
+        postSpawnReadSawPark = false
+
+        parkAsThirdParty(): void {
+          const existing = this.files.get(githubPath)
+          const content = existing?.content as ReturnType<typeof githubIssueFile>
+          const labels = content.payload.labels
+            .filter((label) => label.name !== 'factory:in-progress')
+          labels.push({ name: 'factory:human-review' })
+          this.files.set(githubPath, {
+            ...existing,
+            content: {
+              ...content,
+              payload: { ...content.payload, labels },
+            },
+          })
+          thirdPartyParked = true
+        }
+
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === githubPath && fleet.implementerName && !fleet.exitEmitted) {
+            // This is dispatch's post-spawn read. Completion starts here and
+            // registers its fence before the CLI adapter's first label read.
+            fleet.exitEmitted = true
+            fleet.emitAgentExit(fleet.implementerName, 'exited')
+            await vi.waitFor(() => expect(thirdPartyParked).toBe(true), { timeout: 1_000 })
+            const result = await super.readFile(path)
+            this.postSpawnReadSawPark = true
+            // Let the adapter's provider-confirmation read finish only after
+            // the dispatch has observed the foreign state while the fence is
+            // still registered.
+            setTimeout(() => releaseConfirmation?.(), 0)
+            return result
+          }
+          return super.readFile(path)
+        }
+      }
+
+      const githubContent = githubIssueFile('pear')
+      githubContent.payload.title = '[factory-e2e] preserve foreign GitHub lifecycle ownership'
+      githubContent.payload.body = [
+        'Fix the completion race without attributing a third-party lifecycle change to Factory.',
+        '',
+        'Acceptance criteria:',
+        '- A skipped GitHub CLI label edit never stamps Factory authorship.',
+        '- The live dispatch state-change guard still releases the remote agent.',
+        '- Add a deterministic integration regression for the provider-read ordering.',
+      ].join('\n')
+      const mount = new ThirdPartyGithubParkMount({
+        [githubPath]: githubContent,
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+      const providerLabels = new Set(['factory', 'pear'])
+      const githubWriteback = new GhCliGithubWriteback({
+        runner: async (args) => {
+          if (args[0] === 'label' && args[1] === 'create') {
+            terminalLabelProvisioned = args[2] === 'factory:human-review'
+            return { stdout: '' }
+          }
+          if (args[0] === 'issue' && args[1] === 'view') {
+            if (terminalLabelProvisioned) {
+              terminalViews += 1
+              if (terminalViews === 1) {
+                // The third party wins before the adapter's first read. The
+                // target is present and the previous label absent, so the CLI
+                // must skip `gh issue edit` and report already-matched.
+                providerLabels.delete('factory:in-progress')
+                providerLabels.add('factory:human-review')
+                mount.parkAsThirdParty()
+              } else if (terminalViews === 2 && !releaseConfirmation) {
+                await new Promise<void>((resolve) => {
+                  releaseConfirmation = resolve
+                  setTimeout(resolve, 400)
+                })
+              }
+            }
+            return { stdout: JSON.stringify({ labels: [...providerLabels].map((name) => ({ name })) }) }
+          }
+          if (args[0] === 'issue' && args[1] === 'edit') {
+            if (terminalLabelProvisioned) terminalEdits += 1
+            const added = args[args.indexOf('--add-label') + 1]
+            const removed = args[args.indexOf('--remove-label') + 1]
+            if (args.includes('--add-label') && added) providerLabels.add(added)
+            if (args.includes('--remove-label') && removed) providerLabels.delete(removed)
+          }
+          return { stdout: '' }
+        },
+      })
+      const effectiveGithubWriteback: GithubWriteback = legacyVoid
+        ? {
+            getIssueStatus: async (target) => await githubWriteback.getIssueStatus(target),
+            postComment: async (target, body) => await githubWriteback.postComment(target, body),
+            setStatus: async (target, status) => {
+              await githubWriteback.setStatus(target, status)
+            },
+            closeIssue: async (target, body) => await githubWriteback.closeIssue(target, body),
+          }
+        : githubWriteback
+      const output = buffer()
+      const errors = buffer()
+
+      const code = await runFleetCli([
+        'dispatch',
+        '48',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        createFactory: (factoryConfig, ports) => createFactory(factoryConfig, {
+          ...ports,
+          githubWriteback: effectiveGithubWriteback,
+        }),
+        stdout: output,
+        stderr: errors,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      expect(thirdPartyParked).toBe(true)
+      expect(mount.postSpawnReadSawPark).toBe(true)
+      expect(terminalEdits).toBe(0)
+      expect(code).toBe(3)
+      expect(errors.text()).toContain('Live state changed before writeback for 48')
+      expect(fleet.releases.map((release) => release.reason)).toContain('live dispatch state changed')
+      if (legacyVoid) {
+        expect(errors.text()).toContain('GitHub writeback returned no ownership receipt')
+        expect(errors.text()).toContain('"method":"setStatus"')
+      } else {
+        expect(errors.text()).not.toContain('GitHub writeback returned no ownership receipt')
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    { receipt: 'explicit acknowledged' as const, legacyVoid: false },
+    { receipt: 'legacy void' as const, legacyVoid: true },
+  ])('does not attribute a third-party GitHub close from an in-flight $receipt receipt', async ({ legacyVoid }) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-foreign-close-inflight-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        terminalState: 'done',
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+          heartbeatStaleMs: 10_000,
+        },
+      })
+      const githubPath = '/github/repos/AgentWorkforce__pear/issues/by-id/48.json'
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number: 80,
+          url: 'https://github.com/AgentWorkforce/pear/pull/80',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }),
+        closePullRequest: async () => undefined,
+      }
+      class ControlledCompletingGithubFleetClient extends FakeFleetClient {
+        override readonly placementLocality = 'remote' as const
+        implementerName?: string
+        exitEmitted = false
+
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          const result = await super.spawn(input)
+          if (input.name.includes('-impl-')) this.implementerName = input.name
+          return { ...result, node: 'sf-mini', locality: 'remote' }
+        }
+      }
+      const fleet = new ControlledCompletingGithubFleetClient()
+      let thirdPartyClosed = false
+
+      class ThirdPartyGithubCloseMount extends FakeMountClient {
+        postSpawnReadSawClose = false
+
+        closeAsThirdParty(): void {
+          const existing = this.files.get(githubPath)
+          const content = existing?.content as ReturnType<typeof githubIssueFile>
+          this.files.set(githubPath, {
+            ...existing,
+            content: {
+              ...content,
+              payload: { ...content.payload, state: 'closed' },
+            },
+          })
+          thirdPartyClosed = true
+        }
+
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === githubPath && fleet.implementerName && !fleet.exitEmitted) {
+            // Pin the dispatch's post-spawn read behind completion. The
+            // provider close command returns idempotently after another actor
+            // creates the terminal event, so only the audit receipt can tell
+            // the dispatch that it must not claim ownership.
+            fleet.exitEmitted = true
+            fleet.emitAgentExit(fleet.implementerName, 'exited')
+            await vi.waitFor(() => expect(thirdPartyClosed).toBe(true), { timeout: 1_000 })
+            this.postSpawnReadSawClose = true
+          }
+          return super.readFile(path)
+        }
+      }
+
+      const githubContent = githubIssueFile('pear')
+      githubContent.payload.title = '[factory-e2e] preserve foreign GitHub close ownership'
+      githubContent.payload.body = [
+        'Keep terminal lifecycle ownership provider-authoritative during concurrent close operations.',
+        '',
+        'Acceptance criteria:',
+        '- An idempotent close must not claim Factory ownership when another actor creates the close event.',
+        '- The post-spawn live-state guard must abort the dispatch.',
+        '- Remote agents must be released with the live-state-change reason.',
+      ].join('\n')
+      const mount = new ThirdPartyGithubCloseMount({
+        [githubPath]: githubContent,
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+        '/github/repos/AgentWorkforce/pear/pulls/80/metadata.json': {
+          provider: 'github',
+          objectType: 'pull_request',
+          objectId: '80',
+          payload: {
+            number: 80,
+            title: '[factory-e2e] preserve foreign GitHub close ownership',
+            body: 'Fixes #48',
+            head_ref: 'factory/48-agentworkforce-pear',
+            isDraft: false,
+            state: 'MERGED',
+            merged: true,
+          },
+        },
+      }, githubWrite)
+      let providerState = 'OPEN'
+      const stateEvents: string[] = []
+      let closeCommands = 0
+      const githubWriteback = new GhCliGithubWriteback({
+        runner: async (args) => {
+          if (args[0] === 'issue' && args[1] === 'view' && args.includes('state')) {
+            return { stdout: JSON.stringify({ state: providerState }) }
+          }
+          if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+          if (args[0] === 'api' && args[1] === '--paginate') {
+            return { stdout: stateEvents.join('\n') }
+          }
+          if (args[0] === 'issue' && args[1] === 'close') {
+            closeCommands += 1
+            providerState = 'CLOSED'
+            stateEvents.push('1\tclosed\tother-user')
+            mount.closeAsThirdParty()
+          }
+          return { stdout: '' }
+        },
+      })
+      const effectiveGithubWriteback: GithubWriteback = legacyVoid
+        ? {
+            getIssueStatus: async (target) => await githubWriteback.getIssueStatus(target),
+            postComment: async (target, body) => await githubWriteback.postComment(target, body),
+            setStatus: async (target, status) => await githubWriteback.setStatus(target, status),
+            closeIssue: async (target, body) => {
+              await githubWriteback.closeIssue(target, body)
+            },
+          }
+        : githubWriteback
+      const output = buffer()
+      const errors = buffer()
+
+      const code = await runFleetCli([
+        'dispatch',
+        '48',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        createFactory: (factoryConfig, ports) => createFactory(factoryConfig, {
+          ...ports,
+          githubWriteback: effectiveGithubWriteback,
+        }),
+        stdout: output,
+        stderr: errors,
+        probePrGhRunner: async () => ({
+          stdout: JSON.stringify([{
+            number: 80,
+            title: '[factory-e2e] preserve foreign GitHub close ownership',
+            body: 'Fixes #48',
+            headRefName: 'factory/48-agentworkforce-pear',
+            isDraft: false,
+            state: 'MERGED',
+          }]),
+        }),
+      })
+
+      expect(thirdPartyClosed, JSON.stringify({
+        code,
+        output: output.text(),
+        errors: errors.text(),
+        releases: fleet.releases,
+      })).toBe(true)
+      expect(mount.postSpawnReadSawClose).toBe(true)
+      expect(closeCommands).toBe(1)
+      expect(code).toBe(3)
+      expect(errors.text()).toContain('Live state changed before writeback for 48')
+      expect(fleet.releases.map((release) => release.reason)).toContain('live dispatch state changed')
+      if (legacyVoid) {
+        expect(errors.text()).toContain('GitHub writeback returned no ownership receipt')
+        expect(errors.text()).toContain('"method":"closeIssue"')
+      } else {
+        expect(errors.text()).not.toContain('GitHub writeback returned no ownership receipt')
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('serializes terminal completion that starts after the ready read against the dispatch claim', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-claim-completion-fence-'))
+    let releaseClaim: (() => void) | undefined
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        terminalState: 'human-review',
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+          heartbeatStaleMs: 10_000,
+        },
+      })
+      const githubPath = '/github/repos/AgentWorkforce__pear/issues/by-id/48.json'
+      class CompletingDuringClaimFleetClient extends FakeFleetClient {
+        override readonly placementLocality = 'remote' as const
+        implementerName?: string
+        exitEmitted = false
+
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          const result = await super.spawn(input)
+          if (input.name.includes('-impl-')) this.implementerName = input.name
+          return { ...result, node: 'sf-mini', locality: 'remote' }
+        }
+      }
+      const fleet = new CompletingDuringClaimFleetClient()
+      let resolveCompletionRead!: () => void
+      const completionRead = new Promise<void>((resolve) => {
+        resolveCompletionRead = resolve
+      })
+      class CompletionObservedMount extends FakeMountClient {
+        completionReadSeen = false
+
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === githubPath && fleet.exitEmitted && !this.completionReadSeen) {
+            this.completionReadSeen = true
+            resolveCompletionRead()
+          }
+          return await super.readFile(path)
+        }
+      }
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number: 80,
+          url: 'https://github.com/AgentWorkforce/pear/pull/80',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }),
+        closePullRequest: async () => undefined,
+      }
+      const githubContent = githubIssueFile('pear')
+      githubContent.payload.title = '[factory-e2e] serialize dispatch claim with terminal completion'
+      githubContent.payload.body = [
+        'Prevent a stale post-spawn ready snapshot from overwriting a concurrent terminal writeback.',
+        '',
+        'Acceptance criteria:',
+        '- Completion that starts after the ready read waits for the dispatch claim write.',
+        '- The final provider state remains human review.',
+        '- The agent is released with the terminal completion reason.',
+      ].join('\n')
+      const mount = new CompletionObservedMount({
+        [githubPath]: githubContent,
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+      let resolveClaimStarted!: () => void
+      const claimStarted = new Promise<void>((resolve) => {
+        resolveClaimStarted = resolve
+      })
+      const claimRelease = new Promise<void>((resolve) => {
+        releaseClaim = resolve
+      })
+      const statusCalls: string[] = []
+      let terminalStarted = false
+      const output = buffer()
+      const errors = buffer()
+      const setMountedStatus = (status: 'in-progress' | 'human-review'): void => {
+        const existing = mount.files.get(githubPath)
+        const content = existing?.content as ReturnType<typeof githubIssueFile>
+        const labels = content.payload.labels.filter((label) =>
+          label.name !== 'factory:in-progress' && label.name !== 'factory:human-review')
+        labels.push({ name: `factory:${status}` })
+        mount.files.set(githubPath, {
+          ...existing,
+          content: { ...content, payload: { ...content.payload, labels } },
+        })
+      }
+      const githubWriteback: GithubWriteback = {
+        getIssueStatus: async () => undefined,
+        postComment: async () => undefined,
+        setStatus: async (_issue, status) => {
+          statusCalls.push(`start:${status}`)
+          if (status === 'in-progress') {
+            resolveClaimStarted()
+            if (!fleet.implementerName) throw new Error('implementer was not spawned before the dispatch claim')
+            fleet.exitEmitted = true
+            fleet.emitAgentExit(fleet.implementerName, 'exited')
+            await claimRelease
+          } else if (status === 'human-review') {
+            terminalStarted = true
+          }
+          setMountedStatus(status)
+          statusCalls.push(`applied:${status}`)
+          return 'applied'
+        },
+        closeIssue: async () => 'acknowledged',
+      }
+
+      const run = runFleetCli([
+        'dispatch',
+        '48',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        createFactory: (factoryConfig, ports) => createFactory(factoryConfig, {
+          ...ports,
+          githubWriteback,
+        }),
+        stdout: output,
+        stderr: errors,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      try {
+        await withDeadline(claimStarted, 1_000, 'dispatch claim did not start')
+      } catch (error) {
+        throw new Error(JSON.stringify({
+          error: error instanceof Error ? error.message : String(error),
+          output: output.text(),
+          errors: errors.text(),
+          statusCalls,
+          spawns: fleet.spawns,
+          releases: fleet.releases,
+        }))
+      }
+      await withDeadline(completionRead, 1_000, 'completion did not reach its issue read')
+      await new Promise<void>((resolve) => setTimeout(resolve, 10))
+      const terminalStartedBeforeClaimReleased = terminalStarted
+      releaseClaim()
+      const code = await run
+
+      expect(fleet.exitEmitted).toBe(true)
+      expect(mount.completionReadSeen).toBe(true)
+      expect(terminalStartedBeforeClaimReleased).toBe(false)
+      expect(statusCalls).toEqual([
+        'start:in-progress',
+        'applied:in-progress',
+        'start:human-review',
+        'applied:human-review',
+      ])
+      expect(code).toBe(0)
+      expect((mount.files.get(githubPath)?.content as ReturnType<typeof githubIssueFile>).payload.labels)
+        .toContainEqual({ name: 'factory:human-review' })
+      expect(fleet.releases.map((release) => release.reason)).toContain('issue-human-review')
+    } finally {
+      releaseClaim?.()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('still aborts when a third party parks the issue and this dispatch did not', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-foreign-park-'))
     try {
