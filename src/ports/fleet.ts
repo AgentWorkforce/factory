@@ -223,7 +223,12 @@ export interface FleetClient {
    * that omit this method are conservatively scoped to the client object.
    */
   messageStreamIdentity?(): Promise<string | object | undefined>
-  waitForInjected?(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }>
+  waitForInjected?(input: SendInput, opts?: { timeoutMs?: number }): Promise<{
+    eventId: string
+    targets: string[]
+    /** A separately accepted resend can still produce an uncorrelated duplicate reply. */
+    duplicateDeliveryPossible?: true
+  }>
   sendInput?(name: string, data: string): Promise<void>
   markAgentTerminal?(name: string, reason?: string): void
   onDeliveryFailed?(listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void

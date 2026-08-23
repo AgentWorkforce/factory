@@ -21,6 +21,8 @@ export interface CreateFleetOptions {
 
 export interface CreateFleetDeps {
   harnessClient?: HarnessDriverClientLike
+  /** Proven inbound-stream identity for an injected Harness Driver client. */
+  messageStreamScope?: string | object
   // True when harnessClient owns a broker we spawned, so the fleet shuts it down
   // on dispose instead of leaving it running.
   ownsBroker?: boolean
@@ -67,6 +69,7 @@ export function createFleet(options: CreateFleetOptions = {}, deps: CreateFleetD
 
   return new InternalFleetClient({
     client: deps.harnessClient,
+    messageStreamScope: deps.messageStreamScope,
     ownsBroker: deps.ownsBroker,
     ownedBrokerAgentExitTimeoutMs: resolveOwnedBrokerAgentExitTimeoutMs(deps.ownedBrokerAgentExitTimeoutMs),
     workspaceKey: deps.workspaceKey,

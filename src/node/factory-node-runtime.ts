@@ -30,6 +30,19 @@ export function startFactoryNode(options: StartFactoryNodeOptions): RunningFacto
   let publicationInFlight = false
   let publicationRetryRequested = false
   let publicationTerminal = false
+  let nodeTerminated = false
+  let nodeTerminationReason: unknown
+  const rejectTerminalPublication = (reason: unknown) => {
+    if (publicationCompleted || publicationTerminal) return
+    publicationTerminal = true
+    rejectPublication(reason)
+  }
+  const markNodeTerminated = (reason: unknown) => {
+    if (publicationCompleted || publicationTerminal || nodeTerminated) return
+    nodeTerminated = true
+    nodeTerminationReason = reason
+    if (!publicationInFlight) rejectTerminalPublication(reason)
+  }
   const serve = options.serve ?? startServeNode
   const publishCard = () => {
     const card = options.definition.agentCard
@@ -42,6 +55,10 @@ export function startFactoryNode(options: StartFactoryNodeOptions): RunningFacto
       resolvePublication(published)
     }, (error) => {
       publicationInFlight = false
+      if (nodeTerminated) {
+        rejectTerminalPublication(nodeTerminationReason)
+        return
+      }
       options.warn?.(
         `Factory persona card publication failed; ${
           publicationRetryRequested ? 'a registration arrived during publication, retrying now' : 'the next node registration will retry'
@@ -82,15 +99,21 @@ export function startFactoryNode(options: StartFactoryNodeOptions): RunningFacto
         return
       }
       if (!options.cardPublisher) {
-        publicationTerminal = true
-        rejectPublication(new Error('Factory persona node came online without an AgentCardPublisher'))
+        rejectTerminalPublication(new Error('Factory persona node came online without an AgentCardPublisher'))
         return
       }
       publishCard()
     },
   })
+  void running.done.then(
+    () => markNodeTerminated(new Error('Factory node stopped before persona card publication completed')),
+    (error) => markNodeTerminated(error),
+  )
   return {
-    stop: () => running.stop(),
+    stop: () => {
+      markNodeTerminated(new Error('Factory node was stopped before persona card publication completed'))
+      return running.stop()
+    },
     done: running.done,
     cardPublished,
   }

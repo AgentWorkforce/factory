@@ -418,6 +418,7 @@ describe('InternalFleetClient broker rebind recovery', () => {
 
     const fleet = new InternalFleetClient({ connectionPath })
     cleanup.push(() => fleet.dispose())
+    const streamIdentityBeforeRebind = await fleet.messageStreamIdentity()
     await fleet.sendMessage({ to: 'worker', text: 'hello' })
 
     await first.stop()
@@ -432,5 +433,6 @@ describe('InternalFleetClient broker rebind recovery', () => {
 
     await fleet.sendMessage({ to: 'worker', text: 'hello' })
     expect(second.requests.map((request) => request.path)).toEqual(['/api/send'])
+    await expect(fleet.messageStreamIdentity()).resolves.toBe(streamIdentityBeforeRebind)
   })
 })

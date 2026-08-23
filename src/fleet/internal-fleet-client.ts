@@ -1,8 +1,9 @@
 import { HarnessDriverClient } from '@agent-relay/harness-driver'
 import { AgentRelay } from '@agent-relay/sdk'
+import { createHash } from 'node:crypto'
 import { accessSync, constants, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
@@ -48,6 +49,13 @@ export interface HarnessDriverClientLike {
 
 export interface InternalFleetClientOptions {
   client?: HarnessDriverClientLike
+  /**
+   * Stable identity for an injected client's inbound broker stream when the
+   * caller can prove that boundary. Omit to derive it from connection.json or
+   * the client base URL; clients with no such evidence share a conservative
+   * unknown-stream scope.
+   */
+  messageStreamScope?: string | object
   // True when the injected client owns a broker we spawned, so dispose() shuts it
   // down instead of merely disconnecting (which would leave it running).
   ownsBroker?: boolean
@@ -91,11 +99,13 @@ type PendingInjectedWait = {
   currentEventId: string
   targets: string[]
   timeout: ReturnType<typeof setTimeout>
-  resolve: (result: { eventId: string; targets: string[] }) => void
+  resolve: (result: { eventId: string; targets: string[]; duplicateDeliveryPossible?: true }) => void
   reject: (error: Error) => void
   resendTimer?: ReturnType<typeof setTimeout>
   resendInFlight: boolean
   resendTriggered: boolean
+  duplicateDeliveryPossible: boolean
+  confirmed?: { eventId: string; targets: string[]; duplicateDeliveryPossible?: true }
   settled: boolean
 }
 
@@ -119,6 +129,18 @@ const OWNED_BROKER_AGENT_EXIT_TIMEOUT_MS = 30 * 60 * 1_000
 const RELEASE_RETRY_MAX_ATTEMPTS = 3
 const RELEASE_RETRY_BACKOFF_MS = 250
 const CANONICAL_PRESENCE_REGISTRATION_GRACE_MS = 60_000
+const UNKNOWN_INJECTED_BROKER_STREAM = Object.freeze({})
+const internalBrokerStreamIdentity = (receipt: string): string =>
+  `internal-broker:${createHash('sha256').update(receipt).digest('base64url')}`
+const connectionFileStreamIdentity = (path: string): string =>
+  internalBrokerStreamIdentity(`connection-file:${resolve(path)}`)
+const canonicalBrokerUrl = (value: string): string => {
+  try {
+    return new URL(value).href
+  } catch {
+    return value
+  }
+}
 
 export class InternalFleetClient implements FleetClient {
   readonly placementLocality = 'local' as const
@@ -133,7 +155,9 @@ export class InternalFleetClient implements FleetClient {
   readonly #ownedBrokerAgentExitTimeoutMs: number
   readonly #cwd?: string
   readonly #connectionPath?: string
+  readonly #connectionStreamScope?: string
   readonly #workspaceKey?: string
+  readonly #messageStreamScope?: string | object
   readonly #teammateDirectory?: TeammateDirectory
   readonly #listCanonicalOnlineAgentNames?: () => Promise<readonly string[]>
   readonly #isProcessAlive: (pid: number) => boolean
@@ -173,7 +197,12 @@ export class InternalFleetClient implements FleetClient {
   constructor(options: InternalFleetClientOptions = {}) {
     this.#cwd = options.cwd
     this.#connectionPath = options.connectionPath
+    const connectionPath = options.connectionPath ?? connectionPathForCwd(options.cwd)
+    this.#connectionStreamScope = connectionPath
+      ? connectionFileStreamIdentity(connectionPath)
+      : undefined
     this.#workspaceKey = options.workspaceKey
+    this.#messageStreamScope = options.messageStreamScope
     const directoryToken = resolveRelayWorkspaceKey({ workspaceKey: options.workspaceKey })
     this.#teammateDirectory = options.teammateDirectory ?? (directoryToken
       ? new RelaycastTeammateDirectory({
@@ -409,6 +438,25 @@ export class InternalFleetClient implements FleetClient {
       throw new Error('InternalFleetClient teammate discovery requires a directory or Relay workspace key')
     }
     return await this.#teammateDirectory.discover(query)
+  }
+
+  /**
+   * Identify the broker event stream rather than this wrapper instance.
+   * Separate InternalFleetClient wrappers connected through one connection
+   * file receive the same relay_inbound events and must share uncorrelated
+   * teammate claims. That file is the durable stream boundary: its broker
+   * fingerprint may change during a rebind while existing listeners move to
+   * the replacement, so the claim scope must not change with it. Separately
+   * injected clients can still be the same stream, so a
+   * caller-supplied scope or the actual broker URL is used next. When neither
+   * exists, all unknown injected clients share one conservative scope rather
+   * than unsafely claiming independence from wrapper-object identity.
+   */
+  async messageStreamIdentity(): Promise<string | object> {
+    if (this.#messageStreamScope !== undefined) return this.#messageStreamScope
+    if (this.#connectionStreamScope) return this.#connectionStreamScope
+    if (this.#client.baseUrl) return internalBrokerStreamIdentity(canonicalBrokerUrl(this.#client.baseUrl))
+    return UNKNOWN_INJECTED_BROKER_STREAM
   }
 
   async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
@@ -654,7 +702,11 @@ export class InternalFleetClient implements FleetClient {
     await this.#callBroker('sendMessage', (client) => client.sendMessage(messageInputFrom(input)))
   }
 
-  async waitForInjected(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }> {
+  async waitForInjected(input: SendInput, opts?: { timeoutMs?: number }): Promise<{
+    eventId: string
+    targets: string[]
+    duplicateDeliveryPossible?: true
+  }> {
     this.#ensureEventSubscription()
     const targetWasReady = this.#readyAgentNames.has(input.to)
     const injectedSequenceAtSendStart = this.#injectedByAgent.get(input.to)?.sequence ?? 0
@@ -696,6 +748,7 @@ export class InternalFleetClient implements FleetClient {
         reject,
         resendInFlight: false,
         resendTriggered: false,
+        duplicateDeliveryPossible: false,
         settled: false,
       }
       this.#pendingInjected.set(eventId, pending)
@@ -967,6 +1020,31 @@ export class InternalFleetClient implements FleetClient {
 
   #resolvePendingInjected(pending: PendingInjectedWait, eventId: string): void {
     if (pending.settled) return
+    const confirmation = {
+      eventId,
+      targets: pending.targets,
+      ...(pending.duplicateDeliveryPossible ? { duplicateDeliveryPossible: true as const } : {}),
+    }
+    if (pending.resendInFlight) {
+      // A readiness-triggered resend has already left the process. Keep this
+      // logical delivery pending until that send returns so callers cannot
+      // release their correlation claim while the duplicate is still being
+      // issued. The positive acknowledgement makes the delivery timeout
+      // irrelevant; a blocked resend must retain the claim rather than turn a
+      // confirmed delivery into an ambiguous timeout.
+      pending.confirmed ??= confirmation
+      clearTimeout(pending.timeout)
+      if (pending.resendTimer) clearTimeout(pending.resendTimer)
+      return
+    }
+    this.#settlePendingInjected(pending, confirmation)
+  }
+
+  #settlePendingInjected(
+    pending: PendingInjectedWait,
+    confirmation: { eventId: string; targets: string[]; duplicateDeliveryPossible?: true },
+  ): void {
+    if (pending.settled) return
     pending.settled = true
     this.#activeInjectedWaits.delete(pending)
     clearTimeout(pending.timeout)
@@ -974,7 +1052,7 @@ export class InternalFleetClient implements FleetClient {
     for (const pendingEventId of pending.eventIds) {
       this.#pendingInjected.delete(pendingEventId)
     }
-    pending.resolve({ eventId, targets: pending.targets })
+    pending.resolve(confirmation)
   }
 
   #rejectPendingInjected(pending: PendingInjectedWait, error: Error): void {
@@ -1000,8 +1078,19 @@ export class InternalFleetClient implements FleetClient {
   async #resendPendingInjected(pending: PendingInjectedWait): Promise<void> {
     try {
       const result = await this.#callBroker('sendMessage', (client) => client.sendMessage(messageInputFrom(pending.input)))
+      // Every still-viable event id predates this resend response. Once the
+      // resend is accepted, either that earlier send or the resend can deliver
+      // the same uncorrelated question, so callers must quarantine the pair.
+      pending.duplicateDeliveryPossible ||= pending.eventIds.size > 0
       pending.resendInFlight = false
       if (pending.settled) return
+      if (pending.confirmed) {
+        this.#settlePendingInjected(pending, {
+          ...pending.confirmed,
+          ...(pending.duplicateDeliveryPossible ? { duplicateDeliveryPossible: true } : {}),
+        })
+        return
+      }
 
       const eventId = result.event_id
       pending.currentEventId = eventId
@@ -1018,7 +1107,20 @@ export class InternalFleetClient implements FleetClient {
         this.#failPendingInjectedEvent(pending, eventId, priorFailure)
       }
     } catch (error) {
+      // A transport failure can follow provider acceptance. Preserve the same
+      // conservative duplicate signal whenever an earlier send is still live.
+      pending.duplicateDeliveryPossible ||= pending.eventIds.size > 0
       pending.resendInFlight = false
+      if (pending.settled) return
+      if (pending.confirmed) {
+        // A transport rejection can follow provider acceptance. Once a resend
+        // left this process, conservatively assume it may still deliver.
+        this.#settlePendingInjected(pending, {
+          ...pending.confirmed,
+          ...(pending.duplicateDeliveryPossible ? { duplicateDeliveryPossible: true } : {}),
+        })
+        return
+      }
       if (pending.eventIds.size === 0) {
         this.#rejectPendingInjected(pending, error instanceof Error ? error : new Error(String(error)))
       } else {

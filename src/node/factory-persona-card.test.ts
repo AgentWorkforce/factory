@@ -96,7 +96,7 @@ describe('Factory persona cards', () => {
           name: definition.name,
           capabilities: Object.keys(definition.capabilities),
         }))
-        return { stop: async () => {}, done: Promise.resolve() }
+        return { stop: async () => {}, done: new Promise(() => {}) }
       },
     })
 
@@ -139,7 +139,7 @@ describe('Factory persona cards', () => {
       warn,
       serve(options) {
         registration = options.onRegistered
-        return { stop: async () => {}, done: Promise.resolve() }
+        return { stop: async () => {}, done: new Promise(() => {}) }
       },
     })
     const info = { name: definition.name, capabilities: Object.keys(definition.capabilities) }
@@ -186,7 +186,7 @@ describe('Factory persona cards', () => {
       },
       serve(options) {
         registration = options.onRegistered
-        return { stop: async () => {}, done: Promise.resolve() }
+        return { stop: async () => {}, done: new Promise(() => {}) }
       },
     })
     const info = { name: definition.name, capabilities: Object.keys(definition.capabilities) }
@@ -201,6 +201,47 @@ describe('Factory persona cards', () => {
       address: 'ext-factory-feature-guardian-overlap',
     })
     expect(attempts).toBe(2)
+  })
+
+  it('rejects card publication when node startup terminates before registration', async () => {
+    const definition = createFactoryNodeDefinition({
+      config: parseFactoryNodeConfig({ capabilities: ['spawn:codex'] }),
+      persona: { persona, baseUrl: 'https://relay.example', version: '1.0.0' },
+    })
+    let rejectDone!: (reason: unknown) => void
+    const done = new Promise<void>((_resolve, reject) => { rejectDone = reject })
+    const running = startFactoryNode({
+      definition,
+      connection: { nodeId: 'node-1', nodeToken: 'nt_live_test' },
+      cardPublisher: { publishAgentCard: vi.fn() },
+      serve() {
+        return { stop: async () => {}, done }
+      },
+    })
+    const startupError = new Error('registration credentials rejected')
+
+    rejectDone(startupError)
+
+    await expect(running.cardPublished).rejects.toBe(startupError)
+  })
+
+  it('rejects card publication on a pre-registration stop even if done has not settled', async () => {
+    const definition = createFactoryNodeDefinition({
+      config: parseFactoryNodeConfig({ capabilities: ['spawn:codex'] }),
+      persona: { persona, baseUrl: 'https://relay.example', version: '1.0.0' },
+    })
+    const running = startFactoryNode({
+      definition,
+      connection: { nodeId: 'node-1', nodeToken: 'nt_live_test' },
+      cardPublisher: { publishAgentCard: vi.fn() },
+      serve() {
+        return { stop: async () => {}, done: new Promise(() => {}) }
+      },
+    })
+
+    await running.stop()
+
+    await expect(running.cardPublished).rejects.toThrow(/stopped before persona card publication/)
   })
 
   it('verifies an idempotent registration conflict and returns the existing relay address', async () => {

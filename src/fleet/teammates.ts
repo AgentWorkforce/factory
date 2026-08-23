@@ -119,7 +119,7 @@ export interface AskTeammateResult {
  * separate workspaces independent. Backends that do not expose a stream
  * identity fall back to their client object.
  */
-type AskClaim = 'waiting' | 'timed-out-uncorrelated'
+type AskClaim = 'waiting' | 'timed-out-uncorrelated' | 'duplicate-uncorrelated'
 type AskClaimScope = string | object
 
 const objectScopedAsks = new WeakMap<object, Map<string, AskClaim>>()
@@ -179,6 +179,8 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
     let claimRegistry: Map<string, AskClaim> | undefined
     let claimed: string[] = []
     let timedOutClaim: string[] = []
+    let deliveryOperationSettled = false
+    let duplicateDeliveryPossible = false
     const release = () => {
       deleteClaims(claimScope, claimRegistry, claimed)
       claimed = []
@@ -190,6 +192,12 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       timedOutClaim = claimed
       claimed = []
     }
+    const quarantineDuplicate = () => {
+      if (claimRegistry) {
+        for (const key of claimed) claimRegistry.set(key, 'duplicate-uncorrelated')
+      }
+      claimed = []
+    }
     const releaseTimedOutClaim = () => {
       deleteClaims(claimScope, claimRegistry, timedOutClaim)
       timedOutClaim = []
@@ -199,7 +207,13 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       settled = true
       clearTimeout(timeout)
       unsubscribe()
-      release()
+      // A reply can race ahead of waitForInjected's delivery receipt. Keep the
+      // uncorrelated pair claimed until that waiter has stopped, because its
+      // readiness path may still resend this first question in the meantime.
+      if (deliveryOperationSettled) {
+        if (duplicateDeliveryPossible) quarantineDuplicate()
+        else release()
+      }
       resolve(result)
     }
     const fail = (error: unknown) => {
@@ -251,9 +265,13 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
             ? `askTeammate already has an unanswered question to "${teammate.name}" as "${replyTarget}". ` +
               'A reply carries no correlation id, so it cannot be attributed to one of two open ' +
               'questions; await the first before asking again.'
-            : `askTeammate is quarantining "${teammate.name}" for "${replyTarget}" after a timed-out ` +
-              'question. Replies carry no correlation id and have no maximum delay, so retry is ' +
-              'unsafe for this message stream until the protocol supplies correlation.',
+            : existingClaim === 'timed-out-uncorrelated'
+              ? `askTeammate is quarantining "${teammate.name}" for "${replyTarget}" after a timed-out ` +
+                'question. Replies carry no correlation id and have no maximum delay, so retry is ' +
+                'unsafe for this message stream until the protocol supplies correlation.'
+              : `askTeammate is quarantining "${teammate.name}" for "${replyTarget}" after a duplicate ` +
+                'delivery was accepted. Its later reply cannot be distinguished from a fresh answer, so ' +
+                'retry is unsafe for this message stream until the protocol supplies correlation.',
         )
       }
       for (const key of askKeys) claimRegistry.set(key, 'waiting')
@@ -285,7 +303,8 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       deliveryState = 'pending'
       try {
         if (fleet.waitForInjected) {
-          await fleet.waitForInjected(send, { timeoutMs: Math.max(1, deadline - Date.now()) })
+          const receipt = await fleet.waitForInjected(send, { timeoutMs: Math.max(1, deadline - Date.now()) })
+          duplicateDeliveryPossible = receipt.duplicateDeliveryPossible === true
         } else {
           await fleet.sendMessage(send)
         }
@@ -300,6 +319,14 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
           return
         }
         throw error
+      } finally {
+        deliveryOperationSettled = true
+        // A timed-out confirmed/ambiguous send moved the keys into quarantine;
+        // only an early successful reply still owns `claimed` here.
+        if (settled && timedOutClaim.length === 0) {
+          if (duplicateDeliveryPossible) quarantineDuplicate()
+          else release()
+        }
       }
     })().catch(fail)
   })

@@ -407,6 +407,101 @@ describe('askTeammate', () => {
     await expect(asked).resolves.toMatchObject({ reply: { body: 'answer after send' } })
   })
 
+  it('retains the pair claim after an early reply until delivery retries have stopped', async () => {
+    let resolveFirstDelivery!: (value: { eventId: string; targets: string[] }) => void
+    let firstDelivery = true
+    class PendingDeliveryFleetClient extends FakeFleetClient {
+      override async waitForInjected(
+        input: Parameters<FakeFleetClient['waitForInjected']>[0],
+      ): Promise<{ eventId: string; targets: string[] }> {
+        if (!firstDelivery) return await super.waitForInjected(input)
+        firstDelivery = false
+        this.messages.push(input)
+        return await new Promise((resolve) => { resolveFirstDelivery = resolve })
+      }
+    }
+    const fleet = new PendingDeliveryFleetClient()
+    fleet.teammates.push({
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native',
+    })
+    const first = askTeammate(fleet, {
+      from: 'factory-worker', question: 'q1', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'early answer to q1' })
+    await expect(first).resolves.toMatchObject({ reply: { body: 'early answer to q1' } })
+
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })).rejects.toThrow(/already has an unanswered question/u)
+
+    resolveFirstDelivery({ eventId: 'event-1', targets: ['infra-agent'] })
+    await Promise.resolve()
+    await Promise.resolve()
+    const second = askTeammate(fleet, {
+      from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(2))
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answer to q2' })
+    await expect(second).resolves.toMatchObject({ reply: { body: 'answer to q2' } })
+  })
+
+  it('quarantines the pair after an accepted resend can produce a duplicate reply', async () => {
+    let resolveFirstDelivery!: (value: {
+      eventId: string
+      targets: string[]
+      duplicateDeliveryPossible?: true
+    }) => void
+    let firstDelivery = true
+    class DuplicateDeliveryFleetClient extends FakeFleetClient {
+      override async waitForInjected(
+        input: Parameters<FakeFleetClient['waitForInjected']>[0],
+      ): Promise<{ eventId: string; targets: string[]; duplicateDeliveryPossible?: true }> {
+        if (!firstDelivery) return await super.waitForInjected(input)
+        firstDelivery = false
+        this.messages.push(input)
+        return await new Promise((resolve) => { resolveFirstDelivery = resolve })
+      }
+    }
+    const fleet = new DuplicateDeliveryFleetClient()
+    fleet.teammates.push({
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native',
+    })
+    const first = askTeammate(fleet, {
+      from: 'factory-worker', question: 'q1', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'first answer to q1' })
+    await expect(first).resolves.toMatchObject({ reply: { body: 'first answer to q1' } })
+
+    resolveFirstDelivery({
+      eventId: 'event-1',
+      targets: ['infra-agent'],
+      duplicateDeliveryPossible: true,
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })).rejects.toThrow(/after a duplicate delivery was accepted/u)
+
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'duplicate answer to q1' })
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker', question: 'q3', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })).rejects.toThrow(/after a duplicate delivery was accepted/u)
+    expect(fleet.messages).toHaveLength(1)
+  })
+
   // A reply to an abandoned question is indistinguishable from a reply to a
   // fresh one, and an unrelated DM cannot prove which message is the old
   // answer. A confirmed timed-out send therefore stays quarantined for this
