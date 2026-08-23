@@ -13,6 +13,7 @@ import type { VerificationGate } from './environments/verification-pipeline'
 import type { CostLedger } from './cost/ledger'
 import type { TicketDispatchDelivery } from './delivery/ticket-dispatch'
 import type { FleetControlPlaneStatus } from './fleet/control-plane-circuit'
+import type { FleetConnectStatus } from './ports/fleet'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -184,6 +185,15 @@ export interface FactoryLoopHeartbeat {
   dispatchCapacity?: FactoryDispatchCapacityStatus
   /** Daemon-owned dispatch admission state; status readers must prefer this over a fresh local Factory instance. */
   fleetControlPlane?: FleetControlPlaneStatus
+  /**
+   * Whether the fleet EVENT SOCKET is connected -- the dial that makes this
+   * Factory's agent `online`. Absent when the backend has no socket.
+   *
+   * Distinct from `eventListener`, which is the orchestrator's ISSUE
+   * subscription. Conflating the two is how a fleet client that registered an
+   * agent and never connected read as healthy on every surface.
+   */
+  fleetConnect?: FleetConnectStatus
   /**
    * Redacted projection of this record, safe to serve unauthenticated (#295).
    *
@@ -370,6 +380,20 @@ export interface FactoryPublicEventListenerHealth {
  * probe failure names sockets and paths — so only the state, the counters and
  * the retry instant cross.
  */
+/**
+ * Unauthenticated view of the fleet socket. State and counters only.
+ *
+ * `lastError` is deliberately absent for the same reason it is absent from the
+ * control-plane block: it stays behind the authenticated `/evidence`.
+ */
+export interface FactoryPublicFleetConnectHealth {
+  state: FleetConnectStatus['state'] | 'unknown'
+  attempts?: number
+  lastAttemptAtMs?: number
+  lastConnectedAtMs?: number
+  lastFailureAtMs?: number
+}
+
 export interface FactoryPublicFleetControlPlaneHealth {
   state: FleetControlPlaneStatus['state'] | 'unknown'
   consecutiveFailures: number
@@ -410,6 +434,8 @@ export interface FactoryPublicHealth {
   readinessReconcile?: FactoryPublicReadinessReconcileHealth
   eventListener?: FactoryPublicEventListenerHealth
   fleetControlPlane?: FactoryPublicFleetControlPlaneHealth
+  /** Fleet event socket. NOT dispatch-gating: see DISPATCH_GATING_SUBSYSTEMS. */
+  fleetConnect?: FactoryPublicFleetConnectHealth
   dispatchCapacity?: FactoryPublicDispatchCapacityHealth
 }
 

@@ -132,6 +132,31 @@ export type AgentUsage = {
 }
 export type FleetTrackedAgent = { invocationId?: string; node?: string }
 
+/** Lifecycle of the fleet event socket: the dial that makes this agent `online`. */
+export type FleetConnectState = 'never-attempted' | 'connecting' | 'connected' | 'failed'
+
+/**
+ * Why the fleet event subscription is (or is not) live.
+ *
+ * This exists because the dial had NO status anywhere. `#ensureEventSubscription`
+ * starts `#subscribeEvents()` with `void ... .catch()` and reports a rejection by
+ * calling `#log` only, so a fleet client that registered an agent and then failed
+ * to connect looked identical to a healthy one on every surface. Callers read
+ * `eventListener` and saw `subscribed` -- but that is the orchestrator's ISSUE
+ * subscription, a different subsystem entirely, which is how a broken fleet
+ * socket stayed invisible while every instrument reported healthy.
+ */
+export interface FleetConnectStatus {
+  state: FleetConnectState
+  /** How many times a subscription has been started, including the current one. */
+  attempts: number
+  lastAttemptAtMs?: number
+  lastConnectedAtMs?: number
+  lastFailureAtMs?: number
+  /** Reduced to `Name (CODE)`; never a raw transport message. */
+  lastError?: string
+}
+
 export interface FleetClient {
   /** Backend-wide placement locality, used when recovering a spawn ack crash gap. */
   readonly placementLocality?: 'local' | 'remote'
@@ -157,6 +182,12 @@ export interface FleetClient {
   }): Promise<SpawnResult>
   release(name: string, reason?: string): Promise<void>
   roster(): Promise<RosterEntry>
+  /**
+   * Whether this backend's event socket is connected, and why not when it is not.
+   * Optional: backends with no socket (the internal fleet) simply omit it, and an
+   * absent value is reported as such rather than being invented as healthy.
+   */
+  fleetConnectStatus?(): FleetConnectStatus
   resolveAgentPid?(name: string): Promise<AgentPidResolution>
   protectedPids?(): Promise<number[]>
   sendMessage(input: SendInput): Promise<void>
