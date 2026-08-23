@@ -735,6 +735,7 @@ export class RelayFleetClient implements FleetClient {
     if (this.#registrationAttempts > MAX_REGISTRATION_ATTEMPTS) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'MAX_ATTEMPTS',
         `gave up after ${MAX_REGISTRATION_ATTEMPTS} registration attempts`,
       )
     }
@@ -886,6 +887,7 @@ export class RelayFleetClient implements FleetClient {
       if (!agentId) {
         throw new FactoryAgentRegistrationError(
           this.#agentName,
+          'RECORD_UNREADABLE',
           `name is taken but the record could not be read back: ${errorMessage(lastError)}`,
           { cause: lastError },
         )
@@ -899,6 +901,7 @@ export class RelayFleetClient implements FleetClient {
         if (error instanceof FactoryAgentRegistrationError) throw error
         throw new FactoryAgentRegistrationError(
           this.#agentName,
+          'TAKEOVER_FAILED',
           `could not reclaim the existing identity: ${errorMessage(error)}`,
           { cause: error },
         )
@@ -906,6 +909,7 @@ export class RelayFleetClient implements FleetClient {
     }
     throw new FactoryAgentRegistrationError(
       this.#agentName,
+      'TAKEOVER_EXHAUSTED',
       `could not reclaim the existing identity: ${errorMessage(lastError)}`,
       { cause: lastError },
     )
@@ -926,6 +930,7 @@ export class RelayFleetClient implements FleetClient {
     if (status !== 'offline') {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'STATUS_NOT_OFFLINE',
         `refusing to take over agent in status "${status ?? 'unknown'}"; another factory may still hold this identity`,
       )
     }
@@ -945,6 +950,7 @@ export class RelayFleetClient implements FleetClient {
     } catch (error) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_UNREADABLE',
         `could not read presence to confirm the agent is not live: ${errorMessage(error)}`,
         { cause: error },
       )
@@ -952,6 +958,7 @@ export class RelayFleetClient implements FleetClient {
     if (!Array.isArray(presence)) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_NOT_A_LIST',
         'presence did not return a list, so the agent cannot be confirmed offline',
       )
     }
@@ -961,6 +968,7 @@ export class RelayFleetClient implements FleetClient {
     if (!entry) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_MISSING',
         'presence does not list this agent, so it cannot be confirmed offline',
       )
     }
@@ -968,12 +976,14 @@ export class RelayFleetClient implements FleetClient {
     if (seenStatus === undefined) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_STATUS_MISSING',
         'presence reported no status for this agent, so it cannot be confirmed offline',
       )
     }
     if (LIVE_AGENT_STATUSES.has(seenStatus)) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_REPORTS_LIVE',
         `presence reports this agent as "${seenStatus}"; another factory may still hold this identity`,
       )
     }
@@ -1558,13 +1568,48 @@ function previewReference(value: unknown, placementNode?: string): PreviewRefere
  * Registration could not converge on a usable agent identity. Named so a
  * six-day silent 409 loop surfaces as one actionable failure instead.
  */
+/**
+ * Which of the ten registration failures happened.
+ *
+ * These exist to survive redaction. `describeControlPlaneError` reduces a cause
+ * to `${name}${code}` and appends the code ONLY when it matches
+ * /^[A-Z0-9_]{1,80}$/ -- so a bare `FactoryAgentRegistrationError` is what every
+ * published surface showed, with the sentence naming the actual throw site
+ * discarded. Production reported exactly that string and it could not be told
+ * whether the name was taken, presence was unreadable, the record was not
+ * offline, or the takeover itself failed.
+ *
+ * A constrained token carries none of the message's risk: no transport text, no
+ * URL, no credential. The reducer already validates the shape, so this widens
+ * the answer without widening the exposure.
+ */
+export type FactoryAgentRegistrationErrorCode =
+  | 'MAX_ATTEMPTS'
+  | 'RECORD_UNREADABLE'
+  | 'STATUS_NOT_OFFLINE'
+  | 'PRESENCE_UNREADABLE'
+  | 'PRESENCE_NOT_A_LIST'
+  | 'PRESENCE_MISSING'
+  | 'PRESENCE_STATUS_MISSING'
+  | 'PRESENCE_REPORTS_LIVE'
+  | 'TAKEOVER_FAILED'
+  | 'TAKEOVER_EXHAUSTED'
+
 export class FactoryAgentRegistrationError extends Error {
   readonly agentName: string
+  /** Uppercase token so `describeControlPlaneError` renders it after the name. */
+  readonly code: FactoryAgentRegistrationErrorCode
 
-  constructor(agentName: string, detail: string, options?: { cause?: unknown }) {
+  constructor(
+    agentName: string,
+    code: FactoryAgentRegistrationErrorCode,
+    detail: string,
+    options?: { cause?: unknown },
+  ) {
     super(`Factory agent "${agentName}" could not register with the relay workspace: ${detail}`)
     this.name = 'FactoryAgentRegistrationError'
     this.agentName = agentName
+    this.code = code
     if (options && 'cause' in options) {
       ;(this as Error & { cause?: unknown }).cause = options.cause
     }

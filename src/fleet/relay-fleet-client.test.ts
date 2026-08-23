@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
+import { describeControlPlaneError } from './control-plane-circuit'
 import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, ReadOnlyFleetIdentityError, RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
 import { runFleetCli } from '../cli/fleet'
 
@@ -1897,5 +1898,53 @@ describe('RelayFleetClient fleet connect status', () => {
     expect(lastError).toBe('FleetSocketError (ECONNREFUSED)')
     expect(lastError).not.toContain('at_live_')
     expect(lastError).not.toContain('wss://')
+  })
+})
+
+/**
+ * Production reported `fleetControlPlane.lastError: "FactoryAgentRegistrationError"`
+ * and that string was the whole answer: ten different throw sites reduce to it,
+ * and the sentence naming which one fired is discarded by redaction. These pin
+ * the code through the SAME reducer every published surface uses.
+ */
+describe('registration failures survive redaction with their cause', () => {
+  it('renders the discriminating code after the error name', () => {
+    const error = new FactoryAgentRegistrationError(
+      'factory-cloud-7d6e3ca1',
+      'PRESENCE_MISSING',
+      'presence does not list this agent, so it cannot be confirmed offline',
+    )
+    expect(describeControlPlaneError(error)).toBe('FactoryAgentRegistrationError (PRESENCE_MISSING)')
+  })
+
+  /**
+   * CONTROL. Distinct sites must reduce to DISTINCT strings, or the code adds a
+   * suffix without adding an answer — which is the bug being fixed, one level up.
+   */
+  it('distinguishes the throw sites from one another', () => {
+    const rendered = (
+      [
+        'STATUS_NOT_OFFLINE',
+        'PRESENCE_MISSING',
+        'PRESENCE_UNREADABLE',
+        'TAKEOVER_FAILED',
+        'MAX_ATTEMPTS',
+      ] as const
+    ).map((code) => describeControlPlaneError(new FactoryAgentRegistrationError('a', code, 'detail')))
+    expect(new Set(rendered).size).toBe(rendered.length)
+  })
+
+  /** The detail sentence may embed a transport message, so it must NOT survive. */
+  it('still withholds the message the code replaces', () => {
+    const rendered = describeControlPlaneError(
+      new FactoryAgentRegistrationError(
+        'a',
+        'TAKEOVER_FAILED',
+        'could not reclaim the existing identity: POST https://relay.example/v1/agents?token=at_live_abcdef0123456789 failed',
+      ),
+    )
+    expect(rendered).toBe('FactoryAgentRegistrationError (TAKEOVER_FAILED)')
+    expect(rendered).not.toContain('at_live_')
+    expect(rendered).not.toContain('https://')
   })
 })
