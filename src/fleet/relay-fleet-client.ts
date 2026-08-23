@@ -43,6 +43,12 @@ export interface RelayClientFactoryOptions {
 export interface RelayFleetClientOptions {
   /** Agent-scoped messaging surface. When provided, identity bootstrap is skipped. */
   messaging?: RelayMessaging
+  /**
+   * Stable identity for an injected inbound message stream when the messaging
+   * surface cannot report its Relay workspace. Reuse it across wrappers for
+   * the same stream; use distinct values only for known-distinct streams.
+   */
+  messageStreamScope?: string | object
   workspaceKey?: string
   agentToken?: string
   /** Workspace agent identity the factory registers/rotates for itself. */
@@ -551,6 +557,15 @@ export class RelayFleetClient implements FleetClient {
       const messaging = await this.#ensureMessaging()
       const baseUrl = canonicalRelayBaseUrl(this.#options.baseUrl)
 
+      const explicitScope = this.#options.messageStreamScope
+      if (this.#options.messaging && explicitScope !== undefined) {
+        if (typeof explicitScope === 'string') {
+          const fingerprint = createHash('sha256').update(explicitScope).digest('base64url')
+          return `relay:${baseUrl}:explicit:${fingerprint}`
+        }
+        return explicitScope
+      }
+
       try {
         const workspace = await messaging.workspace.info()
         const workspaceId = typeof workspace.id === 'string' ? workspace.id.trim() : ''
@@ -562,9 +577,12 @@ export class RelayFleetClient implements FleetClient {
         this.#log(`Unable to resolve Relay workspace identity for teammate claims: ${errorMessage(error)}`)
       }
 
-      // An injected surface is the only authoritative scope when bootstrap and
-      // its credentials were intentionally bypassed.
-      if (this.#options.messaging) return messaging
+      // Separate injected wrappers are not evidence of separate streams. If
+      // the surface cannot identify its workspace and the caller supplied no
+      // explicit scope, fail closed by sharing one endpoint-scoped registry.
+      // This may conservatively serialize identical participants in two legacy
+      // workspaces, but it cannot admit two waiters for one unknown stream.
+      if (this.#options.messaging) return `relay:${baseUrl}:injected:unknown`
 
       const env = this.#options.env
       const agentToken = resolveRelayAgentToken({

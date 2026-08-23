@@ -45,6 +45,7 @@ class FakeMessaging {
   meName = 'relay-controller'
   workspaceId = 'workspace-test'
   workspaceInfoCalls = 0
+  workspaceInfoError: Error | undefined
 
   readonly agents = {
     list: async (filter: unknown) => {
@@ -69,6 +70,7 @@ class FakeMessaging {
   readonly workspace = {
     info: async () => {
       this.workspaceInfoCalls += 1
+      if (this.workspaceInfoError) throw this.workspaceInfoError
       return { id: this.workspaceId }
     },
   }
@@ -837,6 +839,32 @@ describe('RelayFleetClient', () => {
     await expect(two.messageStreamIdentity()).resolves.toBe(oneIdentity)
     await expect(other.messageStreamIdentity()).resolves.not.toBe(await one.messageStreamIdentity())
     expect(messagingOne.workspaceInfoCalls).toBe(1)
+  })
+
+  it('shares a conservative fallback across unidentified injected wrappers', async () => {
+    const messagingOne = new FakeMessaging()
+    const messagingTwo = new FakeMessaging()
+    messagingOne.workspaceInfoError = new Error('workspace.info unavailable')
+    messagingTwo.workspaceInfoError = new Error('workspace.info unavailable')
+
+    const one = createClient(messagingOne)
+    const two = createClient(messagingTwo)
+
+    await expect(one.messageStreamIdentity()).resolves.toBe(await two.messageStreamIdentity())
+  })
+
+  it('preserves known-distinct injected streams through explicit scopes', async () => {
+    const messagingOne = new FakeMessaging()
+    const messagingTwo = new FakeMessaging()
+    messagingOne.workspaceInfoError = new Error('workspace.info unavailable')
+    messagingTwo.workspaceInfoError = new Error('workspace.info unavailable')
+
+    const one = createClient(messagingOne, { messageStreamScope: 'workspace-one' })
+    const two = createClient(messagingTwo, { messageStreamScope: 'workspace-two' })
+
+    await expect(one.messageStreamIdentity()).resolves.not.toBe(await two.messageStreamIdentity())
+    expect(messagingOne.workspaceInfoCalls).toBe(0)
+    expect(messagingTwo.workspaceInfoCalls).toBe(0)
   })
 
   it('confirms injected tasks with the sent message id', async () => {
