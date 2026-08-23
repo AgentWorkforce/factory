@@ -921,44 +921,40 @@ export class RelayFleetClient implements FleetClient {
     }
 
     // Presence is the canonical liveness signal, and the agent record can be
-    // stale. Everything below fails CLOSED: only a presence row we actually
-    // read, for this agent, carrying a status we recognise as not-live, may
-    // authorise a seizure. A request that failed, a body we cannot parse, or a
-    // missing row is absence of evidence — not evidence of death.
+    // stale. Two outcomes are routed apart here, and collapsing them swaps one
+    // wrong conclusion for another:
     //
-    // This asymmetry is deliberate. Refusing to boot costs us a recoverable
-    // outage of our own; seizing a live agent's credential strands another
-    // running process and takes the very token it would need to recover.
-    let presence: unknown
-    try {
-      presence = await agents.presence()
-    } catch (error) {
-      throw new FactoryAgentRegistrationError(
-        this.#agentName,
-        `could not read presence to confirm the agent is not live: ${errorMessage(error)}`,
-        { cause: error },
-      )
-    }
-    if (!Array.isArray(presence)) {
-      throw new FactoryAgentRegistrationError(
-        this.#agentName,
-        'presence did not return a list, so the agent cannot be confirmed offline',
-      )
-    }
+    //   presence UNREADABLE (threw, timed out, or came back as something other
+    //   than a list) — evidence of nothing. Fails CLOSED, because seizing a
+    //   live agent's credential strands another running process and takes the
+    //   very token it would need to recover.
+    //
+    //   presence READABLE and omitting this agent — the strongest evidence the
+    //   engine can give that the agent is offline. Proceeds. Treating this as
+    //   inconclusive is what made an orphaned row permanently unreclaimable
+    //   (factory-cloud#55): every registration attempt burned the bounded
+    //   budget, which only a success resets, and dispatch stayed gated.
+    //
+    // A row that IS listed still has to clear the status check below: presence
+    // listing us is the case where the engine may still be holding the
+    // identity, so an unrecognised or missing status stays fail-closed.
+    const presence = await this.#readPresenceRows(agents)
     const entry = presence
       .map((row) => asRecord(row))
       .find((row) => readString(row, 'agentName', 'agent_name', 'name') === this.#agentName)
     if (!entry) {
-      throw new FactoryAgentRegistrationError(
-        this.#agentName,
-        'presence does not list this agent, so it cannot be confirmed offline',
-      )
+      // Confirmed absence. Note this is also the correct reading of an empty
+      // list: a single-agent cloud factory whose only row is the dead one sees
+      // exactly that, and refusing it would re-latch the outage in its most
+      // common shape.
+      this.#log(`Presence is readable and does not list ${this.#agentName}; treating the existing record as offline`)
+      return
     }
     const seenStatus = readString(entry, 'status')
     if (seenStatus === undefined) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
-        'presence reported no status for this agent, so it cannot be confirmed offline',
+        'presence lists this agent with no status, so it cannot be confirmed offline',
       )
     }
     if (LIVE_AGENT_STATUSES.has(seenStatus)) {
@@ -967,6 +963,35 @@ export class RelayFleetClient implements FleetClient {
         `presence reports this agent as "${seenStatus}"; another factory may still hold this identity`,
       )
     }
+  }
+
+  /**
+   * Read the presence list, or fail closed.
+   *
+   * Every failure here means presence could not be read at all — a transport
+   * error, a timeout, or a body that is not a list. None of them say anything
+   * about whether the agent is alive, so none of them may authorise a seizure.
+   * The messages all name presence as UNREADABLE so an operator can tell this
+   * apart from a presence list that was read and simply did not list us.
+   */
+  async #readPresenceRows(agents: RelayMessaging['agents']): Promise<unknown[]> {
+    let presence: unknown
+    try {
+      presence = await agents.presence()
+    } catch (error) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        `presence is unreadable, so the agent cannot be confirmed offline: ${errorMessage(error)}`,
+        { cause: error },
+      )
+    }
+    if (!Array.isArray(presence)) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        'presence is unreadable (it did not return a list), so the agent cannot be confirmed offline',
+      )
+    }
+    return presence
   }
 
   async #takeOverAgent(workspaceKey: string, expectedAgentId: string): Promise<string> {

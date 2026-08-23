@@ -1378,13 +1378,17 @@ describe('RelayFleetClient', () => {
     },
   )
 
-  // A stale `offline` record plus an unreadable presence must never authorise a
+  // A stale `offline` record plus an UNREADABLE presence must never authorise a
   // seizure: the cost of being wrong is stranding a LIVE factory's credential,
   // and the token taken is the one it would have needed to recover.
+  //
+  // "Unreadable" means exactly that — the request failed, or the body was not a
+  // list. A presence list that WAS read and simply omits this agent is the
+  // opposite case and is covered by the must-fire tests below; conflating the
+  // two is the defect this pair exists to pin.
   it.each([
     ['presence request throws', () => { throw new Error('presence unavailable') }],
     ['presence returns a non-list', () => ({ not: 'a list' })],
-    ['presence omits this agent', () => [{ agentName: 'someone-else', status: 'offline' }]],
     ['presence entry carries no status', () => [{ agentName: 'factory' }]],
   ])('fails closed and does not take over when %s', async (_label, impl) => {
     const messaging = new FakeMessaging()
@@ -1411,9 +1415,97 @@ describe('RelayFleetClient', () => {
 
     const error = await fleet.roster().then(() => undefined, (err: unknown) => err)
     expect((error as Error).name).toBe('FactoryAgentRegistrationError')
-    expect((error as Error).message).toMatch(/cannot be confirmed offline|could not read presence/)
+    expect((error as Error).message).toMatch(/cannot be confirmed offline/)
+    // The refusal must not claim absence from presence — that is the other,
+    // now-permitted case, and an operator has to be able to tell them apart.
+    expect((error as Error).message).not.toMatch(/does not list this agent/)
     // The seizure must never have been attempted.
     expect(takeovers).toBe(0)
+  })
+
+  // The must-fire half of the pair. Absence from a presence list we actually
+  // READ is the strongest evidence the engine can give that the agent is
+  // offline; refusing to conclude it is what left an orphaned row permanently
+  // unreclaimable and gated dispatch (factory-cloud#55). The empty-list arm is
+  // the shape a single-agent cloud factory sees, where the dead row is the only
+  // agent there is.
+  it.each([
+    ['presence lists only other agents', () => [{ agentName: 'someone-else', status: 'online' }]],
+    ['presence is readable and empty', () => []],
+  ])('reclaims the identity when %s', async (_label, impl) => {
+    const messaging = new FakeMessaging()
+    const { agents, presenceImpl } = deprecatedAliasAgents()
+    await (agents.register as (i: { name: string }) => Promise<unknown>)({ name: 'factory' })
+    presenceImpl.value = impl as () => unknown
+    const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = []
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      nodeId: 'node_test_1',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      fetch: (async (url: string, init: { body: string }) => {
+        calls.push({ url, body: JSON.parse(init.body) as Record<string, unknown> })
+        return new Response(
+          JSON.stringify({ ok: true, data: { agent_id: 'agent-1', name: 'factory', token: 'at_live_seized' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }) as unknown as typeof globalThis.fetch,
+      createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+    })
+
+    await expect(fleet.roster()).resolves.toBeDefined()
+
+    // Resolving is not enough on its own: the takeover must actually have been
+    // issued, for this record, rather than the conflict being routed elsewhere.
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.url).toBe('https://cast.agentrelay.com/v1/agents/factory/takeover')
+    expect(calls[0]?.body.expected_agent_id).toBe('agent-1')
+  })
+
+  // Control arm. Both presence shapes run through ONE harness that differs in
+  // nothing but the presence stub, so no setup difference can absorb a swap of
+  // the two branches. The `not.toBe` assertion additionally kills the inert
+  // fixture — the failure mode where both arms take the same path for a reason
+  // unrelated to presence, which is exactly what would let a swapped
+  // implementation pass a pair of separately-written tests.
+  it('separates readable-and-absent from unreadable presence, and would notice a swap', async () => {
+    const run = async (impl: () => unknown): Promise<{ seized: boolean; message: string }> => {
+      const messaging = new FakeMessaging()
+      const { agents, presenceImpl } = deprecatedAliasAgents()
+      await (agents.register as (i: { name: string }) => Promise<unknown>)({ name: 'factory' })
+      presenceImpl.value = impl
+      const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+      let takeovers = 0
+      const fleet = new RelayFleetClient({
+        workspaceKey: 'rk_live_test',
+        env: {},
+        sleep: immediateSleep,
+        pollIntervalMs: 0,
+        fetch: (async () => {
+          takeovers += 1
+          return new Response(
+            JSON.stringify({ ok: true, data: { agent_id: 'agent-1', name: 'factory', token: 'at_live_seized' } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }) as unknown as typeof globalThis.fetch,
+        createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+      })
+      const error = await fleet.roster().then(() => undefined, (err: unknown) => err)
+      return { seized: takeovers > 0, message: error instanceof Error ? error.message : '' }
+    }
+
+    const absent = await run(() => [{ agentName: 'someone-else', status: 'online' }])
+    const unreadable = await run(() => { throw new Error('presence unavailable') })
+
+    expect(absent.seized).toBe(true)
+    expect(unreadable.seized).toBe(false)
+    // Fails if the harness cannot tell the two apart at all.
+    expect(absent.seized).not.toBe(unreadable.seized)
+    // And the refusal has to say WHICH of the two it was.
+    expect(unreadable.message).toMatch(/presence is unreadable/)
+    expect(absent.message).toBe('')
   })
 
   it('re-reads the agent id and retries once when the identity moved mid-takeover', async () => {
