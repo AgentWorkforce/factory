@@ -1192,6 +1192,58 @@ describe('GhCliGithubWriteback', () => {
     await expect(github.setStatus(githubIssue, 'ready')).resolves.toBe('acknowledged')
   })
 
+  it('does not attribute a park that another actor removes and recreates after the edit', async () => {
+    const labels = new Set(['factory:in-progress'])
+    const events: string[] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit') {
+          labels.delete('factory:in-progress')
+          labels.add('factory:human-review')
+          events.push('1\tlabeled\tfactory:human-review\tfactory-bot')
+          events.push('2\tunlabeled\tfactory:in-progress\tfactory-bot')
+          labels.delete('factory:human-review')
+          labels.add('factory:human-review')
+          events.push('3\tunlabeled\tfactory:human-review\tother-user')
+          events.push('4\tlabeled\tfactory:human-review\tother-user')
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.setStatus(githubIssue, 'human-review')).resolves.toBe('acknowledged')
+  })
+
+  it('does not attribute ready when another actor recreates the final removal', async () => {
+    const labels = new Set(['factory:human-review'])
+    const events: string[] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit') {
+          labels.delete('factory:human-review')
+          events.push('1\tunlabeled\tfactory:human-review\tfactory-bot')
+          labels.add('factory:human-review')
+          labels.delete('factory:human-review')
+          events.push('2\tlabeled\tfactory:human-review\tother-user')
+          events.push('3\tunlabeled\tfactory:human-review\tother-user')
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.setStatus(githubIssue, 'ready')).resolves.toBe('acknowledged')
+  })
+
   it.each([
     { status: 'ready' as const, labels: [] },
     { status: 'in-progress' as const, labels: ['factory:in-progress'] },

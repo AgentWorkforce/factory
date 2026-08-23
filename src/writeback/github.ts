@@ -429,12 +429,23 @@ export class GhCliGithubWriteback implements GithubWriteback {
     const expected = githubStatusTransitionEvent(from, to)
     if (!expected) return false
     const events = await this.#issueLabelEvents(ref).catch(() => [])
-    return events.some((event) =>
-      !baseline.eventIds.has(event.id)
-      && event.actor === baseline.actor
-      && event.event === expected.event
-      && event.label === expected.label,
+    const statusLabels = new Set(Object.values(FACTORY_GITHUB_STATUS_LABELS).map((label) => label.name))
+    const newStatusEvents = events.filter((event) =>
+      !baseline.eventIds.has(event.id) && statusLabels.has(event.label),
     )
+    let definingIndex = -1
+    for (let index = newStatusEvents.length - 1; index >= 0; index -= 1) {
+      const event = newStatusEvents[index]
+      if (event?.event === expected.event && event.label === expected.label) {
+        definingIndex = index
+        break
+      }
+    }
+    if (definingIndex < 0 || newStatusEvents[definingIndex]?.actor !== baseline.actor) return false
+    // The matching event is not enough if another actor later rewrites any
+    // Factory status label before final-state confirmation. In that case the
+    // visible status was recreated/superseded by the later actor.
+    return newStatusEvents.slice(definingIndex + 1).every((event) => event.actor === baseline.actor)
   }
 
   async #issueLabelEvents(ref: { repo: string; number: number }): Promise<GithubLabelEvent[]> {
