@@ -1219,6 +1219,29 @@ describe('GhCliGithubWriteback', () => {
     await expect(github.setStatus(githubIssue, 'human-review')).resolves.toBe('acknowledged')
   })
 
+  it('attributes a park when another actor only removes the lower-priority stale label', async () => {
+    const labels = new Set(['factory:in-progress'])
+    const events: string[] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit') {
+          labels.add('factory:human-review')
+          events.push('1\tlabeled\tfactory:human-review\tfactory-bot')
+          labels.delete('factory:in-progress')
+          events.push('2\tunlabeled\tfactory:in-progress\tother-user')
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.setStatus(githubIssue, 'human-review')).resolves.toBe('applied')
+  })
+
   it('does not attribute ready when another actor recreates the final removal', async () => {
     const labels = new Set(['factory:human-review'])
     const events: string[] = []

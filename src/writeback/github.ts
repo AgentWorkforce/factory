@@ -73,6 +73,7 @@ interface GithubLabelEvent {
 interface GithubLabelReceiptBaseline {
   actor: string
   eventIds: Set<string>
+  statusLabels: Set<string>
 }
 
 type AppIssueConnectionWrite = GithubConnectionWrite & Required<Pick<
@@ -328,7 +329,7 @@ export class GhCliGithubWriteback implements GithubWriteback {
       }
       const editRequired = editArgs.length > 5
       const receiptBaseline = editRequired
-        ? await this.#labelReceiptBaseline(ref).catch(() => undefined)
+        ? await this.#labelReceiptBaseline(ref, labels).catch(() => undefined)
         : undefined
       if (editRequired) {
         await this.#run(editArgs)
@@ -373,7 +374,7 @@ export class GhCliGithubWriteback implements GithubWriteback {
     }
     const editRequired = editArgs.length > 5
     const receiptBaseline = editRequired
-      ? await this.#labelReceiptBaseline(ref).catch(() => undefined)
+      ? await this.#labelReceiptBaseline(ref, labels).catch(() => undefined)
       : undefined
     if (editRequired) {
       await this.#run(editArgs)
@@ -412,11 +413,19 @@ export class GhCliGithubWriteback implements GithubWriteback {
     )
   }
 
-  async #labelReceiptBaseline(ref: { repo: string; number: number }): Promise<GithubLabelReceiptBaseline> {
+  async #labelReceiptBaseline(
+    ref: { repo: string; number: number },
+    labels: ReadonlySet<string>,
+  ): Promise<GithubLabelReceiptBaseline> {
     const actor = (await this.#run(['api', 'user', '--jq', '.login'])).stdout.trim().toLowerCase()
     if (!actor) throw new Error('GitHub lifecycle receipt could not resolve the authenticated actor')
     const events = await this.#issueLabelEvents(ref)
-    return { actor, eventIds: new Set(events.map((event) => event.id)) }
+    const statusLabelNames = new Set(Object.values(FACTORY_GITHUB_STATUS_LABELS).map((label) => label.name))
+    return {
+      actor,
+      eventIds: new Set(events.map((event) => event.id)),
+      statusLabels: new Set([...labels].filter((label) => statusLabelNames.has(label))),
+    }
   }
 
   async #hasAuthoredStatusTransition(
@@ -433,19 +442,21 @@ export class GhCliGithubWriteback implements GithubWriteback {
     const newStatusEvents = events.filter((event) =>
       !baseline.eventIds.has(event.id) && statusLabels.has(event.label),
     )
-    let definingIndex = -1
-    for (let index = newStatusEvents.length - 1; index >= 0; index -= 1) {
-      const event = newStatusEvents[index]
-      if (event?.event === expected.event && event.label === expected.label) {
-        definingIndex = index
-        break
-      }
+    const effectiveLabels = new Set(baseline.statusLabels)
+    let definingEvent: GithubLabelEvent | undefined
+    for (const event of newStatusEvents) {
+      const before = githubStatusFromLabels(effectiveLabels)
+      if (event.event === 'labeled') effectiveLabels.add(event.label)
+      else effectiveLabels.delete(event.label)
+      const after = githubStatusFromLabels(effectiveLabels)
+      if (before !== to && after === to) definingEvent = event
     }
-    if (definingIndex < 0 || newStatusEvents[definingIndex]?.actor !== baseline.actor) return false
-    // The matching event is not enough if another actor later rewrites any
-    // Factory status label before final-state confirmation. In that case the
-    // visible status was recreated/superseded by the later actor.
-    return newStatusEvents.slice(definingIndex + 1).every((event) => event.actor === baseline.actor)
+    if (githubStatusFromLabels(effectiveLabels) !== to) return false
+    // Attribute the event that last made the confirmed effective status true,
+    // not later status-label cleanup that leaves the effective status intact.
+    return definingEvent?.actor === baseline.actor
+      && definingEvent.event === expected.event
+      && definingEvent.label === expected.label
   }
 
   async #issueLabelEvents(ref: { repo: string; number: number }): Promise<GithubLabelEvent[]> {
