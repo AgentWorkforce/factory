@@ -96,8 +96,7 @@ export interface AskTeammateResult {
 }
 
 /**
- * Claimed teammate pairs per backend: key -> earliest epoch ms at which the
- * key may be reused.
+ * Claimed teammate pairs per backend.
  *
  * `AgentMessage` carries no echoed request field on ANY backend -- there is no
  * reply-to, and `SendInput.data` is not reflected back -- so a reply can never
@@ -108,19 +107,20 @@ export interface AskTeammateResult {
  *   is refused rather than resolved with an answer that may not be its own.
  *   The key uses the RESOLVED teammate and is taken after discovery, so two
  *   callers passing the same skill query contend for one key.
- * - After a TIMEOUT the pair stays quarantined for a further `timeoutMs`,
- *   because the abandoned question's reply can still land and would satisfy a
- *   fresh waiter's predicate exactly. A reply later than that was already past
- *   what its caller was willing to wait for. This is a heuristic; the real fix
- *   is an observable correlation field, and when `AgentMessage` grows one this
- *   whole registry should be replaced by a requestId check.
+ * - After a TIMEOUT the pair stays quarantined until the abandoned question's
+ *   reply is observed and discarded. There is no safe time-based expiry: the
+ *   transport places no upper bound on a late reply, so even a very old answer
+ *   could satisfy a fresh waiter. When `AgentMessage` grows an observable
+ *   correlation field, this registry can be replaced by a requestId check.
  *
  * Scoped per `FleetClient` because two clients in one process address
  * different workspaces, where identical names cannot collide.
  */
-const inFlightAsks = new WeakMap<FleetClient, Map<string, number>>()
+type AskClaim = 'waiting' | 'draining-late-reply'
 
-function claimsFor(fleet: FleetClient): Map<string, number> {
+const inFlightAsks = new WeakMap<FleetClient, Map<string, AskClaim>>()
+
+function claimsFor(fleet: FleetClient): Map<string, AskClaim> {
   let claims = inFlightAsks.get(fleet)
   if (!claims) {
     claims = new Map()
@@ -151,15 +151,14 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
 
   return await new Promise<AskTeammateResult>((resolve, reject) => {
     let settled = false
-    let quarantineOnFail: number | undefined
+    let deliveryStarted = false
     let unsubscribe = () => {}
     let claimed: string | undefined
-    // `quarantine` holds the pair past a timeout; a normal settle frees it.
-    const release = (quarantineUntilMs?: number) => {
+    const release = (nextClaim?: AskClaim) => {
       if (!claimed) return
       const claims = claimsFor(fleet)
-      if (quarantineUntilMs === undefined) claims.delete(claimed)
-      else claims.set(claimed, quarantineUntilMs)
+      if (nextClaim === undefined) claims.delete(claimed)
+      else claims.set(claimed, nextClaim)
       claimed = undefined
     }
     const finish = (result: AskTeammateResult) => {
@@ -175,14 +174,22 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       settled = true
       clearTimeout(timeout)
       unsubscribe()
-      release(quarantineOnFail)
+      release()
       reject(error)
     }
     const timeout = setTimeout(() => {
-      // Quarantine, do not free: the abandoned question's reply can still
-      // arrive and would satisfy the next waiter on this pair exactly.
-      quarantineOnFail = Date.now() + timeoutMs
-      fail(new Error(`Timed out waiting for a reply from a teammate after ${timeoutMs}ms`))
+      if (settled) return
+      settled = true
+      if (deliveryStarted && claimed) {
+        // Keep the original listener armed as a drain. It is the only safe way
+        // to know when the uncorrelated abandoned reply can no longer poison a
+        // later ask on this pair.
+        release('draining-late-reply')
+      } else {
+        unsubscribe()
+        release()
+      }
+      reject(new Error(`Timed out waiting for a reply from a teammate after ${timeoutMs}ms`))
     }, timeoutMs)
 
     void (async () => {
@@ -204,19 +211,19 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       // listener is armed so two waiters can never both accept one reply.
       const askKey = `${agentKey(replyTarget)}\u0000${teammateKey(teammate)}`
       const claims = claimsFor(fleet)
-      const heldUntil = claims.get(askKey)
-      if (heldUntil !== undefined && heldUntil > Date.now()) {
+      const existingClaim = claims.get(askKey)
+      if (existingClaim !== undefined) {
         throw new Error(
-          heldUntil === Infinity
+          existingClaim === 'waiting'
             ? `askTeammate already has an unanswered question to "${teammate.name}" as "${replyTarget}". ` +
               'A reply carries no correlation id, so it cannot be attributed to one of two open ' +
               'questions; await the first before asking again.'
-            : `askTeammate is holding "${teammate.name}" for "${replyTarget}" after a timed-out ` +
-              'question, because that question\'s reply may still arrive and could not be told ' +
-              'apart from this one\'s; retry after the hold expires.',
+            : `askTeammate is quarantining "${teammate.name}" for "${replyTarget}" after a timed-out ` +
+              'question. Replies carry no correlation id and have no maximum delay, so retry is ' +
+              'unsafe until the abandoned reply is observed and discarded.',
         )
       }
-      claims.set(askKey, Infinity)
+      claims.set(askKey, 'waiting')
       claimed = askKey
       // `onAgentMessage` can return before the transport is really listening,
       // so wait for observability BEFORE sending -- otherwise a fast reply
@@ -224,6 +231,13 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       unsubscribe = fleet.onAgentMessage((message) => {
         if (!sameAgent(message.from, teammate.address) && !sameAgent(message.from, teammate.name)) return
         if (!sameAgent(message.target, replyTarget)) return
+        if (settled) {
+          // This is the late reply to the timed-out ask. Consume it without
+          // exposing it to any caller, then make the pair reusable.
+          unsubscribe()
+          claimsFor(fleet).delete(askKey)
+          return
+        }
         finish({ requestId, teammate, reply: message })
       })
       const send = {
@@ -239,6 +253,7 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       }
       await fleet.whenMessagesObservable?.()
       if (settled) return
+      deliveryStarted = true
       if (fleet.waitForInjected) {
         await fleet.waitForInjected(send, { timeoutMs: Math.max(1, deadline - Date.now()) })
       } else {

@@ -332,25 +332,52 @@ describe('askTeammate', () => {
   })
 
   // A reply to an abandoned question is indistinguishable from a reply to a
-  // fresh one, so the pair must not reopen the instant it times out.
+  // fresh one, so the pair cannot reopen on a timer. It becomes safe only when
+  // the old reply is observed and consumed by the quarantine drain.
   // (#178 review, codex P2 third pass)
-  it('quarantines a timed-out pair instead of reopening it immediately', async () => {
-    const fleet = new FakeFleetClient()
-    fleet.teammates.push({
-      name: 'infra-agent',
-      address: 'infra-agent',
-      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
-      tags: [],
-      url: 'https://relay.example/a2a/rpc',
-      kind: 'native',
-    })
-    await expect(askTeammate(fleet, {
-      from: 'factory-worker', question: 'q1', teammate: fleet.teammates[0], timeoutMs: 20,
-    })).rejects.toThrow(/Timed out waiting for a reply/u)
+  it('quarantines a timed-out pair until its late reply is consumed, regardless of age', async () => {
+    vi.useFakeTimers()
+    try {
+      const fleet = new FakeFleetClient()
+      fleet.teammates.push({
+        name: 'infra-agent',
+        address: 'infra-agent',
+        skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+        tags: [],
+        url: 'https://relay.example/a2a/rpc',
+        kind: 'native',
+      })
+      const first = askTeammate(fleet, {
+        from: 'factory-worker', question: 'q1', teammate: fleet.teammates[0], timeoutMs: 20,
+      })
+      const rejected = expect(first).rejects.toThrow(/Timed out waiting for a reply/u)
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(fleet.messages).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(20)
+      await rejected
 
-    await expect(askTeammate(fleet, {
-      from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 20,
-    })).rejects.toThrow(/holding "infra-agent" for "factory-worker" after a timed-out question/u)
+      // Moving far beyond the former 2 * timeout window MUST NOT reopen the
+      // pair while the abandoned response is still outstanding.
+      await vi.advanceTimersByTimeAsync(2_000)
+      await expect(askTeammate(fleet, {
+        from: 'factory-worker', question: 'q2', teammate: fleet.teammates[0], timeoutMs: 20,
+      })).rejects.toThrow(/quarantining "infra-agent" for "factory-worker" after a timed-out question/u)
+
+      fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'late answer to q1' })
+      const third = askTeammate(fleet, {
+        from: 'factory-worker', question: 'q3', teammate: fleet.teammates[0], timeoutMs: 20,
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(fleet.messages).toHaveLength(2)
+      fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answer to q3' })
+      await expect(third).resolves.toMatchObject({ reply: { body: 'answer to q3' } })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   // Two clients address different workspaces; identical names there cannot
