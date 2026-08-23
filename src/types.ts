@@ -532,6 +532,17 @@ export interface IterationReport {
   skipped: Array<{ issue: IssueRef; reason: string }>
   dryRun: boolean
   slackDegraded?: boolean
+  /**
+   * Orphan recovery did not run for this sweep, so `factory:in-progress`
+   * claims were preserved rather than reconciled.
+   *
+   * `dry-run` is expected and benign: a dry run never releases a claim, so it
+   * deliberately skips building the safety context — which on a read-only
+   * fleet client would mean minting a workspace identity just to decide what
+   * the sweep WOULD do. `context-unavailable` is the real degradation: a live
+   * sweep tried to build the context and could not.
+   */
+  orphanRecoveryDegraded?: 'dry-run' | 'context-unavailable'
   /** A cross-process owner was already enumerating this workspace. */
   discoveryDeferred?: 'sweep-in-flight'
   error?: { message: string; stack?: string }
