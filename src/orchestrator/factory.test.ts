@@ -7604,7 +7604,18 @@ describe('FactoryLoop', () => {
       expect(factory.status().inFlight).toHaveLength(5)
       expect(factory.status().queued).toHaveLength(1)
       const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
-      expect(heartbeat).toMatchObject({ status: 'idle', iteration: 3, maxIterations: 3, pid: process.pid })
+      expect(heartbeat).toMatchObject({
+        status: 'idle',
+        source: 'bounded-loop',
+        iteration: 3,
+        maxIterations: 3,
+        pid: process.pid,
+        progress: {
+          sequence: 3,
+          operation: 'discovery-sweep',
+          updatedAtMs: expect.any(Number),
+        },
+      })
       expect(checkFactoryLoopLiveness(heartbeat, { nowMs: heartbeat!.updatedAtMs + 500, staleMs: 10_000 })).toMatchObject({
         ok: true,
         stale: false,
@@ -9782,10 +9793,17 @@ describe('FactoryLoop', () => {
       const initial = await readFactoryLoopHeartbeat(heartbeatPath)
       expect(initial).toMatchObject({
         status: 'running',
+        source: 'live-timer',
         iteration: 0,
         maxIterations: 0,
+        startedAtMs: 0,
         updatedAtMs: 0,
         registryPath,
+        progress: {
+          sequence: 1,
+          operation: 'discovery-sweep',
+          updatedAtMs: 0,
+        },
       })
       expect(checkFactoryLoopLiveness(initial, { nowMs: 900, staleMs: 1_000 })).toMatchObject({
         ok: true,
@@ -9800,6 +9818,9 @@ describe('FactoryLoop', () => {
         status: 'running',
         updatedAtMs: 500,
       })
+      // MUST NOT ADVANCE: the timer proves the process is alive, but no new
+      // dependency-backed sweep committed between these two records.
+      expect(refreshed?.progress).toEqual(initial?.progress)
 
       await factory.stop()
 

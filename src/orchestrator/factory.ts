@@ -770,6 +770,9 @@ export class FactoryLoop implements Factory {
   #liveHeartbeatInFlight = false
   #liveHeartbeatRefresh?: Promise<void>
   #liveHeartbeatLastWriteMs = 0
+  #heartbeatStartedAtMs?: number
+  #progressSequence = 0
+  #lastProgressAtMs?: number
   #stoppingHeartbeatRefreshActive = false
   #readinessReconcileTimer?: ReturnType<typeof setTimeout>
   #readinessReconcileInFlight?: Promise<void>
@@ -1582,6 +1585,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #startLiveHeartbeat(): Promise<void> {
+    this.#beginHeartbeatLifetime()
     this.#liveHeartbeatActive = true
     await this.#writeLiveHeartbeat('running')
     this.#scheduleLiveHeartbeatRefresh()
@@ -1653,6 +1657,12 @@ export class FactoryLoop implements Factory {
       0,
     )
     this.#liveHeartbeatLastWriteMs = this.#clock.now()
+  }
+
+  #beginHeartbeatLifetime(): void {
+    this.#heartbeatStartedAtMs = this.#clock.now()
+    this.#progressSequence = 0
+    this.#lastProgressAtMs = undefined
   }
 
   #liveOptions(overrides: Partial<FactoryLiveSubscriptionOptions>): FactoryLiveSubscriptionOptions {
@@ -2634,6 +2644,10 @@ export class FactoryLoop implements Factory {
       const completed = await this.#commitDiscoverySweep(claim.lease.epoch, checkpoint, residual)
       leaseReleased = completed
       if (!completed) throw new Error('discovery sweep lease was lost before completion')
+      // This is the progress boundary consumed by deployment health. A timer
+      // firing, a sweep starting, or a failed/deferred sweep must not move it.
+      this.#progressSequence += 1
+      this.#lastProgressAtMs = this.#clock.now()
       this.#logger.info?.('[factory] discovery sweep checkpoint committed', {
         owner: claim.lease.owner,
         epoch: claim.lease.epoch,
@@ -4224,6 +4238,7 @@ export class FactoryLoop implements Factory {
     )))
     const heartbeatPath = opts.heartbeatPath ?? this.#config.loop.heartbeatPath
     const registryPath = opts.registryPath ?? this.#config.loop.registryPath
+    this.#beginHeartbeatLifetime()
     this.#loopReapPaths = { heartbeatPath, registryPath }
     const reports: IterationReport[] = []
     let consecutiveFailures = 0
@@ -7932,13 +7947,27 @@ export class FactoryLoop implements Factory {
     maxIterations: number,
   ): Promise<void> {
     const updatedAtMs = this.#clock.now()
+    this.#heartbeatStartedAtMs ??= updatedAtMs
     const heartbeat: FactoryLoopHeartbeat = {
       pid: process.pid,
       status,
+      source: maxIterations === 0 ? 'live-timer' : 'bounded-loop',
       iteration,
       maxIterations,
+      startedAt: new Date(this.#heartbeatStartedAtMs).toISOString(),
+      startedAtMs: this.#heartbeatStartedAtMs,
       updatedAt: new Date(updatedAtMs).toISOString(),
       updatedAtMs,
+      ...(this.#lastProgressAtMs !== undefined
+        ? {
+            progress: {
+              sequence: this.#progressSequence,
+              operation: 'discovery-sweep' as const,
+              updatedAt: new Date(this.#lastProgressAtMs).toISOString(),
+              updatedAtMs: this.#lastProgressAtMs,
+            },
+          }
+        : {}),
       registryPath,
       eventListener: this.#eventListenerStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
