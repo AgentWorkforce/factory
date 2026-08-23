@@ -2275,6 +2275,12 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(3)
       expect(errors.text()).toContain('Live state changed before writeback for 48')
       expect(fleet.releases.map((release) => release.reason)).toContain('live dispatch state changed')
+      if (legacyVoid) {
+        expect(errors.text()).toContain('GitHub writeback returned no ownership receipt')
+        expect(errors.text()).toContain('"method":"setStatus"')
+      } else {
+        expect(errors.text()).not.toContain('GitHub writeback returned no ownership receipt')
+      }
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -2451,6 +2457,12 @@ describe('fleet CLI runtime', () => {
       expect(code).toBe(3)
       expect(errors.text()).toContain('Live state changed before writeback for 48')
       expect(fleet.releases.map((release) => release.reason)).toContain('live dispatch state changed')
+      if (legacyVoid) {
+        expect(errors.text()).toContain('GitHub writeback returned no ownership receipt')
+        expect(errors.text()).toContain('"method":"closeIssue"')
+      } else {
+        expect(errors.text()).not.toContain('GitHub writeback returned no ownership receipt')
+      }
     } finally {
       await rm(root, { recursive: true, force: true })
     }

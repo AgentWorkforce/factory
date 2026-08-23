@@ -817,6 +817,11 @@ export class FactoryLoop implements Factory {
   #previewSweepInFlight?: Promise<void>
   readonly #completionInFlight = new Set<string>()
   readonly #issueWritebackInFlight = new Map<string, Promise<void>>()
+  // A fast completion can make terminal issue state visible while dispatch is
+  // still performing its post-spawn readiness read. Completion publishes its
+  // provider receipt, then waits for that read to classify the state as owned
+  // or foreign before it releases agents under a terminal success reason.
+  readonly #postSpawnIssueObservations = new Map<string, Promise<boolean>>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   #reconciledAgentExitsActive = 0
   readonly #reconciledAgentExitWaiters: Array<() => void> = []
@@ -1371,6 +1376,7 @@ export class FactoryLoop implements Factory {
       this.#livePollInFlight = false
       this.#liveEventQueue.length = 0
       this.#completionInFlight.clear()
+      this.#postSpawnIssueObservations.clear()
       this.#babysitterSpawned.clear()
       this.#babysitterPr.clear()
       this.#babysitterIssueRefs.clear()
@@ -4553,6 +4559,21 @@ export class FactoryLoop implements Factory {
     if (!dryRun) await this.#ensureGithubAgentQuestionWatch(record, liveIssue)
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
+    const observationKey = issueKey(record.issue)
+    let resolvePostSpawnIssueObservation!: (accepted: boolean) => void
+    let postSpawnIssueObservationSettled = false
+    const postSpawnIssueObservation = new Promise<boolean>((resolve) => {
+      resolvePostSpawnIssueObservation = resolve
+    })
+    this.#postSpawnIssueObservations.set(observationKey, postSpawnIssueObservation)
+    const settlePostSpawnIssueObservation = (accepted: boolean): void => {
+      if (postSpawnIssueObservationSettled) return
+      postSpawnIssueObservationSettled = true
+      resolvePostSpawnIssueObservation(accepted)
+      if (this.#postSpawnIssueObservations.get(observationKey) === postSpawnIssueObservation) {
+        this.#postSpawnIssueObservations.delete(observationKey)
+      }
+    }
     try {
       if (!dryRun) {
         const issue = await this.#readIssue(dispatchDecision.issue.path)
@@ -4625,6 +4646,7 @@ export class FactoryLoop implements Factory {
           this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
         }
       }
+      settlePostSpawnIssueObservation(true)
 
       const result = {
         issue: dispatchDecision.issue,
@@ -4648,6 +4670,7 @@ export class FactoryLoop implements Factory {
       }
       return result
     } catch (error) {
+      settlePostSpawnIssueObservation(!(error instanceof LiveDispatchStateChangedError))
       // A spawn can fail after the broker accepted it but before its ack
       // reached Factory. Include every planned worktree agent, not only the
       // acknowledged spawns, so cleanup never races a name-only survivor.
@@ -13896,6 +13919,7 @@ export class FactoryLoop implements Factory {
       return
     }
     this.#completionInFlight.add(completionKey)
+    const postSpawnIssueObservation = this.#postSpawnIssueObservations.get(completionKey)
     let settleIssueWriteback!: () => void
     const issueWritebackSettled = new Promise<void>((resolve) => {
       settleIssueWriteback = resolve
@@ -13966,6 +13990,7 @@ export class FactoryLoop implements Factory {
         if (githubIssue) {
           if (humanReview) {
             const statusWrite = await this.#githubWriteback.setStatus(issue, 'human-review')
+            if (statusWrite === undefined) this.#recordMissingGithubWritebackReceipt('setStatus')
             // Only an explicit provider-proven transition establishes that
             // this dispatch owns the visible park. Legacy void adapters and
             // App acknowledgements remain deliberately untrusted.
@@ -13984,6 +14009,7 @@ export class FactoryLoop implements Factory {
               issue,
               'Factory observed the linked pull request merge and completed this issue.',
             )
+            if (closeWrite === undefined) this.#recordMissingGithubWritebackReceipt('closeIssue')
             // A provider-confirmed, actor-attributed close is the only safe
             // proof that this dispatch owns the visible terminal state. An
             // idempotent no-op, legacy void adapter, or App acknowledgement
@@ -14007,6 +14033,11 @@ export class FactoryLoop implements Factory {
         // outcome is known. Completion still has dependency, Slack and release
         // work to do; none determines whether the observed issue state is safe.
         settleIssueWritebackOnce()
+        // If completion raced dispatch's post-spawn read, let that read consume
+        // the receipt before claiming terminal success. An unproven provider
+        // transition is a foreign live-state change: dispatch owns the
+        // abandonment and must release agents with that reason, not issue-done.
+        if (postSpawnIssueObservation && !await postSpawnIssueObservation) return
         if (!humanReview) await this.#markDependencyTerminalAndReconcile(issue)
       } else {
         settleIssueWritebackOnce()
@@ -14090,6 +14121,15 @@ export class FactoryLoop implements Factory {
         }
       }
     }
+  }
+
+  #recordMissingGithubWritebackReceipt(method: 'setStatus' | 'closeIssue'): void {
+    const implementation = this.#githubWriteback.constructor.name || 'anonymous GithubWriteback'
+    this.#increment('githubWritebackReceiptMissing')
+    this.#logger.warn?.('[factory] GitHub writeback returned no ownership receipt', {
+      implementation,
+      method,
+    })
   }
 
   #emit(event: FactoryEvent, payload: FactoryEventPayload): void {
