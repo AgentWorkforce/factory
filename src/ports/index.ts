@@ -42,6 +42,7 @@ export type {
 export type {
   GithubRead,
   GithubIssueStatus,
+  GithubStatusWriteResult,
   GithubWriteback,
   LinearWriteback,
   SlackWriteback,

@@ -14,9 +14,9 @@ import type {
   FactoryIntegrationConnections,
   FactoryIntegrationProvider,
   FactoryPorts,
-  createFactory,
 } from '../index'
 import {
+  createFactory,
   FactoryConfigSchema,
   FileFactoryCloudEventOutbox,
   LiveDispatchStateChangedError,
@@ -28,6 +28,7 @@ import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
+import { GhCliGithubWriteback } from '../writeback/github'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, resolveFactoryBrokerConnectionPath, runFleetCli } from './fleet'
 
@@ -2101,6 +2102,166 @@ describe('fleet CLI runtime', () => {
       } else {
         expect(releaseReasons).toContain('live dispatch state changed')
       }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not attribute a third-party GitHub park when the in-flight CLI write is a confirmed no-op', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-foreign-park-inflight-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+          heartbeatStaleMs: 10_000,
+        },
+      })
+      const githubPath = '/github/repos/AgentWorkforce__pear/issues/by-id/48.json'
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number: 80,
+          url: 'https://github.com/AgentWorkforce/pear/pull/80',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }),
+        closePullRequest: async () => undefined,
+      }
+      class ControlledCompletingGithubFleetClient extends FakeFleetClient {
+        override readonly placementLocality = 'remote' as const
+        implementerName?: string
+        exitEmitted = false
+
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          const result = await super.spawn(input)
+          if (input.name.includes('-impl-')) this.implementerName = input.name
+          return { ...result, node: 'sf-mini', locality: 'remote' }
+        }
+      }
+      const fleet = new ControlledCompletingGithubFleetClient()
+      let thirdPartyParked = false
+      let terminalLabelProvisioned = false
+      let terminalViews = 0
+      let terminalEdits = 0
+      let releaseConfirmation: (() => void) | undefined
+
+      class ThirdPartyGithubParkMount extends FakeMountClient {
+        postSpawnReadSawPark = false
+
+        parkAsThirdParty(): void {
+          const existing = this.files.get(githubPath)
+          const content = existing?.content as ReturnType<typeof githubIssueFile>
+          const labels = content.payload.labels
+            .filter((label) => label.name !== 'factory:in-progress')
+          labels.push({ name: 'factory:human-review' })
+          this.files.set(githubPath, {
+            ...existing,
+            content: {
+              ...content,
+              payload: { ...content.payload, labels },
+            },
+          })
+          thirdPartyParked = true
+        }
+
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === githubPath && fleet.implementerName && !fleet.exitEmitted) {
+            // This is dispatch's post-spawn read. Completion starts here and
+            // registers its fence before the CLI adapter's first label read.
+            fleet.exitEmitted = true
+            fleet.emitAgentExit(fleet.implementerName, 'exited')
+            await vi.waitFor(() => expect(thirdPartyParked).toBe(true), { timeout: 1_000 })
+            const result = await super.readFile(path)
+            this.postSpawnReadSawPark = true
+            // Let the adapter's provider-confirmation read finish only after
+            // the dispatch has observed the foreign state while the fence is
+            // still registered.
+            setTimeout(() => releaseConfirmation?.(), 0)
+            return result
+          }
+          return super.readFile(path)
+        }
+      }
+
+      const githubContent = githubIssueFile('pear')
+      githubContent.payload.title = '[factory-e2e] preserve foreign GitHub lifecycle ownership'
+      githubContent.payload.body = [
+        'Fix the completion race without attributing a third-party lifecycle change to Factory.',
+        '',
+        'Acceptance criteria:',
+        '- A skipped GitHub CLI label edit never stamps Factory authorship.',
+        '- The live dispatch state-change guard still releases the remote agent.',
+        '- Add a deterministic integration regression for the provider-read ordering.',
+      ].join('\n')
+      const mount = new ThirdPartyGithubParkMount({
+        [githubPath]: githubContent,
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+      const providerLabels = new Set(['factory', 'pear'])
+      const githubWriteback = new GhCliGithubWriteback({
+        runner: async (args) => {
+          if (args[0] === 'label' && args[1] === 'create') {
+            terminalLabelProvisioned = args[2] === 'factory:human-review'
+            return { stdout: '' }
+          }
+          if (args[0] === 'issue' && args[1] === 'view') {
+            if (terminalLabelProvisioned) {
+              terminalViews += 1
+              if (terminalViews === 1) {
+                // The third party wins before the adapter's first read. The
+                // target is present and the previous label absent, so the CLI
+                // must skip `gh issue edit` and report already-matched.
+                providerLabels.delete('factory:in-progress')
+                providerLabels.add('factory:human-review')
+                mount.parkAsThirdParty()
+              } else if (terminalViews === 2 && !releaseConfirmation) {
+                await new Promise<void>((resolve) => {
+                  releaseConfirmation = resolve
+                  setTimeout(resolve, 400)
+                })
+              }
+            }
+            return { stdout: JSON.stringify({ labels: [...providerLabels].map((name) => ({ name })) }) }
+          }
+          if (args[0] === 'issue' && args[1] === 'edit') {
+            if (terminalLabelProvisioned) terminalEdits += 1
+            const added = args[args.indexOf('--add-label') + 1]
+            const removed = args[args.indexOf('--remove-label') + 1]
+            if (args.includes('--add-label') && added) providerLabels.add(added)
+            if (args.includes('--remove-label') && removed) providerLabels.delete(removed)
+          }
+          return { stdout: '' }
+        },
+      })
+      const output = buffer()
+      const errors = buffer()
+
+      const code = await runFleetCli([
+        'dispatch',
+        '48',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        createFactory: (factoryConfig, ports) => createFactory(factoryConfig, {
+          ...ports,
+          githubWriteback,
+        }),
+        stdout: output,
+        stderr: errors,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      expect(thirdPartyParked).toBe(true)
+      expect(mount.postSpawnReadSawPark).toBe(true)
+      expect(terminalEdits).toBe(0)
+      expect(code).toBe(3)
+      expect(errors.text()).toContain('Live state changed before writeback for 48')
+      expect(fleet.releases.map((release) => release.reason)).toContain('live dispatch state changed')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

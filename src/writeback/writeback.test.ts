@@ -1059,8 +1059,8 @@ describe('GhCliGithubWriteback', () => {
     })
 
     await github.postComment(githubIssue, 'Factory dispatch for 48')
-    await github.setStatus(githubIssue, 'in-progress')
-    await github.setStatus(githubIssue, 'human-review')
+    await expect(github.setStatus(githubIssue, 'in-progress')).resolves.toBe('applied')
+    await expect(github.setStatus(githubIssue, 'human-review')).resolves.toBe('applied')
 
     expect(calls).toEqual([
       ['issue', 'comment', '48', '--repo', 'AgentWorkforce/factory', '--body', 'Factory dispatch for 48'],
@@ -1095,7 +1095,7 @@ describe('GhCliGithubWriteback', () => {
       },
     })
 
-    await github.setStatus(githubIssue, 'ready')
+    await expect(github.setStatus(githubIssue, 'ready')).resolves.toBe('applied')
 
     expect(calls).toEqual([
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
@@ -1129,7 +1129,7 @@ describe('GhCliGithubWriteback', () => {
         return { stdout: '' }
       },
     })
-    await github.setStatus(githubIssue, status)
+    await expect(github.setStatus(githubIssue, status)).resolves.toBe('already-matched')
 
     expect(calls.some((args) => args[0] === 'issue' && args[1] === 'edit')).toBe(false)
   })

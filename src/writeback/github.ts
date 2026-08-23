@@ -3,7 +3,7 @@ import { promisify } from 'node:util'
 
 import type { GithubConnectionWrite, MountClient } from '../ports'
 import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } from '../ports/mount'
-import type { GithubIssueStatus, GithubWriteback } from '../ports/writeback'
+import type { GithubIssueStatus, GithubStatusWriteResult, GithubWriteback } from '../ports/writeback'
 import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
 import type { LinearIssue, PrSummary } from '../types'
 import { asRecord, wrappedPayload } from './shared'
@@ -99,7 +99,7 @@ export class AppGithubWriteback implements GithubWriteback {
     })
   }
 
-  async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
+  async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult> {
     const ref = githubIssueRef(issue)
     if (status === 'ready') {
       for (const label of Object.values(FACTORY_GITHUB_STATUS_LABELS)) {
@@ -111,7 +111,7 @@ export class AppGithubWriteback implements GithubWriteback {
           author: 'app',
         })
       }
-      return
+      return 'applied'
     }
     const target = FACTORY_GITHUB_STATUS_LABELS[status]
     const previous = FACTORY_GITHUB_STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
@@ -134,6 +134,7 @@ export class AppGithubWriteback implements GithubWriteback {
       label: previous.name,
       author: 'app',
     })
+    return 'applied'
   }
 
   async closeIssue(issue: LinearIssue, body: string): Promise<void> {
@@ -298,7 +299,7 @@ export class GhCliGithubWriteback implements GithubWriteback {
     return result.stdout.includes(marker)
   }
 
-  async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
+  async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult> {
     const ref = githubIssueRef(issue)
     if (status === 'ready') {
       const labels = await this.#issueLabels(ref)
@@ -308,14 +309,15 @@ export class GhCliGithubWriteback implements GithubWriteback {
           editArgs.push('--remove-label', label.name)
         }
       }
-      if (editArgs.length > 5) {
+      const applied = editArgs.length > 5
+      if (applied) {
         await this.#run(editArgs)
       }
       const confirmed = await this.#issueLabels(ref)
       if (Object.values(FACTORY_GITHUB_STATUS_LABELS).some((label) => confirmed.has(label.name.toLowerCase()))) {
         throw new Error(`GitHub writeback did not confirm removal of Factory status labels on ${ref.repo}#${ref.number}`)
       }
-      return
+      return applied ? 'applied' : 'already-matched'
     }
     const target = FACTORY_GITHUB_STATUS_LABELS[status]
     const previous = FACTORY_GITHUB_STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
@@ -345,12 +347,13 @@ export class GhCliGithubWriteback implements GithubWriteback {
     if (labels.has(previous.name.toLowerCase())) {
       editArgs.push('--remove-label', previous.name)
     }
-    if (editArgs.length > 5) {
+    const applied = editArgs.length > 5
+    if (applied) {
       await this.#run(editArgs)
     }
     const confirmed = await this.#issueLabels(ref)
     if (confirmed.has(target.name.toLowerCase()) && !confirmed.has(previous.name.toLowerCase())) {
-      return
+      return applied ? 'applied' : 'already-matched'
     }
     throw new Error(`GitHub writeback did not confirm ${target.name} on ${ref.repo}#${ref.number}`)
   }

@@ -19,6 +19,13 @@ export interface GithubRead {
 
 export type GithubIssueStatus = 'ready' | 'in-progress' | 'human-review'
 
+/**
+ * Whether a lifecycle call issued a provider mutation. `undefined` preserves
+ * compatibility with caller-supplied writebacks that predate this receipt;
+ * built-in adapters must return an explicit result.
+ */
+export type GithubStatusWriteResult = 'applied' | 'already-matched'
+
 export interface GithubWriteback {
   /** Optional local-user PR publisher, implemented by the default `gh` writeback. */
   publishPullRequest?(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
@@ -29,6 +36,6 @@ export interface GithubWriteback {
   postComment(issue: LinearIssue, body: string): Promise<void>
   /** Provider-authoritative lookup used to reconcile ambiguous comment writes. */
   hasCommentMarker?(issue: LinearIssue, marker: string): Promise<boolean>
-  setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void>
+  setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult | void>
   closeIssue(issue: LinearIssue, body: string): Promise<void>
 }

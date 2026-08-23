@@ -4608,13 +4608,12 @@ export class FactoryLoop implements Factory {
           }
         }
         if (!issue || !this.#isIssueReady(issue)) {
-          // Only a terminal writeback confirmed by the completion already in
-          // flight for this exact record may excuse the change. The marker is
-          // stamped after provider acknowledgement/readback, never at the
-          // earlier locally-visible write boundary. A skipped/idempotent edit
-          // is safe here because the completion deliberately converged on and
-          // confirmed the desired terminal state; it does not claim which
-          // actor first created that state.
+          // Only a terminal writeback applied and confirmed by the completion
+          // already in flight for this exact record may excuse the change. The
+          // marker is stamped after provider acknowledgement/readback, never at
+          // the earlier locally-visible write boundary. A confirmed no-op does
+          // not establish authorship: another actor may have parked the issue
+          // before our adapter's first provider read.
           if (record.issueWritebackConfirmedAtMs === undefined) {
             throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
           }
@@ -13966,8 +13965,13 @@ export class FactoryLoop implements Factory {
         this.#issueWritebackInFlight.set(completionKey, issueWritebackSettled)
         if (githubIssue) {
           if (humanReview) {
-            await this.#githubWriteback.setStatus(issue, 'human-review')
-            record.issueWritebackConfirmedAtMs ??= this.#clock.now()
+            const statusWrite = await this.#githubWriteback.setStatus(issue, 'human-review')
+            if (statusWrite !== 'already-matched') {
+              record.issueWritebackConfirmedAtMs ??= this.#clock.now()
+            }
+            // The lifecycle-state outcome is now known. Unblock the concurrent
+            // post-spawn read before the separate completion comment write.
+            settleIssueWritebackOnce()
             await this.#githubWriteback.postComment(
               issue,
               `Factory agents completed; this issue is awaiting human review. The pull request remains open.\n\nMerge policy: ${this.#config.mergePolicy}`,
@@ -13987,8 +13991,9 @@ export class FactoryLoop implements Factory {
           record.issueWritebackConfirmedAtMs ??= this.#clock.now()
           await this.#recordCanonicalIssueState({ ...record.issue, stateId: targetState })
         }
-        record.issueWritebackConfirmedAtMs ??= this.#clock.now()
-        this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
+        if (record.issueWritebackConfirmedAtMs !== undefined) {
+          this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
+        }
         // Unblock a concurrent post-spawn read as soon as the issue writeback
         // outcome is known. Completion still has dependency, Slack and release
         // work to do; none determines whether the observed issue state is safe.

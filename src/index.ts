@@ -353,6 +353,7 @@ export type {
   AgentUsage,
   GithubRead,
   GithubIssueStatus,
+  GithubStatusWriteResult,
   GithubWriteback,
   LinearWriteback,
   Logger,
