@@ -1175,6 +1175,29 @@ describe('GhCliGithubWriteback', () => {
     ])
   })
 
+  it.each([
+    { status: 'ready' as const, labels: [] },
+    { status: 'in-progress' as const, labels: ['factory:in-progress'] },
+  ])('never fires onApplied when the $status lifecycle edit is skipped', async ({ status, labels: initialLabels }) => {
+    const calls: string[][] = []
+    const labels = new Set(initialLabels)
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        return { stdout: '' }
+      },
+    })
+    const onApplied = vi.fn()
+
+    await github.setStatus(githubIssue, status, { onApplied })
+
+    expect(calls.some((args) => args[0] === 'issue' && args[1] === 'edit')).toBe(false)
+    expect(onApplied).not.toHaveBeenCalled()
+  })
+
   it('rejects an acknowledged lifecycle edit when provider read-back never shows the label', async () => {
     let edits = 0
     const github = new GhCliGithubWriteback({

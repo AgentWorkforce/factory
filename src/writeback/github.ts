@@ -314,8 +314,8 @@ export class GhCliGithubWriteback implements GithubWriteback {
       }
       if (editArgs.length > 5) {
         await this.#run(editArgs)
+        hooks?.onApplied?.()
       }
-      hooks?.onApplied?.()
       const confirmed = await this.#issueLabels(ref)
       if (Object.values(FACTORY_GITHUB_STATUS_LABELS).some((label) => confirmed.has(label.name.toLowerCase()))) {
         throw new Error(`GitHub writeback did not confirm removal of Factory status labels on ${ref.repo}#${ref.number}`)
@@ -352,9 +352,9 @@ export class GhCliGithubWriteback implements GithubWriteback {
     }
     if (editArgs.length > 5) {
       await this.#run(editArgs)
+      // The label edit has landed; `#issueLabels` below only verifies it.
+      hooks?.onApplied?.()
     }
-    // The label edit has landed; `#issueLabels` below only verifies it.
-    hooks?.onApplied?.()
     const confirmed = await this.#issueLabels(ref)
     if (confirmed.has(target.name.toLowerCase()) && !confirmed.has(previous.name.toLowerCase())) {
       return
