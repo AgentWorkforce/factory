@@ -1,5 +1,5 @@
 import { linearByIdPath, linearByUuidPath, linearCommentPath, linearIssuePath } from '../constants/linear'
-import type { MountClient, WritebackApplyHooks } from '../ports'
+import type { MountClient } from '../ports'
 import type { Logger } from '../ports/system'
 import { assertInFactoryScope, isInFactoryScope } from '../safety/factory-scope'
 import type { LinearIssue } from '../types'
@@ -257,7 +257,7 @@ export const MountLinearWriteback = (
   }
 
   const adapter = {
-    async setState(issue: LinearIssue, stateId: string, hooks?: WritebackApplyHooks): Promise<void> {
+    async setState(issue: LinearIssue, stateId: string): Promise<void> {
       const path = issuePath(issue)
       const canonical = await canonicalForIssue(issue)
       assertInFactoryScope(scopeIssueFromPayload(canonical.payload, issue.key), safety)
@@ -265,10 +265,6 @@ export const MountLinearWriteback = (
         ...canonical.writable,
         stateId,
       }, { guarded: true })
-      // The issue reads as this state from here on; the readback below only
-      // confirms it. Anything that needs to attribute the change must be told
-      // now, not when this call returns (factory#319).
-      hooks?.onApplied?.()
       updateCanonicalState(path, issue, canonical, stateId)
       await confirmWriteback(mount, path, () => verifyStateReadback(mount, issue, stateId), logger, readbackConfirm)
     },

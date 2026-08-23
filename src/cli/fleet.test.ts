@@ -1980,21 +1980,14 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  // factory#319 regression guard. The self-race itself is exercised by
-  // "keeps relay dispatch ownership …" above, which failed ~50% of runs on
-  // main and is deterministic with the fix; this control pins the other half
-  // of the contract — that a park this dispatch did NOT make still aborts.
-  // factory#319 MUST-FIRE. Deterministic, and it only became writable once
-  // codex pointed out that the writeback keeps awaiting AFTER the state is
-  // visible: that trailing await is an injectable seam. `setState` writes the
-  // parked state, then awaits its readback confirmation before returning, so
-  // holding that readback open pins the dispatch's post-spawn re-read inside
-  // the window every single run.
-  //
-  // Against a build that stamps the marker only when `setState` RETURNS, the
-  // re-read sees a parked issue with no marker, calls its own write foreign,
-  // and abandons — tearing down agents that had already finished. Exit 3.
-  it('does not abandon when its own park is visible but the writeback has not returned', async () => {
+  // factory#319. The state write becomes locally visible before provider
+  // confirmation returns. Pin the post-spawn read in that interval and test
+  // both outcomes: confirmation lets the completed dispatch converge; a
+  // rejected confirmation MUST NOT excuse the visible park.
+  it.each([
+    { confirmation: 'acked' as const, expectedExit: 0 },
+    { confirmation: 'failed' as const, expectedExit: 3 },
+  ])('waits for its in-flight park confirmation ($confirmation)', async ({ confirmation, expectedExit }) => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-park-inflight-'))
     try {
       const configPath = await writeConfig(root, {
@@ -2056,7 +2049,7 @@ describe('fleet CLI runtime', () => {
             this.reReadSeen = true
             queueMicrotask(() => this.releaseConfirm?.())
           }
-          if (path === issuePath && this.parkWritten) {
+          if (path === issuePath && this.parkWritten && confirmation === 'acked') {
             if (!this.releaseConfirm) {
               // First issue read after the park is `setState`'s own readback
               // confirmation. Hold it, so `setState` cannot return. Bounded so
@@ -2069,6 +2062,11 @@ describe('fleet CLI runtime', () => {
             }
           }
           return super.readFile(path)
+        }
+
+        override async confirmWrite(path: string): Promise<'acked' | 'pending' | 'failed' | 'timeout'> {
+          if (path === issuePath && this.parkWritten) return confirmation
+          return super.confirmWrite(path)
         }
       }
 
@@ -2096,11 +2094,13 @@ describe('fleet CLI runtime', () => {
       // Both must hold or the test is not exercising the window at all.
       expect(mount.parkWritten).toBe(true)
       expect(mount.reReadSeen).toBe(true)
-      // Against main this is 3 — FACTORY_EXIT.RETRYABLE — the same
-      // `expected 3 to be +0` signature as the original flake.
-      expect(code).toBe(0)
-      // Abandoning releases with this reason; completing must not.
-      expect(fleet.releases.map((release) => release.reason)).not.toContain('live dispatch state changed')
+      expect(code).toBe(expectedExit)
+      const releaseReasons = fleet.releases.map((release) => release.reason)
+      if (confirmation === 'acked') {
+        expect(releaseReasons).not.toContain('live dispatch state changed')
+      } else {
+        expect(releaseReasons).toContain('live dispatch state changed')
+      }
     } finally {
       await rm(root, { recursive: true, force: true })
     }

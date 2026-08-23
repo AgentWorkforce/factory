@@ -816,6 +816,7 @@ export class FactoryLoop implements Factory {
   #previewSweepTimer?: ReturnType<typeof setTimeout>
   #previewSweepInFlight?: Promise<void>
   readonly #completionInFlight = new Set<string>()
+  readonly #issueWritebackInFlight = new Map<string, Promise<void>>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   #reconciledAgentExitsActive = 0
   readonly #reconciledAgentExitWaiters: Array<() => void> = []
@@ -4587,28 +4588,33 @@ export class FactoryLoop implements Factory {
       const comment = dispatchComment(dispatchDecision, agents)
       let implementingStateId: string | undefined
       if (!dryRun) {
-        const issue = await this.#readIssue(dispatchDecision.issue.path)
+        let issue = await this.#readIssue(dispatchDecision.issue.path)
+        if ((!issue || !this.#isIssueReady(issue)) && record.issueWritebackConfirmedAtMs === undefined) {
+          // A very fast agent can finish while its own dispatch is still
+          // performing this post-spawn read. Do not guess authorship from the
+          // first visible state: an idempotent provider mutation cannot tell us
+          // whether Factory or another actor won the race. Instead, wait for
+          // this record's concurrent completion writeback to settle, then use
+          // only its provider-confirmed outcome (factory#319).
+          //
+          // The completion promise settles as soon as terminal issue writeback
+          // succeeds or fails, before Slack/release cleanup. If there is no
+          // completion in flight, this is an ordinary foreign state change and
+          // the existing abort remains immediate.
+          const issueWriteback = this.#issueWritebackInFlight.get(issueKey(record.issue))
+          if (issueWriteback) {
+            await issueWriteback
+            issue = await this.#readIssue(dispatchDecision.issue.path)
+          }
+        }
         if (!issue || !this.#isIssueReady(issue)) {
-          // The agents spawned a few lines above can reach terminal before we
-          // get here. Their completion writeback parks the issue — Linear
-          // `humanReview`, or the GitHub human-review label — and stamps
-          // *this same record's* lifecycle on the way past. Re-reading the
-          // issue then shows "not ready", but the writer was us.
-          //
-          // Treating that as a foreign change is not a cosmetic misreport: the
-          // catch below classifies LiveDispatchStateChangedError as terminal
-          // and calls #releaseAndTerminateAgents, so a dispatch whose agents
-          // finished quickly tore down its own completed work and reported
-          // RETRYABLE to its supervisor (factory#319).
-          //
-          // Only THIS dispatch's own confirmed issue writeback may excuse the
-          // change. Lifecycle phases are not enough: `publishing` is entered
-          // before the PR is published and `parking` before anything touches
-          // the issue, so a phase records local progress, not authorship — and
-          // a foreign park landing during those awaits would be misread as
-          // ours (codex review on #321). Losing the row to another owner is a
-          // different condition and is still caught where it always was, by
-          // #saveDispatchLifecycle returning false.
+          // Only a terminal writeback confirmed by the completion already in
+          // flight for this exact record may excuse the change. The marker is
+          // stamped after provider acknowledgement/readback, never at the
+          // earlier locally-visible write boundary. A skipped/idempotent edit
+          // is safe here because the completion deliberately converged on and
+          // confirmed the desired terminal state; it does not claim which
+          // actor first created that state.
           if (record.issueWritebackConfirmedAtMs === undefined) {
             throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
           }
@@ -13891,6 +13897,19 @@ export class FactoryLoop implements Factory {
       return
     }
     this.#completionInFlight.add(completionKey)
+    let settleIssueWriteback!: () => void
+    const issueWritebackSettled = new Promise<void>((resolve) => {
+      settleIssueWriteback = resolve
+    })
+    let issueWritebackDidSettle = false
+    const settleIssueWritebackOnce = () => {
+      if (issueWritebackDidSettle) return
+      issueWritebackDidSettle = true
+      settleIssueWriteback()
+      if (this.#issueWritebackInFlight.get(completionKey) === issueWritebackSettled) {
+        this.#issueWritebackInFlight.delete(completionKey)
+      }
+    }
     let releaseReasonForRetry: string | undefined
     try {
       if (!await this.#assertDispatchLifecycleOwner(record)) return
@@ -13940,17 +13959,14 @@ export class FactoryLoop implements Factory {
       const humanReview = configuredHumanReview || (githubIssue && !githubMerged)
       const statusLabel = humanReview ? 'In Human Review' : 'Done'
       if (issue) {
+        // Register only at the provider-write boundary. Work before this point
+        // (PR discovery/merge gating) has not changed the issue, so a foreign
+        // park during it must still abort immediately rather than waiting on a
+        // possibly long completion path.
+        this.#issueWritebackInFlight.set(completionKey, issueWritebackSettled)
         if (githubIssue) {
           if (humanReview) {
-            // Stamped from inside setStatus, the instant the human-review label
-            // lands: `#isIssueReady` returns false on that label alone, while
-            // setStatus still has its previous-label removal outstanding. A
-            // stamp after setStatus returns leaves the issue readable as
-            // not-ready with the marker unset — the self-abandonment window
-            // (codex review on #322).
-            await this.#githubWriteback.setStatus(issue, 'human-review', {
-              onApplied: () => { record.issueWritebackConfirmedAtMs ??= this.#clock.now() },
-            })
+            await this.#githubWriteback.setStatus(issue, 'human-review')
             record.issueWritebackConfirmedAtMs ??= this.#clock.now()
             await this.#githubWriteback.postComment(
               issue,
@@ -13967,18 +13983,19 @@ export class FactoryLoop implements Factory {
           const targetState = humanReview
             ? this.#states.idFor(issueTeam, 'humanReview')
             : this.#states.idFor(issueTeam, 'done')
-          // Same window on the Linear path, and this is the one the original
-          // flake exercises: `setState` makes the state visible on writeFile,
-          // then keeps awaiting its readback confirmation before returning.
-          await this.#linear.setState(issue, targetState, {
-            onApplied: () => { record.issueWritebackConfirmedAtMs ??= this.#clock.now() },
-          })
+          await this.#linear.setState(issue, targetState)
           record.issueWritebackConfirmedAtMs ??= this.#clock.now()
           await this.#recordCanonicalIssueState({ ...record.issue, stateId: targetState })
         }
         record.issueWritebackConfirmedAtMs ??= this.#clock.now()
         this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
+        // Unblock a concurrent post-spawn read as soon as the issue writeback
+        // outcome is known. Completion still has dependency, Slack and release
+        // work to do; none determines whether the observed issue state is safe.
+        settleIssueWritebackOnce()
         if (!humanReview) await this.#markDependencyTerminalAndReconcile(issue)
+      } else {
+        settleIssueWritebackOnce()
       }
       if (!await this.#saveDispatchLifecycle(record, 'writeback-applied')) return
 
@@ -14041,6 +14058,10 @@ export class FactoryLoop implements Factory {
       if (releaseReasonForRetry) this.#scheduleReleaseRetry(record, releaseReasonForRetry)
       else this.#scheduleDispatchLifecycleRetry(record)
     } finally {
+      // Errors before or during provider confirmation leave the marker unset;
+      // the waiting dispatch will re-read and preserve the foreign-change
+      // abort. Always settle so a failed write cannot strand that dispatch.
+      settleIssueWritebackOnce()
       this.#completionInFlight.delete(completionKey)
       const stateKey = issueStateKey(record.issue)
       this.#probePrGhBackoffUntilMs.delete(stateKey)

@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
-import type { GithubConnectionWrite, MountClient, WritebackApplyHooks } from '../ports'
+import type { GithubConnectionWrite, MountClient } from '../ports'
 import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } from '../ports/mount'
 import type { GithubIssueStatus, GithubWriteback } from '../ports/writeback'
 import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
@@ -99,7 +99,7 @@ export class AppGithubWriteback implements GithubWriteback {
     })
   }
 
-  async setStatus(issue: LinearIssue, status: GithubIssueStatus, hooks?: WritebackApplyHooks): Promise<void> {
+  async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
     const ref = githubIssueRef(issue)
     if (status === 'ready') {
       for (const label of Object.values(FACTORY_GITHUB_STATUS_LABELS)) {
@@ -111,7 +111,6 @@ export class AppGithubWriteback implements GithubWriteback {
           author: 'app',
         })
       }
-      hooks?.onApplied?.()
       return
     }
     const target = FACTORY_GITHUB_STATUS_LABELS[status]
@@ -128,9 +127,6 @@ export class AppGithubWriteback implements GithubWriteback {
       label: target.name,
       author: 'app',
     })
-    // The target label alone decides readiness, so the status change is live
-    // here — the removal below is cleanup. Attribute it now (factory#319).
-    hooks?.onApplied?.()
     await this.#write.mutateIssueLabel({
       repo: ref.repo,
       number: ref.number,
@@ -302,7 +298,7 @@ export class GhCliGithubWriteback implements GithubWriteback {
     return result.stdout.includes(marker)
   }
 
-  async setStatus(issue: LinearIssue, status: GithubIssueStatus, hooks?: WritebackApplyHooks): Promise<void> {
+  async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<void> {
     const ref = githubIssueRef(issue)
     if (status === 'ready') {
       const labels = await this.#issueLabels(ref)
@@ -314,7 +310,6 @@ export class GhCliGithubWriteback implements GithubWriteback {
       }
       if (editArgs.length > 5) {
         await this.#run(editArgs)
-        hooks?.onApplied?.()
       }
       const confirmed = await this.#issueLabels(ref)
       if (Object.values(FACTORY_GITHUB_STATUS_LABELS).some((label) => confirmed.has(label.name.toLowerCase()))) {
@@ -352,8 +347,6 @@ export class GhCliGithubWriteback implements GithubWriteback {
     }
     if (editArgs.length > 5) {
       await this.#run(editArgs)
-      // The label edit has landed; `#issueLabels` below only verifies it.
-      hooks?.onApplied?.()
     }
     const confirmed = await this.#issueLabels(ref)
     if (confirmed.has(target.name.toLowerCase()) && !confirmed.has(previous.name.toLowerCase())) {
