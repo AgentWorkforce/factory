@@ -7607,6 +7607,7 @@ describe('FactoryLoop', () => {
       expect(heartbeat).toMatchObject({
         status: 'idle',
         source: 'bounded-loop',
+        progressContract: 'discovery-sweep-v1',
         iteration: 3,
         maxIterations: 3,
         pid: process.pid,
@@ -9794,6 +9795,7 @@ describe('FactoryLoop', () => {
       expect(initial).toMatchObject({
         status: 'running',
         source: 'live-timer',
+        progressContract: 'discovery-sweep-v1',
         iteration: 0,
         maxIterations: 0,
         startedAtMs: 0,

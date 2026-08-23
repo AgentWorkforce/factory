@@ -146,6 +146,8 @@ export interface FactoryLoopHeartbeat {
   /** Stable for this loop lifetime; lets readers apply a cold-start grace. */
   startedAt?: string
   startedAtMs?: number
+  /** Explicit capability marker for consumers of the progress receipt below. */
+  progressContract?: 'discovery-sweep-v1'
   updatedAt: string
   updatedAtMs: number
   /**

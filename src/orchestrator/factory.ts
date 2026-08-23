@@ -7956,6 +7956,7 @@ export class FactoryLoop implements Factory {
       maxIterations,
       startedAt: new Date(this.#heartbeatStartedAtMs).toISOString(),
       startedAtMs: this.#heartbeatStartedAtMs,
+      progressContract: 'discovery-sweep-v1',
       updatedAt: new Date(updatedAtMs).toISOString(),
       updatedAtMs,
       ...(this.#lastProgressAtMs !== undefined
