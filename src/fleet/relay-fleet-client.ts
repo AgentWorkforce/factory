@@ -991,6 +991,22 @@ export class RelayFleetClient implements FleetClient {
         'presence is unreadable (it did not return a list), so the agent cannot be confirmed offline',
       )
     }
+    // A list whose rows we cannot name is not readable either, however
+    // well-formed the array around them is. Omission only means absence if a
+    // row FOR this agent would have been recognised — so if the SDK renames the
+    // naming field, or a row arrives without one, every row silently stops
+    // matching and a live agent reads as absent. That is the one way the
+    // permitted branch below could strand a running factory, so it is checked
+    // here, on the read, rather than inferred from the lookup missing.
+    const unnamed = presence.findIndex(
+      (row) => readString(asRecord(row), 'agentName', 'agent_name', 'name') === undefined,
+    )
+    if (unnamed !== -1) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        `presence is unreadable (row ${unnamed} carries no agent name), so the agent cannot be confirmed offline`,
+      )
+    }
     return presence
   }
 

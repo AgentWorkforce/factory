@@ -1390,6 +1390,11 @@ describe('RelayFleetClient', () => {
     ['presence request throws', () => { throw new Error('presence unavailable') }],
     ['presence returns a non-list', () => ({ not: 'a list' })],
     ['presence entry carries no status', () => [{ agentName: 'factory' }]],
+    // Omission only means absence if a row FOR this agent would have been
+    // recognised. A row we cannot name breaks that: if the SDK renamed the
+    // naming field, a LIVE agent's row stops matching and reads as absent.
+    ['a presence row carries no agent name', () => [{}]],
+    ['presence rows use an unrecognised naming field', () => [{ agent: 'factory', status: 'online' }]],
   ])('fails closed and does not take over when %s', async (_label, impl) => {
     const messaging = new FakeMessaging()
     const { agents, presenceImpl } = deprecatedAliasAgents()
