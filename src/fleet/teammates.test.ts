@@ -255,6 +255,31 @@ describe('askTeammate', () => {
     await expect(first).resolves.toMatchObject({ reply: { body: 'answer-1' } })
   })
 
+  it('claims a discovered external address and its accepted name alias atomically', async () => {
+    const fleet = new FakeFleetClient()
+    const discovered = {
+      name: 'infra-agent',
+      address: 'ext-infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'a2a' as const,
+    }
+    const direct = { ...discovered, address: 'infra-agent', kind: 'native' as const }
+    fleet.teammates.push(discovered)
+
+    const first = askTeammate(fleet, {
+      from: 'factory-worker', question: 'q1', teammate: discovered, timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker', question: 'q2', teammate: direct, timeoutMs: 1_000,
+    })).rejects.toThrow(/already has an unanswered question to "infra-agent"/u)
+
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answer-1' })
+    await expect(first).resolves.toMatchObject({ reply: { body: 'answer-1' } })
+  })
+
   it('keeps distinct requesters to one teammate independent', async () => {
     // Different reply targets are separate keys, so these must not contend.
     const fleet = new FakeFleetClient()

@@ -105,8 +105,8 @@ export interface AskTeammateResult {
  *
  * - While an ask is waiting, the pair is claimed. A second ask
  *   is refused rather than resolved with an answer that may not be its own.
- *   The key uses the RESOLVED teammate and is taken after discovery, so two
- *   callers passing the same skill query contend for one key.
+ *   The claim set uses every sender identity accepted for the RESOLVED
+ *   teammate and is taken after discovery, so aliases and direct asks contend.
  * - After a TIMEOUT a confirmed send stays quarantined for this client. There
  *   is no safe time- or message-based release: the transport places no upper
  *   bound on a late answer, and an unrelated DM cannot be distinguished from
@@ -154,23 +154,20 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
     let settled = false
     let deliveryState: 'not-started' | 'pending' | 'confirmed' = 'not-started'
     let unsubscribe = () => {}
-    let claimed: string | undefined
-    let timedOutClaim: string | undefined
+    let claimed: string[] = []
+    let timedOutClaim: string[] = []
     const release = () => {
-      if (!claimed) return
-      claimsFor(fleet).delete(claimed)
-      claimed = undefined
+      for (const key of claimed) claimsFor(fleet).delete(key)
+      claimed = []
     }
     const quarantine = () => {
-      if (!claimed) return
-      claimsFor(fleet).set(claimed, 'timed-out-uncorrelated')
+      for (const key of claimed) claimsFor(fleet).set(key, 'timed-out-uncorrelated')
       timedOutClaim = claimed
-      claimed = undefined
+      claimed = []
     }
     const releaseTimedOutClaim = () => {
-      if (!timedOutClaim) return
-      claimsFor(fleet).delete(timedOutClaim)
-      timedOutClaim = undefined
+      for (const key of timedOutClaim) claimsFor(fleet).delete(key)
+      timedOutClaim = []
     }
     const finish = (result: AskTeammateResult) => {
       if (settled) return
@@ -214,9 +211,9 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       // Claimed against the RESOLVED teammate, so a discovery-based ask
       // contends with an explicit one for the same target. Taken before the
       // listener is armed so two waiters can never both accept one reply.
-      const askKey = `${agentKey(replyTarget)}\u0000${teammateKey(teammate)}`
+      const askKeys = teammateClaimKeys(replyTarget, teammate)
       const claims = claimsFor(fleet)
-      const existingClaim = claims.get(askKey)
+      const existingClaim = askKeys.map((key) => claims.get(key)).find((claim) => claim !== undefined)
       if (existingClaim !== undefined) {
         throw new Error(
           existingClaim === 'waiting'
@@ -228,8 +225,8 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
               'unsafe for this client until the protocol supplies correlation.',
         )
       }
-      claims.set(askKey, 'waiting')
-      claimed = askKey
+      for (const key of askKeys) claims.set(key, 'waiting')
+      claimed = askKeys
       // `onAgentMessage` can return before the transport is really listening,
       // so wait for observability BEFORE sending -- otherwise a fast reply
       // lands in the gap and is lost.
@@ -267,7 +264,7 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
         // Only positive, correlated transport rejection proves no answer can
         // arrive. An ordinary waitForInjected timeout is ambiguous: the send
         // may already have landed, so its uncorrelated pair stays quarantined.
-        if (settled && timedOutClaim && error instanceof FleetDeliveryRejectedError) {
+        if (settled && timedOutClaim.length > 0 && error instanceof FleetDeliveryRejectedError) {
           releaseTimedOutClaim()
           return
         }
@@ -369,11 +366,13 @@ function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/u, '')
 }
 
-function teammateKey(teammate: TeammateAgent): string {
-  // Directory transport kind is not part of reply identity. The same Relay
-  // address may be discovered as A2A and addressed directly as native; those
-  // asks still consume the same uncorrelated sender/target reply stream.
-  return agentKey(teammate.address)
+function teammateClaimKeys(replyTarget: string, teammate: TeammateAgent): string[] {
+  const target = agentKey(replyTarget)
+  // Claim every sender identity the listener below accepts. Directory kind is
+  // not reply identity, and an external address plus its public name alias can
+  // overlap a direct ask even though their primary addresses differ.
+  return [...new Set([teammate.address, teammate.name].map(agentKey))]
+    .map((sender) => `${target}\u0000${sender}`)
 }
 
 function sameAgent(left: string, right: string): boolean {
