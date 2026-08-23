@@ -2280,6 +2280,182 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it.each([
+    { receipt: 'explicit acknowledged' as const, legacyVoid: false },
+    { receipt: 'legacy void' as const, legacyVoid: true },
+  ])('does not attribute a third-party GitHub close from an in-flight $receipt receipt', async ({ legacyVoid }) => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-foreign-close-inflight-'))
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        terminalState: 'done',
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+          heartbeatStaleMs: 10_000,
+        },
+      })
+      const githubPath = '/github/repos/AgentWorkforce__pear/issues/by-id/48.json'
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number: 80,
+          url: 'https://github.com/AgentWorkforce/pear/pull/80',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }),
+        closePullRequest: async () => undefined,
+      }
+      class ControlledCompletingGithubFleetClient extends FakeFleetClient {
+        override readonly placementLocality = 'remote' as const
+        implementerName?: string
+        exitEmitted = false
+
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          const result = await super.spawn(input)
+          if (input.name.includes('-impl-')) this.implementerName = input.name
+          return { ...result, node: 'sf-mini', locality: 'remote' }
+        }
+      }
+      const fleet = new ControlledCompletingGithubFleetClient()
+      let thirdPartyClosed = false
+
+      class ThirdPartyGithubCloseMount extends FakeMountClient {
+        postSpawnReadSawClose = false
+
+        closeAsThirdParty(): void {
+          const existing = this.files.get(githubPath)
+          const content = existing?.content as ReturnType<typeof githubIssueFile>
+          this.files.set(githubPath, {
+            ...existing,
+            content: {
+              ...content,
+              payload: { ...content.payload, state: 'closed' },
+            },
+          })
+          thirdPartyClosed = true
+        }
+
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === githubPath && fleet.implementerName && !fleet.exitEmitted) {
+            // Pin the dispatch's post-spawn read behind completion. The
+            // provider close command returns idempotently after another actor
+            // creates the terminal event, so only the audit receipt can tell
+            // the dispatch that it must not claim ownership.
+            fleet.exitEmitted = true
+            fleet.emitAgentExit(fleet.implementerName, 'exited')
+            await vi.waitFor(() => expect(thirdPartyClosed).toBe(true), { timeout: 1_000 })
+            this.postSpawnReadSawClose = true
+          }
+          return super.readFile(path)
+        }
+      }
+
+      const githubContent = githubIssueFile('pear')
+      githubContent.payload.title = '[factory-e2e] preserve foreign GitHub close ownership'
+      githubContent.payload.body = [
+        'Keep terminal lifecycle ownership provider-authoritative during concurrent close operations.',
+        '',
+        'Acceptance criteria:',
+        '- An idempotent close must not claim Factory ownership when another actor creates the close event.',
+        '- The post-spawn live-state guard must abort the dispatch.',
+        '- Remote agents must be released with the live-state-change reason.',
+      ].join('\n')
+      const mount = new ThirdPartyGithubCloseMount({
+        [githubPath]: githubContent,
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+        '/github/repos/AgentWorkforce/pear/pulls/80/metadata.json': {
+          provider: 'github',
+          objectType: 'pull_request',
+          objectId: '80',
+          payload: {
+            number: 80,
+            title: '[factory-e2e] preserve foreign GitHub close ownership',
+            body: 'Fixes #48',
+            head_ref: 'factory/48-agentworkforce-pear',
+            isDraft: false,
+            state: 'MERGED',
+            merged: true,
+          },
+        },
+      }, githubWrite)
+      let providerState = 'OPEN'
+      const stateEvents: string[] = []
+      let closeCommands = 0
+      const githubWriteback = new GhCliGithubWriteback({
+        runner: async (args) => {
+          if (args[0] === 'issue' && args[1] === 'view' && args.includes('state')) {
+            return { stdout: JSON.stringify({ state: providerState }) }
+          }
+          if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+          if (args[0] === 'api' && args[1] === '--paginate') {
+            return { stdout: stateEvents.join('\n') }
+          }
+          if (args[0] === 'issue' && args[1] === 'close') {
+            closeCommands += 1
+            providerState = 'CLOSED'
+            stateEvents.push('1\tclosed\tother-user')
+            mount.closeAsThirdParty()
+          }
+          return { stdout: '' }
+        },
+      })
+      const effectiveGithubWriteback: GithubWriteback = legacyVoid
+        ? {
+            getIssueStatus: async (target) => await githubWriteback.getIssueStatus(target),
+            postComment: async (target, body) => await githubWriteback.postComment(target, body),
+            setStatus: async (target, status) => await githubWriteback.setStatus(target, status),
+            closeIssue: async (target, body) => {
+              await githubWriteback.closeIssue(target, body)
+            },
+          }
+        : githubWriteback
+      const output = buffer()
+      const errors = buffer()
+
+      const code = await runFleetCli([
+        'dispatch',
+        '48',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        createFactory: (factoryConfig, ports) => createFactory(factoryConfig, {
+          ...ports,
+          githubWriteback: effectiveGithubWriteback,
+        }),
+        stdout: output,
+        stderr: errors,
+        probePrGhRunner: async () => ({
+          stdout: JSON.stringify([{
+            number: 80,
+            title: '[factory-e2e] preserve foreign GitHub close ownership',
+            body: 'Fixes #48',
+            headRefName: 'factory/48-agentworkforce-pear',
+            isDraft: false,
+            state: 'MERGED',
+          }]),
+        }),
+      })
+
+      expect(thirdPartyClosed, JSON.stringify({
+        code,
+        output: output.text(),
+        errors: errors.text(),
+        releases: fleet.releases,
+      })).toBe(true)
+      expect(mount.postSpawnReadSawClose).toBe(true)
+      expect(closeCommands).toBe(1)
+      expect(code).toBe(3)
+      expect(errors.text()).toContain('Live state changed before writeback for 48')
+      expect(fleet.releases.map((release) => release.reason)).toContain('live dispatch state changed')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('still aborts when a third party parks the issue and this dispatch did not', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-foreign-park-'))
     try {

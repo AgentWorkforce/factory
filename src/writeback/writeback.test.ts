@@ -858,7 +858,7 @@ describe('AppGithubWriteback', () => {
     await app.postComment(appIssue, 'Factory dispatch for 221')
     await expect(app.setStatus(appIssue, 'human-review')).resolves.toBe('acknowledged')
     await expect(app.setStatus(appIssue, 'ready')).resolves.toBe('acknowledged')
-    await app.closeIssue(appIssue, 'Factory observed the linked PR merge.')
+    await expect(app.closeIssue(appIssue, 'Factory observed the linked PR merge.')).resolves.toBe('acknowledged')
 
     expect(postIssueComment).toHaveBeenNthCalledWith(1, {
       repo: 'AgentWorkforce/factory',
@@ -936,6 +936,13 @@ describe('GhCliGithubWriteback', () => {
     'repos/AgentWorkforce/factory/issues/48/events',
     '--jq',
     '.[] | select(.event == "labeled" or .event == "unlabeled") | [.id, .event, .label.name, .actor.login] | @tsv',
+  ]
+  const issueStateEventsCall = [
+    'api',
+    '--paginate',
+    'repos/AgentWorkforce/factory/issues/48/events',
+    '--jq',
+    '.[] | select(.event == "closed" or .event == "reopened") | [.id, .event, .actor.login] | @tsv',
   ]
 
   it('pushes a local branch and returns the gh-authenticated PR author', async () => {
@@ -1339,18 +1346,76 @@ describe('GhCliGithubWriteback', () => {
 
   it('comments and closes the GitHub issue after merge', async () => {
     const calls: string[][] = []
+    let state = 'OPEN'
+    const events: string[] = []
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
         calls.push(args)
+        if (args[0] === 'issue' && args[1] === 'view' && args.includes('state')) {
+          return { stdout: JSON.stringify({ state }) }
+        }
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'close') {
+          state = 'CLOSED'
+          events.push('1\tclosed\tfactory-bot')
+        }
         return { stdout: '' }
       },
     })
 
-    await github.closeIssue(githubIssue, 'Factory observed the linked pull request merge.')
+    await expect(
+      github.closeIssue(githubIssue, 'Factory observed the linked pull request merge.'),
+    ).resolves.toBe('applied')
 
     expect(calls).toEqual([
       ['issue', 'comment', '48', '--repo', 'AgentWorkforce/factory', '--body', 'Factory observed the linked pull request merge.'],
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'state'],
+      authenticatedActorCall,
+      issueStateEventsCall,
       ['issue', 'close', '48', '--repo', 'AgentWorkforce/factory', '--reason', 'completed'],
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'state'],
+      issueStateEventsCall,
+    ])
+  })
+
+  it('does not attribute an issue close won by another actor between read and command', async () => {
+    let state = 'OPEN'
+    const events: string[] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        if (args[0] === 'issue' && args[1] === 'view' && args.includes('state')) {
+          return { stdout: JSON.stringify({ state }) }
+        }
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'close') {
+          state = 'CLOSED'
+          events.push('1\tclosed\tother-user')
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.closeIssue(githubIssue, 'Factory completion.')).resolves.toBe('acknowledged')
+  })
+
+  it('reports an already-closed issue without issuing a close command', async () => {
+    const calls: string[][] = []
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ state: 'CLOSED' }) }
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.closeIssue(githubIssue, 'Factory completion.')).resolves.toBe('already-matched')
+    expect(calls).toEqual([
+      ['issue', 'comment', '48', '--repo', 'AgentWorkforce/factory', '--body', 'Factory completion.'],
+      ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'state'],
     ])
   })
 

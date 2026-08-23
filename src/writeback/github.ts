@@ -3,7 +3,12 @@ import { promisify } from 'node:util'
 
 import type { GithubConnectionWrite, MountClient } from '../ports'
 import type { GithubPublishPullRequestInput, GithubPublishPullRequestResult } from '../ports/mount'
-import type { GithubIssueStatus, GithubStatusWriteResult, GithubWriteback } from '../ports/writeback'
+import type {
+  GithubIssueCloseWriteResult,
+  GithubIssueStatus,
+  GithubStatusWriteResult,
+  GithubWriteback,
+} from '../ports/writeback'
 import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
 import type { LinearIssue, PrSummary } from '../types'
 import { asRecord, wrappedPayload } from './shared'
@@ -74,6 +79,17 @@ interface GithubLabelReceiptBaseline {
   actor: string
   eventIds: Set<string>
   statusLabels: Set<string>
+}
+
+interface GithubIssueStateEvent {
+  id: string
+  event: 'closed' | 'reopened'
+  actor: string
+}
+
+interface GithubIssueCloseReceiptBaseline {
+  actor: string
+  eventIds: Set<string>
 }
 
 type AppIssueConnectionWrite = GithubConnectionWrite & Required<Pick<
@@ -154,7 +170,7 @@ export class AppGithubWriteback implements GithubWriteback {
     return 'acknowledged'
   }
 
-  async closeIssue(issue: LinearIssue, body: string): Promise<void> {
+  async closeIssue(issue: LinearIssue, body: string): Promise<GithubIssueCloseWriteResult> {
     const ref = githubIssueRef(issue)
     await this.postComment(issue, body)
     await this.#write.updateIssue({
@@ -163,6 +179,9 @@ export class AppGithubWriteback implements GithubWriteback {
       state: 'closed',
       author: 'app',
     })
+    // Relayfile confirms acknowledgement, but this writer has no provider
+    // audit receipt that distinguishes our close from a concurrent actor's.
+    return 'acknowledged'
   }
 }
 
@@ -478,9 +497,11 @@ export class GhCliGithubWriteback implements GithubWriteback {
       })
   }
 
-  async closeIssue(issue: LinearIssue, body: string): Promise<void> {
+  async closeIssue(issue: LinearIssue, body: string): Promise<GithubIssueCloseWriteResult> {
     const ref = githubIssueRef(issue)
     await this.postComment(issue, body)
+    if (await this.#issueState(ref) === 'closed') return 'already-matched'
+    const receiptBaseline = await this.#issueCloseReceiptBaseline(ref).catch(() => undefined)
     await this.#run([
       'issue',
       'close',
@@ -490,6 +511,77 @@ export class GhCliGithubWriteback implements GithubWriteback {
       '--reason',
       'completed',
     ])
+    if (await this.#issueState(ref) !== 'closed') {
+      throw new Error(`GitHub writeback did not confirm closed state on ${ref.repo}#${ref.number}`)
+    }
+    return await this.#hasAuthoredIssueClose(ref, receiptBaseline)
+      ? 'applied'
+      : 'acknowledged'
+  }
+
+  async #issueState(ref: { repo: string; number: number }): Promise<'open' | 'closed'> {
+    const result = await this.#run([
+      'issue',
+      'view',
+      String(ref.number),
+      '--repo',
+      ref.repo,
+      '--json',
+      'state',
+    ])
+    const parsed = JSON.parse(result.stdout) as { state?: unknown }
+    const state = stringValue(parsed.state)?.toLowerCase()
+    if (state === 'open' || state === 'closed') return state
+    throw new Error(`GitHub lifecycle read returned an unknown issue state on ${ref.repo}#${ref.number}`)
+  }
+
+  async #issueCloseReceiptBaseline(
+    ref: { repo: string; number: number },
+  ): Promise<GithubIssueCloseReceiptBaseline> {
+    const actor = (await this.#run(['api', 'user', '--jq', '.login'])).stdout.trim().toLowerCase()
+    if (!actor) throw new Error('GitHub close receipt could not resolve the authenticated actor')
+    const events = await this.#issueStateEvents(ref)
+    return { actor, eventIds: new Set(events.map((event) => event.id)) }
+  }
+
+  async #hasAuthoredIssueClose(
+    ref: { repo: string; number: number },
+    baseline: GithubIssueCloseReceiptBaseline | undefined,
+  ): Promise<boolean> {
+    if (!baseline) return false
+    const events = await this.#issueStateEvents(ref).catch(() => [])
+    const newEvents = events.filter((event) => !baseline.eventIds.has(event.id))
+    let state: 'open' | 'closed' = 'open'
+    let definingClose: GithubIssueStateEvent | undefined
+    for (const event of newEvents) {
+      if (event.event === 'closed') {
+        if (state === 'open') definingClose = event
+        state = 'closed'
+      } else {
+        state = 'open'
+        definingClose = undefined
+      }
+    }
+    return state === 'closed' && definingClose?.actor === baseline.actor
+  }
+
+  async #issueStateEvents(ref: { repo: string; number: number }): Promise<GithubIssueStateEvent[]> {
+    const result = await this.#run([
+      'api',
+      '--paginate',
+      `repos/${ref.repo}/issues/${ref.number}/events`,
+      '--jq',
+      '.[] | select(.event == "closed" or .event == "reopened") | [.id, .event, .actor.login] | @tsv',
+    ])
+    return result.stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .flatMap((line): GithubIssueStateEvent[] => {
+        const [id, event, actor] = line.split('\t')
+        if (!id || (event !== 'closed' && event !== 'reopened') || !actor) return []
+        return [{ id, event, actor: actor.toLowerCase() }]
+      })
   }
 
   async #gitValue(args: string[], description: string): Promise<string> {

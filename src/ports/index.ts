@@ -41,6 +41,7 @@ export type {
 } from './fleet'
 export type {
   GithubRead,
+  GithubIssueCloseWriteResult,
   GithubIssueStatus,
   GithubStatusWriteResult,
   GithubWriteback,

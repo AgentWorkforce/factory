@@ -13980,11 +13980,17 @@ export class FactoryLoop implements Factory {
               `Factory agents completed; this issue is awaiting human review. The pull request remains open.\n\nMerge policy: ${this.#config.mergePolicy}`,
             )
           } else {
-            await this.#githubWriteback.closeIssue(
+            const closeWrite = await this.#githubWriteback.closeIssue(
               issue,
               'Factory observed the linked pull request merge and completed this issue.',
             )
-            record.issueWritebackConfirmedAtMs ??= this.#clock.now()
+            // A provider-confirmed, actor-attributed close is the only safe
+            // proof that this dispatch owns the visible terminal state. An
+            // idempotent no-op, legacy void adapter, or App acknowledgement
+            // may instead mean a third party won the close race.
+            if (closeWrite === 'applied') {
+              record.issueWritebackConfirmedAtMs ??= this.#clock.now()
+            }
           }
         } else {
           const targetState = humanReview

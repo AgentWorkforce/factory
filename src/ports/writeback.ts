@@ -28,6 +28,13 @@ export type GithubIssueStatus = 'ready' | 'in-progress' | 'human-review'
  */
 export type GithubStatusWriteResult = 'applied' | 'already-matched' | 'acknowledged'
 
+/**
+ * Whether closing an issue provably created the provider's visible transition.
+ * The same conservative receipt semantics as status writes apply: only an
+ * `applied` result may establish Factory ownership of the closed state.
+ */
+export type GithubIssueCloseWriteResult = 'applied' | 'already-matched' | 'acknowledged'
+
 export interface GithubWriteback {
   /** Optional local-user PR publisher, implemented by the default `gh` writeback. */
   publishPullRequest?(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
@@ -39,5 +46,5 @@ export interface GithubWriteback {
   /** Provider-authoritative lookup used to reconcile ambiguous comment writes. */
   hasCommentMarker?(issue: LinearIssue, marker: string): Promise<boolean>
   setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult | void>
-  closeIssue(issue: LinearIssue, body: string): Promise<void>
+  closeIssue(issue: LinearIssue, body: string): Promise<GithubIssueCloseWriteResult | void>
 }

@@ -352,6 +352,7 @@ export type {
   SpawnResult,
   AgentUsage,
   GithubRead,
+  GithubIssueCloseWriteResult,
   GithubIssueStatus,
   GithubStatusWriteResult,
   GithubWriteback,
