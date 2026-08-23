@@ -608,6 +608,12 @@ interface PostSpawnDispatchClaimFence {
   claimStarted: boolean
   accepted?: boolean
   settled: Promise<boolean>
+  settle(accepted: boolean): void
+}
+
+interface PostSpawnIssueObservation {
+  settled: Promise<boolean>
+  settle(accepted: boolean): void
 }
 
 const realClock: Clock = {
@@ -828,7 +834,7 @@ export class FactoryLoop implements Factory {
   // still performing its post-spawn readiness read. Completion publishes its
   // provider receipt, then waits for that read to classify the state as owned
   // or foreign before it releases agents under a terminal success reason.
-  readonly #postSpawnIssueObservations = new Map<string, Promise<boolean>>()
+  readonly #postSpawnIssueObservations = new Map<string, PostSpawnIssueObservation>()
   // The post-spawn ready read and following dispatch claim form one local
   // write boundary. A completion arriving first makes dispatch wait and
   // re-read; one arriving after claim entry waits for the claim to finish.
@@ -1320,6 +1326,15 @@ export class FactoryLoop implements Factory {
   async stop(): Promise<void> {
     this.#started = false
     this.#stopping = true
+    // These waits are armed before every planned spawn returns. Resolve them
+    // before the first shutdown await: a fast first agent may be completing
+    // while a later spawn is hung, and #drainAgentExitsInFlight would otherwise
+    // wait forever on a resolver stranded inside that dispatch stack.
+    const postSpawnWaitKeys = new Set([
+      ...this.#postSpawnIssueObservations.keys(),
+      ...this.#postSpawnDispatchClaimFences.keys(),
+    ])
+    for (const key of postSpawnWaitKeys) this.#settlePostSpawnDispatchWaits(key, false, 'stop')
     if (this.#babysitterResourceDeliveryRetryTimer) clearTimeout(this.#babysitterResourceDeliveryRetryTimer)
     this.#babysitterResourceDeliveryRetryTimer = undefined
     if (this.#babysitterResourceSubscriptionRenewTimer) clearTimeout(this.#babysitterResourceSubscriptionRenewTimer)
@@ -4573,39 +4588,46 @@ export class FactoryLoop implements Factory {
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
     const observationKey = issueKey(record.issue)
     let resolvePostSpawnIssueObservation!: (accepted: boolean) => void
-    let postSpawnIssueObservationSettled = false
-    const postSpawnIssueObservation = new Promise<boolean>((resolve) => {
+    let postSpawnIssueObservationDidSettle = false
+    const postSpawnIssueObservationSettled = new Promise<boolean>((resolve) => {
       resolvePostSpawnIssueObservation = resolve
     })
+    let postSpawnIssueObservation!: PostSpawnIssueObservation
+    postSpawnIssueObservation = {
+      settled: postSpawnIssueObservationSettled,
+      settle: (accepted: boolean): void => {
+        if (postSpawnIssueObservationDidSettle) return
+        postSpawnIssueObservationDidSettle = true
+        resolvePostSpawnIssueObservation(accepted)
+        if (this.#postSpawnIssueObservations.get(observationKey) === postSpawnIssueObservation) {
+          this.#postSpawnIssueObservations.delete(observationKey)
+        }
+      },
+    }
     this.#postSpawnIssueObservations.set(observationKey, postSpawnIssueObservation)
     let resolvePostSpawnDispatchClaim!: (accepted: boolean) => void
     let postSpawnDispatchClaimSettled = false
     const postSpawnDispatchClaim = new Promise<boolean>((resolve) => {
       resolvePostSpawnDispatchClaim = resolve
     })
-    const postSpawnDispatchClaimFence: PostSpawnDispatchClaimFence = {
+    let postSpawnDispatchClaimFence!: PostSpawnDispatchClaimFence
+    postSpawnDispatchClaimFence = {
       completionAtWriteBoundary: false,
       claimStarted: false,
       settled: postSpawnDispatchClaim,
+      settle: (accepted: boolean): void => {
+        if (postSpawnDispatchClaimSettled) return
+        postSpawnDispatchClaimSettled = true
+        postSpawnDispatchClaimFence.accepted = accepted
+        resolvePostSpawnDispatchClaim(accepted)
+        if (this.#postSpawnDispatchClaimFences.get(observationKey) === postSpawnDispatchClaimFence) {
+          this.#postSpawnDispatchClaimFences.delete(observationKey)
+        }
+      },
     }
     this.#postSpawnDispatchClaimFences.set(observationKey, postSpawnDispatchClaimFence)
-    const settlePostSpawnIssueObservation = (accepted: boolean): void => {
-      if (postSpawnIssueObservationSettled) return
-      postSpawnIssueObservationSettled = true
-      resolvePostSpawnIssueObservation(accepted)
-      if (this.#postSpawnIssueObservations.get(observationKey) === postSpawnIssueObservation) {
-        this.#postSpawnIssueObservations.delete(observationKey)
-      }
-    }
-    const settlePostSpawnDispatchClaim = (accepted: boolean): void => {
-      if (postSpawnDispatchClaimSettled) return
-      postSpawnDispatchClaimSettled = true
-      postSpawnDispatchClaimFence.accepted = accepted
-      resolvePostSpawnDispatchClaim(accepted)
-      if (this.#postSpawnDispatchClaimFences.get(observationKey) === postSpawnDispatchClaimFence) {
-        this.#postSpawnDispatchClaimFences.delete(observationKey)
-      }
-    }
+    const settlePostSpawnIssueObservation = postSpawnIssueObservation.settle
+    const settlePostSpawnDispatchClaim = postSpawnDispatchClaimFence.settle
     try {
       if (!dryRun) {
         const issue = await this.#readIssue(dispatchDecision.issue.path)
@@ -9707,6 +9729,11 @@ export class FactoryLoop implements Factory {
   // record leaves the batch.
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
     const key = issueKey(record.issue)
+    // A dispatch can be stuck inside a later spawn after an earlier agent has
+    // already started completion. Release both post-spawn waits before the
+    // first abandonment await so terminal processing cannot remain an
+    // absorbing promise after this lifecycle is reaped.
+    this.#settlePostSpawnDispatchWaits(key, false, 'abandonment')
     const heldPastDeadline = reason === HELD_PAST_DEADLINE_RELEASE_REASON
     const agentReleaseReason = heldPastDeadline ? HELD_PAST_DEADLINE_RELEASE_REASON : 'issue-abandoned'
     this.#abandonedDispatchReasons.set(key, reason)
@@ -14096,7 +14123,7 @@ export class FactoryLoop implements Factory {
         // the receipt before claiming terminal success. An unproven provider
         // transition is a foreign live-state change: dispatch owns the
         // abandonment and must release agents with that reason, not issue-done.
-        if (postSpawnIssueObservation && !await postSpawnIssueObservation) return
+        if (postSpawnIssueObservation && !await postSpawnIssueObservation.settled) return
         if (!humanReview) await this.#markDependencyTerminalAndReconcile(issue)
       } else {
         settleIssueWritebackOnce()
@@ -14189,6 +14216,22 @@ export class FactoryLoop implements Factory {
       implementation,
       method,
     })
+  }
+
+  #settlePostSpawnDispatchWaits(
+    key: string,
+    accepted: boolean,
+    source?: 'abandonment' | 'stop',
+  ): boolean {
+    const observation = this.#postSpawnIssueObservations.get(key)
+    const claimFence = this.#postSpawnDispatchClaimFences.get(key)
+    if (!observation && !claimFence) return false
+    // Capture both before either settlement deletes its own map entry.
+    observation?.settle(accepted)
+    claimFence?.settle(accepted)
+    if (source === 'abandonment') this.#increment('postSpawnWaitsSettledByAbandonment')
+    if (source === 'stop') this.#increment('postSpawnWaitsSettledByStop')
+    return true
   }
 
   #emit(event: FactoryEvent, payload: FactoryEventPayload): void {

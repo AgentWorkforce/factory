@@ -949,6 +949,22 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
   }
 }
 
+class LaterSpawnHangingFleetClient extends RemoteLifecycleFleetClient {
+  readonly laterSpawnGate = Promise.withResolvers<void>()
+  terminalExitEmitted = false
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    if (input.name.includes('-review') && !this.terminalExitEmitted) {
+      const implementer = this.spawns.find((spawn) => spawn.name.includes('-impl-'))
+      if (!implementer) throw new Error('reviewer spawn started before the implementer placement')
+      this.terminalExitEmitted = true
+      this.emitAgentExit(implementer.name, 'issue-done')
+      await this.laterSpawnGate.promise
+    }
+    return await super.spawn(input)
+  }
+}
+
 class DurableRemoteLifecycleFleetClient extends RemoteLifecycleFleetClient {
   override readonly durableOwnership = true
 }
@@ -10969,6 +10985,109 @@ describe('FactoryLoop', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it('settles post-spawn completion waits when a later spawn reaches the held-agent deadline', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-deadline-'))
+    const number = 1252
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new LaterSpawnHangingFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 1_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let stopped = false
+    try {
+      await vi.waitFor(() => expect(fleet.terminalExitEmitted).toBe(true), { timeout: 4_000 })
+      await vi.waitFor(() => expect(githubWriteback.statuses).toContainEqual({
+        key: String(number),
+        status: 'human-review',
+      }), { timeout: 4_000 })
+      // Completion has written provider terminal state and is now waiting for
+      // the post-spawn observation, while the reviewer spawn never returns.
+      await vi.waitFor(() => expect(factory.status().counters.postSpawnWaitsSettledByAbandonment)
+        .toBe(1), { timeout: 8_000 })
+      await vi.waitFor(() => expect(fleet.releases).toContainEqual({
+        name: `ar-${number}-impl-pear`,
+        reason: 'held-past-deadline',
+      }), { timeout: 4_000 })
+
+      // The deadline settlement must have drained the completion exit before
+      // shutdown supplies its independent settlement backstop.
+      await withDeadline(factory.stop(), 2_000, 'stop remained blocked after held-agent abandonment')
+      stopped = true
+      expect(factory.status().counters.postSpawnWaitsSettledByStop).toBeUndefined()
+
+      fleet.laterSpawnGate.resolve()
+      await withDeadline(run, 8_000, 'late reviewer spawn did not unwind after abandonment')
+    } finally {
+      fleet.laterSpawnGate.resolve()
+      if (!stopped) await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('settles post-spawn completion waits before shutdown drains agent exits', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-stop-'))
+    const number = 1253
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new LaterSpawnHangingFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 60_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let stopped = false
+    try {
+      await vi.waitFor(() => expect(fleet.terminalExitEmitted).toBe(true), { timeout: 4_000 })
+      await vi.waitFor(() => expect(githubWriteback.statuses).toContainEqual({
+        key: String(number),
+        status: 'human-review',
+      }), { timeout: 4_000 })
+      expect(factory.status().counters.postSpawnWaitsSettledByAbandonment).toBeUndefined()
+
+      await withDeadline(factory.stop(), 2_000, 'stop remained blocked on a post-spawn completion wait')
+      stopped = true
+      expect(factory.status().counters.postSpawnWaitsSettledByStop).toBe(1)
+
+      fleet.laterSpawnGate.resolve()
+      await withDeadline(run, 8_000, 'late reviewer spawn did not unwind after stop')
+    } finally {
+      fleet.laterSpawnGate.resolve()
+      if (!stopped) await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
 
   // #303: a lifecycle that reached a slot-occupying phase and never had a
   // live agent placement has no `heldSinceAtMs`, so both halves of the
