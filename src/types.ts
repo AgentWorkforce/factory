@@ -139,10 +139,27 @@ export type FactoryLoopHeartbeatStatus = 'running' | 'idle' | 'stopping'
 export interface FactoryLoopHeartbeat {
   pid: number
   status: FactoryLoopHeartbeatStatus
+  /** Writer path for this record; `live-timer` proves process liveness only. */
+  source?: 'live-timer' | 'bounded-loop'
   iteration: number
   maxIterations: number
+  /** Stable for this loop lifetime; lets readers apply a cold-start grace. */
+  startedAt?: string
+  startedAtMs?: number
+  /** Explicit capability marker for consumers of the progress receipt below. */
+  progressContract?: 'discovery-sweep-v1'
   updatedAt: string
   updatedAtMs: number
+  /**
+   * Advances only after a discovery sweep commits successfully. Timer-only
+   * heartbeat refreshes copy this receipt unchanged.
+   */
+  progress?: {
+    sequence: number
+    operation: 'discovery-sweep'
+    updatedAt: string
+    updatedAtMs: number
+  }
   registryPath?: string
   eventListener?: FactoryEventListenerStatus
   readinessReconcile?: FactoryReadinessReconcileStatus
