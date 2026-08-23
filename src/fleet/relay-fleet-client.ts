@@ -1238,12 +1238,6 @@ export class RelayFleetClient implements FleetClient {
     })
   }
 
-  /**
-   * `connected` is stamped at the dial itself, not when `#subscribeEvents`
-   * resolves: that function also returns early when the client is disposed, and
-   * reporting THAT as connected would recreate the exact false-healthy signal
-   * this status exists to remove.
-   */
   fleetConnectStatus(): FleetConnectStatus {
     return { ...this.#fleetConnect }
   }
@@ -1252,17 +1246,27 @@ export class RelayFleetClient implements FleetClient {
     const messaging = await this.#ensureMessaging()
     await this.#ensureLifecycleAction(messaging)
     if (this.#disposed) return
-    messaging.events.connect()
+    // Listen before dialing so a synchronous lifecycle event cannot race past
+    // the observer. `connect()` is void: returning only proves the SDK accepted
+    // the dial, not that the WebSocket handshake completed.
+    const unsubscribe = messaging.events.on('any', (event) => this.#handleEvent(event))
+    const statusBeforeDial = this.#fleetConnect
+    try {
+      messaging.events.connect()
+    } catch (error) {
+      unsubscribe()
+      throw error
+    }
+    this.#eventUnsubscribers.push(unsubscribe)
     this.#fleetConnect = {
       ...this.#fleetConnect,
-      state: 'connected',
-      lastConnectedAtMs: this.#now(),
-      lastError: undefined,
+      ...(this.#fleetConnect === statusBeforeDial ? { state: 'dialed' as const } : {}),
+      lastDialedAtMs: this.#now(),
     }
-    this.#eventUnsubscribers.push(messaging.events.on('any', (event) => this.#handleEvent(event)))
   }
 
   #handleEvent(event: RelayMessagingEvent): void {
+    this.#observeFleetConnectionEvent(event)
     switch (event.type) {
       case 'dmReceived':
       case 'groupDmReceived':
@@ -1282,6 +1286,43 @@ export class RelayFleetClient implements FleetClient {
         break
       default:
         break
+    }
+  }
+
+  /** Translate the SDK's real stream lifecycle into the published status. */
+  #observeFleetConnectionEvent(event: RelayMessagingEvent): void {
+    const now = this.#now()
+    switch (event.type) {
+      case 'disconnected':
+      case 'permanentlyDisconnected':
+        this.#fleetConnect = {
+          ...this.#fleetConnect,
+          state: 'failed',
+          lastFailureAtMs: now,
+          lastError: 'RelayEventStreamDisconnected',
+        }
+        return
+      case 'error':
+        this.#fleetConnect = {
+          ...this.#fleetConnect,
+          state: 'failed',
+          lastFailureAtMs: now,
+          lastError: 'RelayEventStreamError',
+        }
+        return
+      case 'reconnecting':
+        this.#fleetConnect = { ...this.#fleetConnect, state: 'connecting' }
+        return
+      default:
+        // `connected` and every data event are confirmations that the event
+        // stream opened. A void `connect()` call alone never reaches this arm.
+        this.#fleetConnect = {
+          ...this.#fleetConnect,
+          state: 'connected',
+          firstEventAtMs: this.#fleetConnect.firstEventAtMs ?? now,
+          ...(this.#fleetConnect.state !== 'connected' ? { lastConnectedAtMs: now } : {}),
+          lastError: undefined,
+        }
     }
   }
 

@@ -74,6 +74,7 @@ const EVENT_LISTENER_STATES: readonly FactoryEventListenerStatus['state'][] = [
 const FLEET_CONNECT_STATES: readonly FleetConnectStatus['state'][] = [
   'never-attempted',
   'connecting',
+  'dialed',
   'connected',
   'failed',
 ]
@@ -462,6 +463,8 @@ function fleetConnectHealth(status: FleetConnectStatus): FactoryPublicFleetConne
     state: enumValue(status.state, FLEET_CONNECT_STATES),
     ...(attempts !== undefined ? { attempts } : {}),
     ...optionalTimestamp('lastAttemptAtMs', status.lastAttemptAtMs),
+    ...optionalTimestamp('lastDialedAtMs', status.lastDialedAtMs),
+    ...optionalTimestamp('firstEventAtMs', status.firstEventAtMs),
     ...optionalTimestamp('lastConnectedAtMs', status.lastConnectedAtMs),
     ...optionalTimestamp('lastFailureAtMs', status.lastFailureAtMs),
     // `lastError` stays behind /evidence, exactly as it does for the circuit.
@@ -622,6 +625,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   const readiness = plainRecord(record.readinessReconcile)
   const listener = plainRecord(record.eventListener)
   const fleet = plainRecord(record.fleetControlPlane)
+  const fleetConnect = plainRecord(record.fleetConnect)
   const capacity = plainRecord(record.dispatchCapacity)
   // Re-derive the wedge from the occupants the record carries rather than
   // trusting its own `agentlessOccupants`: a producer that published the
@@ -688,6 +692,20 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             failureThreshold: counter(fleet.failureThreshold),
             ...optionalTimestamp('lastFailureAtMs', fleet.lastFailureAtMs),
             ...optionalTimestamp('retryAtMs', fleet.retryAtMs),
+          },
+        }
+      : {}),
+    ...(fleetConnect
+      ? {
+          fleetConnect: {
+            state: enumValue(fleetConnect.state, FLEET_CONNECT_STATES),
+            ...optionalCount('attempts', fleetConnect.attempts),
+            ...optionalTimestamp('lastAttemptAtMs', fleetConnect.lastAttemptAtMs),
+            ...optionalTimestamp('lastDialedAtMs', fleetConnect.lastDialedAtMs),
+            ...optionalTimestamp('firstEventAtMs', fleetConnect.firstEventAtMs),
+            ...optionalTimestamp('lastConnectedAtMs', fleetConnect.lastConnectedAtMs),
+            ...optionalTimestamp('lastFailureAtMs', fleetConnect.lastFailureAtMs),
+            // Never retain `lastError` from a remote unauthenticated record.
           },
         }
       : {}),

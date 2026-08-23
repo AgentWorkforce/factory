@@ -767,9 +767,14 @@ describe('fleet connect health', () => {
     })
 
   it('publishes the socket state unauthenticated', () => {
-    const health = publicHealthFromHeartbeat(withConnect(), { nowMs: BOOT_MS })
+    const health = publicHealthFromHeartbeat(withConnect({
+      lastDialedAtMs: BOOT_MS - 4_500,
+      firstEventAtMs: BOOT_MS - 4_250,
+    }), { nowMs: BOOT_MS })
     expect(health.fleetConnect?.state).toBe('failed')
     expect(health.fleetConnect?.attempts).toBe(1)
+    expect(health.fleetConnect?.lastDialedAtMs).toBe(BOOT_MS - 4_500)
+    expect(health.fleetConnect?.firstEventAtMs).toBe(BOOT_MS - 4_250)
   })
 
   /** `lastError` stays behind /evidence, exactly as it does for the circuit. */
@@ -794,5 +799,22 @@ describe('fleet connect health', () => {
   it('omits the block entirely when the backend has no socket', () => {
     const health = publicHealthFromHeartbeat(heartbeat(), { nowMs: BOOT_MS })
     expect(health.fleetConnect).toBeUndefined()
+  })
+
+  it('retains a failed socket record through normalization without retaining lastError', () => {
+    const published = publicHealthFromHeartbeat(withConnect({
+      lastDialedAtMs: BOOT_MS - 4_500,
+      firstEventAtMs: BOOT_MS - 4_250,
+    }), { nowMs: BOOT_MS })
+    const normalized = normalizePublicHealth({
+      ...published,
+      fleetConnect: {
+        ...published.fleetConnect,
+        lastError: 'connect failed to wss://relay.example?token=secret',
+      },
+    })
+
+    expect(normalized?.fleetConnect).toEqual(published.fleetConnect)
+    expect(Object.hasOwn(normalized?.fleetConnect ?? {}, 'lastError')).toBe(false)
   })
 })

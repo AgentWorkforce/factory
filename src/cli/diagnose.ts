@@ -483,6 +483,17 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
         )
       }
     }
+    const fleetConnect = health.fleetConnect
+    if (fleetConnect) {
+      lines.push('  fleetConnect:')
+      lines.push(`    state              : ${fleetConnect.state}`)
+      lines.push(`    attempts           : ${fleetConnect.attempts ?? '—'}`)
+      lines.push(`    lastAttemptAt      : ${formatInstant(fleetConnect.lastAttemptAtMs)}`)
+      lines.push(`    lastDialedAt       : ${formatInstant(fleetConnect.lastDialedAtMs)}`)
+      lines.push(`    firstEventAt       : ${formatInstant(fleetConnect.firstEventAtMs)}`)
+      lines.push(`    lastConnectedAt    : ${formatInstant(fleetConnect.lastConnectedAtMs)}`)
+      lines.push(`    lastFailureAt      : ${formatInstant(fleetConnect.lastFailureAtMs)}`)
+    }
     lines.push(`  eventListener        : ${health.eventListener?.state ?? 'unknown'}`)
   } else if (diagnosis.unreadable) {
     lines.push('  health block         : none — this response carried no Factory health')

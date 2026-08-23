@@ -1264,9 +1264,11 @@ async function factoryStatusWithMountHealth(
   heartbeatStaleMs: number,
   versionInfo?: FactoryVersionInfo,
   stateStoreStatus?: { backend: string },
-): Promise<Omit<ReturnType<Factory['status']>, 'fleetControlPlane'> & {
+): Promise<Omit<ReturnType<Factory['status']>, 'fleetControlPlane' | 'fleetConnect'> & {
   /** Undefined when a live older daemon predates fleet control-plane reporting. */
   fleetControlPlane?: ReturnType<Factory['status']>['fleetControlPlane']
+  /** Undefined when a live older daemon predates fleet socket reporting. */
+  fleetConnect?: ReturnType<Factory['status']>['fleetConnect']
   stateStore?: { backend: string }
   version?: string
   installedAt?: string
@@ -1307,6 +1309,9 @@ async function factoryStatusWithMountHealth(
   const fleetControlPlane = liveness.ok
     ? heartbeat?.fleetControlPlane
     : observableStatus.fleetControlPlane
+  const fleetConnect = liveness.ok
+    ? heartbeat?.fleetConnect
+    : observableStatus.fleetConnect
   // Same rule as readinessReconcile (#303): a live daemon owns the batch, and
   // a fresh local Factory instance holds no lifecycles. Falling back to that
   // instance when a live daemon predates the field would publish its empty
@@ -1333,6 +1338,7 @@ async function factoryStatusWithMountHealth(
     eventListener,
     readinessReconcile,
     fleetControlPlane,
+    fleetConnect,
     ...(dispatchCapacity ? { dispatchCapacity } : {}),
   }
   return {
@@ -1343,6 +1349,7 @@ async function factoryStatusWithMountHealth(
     eventListener,
     readinessReconcile,
     fleetControlPlane,
+    fleetConnect,
     ...(dispatchCapacity ? { dispatchCapacity } : {}),
     localMountDegraded: health.degraded,
     ...(health.reason ? { localMountDegradedReason: health.reason } : {}),

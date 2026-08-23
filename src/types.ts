@@ -390,6 +390,8 @@ export interface FactoryPublicFleetConnectHealth {
   state: FleetConnectStatus['state'] | 'unknown'
   attempts?: number
   lastAttemptAtMs?: number
+  lastDialedAtMs?: number
+  firstEventAtMs?: number
   lastConnectedAtMs?: number
   lastFailureAtMs?: number
 }
@@ -609,6 +611,8 @@ export interface FactoryStatus {
   counters: Record<string, number>
   /** Broker/fleet mutation gate. An open circuit blocks new workers until a successful half-open roster probe. */
   fleetControlPlane: FleetControlPlaneStatus
+  /** Fleet event socket status. Absent when the backend has no socket. */
+  fleetConnect?: FleetConnectStatus
   slackDegraded?: boolean
   slackDegradedReason?: string
   /** Primary Relayfile subscription/poll registration, not event activity. */

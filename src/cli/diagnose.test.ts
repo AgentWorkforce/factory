@@ -61,6 +61,14 @@ const healthy = {
       lastStartedAtMs: NOW_MS - 30_000,
       lastCompletedAtMs: NOW_MS - 29_000,
     },
+    fleetConnect: {
+      state: 'connected',
+      attempts: 1,
+      lastAttemptAtMs: NOW_MS - 32_000,
+      lastDialedAtMs: NOW_MS - 31_000,
+      firstEventAtMs: NOW_MS - 30_500,
+      lastConnectedAtMs: NOW_MS - 30_000,
+    },
     eventListener: { state: 'subscribed' },
   },
 }
@@ -82,6 +90,10 @@ describe('factory diagnose --deployed (#295)', () => {
     expect(seen).toEqual([`${BASE}/healthz`])
     expect(out.text()).toContain('dispatching')
     expect(out.text()).toContain('readinessReconcile')
+    expect(out.text()).toContain('fleetConnect')
+    expect(out.text()).toContain('connected')
+    expect(out.text()).toContain(`lastAttemptAt      : ${new Date(NOW_MS - 32_000).toISOString()}`)
+    expect(out.text()).toContain(`lastConnectedAt    : ${new Date(NOW_MS - 30_000).toISOString()}`)
   })
 
   // The 2026-08-19/20 outage: eight consecutive failures behind `ok: true`.
@@ -765,4 +777,3 @@ describe('factory diagnose --deployed (#295)', () => {
     }
   })
 })
-

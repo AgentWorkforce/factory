@@ -38,6 +38,7 @@ class FakeMessaging {
   agentPresenceRows: Array<{ agentId: string; agentName: string; status: 'online' | 'offline' }> | undefined
   nodeRows: Array<Partial<RelayNode> & { name: string }> = []
   directError: Error | undefined
+  connectEvent: unknown | undefined
   connected = 0
   disconnected = 0
   nextInvocationId = 0
@@ -125,6 +126,7 @@ class FakeMessaging {
   readonly events = {
     connect: () => {
       this.connected += 1
+      if (this.connectEvent !== undefined) this.emit('any', this.connectEvent)
     },
     disconnect: async () => {
       this.disconnected += 1
@@ -1929,16 +1931,62 @@ describe('RelayFleetClient fleet connect status', () => {
     expect(status.lastError).toBeUndefined()
   })
 
-  it('reports connected only after the dial actually happens', async () => {
+  it('reports only dialed until the socket produces a confirming event', async () => {
     const messaging = new FakeMessaging()
+    let now = 1_000
+    const fleet = createClient(messaging, { now: () => ++now })
+    fleet.onAgentExit(() => {})
+    await flush()
+
+    expect(fleet.fleetConnectStatus()).toMatchObject({
+      state: 'dialed',
+      attempts: 1,
+      lastDialedAtMs: 1_002,
+    })
+    expect(fleet.fleetConnectStatus().firstEventAtMs).toBeUndefined()
+    expect(messaging.connected).toBe(1)
+
+    messaging.emit('any', { type: 'connected' })
+    expect(fleet.fleetConnectStatus()).toMatchObject({
+      state: 'connected',
+      firstEventAtMs: 1_003,
+      lastConnectedAtMs: 1_003,
+    })
+  })
+
+  it('records an established socket dropping and its later recovery', async () => {
+    const messaging = new FakeMessaging()
+    let now = 2_000
+    const fleet = createClient(messaging, { now: () => ++now })
+    fleet.onAgentExit(() => {})
+    await flush()
+
+    messaging.emit('any', { type: 'connected' })
+    const firstEventAtMs = fleet.fleetConnectStatus().firstEventAtMs
+    messaging.emit('any', { type: 'disconnected' })
+    expect(fleet.fleetConnectStatus()).toMatchObject({
+      state: 'failed',
+      lastError: 'RelayEventStreamDisconnected',
+    })
+
+    messaging.emit('any', { type: 'reconnecting', attempt: 1 })
+    expect(fleet.fleetConnectStatus().state).toBe('connecting')
+    messaging.emit('any', { type: 'connected' })
+    expect(fleet.fleetConnectStatus().state).toBe('connected')
+    expect(fleet.fleetConnectStatus().firstEventAtMs).toBe(firstEventAtMs)
+    expect(fleet.fleetConnectStatus().lastError).toBeUndefined()
+  })
+
+  it('does not overwrite a synchronous connection event with dialed', async () => {
+    const messaging = new FakeMessaging()
+    messaging.connectEvent = { type: 'connected' }
     const fleet = createClient(messaging)
     fleet.onAgentExit(() => {})
     await flush()
-    const status = fleet.fleetConnectStatus()
-    expect(status.state).toBe('connected')
-    expect(status.attempts).toBe(1)
-    expect(messaging.connected).toBe(1)
-    expect(status.lastConnectedAtMs).toBeTypeOf('number')
+
+    expect(fleet.fleetConnectStatus().state).toBe('connected')
+    expect(fleet.fleetConnectStatus().lastDialedAtMs).toBeTypeOf('number')
+    expect(fleet.fleetConnectStatus().firstEventAtMs).toBeTypeOf('number')
   })
 
   /**
@@ -1975,6 +2023,7 @@ describe('RelayFleetClient fleet connect status', () => {
     const healthyFleet = createClient(healthy)
     healthyFleet.onAgentExit(() => {})
     await flush()
+    healthy.emit('any', { type: 'connected' })
 
     expect(failingFleet.fleetConnectStatus().state).toBe('failed')
     expect(healthyFleet.fleetConnectStatus().state).toBe('connected')

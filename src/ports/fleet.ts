@@ -133,7 +133,7 @@ export type AgentUsage = {
 export type FleetTrackedAgent = { invocationId?: string; node?: string }
 
 /** Lifecycle of the fleet event socket: the dial that makes this agent `online`. */
-export type FleetConnectState = 'never-attempted' | 'connecting' | 'connected' | 'failed'
+export type FleetConnectState = 'never-attempted' | 'connecting' | 'dialed' | 'connected' | 'failed'
 
 /**
  * Why the fleet event subscription is (or is not) live.
@@ -151,6 +151,10 @@ export interface FleetConnectStatus {
   /** How many times a subscription has been started, including the current one. */
   attempts: number
   lastAttemptAtMs?: number
+  /** The SDK accepted `connect()`; this does not prove that the socket opened. */
+  lastDialedAtMs?: number
+  /** First event that proved this client received data from the stream. */
+  firstEventAtMs?: number
   lastConnectedAtMs?: number
   lastFailureAtMs?: number
   /** Reduced to `Name (CODE)`; never a raw transport message. */
