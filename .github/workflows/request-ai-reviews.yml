@@ -21,7 +21,6 @@ jobs:
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     permissions:
-      contents: read
       issues: write
     steps:
       - name: Request exact-head reviews
