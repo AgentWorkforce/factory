@@ -526,6 +526,15 @@ The definition reads its node config from `./factory.node.json` (or
 mapped repo is advertised as a `repo:<label>` tag so placement can route
 repo-scoped spawns to it. Spawns for unadvertised paths are refused on the node.
 
+The default `@agent-relay/factory/node` export is a generic worker-machine
+definition; it does not host a persona and therefore does not publish an agent
+card. An application that intentionally couples a persona to a Factory node
+uses the exported `createFactoryNodeDefinition({ persona })` and
+`startFactoryNode({ cardPublisher })` runtime. `startFactoryNode` owns the
+online-registration edge and publishes the canonical card there; cloud personas
+such as the checked-in `factory-feature-guardian` continue to use the Agent
+Workforce cloud-persona deployment path described above.
+
 ### Tailnet live previews
 
 Factory can attach an issue-lifetime [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)

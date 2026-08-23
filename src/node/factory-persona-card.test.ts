@@ -161,6 +161,48 @@ describe('Factory persona cards', () => {
     expect(attempts).toBe(2)
   })
 
+  it('preserves a registration edge that arrives while publication is in flight', async () => {
+    const definition = createFactoryNodeDefinition({
+      config: parseFactoryNodeConfig({ capabilities: ['spawn:codex'] }),
+      persona: { persona, baseUrl: 'https://relay.example', version: '1.0.0' },
+    })
+    let registration: ((info: { name: string; capabilities: string[] }) => void) | undefined
+    let rejectFirst!: (reason: unknown) => void
+    let attempts = 0
+    const running = startFactoryNode({
+      definition,
+      connection: { nodeId: 'node-1', nodeToken: 'nt_live_test' },
+      cardPublisher: {
+        publishAgentCard() {
+          attempts += 1
+          if (attempts === 1) {
+            return new Promise((_resolve, reject) => { rejectFirst = reject })
+          }
+          return Promise.resolve({
+            name: 'factory-feature-guardian',
+            address: 'ext-factory-feature-guardian-overlap',
+          })
+        },
+      },
+      serve(options) {
+        registration = options.onRegistered
+        return { stop: async () => {}, done: Promise.resolve() }
+      },
+    })
+    const info = { name: definition.name, capabilities: Object.keys(definition.capabilities) }
+
+    registration?.(info)
+    await vi.waitFor(() => expect(attempts).toBe(1))
+    registration?.(info)
+    rejectFirst(new Error('first registration lost its connection'))
+
+    await expect(running.cardPublished).resolves.toEqual({
+      name: 'factory-feature-guardian',
+      address: 'ext-factory-feature-guardian-overlap',
+    })
+    expect(attempts).toBe(2)
+  })
+
   it('verifies an idempotent registration conflict and returns the existing relay address', async () => {
     const definition = createFactoryNodeDefinition({
       config: parseFactoryNodeConfig({

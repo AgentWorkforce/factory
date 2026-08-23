@@ -18,6 +18,7 @@ import {
   type AgentRelayMcpCommand,
 } from '../fleet/internal-fleet-client'
 import type { Capability, PreviewReference } from '../ports/fleet'
+import { resolveRelayWorkspaceKey } from '../fleet/relay-workspace-key'
 import { TailscalePreviewManager, type PreviewManager } from './tailscale-preview'
 import { deriveFactoryPersonaCard, type FactoryPersonaCardInput } from './factory-persona-card'
 
@@ -173,6 +174,8 @@ export interface FactoryNodeDefinitionOptions {
   workflowRunner?: WorkflowRunner
   resolveAgentRelayMcpCommand?: () => AgentRelayMcpCommand | undefined
   previewManager?: PreviewManager
+  /** Relay workspace credential inherited by worker MCP processes. */
+  workspaceKey?: string
   /** Persona hosted by this node; its canonical A2A card is attached for online publication. */
   persona?: FactoryPersonaCardInput
 }
@@ -215,6 +218,11 @@ export interface FactoryNodeInventorySync {
 
 export function createFactoryNodeDefinition(options: FactoryNodeDefinitionOptions): FactoryNodeDefinition {
   const config = options.config
+  // `agent-relay node up` normalizes flag, env, project-pin, and active-store
+  // selection into RELAY_WORKSPACE_KEY before it imports this definition.
+  // Capture it in the node closure so every worker gets authenticated teammate
+  // tools even when the caller did not pass an explicit credential.
+  const workspaceKey = options.workspaceKey ?? resolveRelayWorkspaceKey()
   const capabilities = normalizeCapabilities([
     ...config.capabilities,
     ...(config.preview ? ['preview:tailscale-serve'] : []),
@@ -252,6 +260,7 @@ export function createFactoryNodeDefinition(options: FactoryNodeDefinitionOption
       metadata: { ...metadata, handler: 'harness', cli: capabilityCli[capability] },
     }, async (input, ctx) => runSpawnCapability(capability, input, ctx, {
       config,
+      workspaceKey,
       resolveAgentRelayMcpCommand: options.resolveAgentRelayMcpCommand ?? resolveAgentRelayMcpCommand,
     })) as unknown as FleetCapabilityValue
   }
@@ -361,7 +370,7 @@ async function runSpawnCapability(
   capability: Extract<FactoryNodeCapability, 'spawn:claude' | 'spawn:codex'>,
   input: SpawnCapabilityInput,
   ctx: FleetActionContext,
-  deps: Pick<FactoryNodeDefinitionOptions, 'config' | 'resolveAgentRelayMcpCommand'>,
+  deps: Pick<FactoryNodeDefinitionOptions, 'config' | 'workspaceKey' | 'resolveAgentRelayMcpCommand'>,
 ): Promise<unknown> {
   if (!input.name) {
     throw new Error(`${capability} requires name or agent`)
@@ -388,7 +397,7 @@ async function runSpawnCapability(
     ? buildRelayMcpHarnessConfig(
         spawnInput,
         command,
-        undefined,
+        deps.workspaceKey,
         input.identityKey,
       ) as FleetSpawnAgentInput['agent']['harness_config']
     : undefined

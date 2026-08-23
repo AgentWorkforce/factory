@@ -28,8 +28,31 @@ export function startFactoryNode(options: StartFactoryNodeOptions): RunningFacto
   })
   let publicationCompleted = false
   let publicationInFlight = false
+  let publicationRetryRequested = false
   let publicationTerminal = false
   const serve = options.serve ?? startServeNode
+  const publishCard = () => {
+    const card = options.definition.agentCard
+    if (!card || !options.cardPublisher || publicationCompleted || publicationInFlight || publicationTerminal) return
+    publicationInFlight = true
+    void options.cardPublisher.publishAgentCard(card).then((published) => {
+      publicationInFlight = false
+      publicationRetryRequested = false
+      publicationCompleted = true
+      resolvePublication(published)
+    }, (error) => {
+      publicationInFlight = false
+      options.warn?.(
+        `Factory persona card publication failed; ${
+          publicationRetryRequested ? 'a registration arrived during publication, retrying now' : 'the next node registration will retry'
+        }: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      if (publicationRetryRequested) {
+        publicationRetryRequested = false
+        publishCard()
+      }
+    })
+  }
   const running = serve({
     definition: options.definition,
     connection: options.connection,
@@ -44,7 +67,14 @@ export function startFactoryNode(options: StartFactoryNodeOptions): RunningFacto
     ...(options.warn ? { warn: options.warn } : {}),
     onRegistered(info) {
       options.onRegistered?.(info)
-      if (publicationCompleted || publicationInFlight || publicationTerminal) return
+      if (publicationCompleted || publicationTerminal) return
+      if (publicationInFlight) {
+        // A reconnect can finish while the previous registration's HTTP write
+        // is still pending. Preserve that edge so a later failure retries
+        // immediately instead of waiting for a third registration.
+        publicationRetryRequested = true
+        return
+      }
       const card = options.definition.agentCard
       if (!card) {
         publicationCompleted = true
@@ -56,22 +86,7 @@ export function startFactoryNode(options: StartFactoryNodeOptions): RunningFacto
         rejectPublication(new Error('Factory persona node came online without an AgentCardPublisher'))
         return
       }
-      publicationInFlight = true
-      void options.cardPublisher.publishAgentCard(card).then((published) => {
-        publicationInFlight = false
-        publicationCompleted = true
-        resolvePublication(published)
-      }, (error) => {
-        // An online edge can recur after a reconnect. Keep cardPublished
-        // pending and allow that later edge to retry a transient Relaycast
-        // failure; only success suppresses future publication attempts.
-        publicationInFlight = false
-        options.warn?.(
-          `Factory persona card publication failed; the next node registration will retry: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        )
-      })
+      publishCard()
     },
   })
   return {
