@@ -1,6 +1,9 @@
 name: Request AI reviews
 
 on:
+  push:
+    branches:
+      - fix/ai-review-request-permission
   pull_request_target:
     types:
       - opened
@@ -18,18 +21,25 @@ concurrency:
 
 jobs:
   request:
-    if: ${{ !github.event.pull_request.draft }}
+    if: ${{ github.event_name == 'push' || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     permissions:
       issues: write
-      pull-requests: write
     steps:
       - name: Request exact-head reviews
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '340' }}
         run: |
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            gh api \
+              --include \
+              --method POST \
+              "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --raw-field body="Temporary GITHUB_TOKEN permission diagnostic for ${HEAD_SHA}."
+            exit 0
+          fi
           body=$(printf '@coderabbitai review\n\n@codex review\n\nRequested for exact head `%s`.\n<!-- factory-ai-review-request:%s -->' "$HEAD_SHA" "$HEAD_SHA")
           gh api \
             --method POST \
