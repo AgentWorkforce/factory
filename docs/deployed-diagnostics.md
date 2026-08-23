@@ -92,13 +92,26 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   A cold container legitimately spends minutes in its first pass (#36 measured 61 minutes while the
   Relayfile mirror hydrated), so check `lastCompletedAtMs`: absent means "first pass since boot,
   still hydrating"; present and hours old means "was fine, then wedged".
-- **How long a stall can last** — a sweep is bounded at `liveSubscription.reconcileTimeoutMs`,
-  90 minutes by default (#296). On expiry the *wait* fails, so `consecutiveFailures` starts rising
-  and the loop schedules the next pass; the sweep itself is not cancelled, because it holds a durable
-  discovery lease, so `inFlightSinceMs` keeps ageing until it really finishes. A `stalled` state that
-  never turns into a rising `consecutiveFailures` therefore means the process is not running the loop
-  at all, which is a restart, not a wait. The deadline sits above #36's 61-minute measurement on
+- **How long a stall can last** — two deadlines, at different scales.
+
+  `liveSubscription.relayfileOperationTimeoutMs` bounds ONE relayfile call, five minutes by default
+  (#351). This is the one that catches a wedge. Expiry cancels the request, fails the pass with
+  `lastErrorClass: "RelayfileOperationTimeoutError"` and a `lastError` naming the call
+  (`relayfile listTree did not respond within 300000ms (GitHub issue ingestion)`), and unwinds the
+  sweep — which releases the discovery lease, so the next cycle starts clean.
+
+  `liveSubscription.reconcileTimeoutMs` bounds the whole sweep, 90 minutes by default (#296). It is
+  the outer backstop only. On expiry the *wait* fails, so `consecutiveFailures` starts rising and the
+  loop schedules the next pass; the sweep itself is not cancelled, because it holds a durable
+  discovery lease, so `inFlightSinceMs` keeps ageing until it really finishes — and the next pass
+  coalesces onto that same running `runOnce()`. The deadline sits above #36's 61-minute measurement on
   purpose: setting it below realistic cold-mirror hydration would turn a slow boot into a crash loop.
+  Per-call bounds can be far tighter precisely because that cold-mirror cost is spread across
+  thousands of calls rather than concentrated in one.
+
+  A `stalled` state that never turns into a rising `consecutiveFailures` means either the process is
+  not running the loop at all, or it predates #351 — on a current build a hung call fails within
+  `relayfileOperationTimeoutMs`.
 
 ### Why `ok` stays `true` while `status` goes amber
 

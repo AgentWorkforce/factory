@@ -125,6 +125,12 @@ export interface FactoryLiveSubscriptionOptions {
    * sized above realistic worst-case mirror hydration, not to the interval.
    */
   reconcileTimeoutMs: number
+  /**
+   * Deadline for one relayfile call inside a sweep (#351). Bounds what
+   * `reconcileTimeoutMs` cannot: a single dependency call that never returns,
+   * which no deadline checked *between* awaits can reach.
+   */
+  relayfileOperationTimeoutMs: number
 }
 
 /**

@@ -62,7 +62,7 @@ class FakeRelayFileClient implements RelayFileClientLike {
     path: string
     baseRevision: string
   }> = []
-  readonly listTreeCalls: Array<{ workspaceId: string; options?: { path?: string; depth?: number; cursor?: string } }> = []
+  readonly listTreeCalls: Array<{ workspaceId: string; options?: { path?: string; depth?: number; cursor?: string; signal?: AbortSignal } }> = []
   readonly getEventsCalls: Array<{ workspaceId: string; opts?: { cursor?: string; limit?: number; provider?: string; last?: number } }> = []
   readonly listLastNChangesCalls: Array<{ limit: number; context?: { workspaceId: string } }> = []
   readonly getOpCalls: Array<{ workspaceId: string; opId: string }> = []
@@ -1456,8 +1456,11 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.readFileCalls[0]).toEqual({ workspaceId: 'rw_test', path: '/linear/issues/AR-1.json' })
     expect(fake.listTreeCalls[0]).toEqual({
       workspaceId: 'rw_test',
-      options: { path: '/linear/issues', cursor: undefined },
+      // #351: reads carry the per-operation deadline's signal, so a relayfile
+      // call that stops answering is cancelled instead of waited on forever.
+      options: { path: '/linear/issues', cursor: undefined, signal: expect.any(AbortSignal) },
     })
+    expect(fake.listTreeCalls[0]?.options?.signal?.aborted).toBe(false)
     expect(fake.getEventsCalls[0]).toEqual({ workspaceId: 'rw_test', opts: { cursor: 'evt-0', limit: 10 } })
   })
 
@@ -1484,6 +1487,84 @@ describe('RelayfileCloudMountClient', () => {
       ),
     )
     expect(fake.listTreeCalls.map((call) => call.options?.cursor)).toEqual([undefined, '2', '4'])
+  })
+
+  // #351: the SDK attaches an AbortSignal to its fetch only when the caller
+  // supplies one, and nothing here did — so every relayfile read was a bare
+  // fetch() with no deadline. One of them stopped answering on 2026-08-23 and
+  // the readiness reconcile cycle that issued it never finished.
+  describe('bounded relayfile reads', () => {
+    class HangingListTreeClient extends FakeRelayFileClient {
+      seenSignal?: AbortSignal
+
+      override async listTree(
+        workspaceId: string,
+        options?: { path?: string; depth?: number; cursor?: string; signal?: AbortSignal },
+      ): Promise<never> {
+        this.listTreeCalls.push({ workspaceId, options })
+        this.seenSignal = options?.signal
+        return await new Promise<never>((_resolve, reject) => {
+          options?.signal?.addEventListener('abort', () => {
+            reject((options.signal as AbortSignal & { reason?: unknown }).reason)
+          })
+        })
+      }
+    }
+
+    it('cancels a read that stops answering and names the operation', async () => {
+      const client = new HangingListTreeClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 25,
+      })
+
+      await expect(mount.listTree('/github/repos')).rejects.toMatchObject({
+        name: 'RelayfileOperationTimeoutError',
+        operation: 'listTree',
+      })
+      // Cancelled, not merely abandoned. An abandoned wait leaves the socket
+      // and the SDK's retry loop live, and hands the next caller the same
+      // wedged in-flight read.
+      expect(client.seenSignal?.aborted).toBe(true)
+    })
+
+    it('honours the ensureSubRoot timeout it used to accept and discard', async () => {
+      const client = new HangingListTreeClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        // Client-wide budget far past the caller's, so only the per-call
+        // argument can end this. It was silently dropped before #351, which is
+        // why `#ensureGithubIngestionReady` passing 90_000 bounded nothing.
+        operationTimeoutMs: 60_000,
+      })
+
+      await expect(mount.ensureSubRoot('/github/issues', { timeoutMs: 25 })).rejects.toMatchObject({
+        name: 'RelayfileOperationTimeoutError',
+        operation: 'ensureSubRoot',
+      })
+    })
+
+    it('leaves the call unbounded when no budget is configured', async () => {
+      const client = new HangingListTreeClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 0,
+      })
+
+      const pending = mount.listTree('/github/repos')
+      const settled = await Promise.race([
+        pending.then(() => 'settled' as const, () => 'settled' as const),
+        new Promise<'pending'>((resolve) => { setTimeout(() => resolve('pending'), 50) }),
+      ])
+      expect(settled).toBe('pending')
+      expect(client.seenSignal).toBeUndefined()
+      // Nothing will ever settle this; drop the reference explicitly so the
+      // rejection-free pending promise is not mistaken for a leak.
+      void pending.catch(() => undefined)
+    })
   })
 
   it('uses recent change-log events for provider-filtered getEvents tail reads', async () => {

@@ -22,6 +22,14 @@ import {
   type WriteQueuedResponse,
 } from '@relayfile/sdk'
 import { RelayfileSetup } from '@relayfile/sdk/cli'
+import {
+  DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS,
+  RelayfileOperationTimeoutError,
+  isRelayfileCallAbort,
+  relayfileCallBudgetMs,
+  relayfileCallDeadline,
+  withRelayfileCallDeadline,
+} from './relayfile-operation-timeout'
 import { existsSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 
@@ -260,10 +268,26 @@ export interface RelayfileCloudMountClientConfig {
   skipRegisteredMirrorLookup?: boolean
   isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
+  /**
+   * Deadline for one relayfile read, in milliseconds (#351).
+   *
+   * The SDK attaches an `AbortSignal` to its `fetch` only when the caller
+   * supplies one, so without this every read is a bare `fetch()` that can wait
+   * forever. Zero or a non-finite value restores that unbounded behaviour.
+   */
+  operationTimeoutMs?: number
 }
 
 export type RelayFileClientLike = {
-    readFile(workspaceId: string, path: string): Promise<FileReadResponse>
+    // `correlationId`/`signal` are the SDK's own trailing arguments. Declared
+    // here so a read can carry a deadline (#351); optional, so a narrower fake
+    // still satisfies the type.
+    readFile(
+      workspaceId: string,
+      path: string,
+      correlationId?: string,
+      signal?: AbortSignal,
+    ): Promise<FileReadResponse>
     writeFile(input: WriteFileInput): Promise<WriteQueuedResponse>
     deleteFile(input: DeleteFileInput): Promise<WriteQueuedResponse>
     listTree(workspaceId: string, options?: ListTreeOptions): Promise<TreeResponse>
@@ -335,6 +359,7 @@ export class RelayfileCloudMountClient implements MountClient {
   #disposed = false
   #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
   readonly #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
+  readonly #operationTimeoutMs: number
   readonly #lastOpByPath = new Map<string, string>()
   readonly #confirmedExternalIdByPath = new Map<string, string>()
   readonly #confirmedFailureReasonByPath = new Map<string, string>()
@@ -345,6 +370,7 @@ export class RelayfileCloudMountClient implements MountClient {
     }
 
     this.workspaceId = config.workspaceId ?? DEFAULT_WORKSPACE_ID
+    this.#operationTimeoutMs = config.operationTimeoutMs ?? DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS
     this.#client = config.client
     this.#tokenProvider = config.tokenProvider ?? (() => this.#client.getToken?.())
     this.#baseUrl = config.baseUrl ?? this.#client.getBaseUrl?.()
@@ -646,7 +672,8 @@ export class RelayfileCloudMountClient implements MountClient {
   }
 
   async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
-    const response = await this.#client.readFile(this.workspaceId, path)
+    const response = await this.#bounded('readFile', this.#operationTimeoutMs, (signal) =>
+      this.#client.readFile(this.workspaceId, path, undefined, signal))
     return {
       content: parseRemoteContent(response),
       revision: response.revision,
@@ -735,18 +762,88 @@ export class RelayfileCloudMountClient implements MountClient {
   }
 
   async listTree(prefix: string): Promise<string[]> {
-    const paths: string[] = []
-    let cursor: string | undefined
-    for (;;) {
-      const response = await this.#client.listTree(this.workspaceId, {
-        path: prefix,
-        cursor,
+    // ONE deadline for the whole walk, not one per page. The cursor loop is
+    // unbounded, so a per-page budget would let a server that keeps handing
+    // back a `nextCursor` run for as long as it likes — the loop would stay
+    // unbounded while every individual call looked bounded (#351).
+    const budgetMs = relayfileCallBudgetMs(this.#operationTimeoutMs)
+    const deadline = relayfileCallDeadline('listTree', budgetMs)
+    const deadlineAtMs = budgetMs === undefined ? undefined : Date.now() + budgetMs
+    try {
+      return await this.#named('listTree', budgetMs, async () => {
+        const paths: string[] = []
+        let cursor: string | undefined
+        for (;;) {
+          const response = await withRelayfileCallDeadline(
+            'listTree',
+            undefined,
+            this.#remainingMs('listTree', deadlineAtMs),
+            () => this.#client.listTree(this.workspaceId, {
+              path: prefix,
+              cursor,
+              ...(deadline.signal ? { signal: deadline.signal } : {}),
+            }),
+          )
+          paths.push(...response.entries.map((entry) => entry.path))
+          if (!response.nextCursor) break
+          cursor = response.nextCursor
+        }
+        return paths.sort()
       })
-      paths.push(...response.entries.map((entry) => entry.path))
-      if (!response.nextCursor) break
-      cursor = response.nextCursor
+    } finally {
+      deadline.dispose()
     }
-    return paths.sort()
+  }
+
+  /** What is left of a multi-call operation's budget, refusing at zero. */
+  #remainingMs(operation: string, deadlineAtMs: number | undefined): number | undefined {
+    if (deadlineAtMs === undefined) return undefined
+    const remainingMs = deadlineAtMs - Date.now()
+    // Refuse rather than fall through: `withRelayfileCallDeadline` treats a
+    // non-positive budget as "no budget" and would run the call unbounded.
+    if (remainingMs <= 0) {
+      throw new RelayfileOperationTimeoutError(operation, this.#operationTimeoutMs)
+    }
+    return remainingMs
+  }
+
+  /**
+   * One relayfile read under a deadline: cancelled at the transport where the
+   * SDK honours the signal, and abandoned by the race where it does not.
+   */
+  async #bounded<T>(
+    operation: string,
+    budgetMs: number | undefined,
+    start: (signal?: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const usableMs = relayfileCallBudgetMs(budgetMs)
+    const deadline = relayfileCallDeadline(operation, usableMs)
+    try {
+      return await this.#named(operation, usableMs, () =>
+        withRelayfileCallDeadline(operation, undefined, usableMs, () => start(deadline.signal)))
+    } finally {
+      deadline.dispose()
+    }
+  }
+
+  /**
+   * Give the deadline a name an operator can act on.
+   *
+   * A signal expiry surfaces as a bare `TimeoutError` reading "the operation
+   * was aborted" — true and useless. `readinessReconcile.lastError` has to say
+   * which relayfile call it was waiting on, which is the whole point of #351.
+   * These paths pass no other signal, so an abort here can only be ours.
+   */
+  async #named<T>(operation: string, budgetMs: number | undefined, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run()
+    } catch (error) {
+      if (budgetMs !== undefined && isRelayfileCallAbort(error)) {
+        if (error instanceof RelayfileOperationTimeoutError) throw error
+        throw new RelayfileOperationTimeoutError(operation, budgetMs)
+      }
+      throw error
+    }
   }
 
   subscribe(globs: string[], onChange: (event: ChangeEvent) => void, opts?: SubscribeOptions): Subscription {
@@ -970,9 +1067,18 @@ export class RelayfileCloudMountClient implements MountClient {
     return this.#confirmedExternalIdByPath.get(path)
   }
 
-  async ensureSubRoot(prefix: string, _opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'> {
+  // `timeoutMs` used to be accepted and discarded, so `#ensureGithubIngestionReady`
+  // passed 90_000 and got no bound at all — the call site believed it was
+  // bounded and was not (#351). It is honoured now, falling back to the
+  // client-wide operation budget.
+  async ensureSubRoot(prefix: string, opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'> {
     try {
-      await this.#client.listTree(this.workspaceId, { path: prefix, depth: 1 })
+      await this.#bounded('ensureSubRoot', opts?.timeoutMs ?? this.#operationTimeoutMs, (signal) =>
+        this.#client.listTree(this.workspaceId, {
+          path: prefix,
+          depth: 1,
+          ...(signal ? { signal } : {}),
+        }))
       return 'ready'
     } catch (error) {
       if (isHttpStatus(error, 404)) return 'absent'

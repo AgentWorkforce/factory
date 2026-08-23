@@ -2203,6 +2203,9 @@ async function buildMount(
   mount = await (deps.cloudMountFromConfig ?? RelayfileCloudMountClient.fromConfig)({
     workspaceId: loaded.config.workspaceId,
     localMountRoot: loaded.config.localMountRoot,
+    // The transport half of #351: without a signal the SDK issues a bare
+    // fetch() with no deadline, which is what wedged the reconcile loop.
+    operationTimeoutMs: loaded.config.liveSubscription.relayfileOperationTimeoutMs,
     logger: observability.logger,
     onLocalMountHealth: observability.onLocalMountHealth,
     isAllowedDraft: (path, content, opts) => isAllowedFactoryDraft(path, content, opts, mount, loaded.config),

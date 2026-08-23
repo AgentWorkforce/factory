@@ -3,6 +3,11 @@ import { readFile } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
 
 import { DEFAULT_READINESS_RECONCILE_TIMEOUT_MS, FactoryConfigSchema, type FactoryConfig } from '../config/schema'
+import {
+  DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS,
+  RelayfileOperationTimeoutError,
+  withRelayfileCallDeadline,
+} from '../mount/relayfile-operation-timeout'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
@@ -480,9 +485,28 @@ const DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS = 5 * 60_000
 const DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS = 15_000
 const REMOTE_OPERATION_PROGRESS_INTERVAL_MS = 15_000
 const REMOTE_OPERATION_SLOW_WARN_MS = 30_000
+/** How far the cycle-level relayfile backstop sits above the transport deadline. */
+const RELAYFILE_OPERATION_BACKSTOP_RATIO = 1.25
 const DISCOVERY_SWEEP_LEASE_MS = 5 * 60_000
 const DISCOVERY_SWEEP_RENEW_MS = 30_000
 const READINESS_RECONCILE_FAILURE_THRESHOLD = 3
+
+/**
+ * A relayfile fault a swallowing catch must not turn into "no result".
+ *
+ * A 429 already escaped every one of these (#297): it is a fact about the
+ * dependency, not about the one item being read, so folding it into an empty
+ * result reports a clean pass over work that was never served.
+ *
+ * A per-call timeout (#351) is the same fact in a worse costume. The read that
+ * hung will hang for the next item too, and `#githubIssuePaths` swallowing it
+ * turns a wedged dependency into a *successful* sweep that discovered zero
+ * issues — `consecutiveFailures: 0`, no `lastError`, nothing dispatched. That
+ * is the exact silence this bound exists to remove, so it escapes here too.
+ */
+const isPassWideRelayfileFault = (error: unknown): boolean =>
+  Boolean(relayfileOverload(error)) || error instanceof RelayfileOperationTimeoutError
+
 const DISCOVERY_CHANGE_EVENT_LIMIT = 1_000
 const DISCOVERY_OVERLOAD_BACKOFF_MAX_MS = 5 * 60_000
 /** First rung of the ladder when the 429 advertises no `Retry-After`. */
@@ -778,6 +802,14 @@ export class FactoryLoop implements Factory {
   #readinessReconcileInFlight?: Promise<void>
   #readinessReconcileIntervalMs = 60_000
   #readinessReconcileTimeoutMs = DEFAULT_READINESS_RECONCILE_TIMEOUT_MS
+  /**
+   * Deadline for ONE relayfile call (#351).
+   *
+   * `#readinessReconcileTimeoutMs` bounds the sweep; this bounds the calls
+   * inside it. Only the second one can reach a dependency call that never
+   * returns: a deadline checked between awaits never regains control to check.
+   */
+  #relayfileOperationTimeoutMs = DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS
   // Set for exactly as long as a sweep is running. `state` is derived from
   // this, so an in-flight pass can no longer masquerade as the last settled one.
   #readinessReconcileInFlightSinceMs?: number
@@ -939,6 +971,9 @@ export class FactoryLoop implements Factory {
   constructor(config: FactoryConfig, ports: FactoryPorts) {
     this.#readOnly = ports.readOnly ?? false
     this.#config = config
+    // Also read here, not only in `#startLiveSubscription`: a standalone
+    // `runOnce()` never starts the live subscription and must still be bounded.
+    this.#relayfileOperationTimeoutMs = config.liveSubscription.relayfileOperationTimeoutMs
     this.#mount = ports.mount
     // Resolved role<->state mapping. The CLI injects a name-resolved, per-team
     // resolution via ports; fall back to one built from explicit stateIds plus
@@ -1522,6 +1557,7 @@ export class FactoryLoop implements Factory {
     // `start()` overrides skip the schema's cross-field check, so re-apply its
     // floor here: a deadline under one interval would kill every pass.
     this.#readinessReconcileTimeoutMs = Math.max(options.reconcileTimeoutMs, options.reconcileIntervalMs)
+    this.#relayfileOperationTimeoutMs = options.relayfileOperationTimeoutMs
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     const highWatermark = await this.#currentEventHighWatermark()
@@ -1688,6 +1724,8 @@ export class FactoryLoop implements Factory {
       replaySkewMarginMs: overrides.replaySkewMarginMs ?? this.#config.liveSubscription.replaySkewMarginMs,
       reconcileIntervalMs: overrides.reconcileIntervalMs ?? this.#config.liveSubscription.reconcileIntervalMs,
       reconcileTimeoutMs: overrides.reconcileTimeoutMs ?? this.#config.liveSubscription.reconcileTimeoutMs,
+      relayfileOperationTimeoutMs: overrides.relayfileOperationTimeoutMs
+        ?? this.#config.liveSubscription.relayfileOperationTimeoutMs,
     }
   }
 
@@ -3446,7 +3484,7 @@ export class FactoryLoop implements Factory {
         ? { available: false }
         : { available: true, highWatermark }
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       this.#increment('discoveryHighWatermarkFailures')
       this.#logger.warn?.('[factory] discovery high-watermark unavailable; using a full sweep without caching', {
         error: describeError(error).errorMessage,
@@ -3469,7 +3507,7 @@ export class FactoryLoop implements Factory {
       })
       events = [...page.events].sort(compareDiscoveryEvents)
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       this.#logger.warn?.('[factory] discovery change feed unavailable; refreshing tree prefixes once', {
         error: describeError(error).errorMessage,
       })
@@ -4200,7 +4238,22 @@ export class FactoryLoop implements Factory {
     }
 
     try {
-      const result = await fn()
+      // The bound the 2026-08-23 wedge needed (#351). `#readinessReconcileTimeoutMs`
+      // is 90 minutes and rejects only the WAIT — the sweep keeps its discovery
+      // lease and the next cycle coalesces onto it — so a call that never
+      // returns stopped dispatch for as long as the process lived. Bounding the
+      // call instead makes the pass unwind, which releases the lease and lets
+      // the next cycle actually start.
+      //
+      // Slightly above the transport's own deadline so the mount's cancellation
+      // wins the race and reports the more precise error; this is the backstop
+      // for mounts that cannot honour a signal.
+      const result = await withRelayfileCallDeadline(
+        operation,
+        details.phase,
+        this.#relayfileOperationBackstopMs(),
+        fn,
+      )
       const elapsedMs = this.#elapsedSince(startedAtMs)
       const count = opts.count?.(result)
       if (opts.logComplete) {
@@ -4265,6 +4318,19 @@ export class FactoryLoop implements Factory {
         clearInterval(progressTimer)
       }
     }
+  }
+
+  /**
+   * The cycle-level backstop budget: the transport deadline plus a margin.
+   *
+   * Proportional rather than a flat grace so it holds at both ends of the
+   * range — a five-minute production budget and a millisecond test budget both
+   * leave the transport room to fire first.
+   */
+  #relayfileOperationBackstopMs(): number | undefined {
+    const timeoutMs = this.#relayfileOperationTimeoutMs
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return undefined
+    return Math.ceil(timeoutMs * RELAYFILE_OPERATION_BACKSTOP_RATIO)
   }
 
   #elapsedSince(startedAtMs: number): number {
@@ -7299,7 +7365,7 @@ export class FactoryLoop implements Factory {
       this.#githubIssuePathIndexReady = true
       return [...issuePaths.values()].sort()
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       this.#githubIssuePathIndexReady = false
       this.#increment('githubIssueListFailures')
       this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
@@ -7314,7 +7380,7 @@ export class FactoryLoop implements Factory {
       const { content } = await this.#readRelayfileFile(indexPath, 'GitHub issue index discovery')
       parsed = parseJsonContent(content)
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       return undefined
     }
     if (!Array.isArray(parsed)) return undefined
@@ -7424,7 +7490,7 @@ export class FactoryLoop implements Factory {
       }
       this.#increment('githubIssueMirrorsCreated')
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       this.#logger.error?.('[factory] failed to ingest GitHub issue', error)
     }
   }
@@ -8258,7 +8324,7 @@ export class FactoryLoop implements Factory {
       this.#indexDependencyIssue(resolvedIssue)
       return resolvedIssue
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       if (isMissingIssueFileError(error) && isIssuePathUnderRoot(path)) {
         this.#increment('phantomSkipped')
         this.#logger.debug?.('[factory] skipped missing issue file discovered from issue tree', { path })
@@ -9415,7 +9481,7 @@ export class FactoryLoop implements Factory {
       try {
         paths = await this.#listRelayfileTree(root, 'exact-head PR confirmation')
       } catch (error) {
-        if (relayfileOverload(error)) throw error
+        if (isPassWideRelayfileFault(error)) throw error
         continue
       }
       for (const path of paths) {
@@ -9686,7 +9752,7 @@ export class FactoryLoop implements Factory {
         try {
           return await this.#listRelayfileTree(root, 'published PR confirmation')
         } catch (error) {
-          if (relayfileOverload(error)) throw error
+          if (isPassWideRelayfileFault(error)) throw error
           return []
         }
       }))).flat()
@@ -11486,7 +11552,7 @@ export class FactoryLoop implements Factory {
           }
         }
       } catch (error) {
-        if (relayfileOverload(error)) throw error
+        if (isPassWideRelayfileFault(error)) throw error
         this.#logger.warn?.('[factory] unable to list GitHub issue comments for replay', { prefix, error })
       }
     }
@@ -14174,7 +14240,7 @@ export class FactoryLoop implements Factory {
         const tree = await this.#listRelayfileTree(root, 'PR meta path discovery')
         found.push(...tree.filter((path) => path.endsWith('.json') && numberSegment.test(path)))
       } catch (error) {
-        if (relayfileOverload(error)) throw error
+        if (isPassWideRelayfileFault(error)) throw error
         // try the next root
       }
     }
@@ -15495,7 +15561,7 @@ export class FactoryLoop implements Factory {
       try {
         return await this.#listRelayfileTree(prefix, 'Slack identity lookup')
       } catch (error) {
-        if (relayfileOverload(error)) throw error
+        if (isPassWideRelayfileFault(error)) throw error
         return []
       }
     }
@@ -18847,7 +18913,7 @@ const resolveIssuePrFromMount = async (
       try {
         for (const path of await listTree(root)) paths.add(path)
       } catch (error) {
-        if (relayfileOverload(error)) throw error
+        if (isPassWideRelayfileFault(error)) throw error
         listErrors.push(error)
       }
     }
