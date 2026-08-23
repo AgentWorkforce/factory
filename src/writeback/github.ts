@@ -111,7 +111,7 @@ export class AppGithubWriteback implements GithubWriteback {
           author: 'app',
         })
       }
-      return 'applied'
+      return 'acknowledged'
     }
     const target = FACTORY_GITHUB_STATUS_LABELS[status]
     const previous = FACTORY_GITHUB_STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
@@ -134,7 +134,11 @@ export class AppGithubWriteback implements GithubWriteback {
       label: previous.name,
       author: 'app',
     })
-    return 'applied'
+    // Relayfile confirms that the operation was acknowledged, but the App
+    // writer has no provider-authoritative read/audit receipt proving whether
+    // this idempotent add created the visible label transition. Do not let the
+    // orchestrator claim authorship from acknowledgement alone.
+    return 'acknowledged'
   }
 
   async closeIssue(issue: LinearIssue, body: string): Promise<void> {
@@ -334,6 +338,7 @@ export class GhCliGithubWriteback implements GithubWriteback {
       '--force',
     ])
     const labels = await this.#issueLabels(ref)
+    const statusBefore = githubStatusFromLabels(labels)
     const editArgs = [
       'issue',
       'edit',
@@ -353,7 +358,10 @@ export class GhCliGithubWriteback implements GithubWriteback {
     }
     const confirmed = await this.#issueLabels(ref)
     if (confirmed.has(target.name.toLowerCase()) && !confirmed.has(previous.name.toLowerCase())) {
-      return applied ? 'applied' : 'already-matched'
+      // Removing an obsolete label is a provider mutation, but it does not
+      // establish ownership when the requested effective status already won
+      // before our first read (notably human-review over in-progress).
+      return statusBefore === status ? 'already-matched' : 'applied'
     }
     throw new Error(`GitHub writeback did not confirm ${target.name} on ${ref.repo}#${ref.number}`)
   }
@@ -402,6 +410,12 @@ export class GhCliGithubWriteback implements GithubWriteback {
     }
     throw new Error(`Unable to resolve ${description} for GitHub user PR publication`)
   }
+}
+
+const githubStatusFromLabels = (labels: Set<string>): GithubIssueStatus => {
+  if (labels.has(FACTORY_GITHUB_STATUS_LABELS['human-review'].name.toLowerCase())) return 'human-review'
+  if (labels.has(FACTORY_GITHUB_STATUS_LABELS['in-progress'].name.toLowerCase())) return 'in-progress'
+  return 'ready'
 }
 
 const defaultGitRunner: GhRunner = async (args) => {

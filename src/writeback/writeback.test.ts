@@ -856,8 +856,8 @@ describe('AppGithubWriteback', () => {
       body: 'Fixes #221',
     })).resolves.toMatchObject({ number: 322, author: 'app' })
     await app.postComment(appIssue, 'Factory dispatch for 221')
-    await app.setStatus(appIssue, 'human-review')
-    await app.setStatus(appIssue, 'ready')
+    await expect(app.setStatus(appIssue, 'human-review')).resolves.toBe('acknowledged')
+    await expect(app.setStatus(appIssue, 'ready')).resolves.toBe('acknowledged')
     await app.closeIssue(appIssue, 'Factory observed the linked PR merge.')
 
     expect(postIssueComment).toHaveBeenNthCalledWith(1, {
@@ -1132,6 +1132,26 @@ describe('GhCliGithubWriteback', () => {
     await expect(github.setStatus(githubIssue, status)).resolves.toBe('already-matched')
 
     expect(calls.some((args) => args[0] === 'issue' && args[1] === 'edit')).toBe(false)
+  })
+
+  it('does not claim a status transition for cleanup after human-review already won', async () => {
+    const calls: string[][] = []
+    const labels = new Set(['factory:in-progress', 'factory:human-review'])
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit' && args.includes('--remove-label')) {
+          labels.delete('factory:in-progress')
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.setStatus(githubIssue, 'human-review')).resolves.toBe('already-matched')
+    expect(calls.some((args) => args[0] === 'issue' && args[1] === 'edit')).toBe(true)
   })
 
   it('rejects an acknowledged lifecycle edit when provider read-back never shows the label', async () => {

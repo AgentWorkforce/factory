@@ -2107,7 +2107,10 @@ describe('fleet CLI runtime', () => {
     }
   })
 
-  it('does not attribute a third-party GitHub park when the in-flight CLI write is a confirmed no-op', async () => {
+  it.each([
+    { receipt: 'explicit already-matched' as const, legacyVoid: false },
+    { receipt: 'legacy void' as const, legacyVoid: true },
+  ])('does not attribute a third-party GitHub park from an in-flight $receipt receipt', async ({ legacyVoid }) => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-github-foreign-park-inflight-'))
     try {
       const configPath = await writeConfig(root, {
@@ -2234,6 +2237,16 @@ describe('fleet CLI runtime', () => {
           return { stdout: '' }
         },
       })
+      const effectiveGithubWriteback: GithubWriteback = legacyVoid
+        ? {
+            getIssueStatus: async (target) => await githubWriteback.getIssueStatus(target),
+            postComment: async (target, body) => await githubWriteback.postComment(target, body),
+            setStatus: async (target, status) => {
+              await githubWriteback.setStatus(target, status)
+            },
+            closeIssue: async (target, body) => await githubWriteback.closeIssue(target, body),
+          }
+        : githubWriteback
       const output = buffer()
       const errors = buffer()
 
@@ -2249,7 +2262,7 @@ describe('fleet CLI runtime', () => {
         mount,
         createFactory: (factoryConfig, ports) => createFactory(factoryConfig, {
           ...ports,
-          githubWriteback,
+          githubWriteback: effectiveGithubWriteback,
         }),
         stdout: output,
         stderr: errors,

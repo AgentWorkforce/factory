@@ -20,11 +20,12 @@ export interface GithubRead {
 export type GithubIssueStatus = 'ready' | 'in-progress' | 'human-review'
 
 /**
- * Whether a lifecycle call issued a provider mutation. `undefined` preserves
- * compatibility with caller-supplied writebacks that predate this receipt;
- * built-in adapters must return an explicit result.
+ * Whether a lifecycle call provably changed the provider's effective status.
+ * `acknowledged` means the provider accepted an idempotent operation but its
+ * API did not prove who created the visible transition. `undefined` preserves
+ * compatibility with caller-supplied writebacks that predate this receipt.
  */
-export type GithubStatusWriteResult = 'applied' | 'already-matched'
+export type GithubStatusWriteResult = 'applied' | 'already-matched' | 'acknowledged'
 
 export interface GithubWriteback {
   /** Optional local-user PR publisher, implemented by the default `gh` writeback. */

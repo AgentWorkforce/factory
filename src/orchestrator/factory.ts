@@ -13966,7 +13966,10 @@ export class FactoryLoop implements Factory {
         if (githubIssue) {
           if (humanReview) {
             const statusWrite = await this.#githubWriteback.setStatus(issue, 'human-review')
-            if (statusWrite !== 'already-matched') {
+            // Only an explicit provider-proven transition establishes that
+            // this dispatch owns the visible park. Legacy void adapters and
+            // App acknowledgements remain deliberately untrusted.
+            if (statusWrite === 'applied') {
               record.issueWritebackConfirmedAtMs ??= this.#clock.now()
             }
             // The lifecycle-state outcome is now known. Unblock the concurrent
