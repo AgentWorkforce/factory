@@ -202,7 +202,7 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       // Claimed against the RESOLVED teammate, so a discovery-based ask
       // contends with an explicit one for the same target. Taken before the
       // listener is armed so two waiters can never both accept one reply.
-      const askKey = `${replyTarget.toLowerCase()}\u0000${teammateKey(teammate)}`
+      const askKey = `${agentKey(replyTarget)}\u0000${teammateKey(teammate)}`
       const claims = claimsFor(fleet)
       const heldUntil = claims.get(askKey)
       if (heldUntil !== undefined && heldUntil > Date.now()) {
@@ -341,11 +341,15 @@ function normalizeBaseUrl(value: string): string {
 }
 
 function teammateKey(teammate: TeammateAgent): string {
-  return `${teammate.kind}:${teammate.address.toLowerCase()}`
+  return `${teammate.kind}:${agentKey(teammate.address)}`
 }
 
 function sameAgent(left: string, right: string): boolean {
-  return left.replace(/^@/u, '').toLowerCase() === right.replace(/^@/u, '').toLowerCase()
+  return agentKey(left) === agentKey(right)
+}
+
+function agentKey(value: string): string {
+  return value.replace(/^@/u, '').toLowerCase()
 }
 
 function normalizedComparable(value: string | undefined): string {
