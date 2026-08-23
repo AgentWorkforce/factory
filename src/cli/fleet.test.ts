@@ -2468,6 +2468,169 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('serializes terminal completion that starts after the ready read against the dispatch claim', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-claim-completion-fence-'))
+    let releaseClaim: (() => void) | undefined
+    try {
+      const configPath = await writeConfig(root, {
+        issueSource: 'github',
+        terminalState: 'human-review',
+        loop: {
+          heartbeatPath: join(root, 'heartbeat.json'),
+          registryPath: join(root, 'registry.json'),
+          heartbeatStaleMs: 10_000,
+        },
+      })
+      const githubPath = '/github/repos/AgentWorkforce__pear/issues/by-id/48.json'
+      class CompletingDuringClaimFleetClient extends FakeFleetClient {
+        override readonly placementLocality = 'remote' as const
+        implementerName?: string
+        exitEmitted = false
+
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          const result = await super.spawn(input)
+          if (input.name.includes('-impl-')) this.implementerName = input.name
+          return { ...result, node: 'sf-mini', locality: 'remote' }
+        }
+      }
+      const fleet = new CompletingDuringClaimFleetClient()
+      let resolveCompletionRead!: () => void
+      const completionRead = new Promise<void>((resolve) => {
+        resolveCompletionRead = resolve
+      })
+      class CompletionObservedMount extends FakeMountClient {
+        completionReadSeen = false
+
+        override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+          if (path === githubPath && fleet.exitEmitted && !this.completionReadSeen) {
+            this.completionReadSeen = true
+            resolveCompletionRead()
+          }
+          return await super.readFile(path)
+        }
+      }
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => ({
+          repo: input.repo,
+          number: 80,
+          url: 'https://github.com/AgentWorkforce/pear/pull/80',
+          headRef: input.headRef ?? 'unexpected-local-head',
+        }),
+        closePullRequest: async () => undefined,
+      }
+      const githubContent = githubIssueFile('pear')
+      githubContent.payload.title = '[factory-e2e] serialize dispatch claim with terminal completion'
+      githubContent.payload.body = [
+        'Prevent a stale post-spawn ready snapshot from overwriting a concurrent terminal writeback.',
+        '',
+        'Acceptance criteria:',
+        '- Completion that starts after the ready read waits for the dispatch claim write.',
+        '- The final provider state remains human review.',
+        '- The agent is released with the terminal completion reason.',
+      ].join('\n')
+      const mount = new CompletionObservedMount({
+        [githubPath]: githubContent,
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+      let resolveClaimStarted!: () => void
+      const claimStarted = new Promise<void>((resolve) => {
+        resolveClaimStarted = resolve
+      })
+      const claimRelease = new Promise<void>((resolve) => {
+        releaseClaim = resolve
+      })
+      const statusCalls: string[] = []
+      let terminalStarted = false
+      const output = buffer()
+      const errors = buffer()
+      const setMountedStatus = (status: 'in-progress' | 'human-review'): void => {
+        const existing = mount.files.get(githubPath)
+        const content = existing?.content as ReturnType<typeof githubIssueFile>
+        const labels = content.payload.labels.filter((label) =>
+          label.name !== 'factory:in-progress' && label.name !== 'factory:human-review')
+        labels.push({ name: `factory:${status}` })
+        mount.files.set(githubPath, {
+          ...existing,
+          content: { ...content, payload: { ...content.payload, labels } },
+        })
+      }
+      const githubWriteback: GithubWriteback = {
+        getIssueStatus: async () => undefined,
+        postComment: async () => undefined,
+        setStatus: async (_issue, status) => {
+          statusCalls.push(`start:${status}`)
+          if (status === 'in-progress') {
+            resolveClaimStarted()
+            if (!fleet.implementerName) throw new Error('implementer was not spawned before the dispatch claim')
+            fleet.exitEmitted = true
+            fleet.emitAgentExit(fleet.implementerName, 'exited')
+            await claimRelease
+          } else if (status === 'human-review') {
+            terminalStarted = true
+          }
+          setMountedStatus(status)
+          statusCalls.push(`applied:${status}`)
+          return 'applied'
+        },
+        closeIssue: async () => 'acknowledged',
+      }
+
+      const run = runFleetCli([
+        'dispatch',
+        '48',
+        '--backend',
+        'relay',
+        '--config',
+        configPath,
+      ], {
+        fleet,
+        mount,
+        createFactory: (factoryConfig, ports) => createFactory(factoryConfig, {
+          ...ports,
+          githubWriteback,
+        }),
+        stdout: output,
+        stderr: errors,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      try {
+        await withDeadline(claimStarted, 1_000, 'dispatch claim did not start')
+      } catch (error) {
+        throw new Error(JSON.stringify({
+          error: error instanceof Error ? error.message : String(error),
+          output: output.text(),
+          errors: errors.text(),
+          statusCalls,
+          spawns: fleet.spawns,
+          releases: fleet.releases,
+        }))
+      }
+      await withDeadline(completionRead, 1_000, 'completion did not reach its issue read')
+      await new Promise<void>((resolve) => setTimeout(resolve, 10))
+      const terminalStartedBeforeClaimReleased = terminalStarted
+      releaseClaim()
+      const code = await run
+
+      expect(fleet.exitEmitted).toBe(true)
+      expect(mount.completionReadSeen).toBe(true)
+      expect(terminalStartedBeforeClaimReleased).toBe(false)
+      expect(statusCalls).toEqual([
+        'start:in-progress',
+        'applied:in-progress',
+        'start:human-review',
+        'applied:human-review',
+      ])
+      expect(code).toBe(0)
+      expect((mount.files.get(githubPath)?.content as ReturnType<typeof githubIssueFile>).payload.labels)
+        .toContainEqual({ name: 'factory:human-review' })
+      expect(fleet.releases.map((release) => release.reason)).toContain('issue-human-review')
+    } finally {
+      releaseClaim?.()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('still aborts when a third party parks the issue and this dispatch did not', async () => {
     const root = await mkdtemp(join(tmpdir(), 'fleet-cli-foreign-park-'))
     try {

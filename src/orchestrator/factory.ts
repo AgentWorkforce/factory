@@ -603,6 +603,13 @@ class ReadinessReconcileTimeoutError extends Error {
   }
 }
 
+interface PostSpawnDispatchClaimFence {
+  completionAtWriteBoundary: boolean
+  claimStarted: boolean
+  accepted?: boolean
+  settled: Promise<boolean>
+}
+
 const realClock: Clock = {
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -822,6 +829,10 @@ export class FactoryLoop implements Factory {
   // provider receipt, then waits for that read to classify the state as owned
   // or foreign before it releases agents under a terminal success reason.
   readonly #postSpawnIssueObservations = new Map<string, Promise<boolean>>()
+  // The post-spawn ready read and following dispatch claim form one local
+  // write boundary. A completion arriving first makes dispatch wait and
+  // re-read; one arriving after claim entry waits for the claim to finish.
+  readonly #postSpawnDispatchClaimFences = new Map<string, PostSpawnDispatchClaimFence>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   #reconciledAgentExitsActive = 0
   readonly #reconciledAgentExitWaiters: Array<() => void> = []
@@ -1377,6 +1388,7 @@ export class FactoryLoop implements Factory {
       this.#liveEventQueue.length = 0
       this.#completionInFlight.clear()
       this.#postSpawnIssueObservations.clear()
+      this.#postSpawnDispatchClaimFences.clear()
       this.#babysitterSpawned.clear()
       this.#babysitterPr.clear()
       this.#babysitterIssueRefs.clear()
@@ -4566,12 +4578,32 @@ export class FactoryLoop implements Factory {
       resolvePostSpawnIssueObservation = resolve
     })
     this.#postSpawnIssueObservations.set(observationKey, postSpawnIssueObservation)
+    let resolvePostSpawnDispatchClaim!: (accepted: boolean) => void
+    let postSpawnDispatchClaimSettled = false
+    const postSpawnDispatchClaim = new Promise<boolean>((resolve) => {
+      resolvePostSpawnDispatchClaim = resolve
+    })
+    const postSpawnDispatchClaimFence: PostSpawnDispatchClaimFence = {
+      completionAtWriteBoundary: false,
+      claimStarted: false,
+      settled: postSpawnDispatchClaim,
+    }
+    this.#postSpawnDispatchClaimFences.set(observationKey, postSpawnDispatchClaimFence)
     const settlePostSpawnIssueObservation = (accepted: boolean): void => {
       if (postSpawnIssueObservationSettled) return
       postSpawnIssueObservationSettled = true
       resolvePostSpawnIssueObservation(accepted)
       if (this.#postSpawnIssueObservations.get(observationKey) === postSpawnIssueObservation) {
         this.#postSpawnIssueObservations.delete(observationKey)
+      }
+    }
+    const settlePostSpawnDispatchClaim = (accepted: boolean): void => {
+      if (postSpawnDispatchClaimSettled) return
+      postSpawnDispatchClaimSettled = true
+      postSpawnDispatchClaimFence.accepted = accepted
+      resolvePostSpawnDispatchClaim(accepted)
+      if (this.#postSpawnDispatchClaimFences.get(observationKey) === postSpawnDispatchClaimFence) {
+        this.#postSpawnDispatchClaimFences.delete(observationKey)
       }
     }
     try {
@@ -4610,7 +4642,15 @@ export class FactoryLoop implements Factory {
       let implementingStateId: string | undefined
       if (!dryRun) {
         let issue = await this.#readIssue(dispatchDecision.issue.path)
-        if ((!issue || !this.#isIssueReady(issue)) && record.issueWritebackConfirmedAtMs === undefined) {
+        if (postSpawnDispatchClaimFence.completionAtWriteBoundary) {
+          // Completion reached its terminal provider-write boundary before
+          // dispatch entered the claim boundary. Always re-read after its
+          // receipt, even when the first snapshot was ready: the terminal
+          // write may have started immediately after that snapshot.
+          const issueWriteback = this.#issueWritebackInFlight.get(issueKey(record.issue))
+          if (issueWriteback) await issueWriteback
+          issue = await this.#readIssue(dispatchDecision.issue.path)
+        } else if ((!issue || !this.#isIssueReady(issue)) && record.issueWritebackConfirmedAtMs === undefined) {
           // A very fast agent can finish while its own dispatch is still
           // performing this post-spawn read. Do not guess authorship from the
           // first visible state: an idempotent provider mutation cannot tell us
@@ -4641,11 +4681,16 @@ export class FactoryLoop implements Factory {
           // The claim is moot and would be wrong to write: it would drag an
           // issue our own lifecycle has already parked back to `implementing`.
         } else {
+          // This assignment is synchronous with the preceding completion flag
+          // check. Completion either arrived first (the branch above) or will
+          // now observe claimStarted and wait; no await-sized gap remains.
+          postSpawnDispatchClaimFence.claimStarted = true
           implementingStateId = await this.#applyDispatchClaim(record, issue, comment)
           record.issueWritebackConfirmedAtMs ??= this.#clock.now()
           this.#emit('writeback-verified', { issue: dispatchDecision.issue, path: issue.path })
         }
       }
+      settlePostSpawnDispatchClaim(true)
       settlePostSpawnIssueObservation(true)
 
       const result = {
@@ -4670,6 +4715,7 @@ export class FactoryLoop implements Factory {
       }
       return result
     } catch (error) {
+      settlePostSpawnDispatchClaim(false)
       settlePostSpawnIssueObservation(!(error instanceof LiveDispatchStateChangedError))
       // A spawn can fail after the broker accepted it but before its ack
       // reached Factory. Include every planned worktree agent, not only the
@@ -13920,6 +13966,7 @@ export class FactoryLoop implements Factory {
     }
     this.#completionInFlight.add(completionKey)
     const postSpawnIssueObservation = this.#postSpawnIssueObservations.get(completionKey)
+    const postSpawnDispatchClaimFence = this.#postSpawnDispatchClaimFences.get(completionKey)
     let settleIssueWriteback!: () => void
     const issueWritebackSettled = new Promise<void>((resolve) => {
       settleIssueWriteback = resolve
@@ -13982,6 +14029,18 @@ export class FactoryLoop implements Factory {
       const humanReview = configuredHumanReview || (githubIssue && !githubMerged)
       const statusLabel = humanReview ? 'In Human Review' : 'Done'
       if (issue) {
+        if (postSpawnDispatchClaimFence) {
+          // Publish boundary arrival before any await. Dispatch performs the
+          // paired synchronous claimStarted assignment after its ready read,
+          // so exactly one side wins: an earlier completion is awaited and
+          // re-read; a claim already entering its provider write finishes
+          // before this terminal write begins.
+          postSpawnDispatchClaimFence.completionAtWriteBoundary = true
+          if (
+            (postSpawnDispatchClaimFence.claimStarted || postSpawnDispatchClaimFence.accepted !== undefined) &&
+            !(postSpawnDispatchClaimFence.accepted ?? await postSpawnDispatchClaimFence.settled)
+          ) return
+        }
         // Register only at the provider-write boundary. Work before this point
         // (PR discovery/merge gating) has not changed the issue, so a foreign
         // park during it must still abort immediately rather than waiting on a
