@@ -43,6 +43,8 @@ class FakeMessaging {
   readonly agentListFilters: unknown[] = []
   agentPresenceCalls = 0
   meName = 'relay-controller'
+  workspaceId = 'workspace-test'
+  workspaceInfoCalls = 0
 
   readonly agents = {
     list: async (filter: unknown) => {
@@ -62,6 +64,13 @@ class FakeMessaging {
 
   readonly nodes = {
     list: async () => this.nodeRows as RelayNode[],
+  }
+
+  readonly workspace = {
+    info: async () => {
+      this.workspaceInfoCalls += 1
+      return { id: this.workspaceId }
+    },
   }
 
   readonly messages = {
@@ -810,6 +819,24 @@ describe('RelayFleetClient', () => {
 
     expect(messaging.directs).toEqual([{ to: 'ar-1-impl', text: 'hello', mode: 'wait' }])
     expect(messaging.channelSends).toEqual([{ channel: 'wf-factory', text: 'update', mode: 'steer' }])
+  })
+
+  it('identifies message streams by Relay workspace rather than client wrapper', async () => {
+    const messagingOne = new FakeMessaging()
+    const messagingTwo = new FakeMessaging()
+    const messagingOther = new FakeMessaging()
+    messagingOne.workspaceId = 'shared-workspace'
+    messagingTwo.workspaceId = 'shared-workspace'
+    messagingOther.workspaceId = 'other-workspace'
+
+    const one = createClient(messagingOne)
+    const two = createClient(messagingTwo)
+    const other = createClient(messagingOther)
+
+    const oneIdentity = await one.messageStreamIdentity()
+    await expect(two.messageStreamIdentity()).resolves.toBe(oneIdentity)
+    await expect(other.messageStreamIdentity()).resolves.not.toBe(await one.messageStreamIdentity())
+    expect(messagingOne.workspaceInfoCalls).toBe(1)
   })
 
   it('confirms injected tasks with the sent message id', async () => {

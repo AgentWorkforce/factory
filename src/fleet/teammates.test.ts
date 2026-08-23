@@ -554,9 +554,9 @@ describe('askTeammate', () => {
     }
   })
 
-  // Two clients address different workspaces; identical names there cannot
-  // collide and must not contend. (#178 review, codex P2 third pass)
-  it('scopes claims per fleet client', async () => {
+  // Two clients authenticated to the same message stream receive the same
+  // replies. Their wrapper-object identities must not admit two waiters.
+  it('shares claims across fleet clients for one message stream', async () => {
     const teammate = {
       name: 'infra-agent',
       address: 'infra-agent',
@@ -567,6 +567,38 @@ describe('askTeammate', () => {
     }
     const one = new FakeFleetClient()
     const two = new FakeFleetClient()
+    const sharedStream = async () => 'relay:https://relay.example:workspace:shared'
+    Object.assign(one, { effectiveSender: async () => 'factory-app', messageStreamIdentity: sharedStream })
+    Object.assign(two, { effectiveSender: async () => 'factory-app', messageStreamIdentity: sharedStream })
+
+    const first = askTeammate(one, {
+      from: 'worker-one', question: 'q1', teammate, timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(one.messages).toHaveLength(1))
+    await expect(askTeammate(two, {
+      from: 'worker-two', question: 'q2', teammate, timeoutMs: 1_000,
+    })).rejects.toThrow(/already has an unanswered question to "infra-agent" as "factory-app"/u)
+    expect(two.messages).toHaveLength(0)
+
+    one.emitAgentMessage({ from: 'infra-agent', target: 'factory-app', body: 'answer-1' })
+    await expect(first).resolves.toMatchObject({ reply: { body: 'answer-1' } })
+  })
+
+  // Identical participant names in genuinely distinct message streams cannot
+  // collide and must remain independent. (#178 review, codex P2)
+  it('keeps claims independent across distinct message streams', async () => {
+    const teammate = {
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native' as const,
+    }
+    const one = new FakeFleetClient()
+    const two = new FakeFleetClient()
+    Object.assign(one, { messageStreamIdentity: async () => 'relay:https://relay.example:workspace:one' })
+    Object.assign(two, { messageStreamIdentity: async () => 'relay:https://relay.example:workspace:two' })
     one.teammates.push(teammate)
     two.teammates.push(teammate)
 

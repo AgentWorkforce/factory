@@ -213,6 +213,16 @@ export interface FleetClient {
    * reject every reply.
    */
   effectiveSender?(): Promise<string | undefined>
+  /**
+   * Stable, opaque identity of the inbound message stream used by this backend.
+   * Distinct client objects that receive the same messages must return the
+   * same identity so uncorrelated reply claims are shared across them. Clients
+   * for genuinely separate streams must return different identities.
+   *
+   * The result must remain referentially/string-equal across calls. Backends
+   * that omit this method are conservatively scoped to the client object.
+   */
+  messageStreamIdentity?(): Promise<string | object | undefined>
   waitForInjected?(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }>
   sendInput?(name: string, data: string): Promise<void>
   markAgentTerminal?(name: string, reason?: string): void

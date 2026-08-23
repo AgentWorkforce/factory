@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import { AgentRelay } from '@agent-relay/sdk'
 
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
@@ -183,6 +185,7 @@ export class RelayFleetClient implements FleetClient {
   #messaging: RelayMessaging | undefined
   #teammateDirectory: TeammateDirectory | undefined
   #messagingReady: Promise<RelayMessaging> | undefined
+  #messageStreamIdentityReady: Promise<string | object> | undefined
   #lifecycleActionReady: Promise<void> | undefined
   #authenticatedAgentName: string
   #eventsStarted = false
@@ -536,6 +539,50 @@ export class RelayFleetClient implements FleetClient {
     const resolved = identity.name?.trim()
     if (resolved) this.#authenticatedAgentName = resolved
     return this.#authenticatedAgentName
+  }
+
+  /**
+   * Identify the actual Relay workspace stream rather than this wrapper.
+   * Multiple clients authenticated to one workspace receive the same direct
+   * messages, so their uncorrelated ask/reply claims must contend.
+   */
+  async messageStreamIdentity(): Promise<string | object | undefined> {
+    this.#messageStreamIdentityReady ??= (async () => {
+      const messaging = await this.#ensureMessaging()
+      const baseUrl = canonicalRelayBaseUrl(this.#options.baseUrl)
+
+      try {
+        const workspace = await messaging.workspace.info()
+        const workspaceId = typeof workspace.id === 'string' ? workspace.id.trim() : ''
+        if (workspaceId) return `relay:${baseUrl}:workspace:${workspaceId}`
+      } catch (error) {
+        // Older/injected messaging surfaces may not expose workspace.info(). A
+        // credential fingerprint or the injected object below still preserves
+        // a stable boundary without failing an otherwise usable message path.
+        this.#log(`Unable to resolve Relay workspace identity for teammate claims: ${errorMessage(error)}`)
+      }
+
+      // An injected surface is the only authoritative scope when bootstrap and
+      // its credentials were intentionally bypassed.
+      if (this.#options.messaging) return messaging
+
+      const env = this.#options.env
+      const agentToken = resolveRelayAgentToken({
+        agentToken: this.#registeredAgentToken ?? this.#options.agentToken,
+        ...(env ? { env } : {}),
+      })
+      const workspaceKey = resolveRelayWorkspaceKey({
+        workspaceKey: this.#options.workspaceKey,
+        ...(env ? { env, activeWorkspaceKey: () => undefined } : {}),
+      })
+      const credential = agentToken ?? workspaceKey
+      if (credential) {
+        const fingerprint = createHash('sha256').update(credential).digest('base64url')
+        return `relay:${baseUrl}:credential:${fingerprint}`
+      }
+      return messaging
+    })()
+    return await this.#messageStreamIdentityReady
   }
 
   async sendMessage(input: SendInput): Promise<void> {
@@ -1577,6 +1624,15 @@ function isIdentityMovedError(error: unknown): boolean {
   const record = asRecord(error)
   if (record?.code === 'agent_identity_conflict') return true
   return /agent_identity_conflict|no longer has expected id/i.test(errorMessage(error))
+}
+
+function canonicalRelayBaseUrl(value: string | undefined): string {
+  const candidate = value ?? DEFAULT_RELAY_BASE_URL
+  try {
+    return new URL(candidate).toString().replace(/\/$/u, '')
+  } catch {
+    return candidate.replace(/\/$/u, '')
+  }
 }
 
 function isUnknownRecipientError(error: unknown): boolean {

@@ -96,7 +96,7 @@ export interface AskTeammateResult {
 }
 
 /**
- * Claimed teammate pairs per backend.
+ * Claimed teammate pairs per inbound message stream.
  *
  * `AgentMessage` carries no echoed request field on ANY backend -- there is no
  * reply-to, and `SendInput.data` is not reflected back -- so a reply can never
@@ -107,27 +107,48 @@ export interface AskTeammateResult {
  *   is refused rather than resolved with an answer that may not be its own.
  *   The claim set uses every sender identity accepted for the RESOLVED
  *   teammate and is taken after discovery, so aliases and direct asks contend.
- * - After a TIMEOUT a confirmed send stays quarantined for this client. There
+ * - After a TIMEOUT a confirmed send stays quarantined for this stream. There
  *   is no safe time- or message-based release: the transport places no upper
  *   bound on a late answer, and an unrelated DM cannot be distinguished from
  *   that answer. Only a definitive late delivery failure frees the pair. When
  *   `AgentMessage` grows an observable correlation field, this registry can be
  *   replaced by a requestId check.
  *
- * Scoped per `FleetClient` because two clients in one process address
- * different workspaces, where identical names cannot collide.
+ * `FleetClient.messageStreamIdentity()` lets distinct client wrappers that
+ * observe one authenticated stream share a registry while keeping genuinely
+ * separate workspaces independent. Backends that do not expose a stream
+ * identity fall back to their client object.
  */
 type AskClaim = 'waiting' | 'timed-out-uncorrelated'
+type AskClaimScope = string | object
 
-const inFlightAsks = new WeakMap<FleetClient, Map<string, AskClaim>>()
+const objectScopedAsks = new WeakMap<object, Map<string, AskClaim>>()
+const namedScopedAsks = new Map<string, Map<string, AskClaim>>()
 
-function claimsFor(fleet: FleetClient): Map<string, AskClaim> {
-  let claims = inFlightAsks.get(fleet)
+function claimsFor(scope: AskClaimScope): Map<string, AskClaim> {
+  if (typeof scope === 'string') {
+    let claims = namedScopedAsks.get(scope)
+    if (!claims) {
+      claims = new Map()
+      namedScopedAsks.set(scope, claims)
+    }
+    return claims
+  }
+
+  let claims = objectScopedAsks.get(scope)
   if (!claims) {
     claims = new Map()
-    inFlightAsks.set(fleet, claims)
+    objectScopedAsks.set(scope, claims)
   }
   return claims
+}
+
+function deleteClaims(scope: AskClaimScope | undefined, claims: Map<string, AskClaim> | undefined, keys: string[]): void {
+  if (!claims) return
+  for (const key of keys) claims.delete(key)
+  if (typeof scope === 'string' && claims.size === 0 && namedScopedAsks.get(scope) === claims) {
+    namedScopedAsks.delete(scope)
+  }
 }
 
 /**
@@ -154,19 +175,23 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
     let settled = false
     let deliveryState: 'not-started' | 'pending' | 'confirmed' = 'not-started'
     let unsubscribe = () => {}
+    let claimScope: AskClaimScope | undefined
+    let claimRegistry: Map<string, AskClaim> | undefined
     let claimed: string[] = []
     let timedOutClaim: string[] = []
     const release = () => {
-      for (const key of claimed) claimsFor(fleet).delete(key)
+      deleteClaims(claimScope, claimRegistry, claimed)
       claimed = []
     }
     const quarantine = () => {
-      for (const key of claimed) claimsFor(fleet).set(key, 'timed-out-uncorrelated')
+      if (claimRegistry) {
+        for (const key of claimed) claimRegistry.set(key, 'timed-out-uncorrelated')
+      }
       timedOutClaim = claimed
       claimed = []
     }
     const releaseTimedOutClaim = () => {
-      for (const key of timedOutClaim) claimsFor(fleet).delete(key)
+      deleteClaims(claimScope, claimRegistry, timedOutClaim)
       timedOutClaim = []
     }
     const finish = (result: AskTeammateResult) => {
@@ -208,12 +233,18 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       if (!fleet.onAgentMessage) {
         throw new Error('This fleet backend cannot observe teammate replies')
       }
+      // Client-object identity is not necessarily the message-stream identity:
+      // two Relay clients may authenticate to one workspace/agent and observe
+      // the same DMs. Scope the uncorrelated claim to the shared stream when a
+      // backend can identify it, with the client object as the safe fallback.
+      claimScope = (await fleet.messageStreamIdentity?.()) ?? fleet
+      if (settled) return
       // Claimed against the RESOLVED teammate, so a discovery-based ask
       // contends with an explicit one for the same target. Taken before the
       // listener is armed so two waiters can never both accept one reply.
       const askKeys = teammateClaimKeys(replyTarget, teammate)
-      const claims = claimsFor(fleet)
-      const existingClaim = askKeys.map((key) => claims.get(key)).find((claim) => claim !== undefined)
+      claimRegistry = claimsFor(claimScope)
+      const existingClaim = askKeys.map((key) => claimRegistry?.get(key)).find((claim) => claim !== undefined)
       if (existingClaim !== undefined) {
         throw new Error(
           existingClaim === 'waiting'
@@ -222,10 +253,10 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
               'questions; await the first before asking again.'
             : `askTeammate is quarantining "${teammate.name}" for "${replyTarget}" after a timed-out ` +
               'question. Replies carry no correlation id and have no maximum delay, so retry is ' +
-              'unsafe for this client until the protocol supplies correlation.',
+              'unsafe for this message stream until the protocol supplies correlation.',
         )
       }
-      for (const key of askKeys) claims.set(key, 'waiting')
+      for (const key of askKeys) claimRegistry.set(key, 'waiting')
       claimed = askKeys
       // `onAgentMessage` can return before the transport is really listening,
       // so wait for observability BEFORE sending -- otherwise a fast reply
