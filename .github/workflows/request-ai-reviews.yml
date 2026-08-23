@@ -1,0 +1,36 @@
+name: Request AI reviews
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+
+# The workflow runs from the trusted base branch and never checks out or
+# executes contributor code. It only posts a head-stamped PR comment.
+permissions: {}
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  request:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Request exact-head reviews
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          body=$(printf '@coderabbitai review\n\n@codex review\n\nRequested for exact head `%s`.\n<!-- factory-ai-review-request:%s -->' "$HEAD_SHA" "$HEAD_SHA")
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --raw-field body="$body"
