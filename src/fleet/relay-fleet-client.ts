@@ -72,6 +72,23 @@ export interface RelayFleetClientOptions {
   now?: () => number
   sleep?: (ms: number) => Promise<void>
   log?: (message: string) => void
+  /**
+   * Refuse to mint a workspace identity for this client.
+   *
+   * A read-only CLI invocation (`factory status`, any `--dry-run` sweep) must
+   * leave no trace in the workspace. Registration is the one fleet operation
+   * that writes: it creates a `factory-cloud-<id>` agent row the caller then
+   * abandons at process exit, without ever entering presence. The live daemon
+   * boots seconds later under the same name, cannot reclaim the orphan, and
+   * latches after MAX_REGISTRATION_ATTEMPTS — which is how a status probe took
+   * dispatch down for a week (factory-cloud#55).
+   *
+   * With this set, an explicitly supplied `agentToken`/`messaging` still works,
+   * so a read-only command that already owns an identity keeps full fleet
+   * reads. What it cannot do is create a new one: that fails closed with
+   * `ReadOnlyFleetIdentityError` rather than silently planting a row.
+   */
+  readOnly?: boolean
 }
 
 const knownCapabilities = new Set<NodeCapability>(['spawn:claude', 'spawn:codex', 'workflow:run', 'preview:tailscale-serve'])
@@ -112,6 +129,26 @@ const LATE_PLACEMENT_RELEASE_REASON = 'late-placement-timeout'
 const CALL_TIMED_OUT = Symbol('relay.placement.callTimedOut')
 
 type CallOutcome<T> = { ok: true; value: T } | { ok: false; error: unknown }
+
+/**
+ * A read-only fleet client was asked to mint a workspace identity.
+ *
+ * Thrown instead of registering so the failure is loud and attributable. The
+ * callers that can hit it (roster reads inside a dry-run sweep) already treat a
+ * control-plane read failure as a degraded-but-continue condition, which is the
+ * correct outcome here: a probe that cannot enumerate the fleet without
+ * creating an agent should report less, not write more.
+ */
+export class ReadOnlyFleetIdentityError extends Error {
+  constructor(agentName: string) {
+    super(
+      `Refusing to register relay agent "${agentName}": this fleet client is read-only. ` +
+      'A status or dry-run command must not create a workspace agent; ' +
+      'supply RELAY_AGENT_TOKEN to give it an existing identity instead.',
+    )
+    this.name = 'ReadOnlyFleetIdentityError'
+  }
+}
 
 /**
  * A placement call that outlived the operation's remaining budget (#306).
@@ -162,6 +199,7 @@ export class RelayFleetClient implements FleetClient {
   readonly #now: () => number
   readonly #sleep: (ms: number) => Promise<void>
   readonly #log: (message: string) => void
+  readonly #readOnly: boolean
   readonly #agentExitListeners = new Set<AgentExitListener>()
   readonly #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   readonly #agentMessageListeners = new Set<AgentMessageListener>()
@@ -208,6 +246,7 @@ export class RelayFleetClient implements FleetClient {
     this.#now = options.now ?? Date.now
     this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
     this.#log = options.log ?? (() => {})
+    this.#readOnly = options.readOnly ?? false
     this.#messaging = options.messaging
   }
 
@@ -654,6 +693,11 @@ export class RelayFleetClient implements FleetClient {
     // failure from colliding with our own record (factory#316).
     agentToken ??= this.#registeredAgentToken
     if (!agentToken) {
+      // The single write in this client's bootstrap, and the one a read-only
+      // caller must never reach. Guarded here rather than at each call site so
+      // the property holds for every fleet operation, present and future: no
+      // path through a read-only client can plant an agent row.
+      if (this.#readOnly) throw new ReadOnlyFleetIdentityError(this.#agentName)
       agentToken = await this.#registerFactoryAgent(workspaceKey as string)
       this.#registeredAgentToken = agentToken
     }

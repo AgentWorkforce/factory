@@ -56,6 +56,76 @@ import {
   FleetControlPlaneCircuitOpenError,
 } from '../fleet/control-plane-circuit'
 
+describe('read-only construction', () => {
+  // Every fleet subscription the Factory installs at construction. On the relay
+  // backend the first of these mints this process's workspace identity, so a
+  // read-only command that constructs a Factory registers an agent it then
+  // abandons before presence — the boot-unique orphan the live daemon can never
+  // reclaim (factory-cloud#55).
+  class SubscriptionCountingFleet extends FakeFleetClient {
+    subscriptions = 0
+
+    override onAgentExit(listener: Parameters<FakeFleetClient['onAgentExit']>[0]): () => void {
+      this.subscriptions += 1
+      return super.onAgentExit(listener)
+    }
+
+    override onAgentMessage(listener: Parameters<NonNullable<FakeFleetClient['onAgentMessage']>>[0]): () => void {
+      this.subscriptions += 1
+      return super.onAgentMessage(listener)
+    }
+
+    override onAgentLifecycleSignal(
+      listener: Parameters<NonNullable<FakeFleetClient['onAgentLifecycleSignal']>>[0],
+    ): () => void {
+      this.subscriptions += 1
+      return super.onAgentLifecycleSignal(listener)
+    }
+
+    override onAgentUsage(listener: Parameters<NonNullable<FakeFleetClient['onAgentUsage']>>[0]): () => void {
+      this.subscriptions += 1
+      return super.onAgentUsage(listener)
+    }
+  }
+
+  // The control arm. Without it the must-not-fire test below could pass because
+  // the fixture never subscribes at all, and would prove nothing.
+  it('subscribes to fleet events when the instance is live', () => {
+    const fleet = new SubscriptionCountingFleet()
+    createFactory(config(), { mount: new FakeMountClient(), fleet, triage: new StaticTriage(), logger: {} })
+
+    expect(fleet.subscriptions).toBeGreaterThan(0)
+  })
+
+  it('touches the fleet not at all when the instance is read-only', () => {
+    const fleet = new SubscriptionCountingFleet()
+    createFactory(config(), {
+      mount: new FakeMountClient(),
+      fleet,
+      triage: new StaticTriage(),
+      logger: {},
+      readOnly: true,
+    })
+
+    expect(fleet.subscriptions).toBe(0)
+  })
+
+  // A read-only instance is built with no event wiring and, in the CLI, with a
+  // fleet client that cannot register. Starting one would be a half-live daemon,
+  // so refuse rather than quietly reintroduce the side effect this mode removes.
+  it('refuses to start a read-only instance', async () => {
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient(),
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      logger: {},
+      readOnly: true,
+    })
+
+    await expect(factory.start()).rejects.toThrow('constructed read-only')
+  })
+})
+
 describe('fleet control-plane admission', () => {
   class StalledRosterFleet extends FakeFleetClient {
     rosterCalls = 0

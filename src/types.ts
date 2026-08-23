@@ -62,6 +62,17 @@ export interface FactoryPorts {
   relayflows?: FactoryRelayflowDispatchPort
   /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
   worktrees?: AgentWorktreeManager
+  /**
+   * This instance serves a read-only command (`status`, a `--dry-run` sweep) and
+   * must be free of workspace side effects.
+   *
+   * Construction alone used to subscribe to fleet events, and subscribing mints
+   * this process's relay identity — so `factory status` created an agent row it
+   * then abandoned before presence, which is what wedged cloud dispatch for a
+   * week (factory-cloud#55). A read-only instance skips that wiring and refuses
+   * `start()`; pair it with a read-only `fleet` client for the hard guarantee.
+   */
+  readOnly?: boolean
 }
 
 export interface FactoryRelayflowDispatchPort extends Omit<DispatchRelayflowOptions, 'cwd'> {
