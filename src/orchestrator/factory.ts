@@ -4923,6 +4923,9 @@ export class FactoryLoop implements Factory {
       })) ?? [],
       counters: { ...this.#counters },
       fleetControlPlane: this.#fleetControlPlane.status(),
+      // Optional on the port: a backend with no socket omits it, and an absent
+      // value stays absent rather than being invented as healthy.
+      ...(this.#fleet.fleetConnectStatus ? { fleetConnect: this.#fleet.fleetConnectStatus() } : {}),
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
       eventListener: this.#eventListenerStatus(),
@@ -8085,6 +8088,9 @@ export class FactoryLoop implements Factory {
       readinessReconcile: this.#readinessReconcileStatus(),
       dispatchCapacity: this.#dispatchCapacityStatus(),
       fleetControlPlane: this.#fleetControlPlane.status(),
+      // Optional on the port: a backend with no socket omits it, and an absent
+      // value stays absent rather than being invented as healthy.
+      ...(this.#fleet.fleetConnectStatus ? { fleetConnect: this.#fleet.fleetConnectStatus() } : {}),
     }
     // The deployed container serves `/healthz` straight out of this file and
     // has no redaction logic of its own, so publish the already-safe view here

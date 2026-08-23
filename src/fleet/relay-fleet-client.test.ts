@@ -1813,3 +1813,89 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
     expect(reads).toBe(0)
   })
 })
+
+/**
+ * The fleet socket had no status anywhere. `#ensureEventSubscription` starts the
+ * subscription with `void ... .catch()` and reported a rejection by calling
+ * `#log` only, so a client that registered an agent and then failed to connect
+ * was indistinguishable from a healthy one on every surface. These pin the
+ * outcome into a field a health surface can publish.
+ */
+describe('RelayFleetClient fleet connect status', () => {
+  it('starts as never-attempted, so an unstarted socket is not reported as healthy', () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    const status = fleet.fleetConnectStatus()
+    expect(status.state).toBe('never-attempted')
+    expect(status.attempts).toBe(0)
+    expect(status.lastError).toBeUndefined()
+  })
+
+  it('reports connected only after the dial actually happens', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    fleet.onAgentExit(() => {})
+    await flush()
+    const status = fleet.fleetConnectStatus()
+    expect(status.state).toBe('connected')
+    expect(status.attempts).toBe(1)
+    expect(messaging.connected).toBe(1)
+    expect(status.lastConnectedAtMs).toBeTypeOf('number')
+  })
+
+  /**
+   * THE REGRESSION THIS EXISTS FOR. Before, this produced a `#log` line and
+   * nothing else: every status surface still read healthy.
+   */
+  it('records a failed subscription instead of only logging it', async () => {
+    const messaging = new FakeMessaging()
+    messaging.commands.available = () => false
+    const fleet = createClient(messaging)
+    fleet.onAgentExit(() => {})
+    await flush()
+    const status = fleet.fleetConnectStatus()
+    expect(status.state).toBe('failed')
+    expect(status.attempts).toBe(1)
+    expect(status.lastFailureAtMs).toBeTypeOf('number')
+    expect(status.lastError).toBeDefined()
+    expect(messaging.connected).toBe(0)
+  })
+
+  /**
+   * CONTROL. The failure arm above only means something if the SAME harness can
+   * produce the other outcome -- otherwise it would pass against a client that
+   * reports 'failed' unconditionally.
+   */
+  it('the same harness yields connected when the gate does not throw', async () => {
+    const failing = new FakeMessaging()
+    failing.commands.available = () => false
+    const failingFleet = createClient(failing)
+    failingFleet.onAgentExit(() => {})
+    await flush()
+
+    const healthy = new FakeMessaging()
+    const healthyFleet = createClient(healthy)
+    healthyFleet.onAgentExit(() => {})
+    await flush()
+
+    expect(failingFleet.fleetConnectStatus().state).toBe('failed')
+    expect(healthyFleet.fleetConnectStatus().state).toBe('connected')
+  })
+
+  it('reduces the cause to a name and code, never a transport message', async () => {
+    const messaging = new FakeMessaging()
+    messaging.commands.available = () => {
+      const error = new Error('connect failed to wss://relay.example/socket?token=at_live_abcdef0123456789')
+      error.name = 'FleetSocketError'
+      ;(error as Error & { code?: string }).code = 'ECONNREFUSED'
+      throw error
+    }
+    const fleet = createClient(messaging)
+    fleet.onAgentExit(() => {})
+    await flush()
+    const lastError = fleet.fleetConnectStatus().lastError ?? ''
+    expect(lastError).toBe('FleetSocketError (ECONNREFUSED)')
+    expect(lastError).not.toContain('at_live_')
+    expect(lastError).not.toContain('wss://')
+  })
+})

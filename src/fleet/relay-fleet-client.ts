@@ -1,8 +1,9 @@
 import { AgentRelay } from '@agent-relay/sdk'
 
+import { describeControlPlaneError } from './control-plane-circuit'
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
 
-import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, FleetConnectStatus, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type {
   RelayActionInvocation,
   RelayActionInvocationAck,
@@ -217,6 +218,15 @@ export class RelayFleetClient implements FleetClient {
   #authenticatedAgentName: string
   #eventsStarted = false
   #disposed = false
+  /**
+   * The fleet socket's own status.
+   *
+   * Kept here rather than inferred by callers because the dial is
+   * fire-and-forget: `#ensureEventSubscription` cannot return its outcome, so
+   * without this the ONLY trace of a failed connect was a `#log` line that no
+   * health surface reads.
+   */
+  #fleetConnect: FleetConnectStatus = { state: 'never-attempted', attempts: 0 }
   #watchTimer: ReturnType<typeof setInterval> | undefined
   #reconciling: Promise<void> | undefined
   #pendingReleaseRetry: Promise<void> | undefined
@@ -1156,10 +1166,35 @@ export class RelayFleetClient implements FleetClient {
   #ensureEventSubscription(): void {
     if (this.#eventsStarted) return
     this.#eventsStarted = true
+    this.#fleetConnect = {
+      ...this.#fleetConnect,
+      state: 'connecting',
+      attempts: this.#fleetConnect.attempts + 1,
+      lastAttemptAtMs: this.#now(),
+    }
     void this.#subscribeEvents().catch((error) => {
       this.#eventsStarted = false
+      // The rejection now lands in a field a health surface can publish. It kept
+      // going only to `#log` before, which is why a fleet client that never
+      // connected was indistinguishable from a healthy one everywhere.
+      this.#fleetConnect = {
+        ...this.#fleetConnect,
+        state: 'failed',
+        lastFailureAtMs: this.#now(),
+        lastError: describeControlPlaneError(error),
+      }
       this.#log(`relay fleet event subscription failed: ${errorMessage(error)}`)
     })
+  }
+
+  /**
+   * `connected` is stamped at the dial itself, not when `#subscribeEvents`
+   * resolves: that function also returns early when the client is disposed, and
+   * reporting THAT as connected would recreate the exact false-healthy signal
+   * this status exists to remove.
+   */
+  fleetConnectStatus(): FleetConnectStatus {
+    return { ...this.#fleetConnect }
   }
 
   async #subscribeEvents(): Promise<void> {
@@ -1167,6 +1202,12 @@ export class RelayFleetClient implements FleetClient {
     await this.#ensureLifecycleAction(messaging)
     if (this.#disposed) return
     messaging.events.connect()
+    this.#fleetConnect = {
+      ...this.#fleetConnect,
+      state: 'connected',
+      lastConnectedAtMs: this.#now(),
+      lastError: undefined,
+    }
     this.#eventUnsubscribers.push(messaging.events.on('any', (event) => this.#handleEvent(event)))
   }
 

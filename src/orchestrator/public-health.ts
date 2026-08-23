@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { telemetryErrorClassName } from '../observability/error-class.js'
 import type { FleetControlPlaneStatus } from '../fleet/control-plane-circuit'
+import type { FleetConnectStatus } from '../ports/fleet'
 import { DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS, DEFAULT_CAPACITY_WAIT_WARN_MS } from '../config/schema'
 import type {
   FactoryDispatchCapacityStatus,
@@ -9,6 +10,7 @@ import type {
   FactoryPublicDispatchCapacityHealth,
   FactoryPublicDispatchSlotOccupant,
   FactoryPublicEventListenerHealth,
+  FactoryPublicFleetConnectHealth,
   FactoryPublicFleetControlPlaneHealth,
   FactoryPublicHealth,
   FactoryPublicReadinessReconcileHealth,
@@ -67,6 +69,13 @@ const EVENT_LISTENER_STATES: readonly FactoryEventListenerStatus['state'][] = [
   'starting',
   'subscribed',
   'polling',
+]
+
+const FLEET_CONNECT_STATES: readonly FleetConnectStatus['state'][] = [
+  'never-attempted',
+  'connecting',
+  'connected',
+  'failed',
 ]
 
 const FLEET_CONTROL_PLANE_STATES: readonly FleetControlPlaneStatus['state'][] = [
@@ -438,6 +447,27 @@ function dispatchCapacityHealth(
   }
 }
 
+/**
+ * Project the fleet socket for the UNAUTHENTICATED surface.
+ *
+ * Deliberately NOT added to DISPATCH_GATING_SUBSYSTEMS. A failed socket does not
+ * itself stop dispatch -- `roster()` runs over HTTP -- and listing it there would
+ * flip `ok` on a live deployment and hand the container-replacement logic a new
+ * reason to cycle. Publishing the fact is the goal; changing what `ok` means is a
+ * separate decision belonging to whoever owns dispatch behaviour.
+ */
+function fleetConnectHealth(status: FleetConnectStatus): FactoryPublicFleetConnectHealth {
+  const attempts = counter(status.attempts)
+  return {
+    state: enumValue(status.state, FLEET_CONNECT_STATES),
+    ...(attempts !== undefined ? { attempts } : {}),
+    ...optionalTimestamp('lastAttemptAtMs', status.lastAttemptAtMs),
+    ...optionalTimestamp('lastConnectedAtMs', status.lastConnectedAtMs),
+    ...optionalTimestamp('lastFailureAtMs', status.lastFailureAtMs),
+    // `lastError` stays behind /evidence, exactly as it does for the circuit.
+  }
+}
+
 function fleetControlPlaneHealth(
   status: FleetControlPlaneStatus,
 ): FactoryPublicFleetControlPlaneHealth {
@@ -485,6 +515,7 @@ export function publicHealthFromHeartbeat(
   const readinessReconcile = heartbeat.readinessReconcile
     ? readinessReconcileHealth(heartbeat.readinessReconcile, nowMs)
     : undefined
+  const fleetConnect = heartbeat.fleetConnect ? fleetConnectHealth(heartbeat.fleetConnect) : undefined
   const fleetControlPlane = heartbeat.fleetControlPlane
     ? fleetControlPlaneHealth(heartbeat.fleetControlPlane)
     : undefined
@@ -565,6 +596,7 @@ export function publicHealthFromHeartbeat(
     ...(readinessReconcile ? { readinessReconcile } : {}),
     ...(eventListener ? { eventListener } : {}),
     ...(fleetControlPlane ? { fleetControlPlane } : {}),
+    ...(fleetConnect ? { fleetConnect } : {}),
     ...(dispatchCapacity ? { dispatchCapacity } : {}),
   }
 }
