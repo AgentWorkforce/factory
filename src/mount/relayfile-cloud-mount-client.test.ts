@@ -1546,6 +1546,26 @@ describe('RelayfileCloudMountClient', () => {
       })
     })
 
+    it('caps an explicit ensureSubRoot timeout at the tighter client-wide budget', async () => {
+      const client = new HangingListTreeClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 25,
+      })
+
+      // The caller's argument must cap, not replace: a client-wide budget
+      // tighter than the argument has to still cancel at the transport, or the
+      // orchestrator's backstop fires first and abandons the wait instead
+      // (codex on #354).
+      await expect(mount.ensureSubRoot('/github/issues', { timeoutMs: 60_000 })).rejects.toMatchObject({
+        name: 'RelayfileOperationTimeoutError',
+        operation: 'ensureSubRoot',
+        timeoutMs: 25,
+      })
+      expect(client.seenSignal?.aborted).toBe(true)
+    })
+
     it('leaves the call unbounded when no budget is configured', async () => {
       const client = new HangingListTreeClient()
       const mount = new RelayfileCloudMountClient({

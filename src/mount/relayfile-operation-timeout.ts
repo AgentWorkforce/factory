@@ -45,16 +45,51 @@ export class RelayfileOperationTimeoutError extends Error {
   }
 }
 
+/** The budget to apply, or `undefined` when the caller configured none. */
+export const relayfileCallBudgetMs = (timeoutMs: number | undefined): number | undefined =>
+  timeoutMs !== undefined && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : undefined
+
+/**
+ * The tighter of several budgets, ignoring the ones that impose none.
+ *
+ * A caller's explicit per-call timeout must *cap* the client-wide budget rather
+ * than replace it: a config that tightened `relayfileOperationTimeoutMs` below
+ * an explicit argument would otherwise leave the transport running past the
+ * orchestrator's backstop, which abandons the wait instead of cancelling the
+ * call — the exact behaviour this module exists to avoid.
+ */
+export const tighterRelayfileBudgetMs = (
+  ...timeoutsMs: ReadonlyArray<number | undefined>
+): number | undefined => {
+  const budgets = timeoutsMs
+    .map((timeoutMs) => relayfileCallBudgetMs(timeoutMs))
+    .filter((budget): budget is number => budget !== undefined)
+  return budgets.length === 0 ? undefined : Math.min(...budgets)
+}
+
+/**
+ * The same timeout, carrying the phase the orchestrator knows and the transport
+ * does not.
+ *
+ * The transport deadline is meant to win the race, so without this the
+ * persisted `lastError` would read `relayfile listTree did not respond within
+ * 300000ms` with no way to tell one list or read context from another — which
+ * is most of what naming the call was for.
+ */
+export function relayfileTimeoutWithPhase(error: unknown, phase: string | undefined): unknown {
+  if (phase === undefined) return error
+  if (!(error instanceof RelayfileOperationTimeoutError) || error.phase !== undefined) return error
+  const enriched = new RelayfileOperationTimeoutError(error.operation, error.timeoutMs, phase)
+  enriched.cause = error
+  return enriched
+}
+
 /** True for the abort a `signal` deadline raises, in either transport's shape. */
 export function isRelayfileCallAbort(error: unknown): boolean {
   if (error instanceof RelayfileOperationTimeoutError) return true
   if (!(error instanceof Error)) return false
   return error.name === 'TimeoutError' || error.name === 'AbortError'
 }
-
-/** The budget to apply, or `undefined` when the caller configured none. */
-export const relayfileCallBudgetMs = (timeoutMs: number | undefined): number | undefined =>
-  timeoutMs !== undefined && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : undefined
 
 /** A cancellation signal plus the means to release its timer. */
 export interface RelayfileCallDeadline {

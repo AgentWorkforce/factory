@@ -30,6 +30,7 @@ import {
 } from '../index'
 import { LatePlacementReleasedError, changeEventPath } from './factory'
 import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
+import { RelayfileOperationTimeoutError } from '../mount/relayfile-operation-timeout'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
@@ -13482,6 +13483,72 @@ describe('FactoryLoop', () => {
         await factory.stop()
       }
       // Two sequential `vi.waitFor` windows do not fit the suite's 5s default.
+    }, 20_000)
+
+    // With the real cloud mount the TRANSPORT deadline wins the race by design,
+    // and the mount does not know which phase it was serving — so without the
+    // orchestrator enriching it, `lastError` names the call but not the context
+    // and an operator cannot tell one of many list/read sites from another
+    // (codex on #354).
+    it('names the phase on a timeout the transport raised, not just its own', async () => {
+      class TransportTimeoutMount extends CountingEventsMount {
+        readonly hangStarted: Promise<void>
+        failListTree = false
+        #signalHangStarted: () => void = () => undefined
+
+        constructor() {
+          super()
+          this.hangStarted = new Promise((resolve) => { this.#signalHangStarted = resolve })
+          this.setSubRoot('/linear/issues', 'absent')
+        }
+
+        override async listTree(prefix: string): Promise<string[]> {
+          if (this.failListTree) {
+            this.#signalHangStarted()
+            // Exactly what RelayfileCloudMountClient raises when its own signal
+            // fires: named operation, no phase.
+            throw new RelayfileOperationTimeoutError('listTree', 300_000)
+          }
+          return super.listTree(prefix)
+        }
+      }
+
+      const mount = new TransportTimeoutMount()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: {
+          transport: 'subscribe',
+          reconcileIntervalMs: 20,
+          reconcileTimeoutMs: 60_000,
+          // Out of reach: the orchestrator's own race must not be what produces
+          // the error, or this would not test the transport path at all.
+          relayfileOperationTimeoutMs: 60_000,
+        },
+      })
+      try {
+        mount.failListTree = true
+        await mount.hangStarted
+
+        await vi.waitFor(() => {
+          const readiness = factory.status().readinessReconcile
+          expect(readiness?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(1)
+          expect(readiness?.lastErrorClass).toBe('RelayfileOperationTimeoutError')
+          // The parenthesised phase is the part the transport could not supply.
+          expect(readiness?.lastError)
+            .toMatch(/relayfile listTree did not respond within \d+ms \(.+\)/u)
+        }, { timeout: 5_000 })
+      } finally {
+        mount.failListTree = false
+        await factory.stop()
+      }
     }, 20_000)
 
     // The control for the test above. Same fixture, same hang, only the

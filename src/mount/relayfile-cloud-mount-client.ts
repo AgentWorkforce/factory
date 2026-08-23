@@ -28,6 +28,7 @@ import {
   isRelayfileCallAbort,
   relayfileCallBudgetMs,
   relayfileCallDeadline,
+  tighterRelayfileBudgetMs,
   withRelayfileCallDeadline,
 } from './relayfile-operation-timeout'
 import { existsSync } from 'node:fs'
@@ -1069,11 +1070,14 @@ export class RelayfileCloudMountClient implements MountClient {
 
   // `timeoutMs` used to be accepted and discarded, so `#ensureGithubIngestionReady`
   // passed 90_000 and got no bound at all — the call site believed it was
-  // bounded and was not (#351). It is honoured now, falling back to the
-  // client-wide operation budget.
+  // bounded and was not (#351). It is honoured now, and it *caps* rather than
+  // replaces the client-wide budget: a config that tightened
+  // `relayfileOperationTimeoutMs` below the caller's argument would otherwise
+  // let the transport run past the orchestrator's backstop, abandoning the wait
+  // instead of cancelling the call (codex on #354).
   async ensureSubRoot(prefix: string, opts?: { timeoutMs?: number }): Promise<'ready' | 'absent'> {
     try {
-      await this.#bounded('ensureSubRoot', opts?.timeoutMs ?? this.#operationTimeoutMs, (signal) =>
+      await this.#bounded('ensureSubRoot', tighterRelayfileBudgetMs(opts?.timeoutMs, this.#operationTimeoutMs), (signal) =>
         this.#client.listTree(this.workspaceId, {
           path: prefix,
           depth: 1,

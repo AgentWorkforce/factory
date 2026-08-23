@@ -6,6 +6,7 @@ import { DEFAULT_READINESS_RECONCILE_TIMEOUT_MS, FactoryConfigSchema, type Facto
 import {
   DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS,
   RelayfileOperationTimeoutError,
+  relayfileTimeoutWithPhase,
   withRelayfileCallDeadline,
 } from '../mount/relayfile-operation-timeout'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
@@ -4312,7 +4313,11 @@ export class FactoryLoop implements Factory {
           error: describeError(error).errorMessage,
         })
       }
-      throw error
+      // The transport deadline is meant to win the race above, and the mount
+      // does not know which phase it was serving. Without this, `lastError`
+      // would name the call but not the context — one of many list/read sites
+      // (codex on #354).
+      throw relayfileTimeoutWithPhase(error, details.phase)
     } finally {
       if (progressTimer) {
         clearInterval(progressTimer)
