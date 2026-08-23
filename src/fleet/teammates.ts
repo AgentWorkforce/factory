@@ -370,7 +370,10 @@ function normalizeBaseUrl(value: string): string {
 }
 
 function teammateKey(teammate: TeammateAgent): string {
-  return `${teammate.kind}:${agentKey(teammate.address)}`
+  // Directory transport kind is not part of reply identity. The same Relay
+  // address may be discovered as A2A and addressed directly as native; those
+  // asks still consume the same uncorrelated sender/target reply stream.
+  return agentKey(teammate.address)
 }
 
 function sameAgent(left: string, right: string): boolean {

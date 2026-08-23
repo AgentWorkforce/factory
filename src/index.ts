@@ -7,6 +7,7 @@ export { DocumentStateStore, FileStateStore, githubWatchStatePath } from './stat
 export type { DocumentStateStoreOptions, FileStateStoreOptions } from './state/file-state-store.js'
 export { WatchStateDocumentConflictError } from './state/document-store.js'
 export { parseWatchStateDocument } from './state/watch-state-document.js'
+export { FleetDeliveryRejectedError } from './ports'
 export type {
   PersistedWorkspaceState,
   WatchStateDocument,

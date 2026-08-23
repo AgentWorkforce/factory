@@ -19,6 +19,7 @@ export type {
   SubscribeOptions,
   Subscription,
 } from './mount'
+export { FleetDeliveryRejectedError } from './fleet'
 export type {
   A2aSkill,
   AgentLifecycleSignal,

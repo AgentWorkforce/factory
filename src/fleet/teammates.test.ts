@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { FleetDeliveryRejectedError } from '../ports/fleet'
+import { FleetDeliveryRejectedError } from '../index'
 import { FakeFleetClient } from '../testing/fakes'
 import { askTeammate, RelaycastTeammateDirectory } from './teammates'
 
@@ -224,6 +224,31 @@ describe('askTeammate', () => {
       question: 'q2',
       teammate: { ...teammate, address: 'infra-agent' },
       timeoutMs: 1_000,
+    })).rejects.toThrow(/already has an unanswered question to "infra-agent"/u)
+
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answer-1' })
+    await expect(first).resolves.toMatchObject({ reply: { body: 'answer-1' } })
+  })
+
+  it('shares one claim across discovery kinds for the same reply address', async () => {
+    const fleet = new FakeFleetClient()
+    const discovered = {
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'a2a' as const,
+    }
+    const direct = { ...discovered, kind: 'native' as const }
+    fleet.teammates.push(discovered)
+
+    const first = askTeammate(fleet, {
+      from: 'factory-worker', question: 'q1', teammate: discovered, timeoutMs: 1_000,
+    })
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+    await expect(askTeammate(fleet, {
+      from: 'factory-worker', question: 'q2', teammate: direct, timeoutMs: 1_000,
     })).rejects.toThrow(/already has an unanswered question to "infra-agent"/u)
 
     fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answer-1' })
