@@ -2862,7 +2862,13 @@ export class FactoryLoop implements Factory {
       }
       const paths = await this.#readyIssuePaths()
       const orphanRecovery = issueSource === 'github'
-        ? await this.#githubOrphanRecoveryContext()
+        ? await this.#githubOrphanRecoveryContext(dryRun)
+        : undefined
+      // Preserved-not-reconciled is a fact the caller needs either way, but the
+      // two causes are not the same event: a dry run skips the context by
+      // design, a live sweep that has none failed to build one.
+      const orphanRecoveryDegraded = issueSource === 'github' && orphanRecovery === undefined
+        ? (dryRun ? 'dry-run' as const : 'context-unavailable' as const)
         : undefined
       const pulled: IssueRef[] = []
       const triaged: TriageDecision[] = []
@@ -3124,7 +3130,15 @@ export class FactoryLoop implements Factory {
         }
       }
 
-      report = { pulled, triaged, dispatched, skipped, dryRun, slackDegraded: this.#slackDegraded }
+      report = {
+        pulled,
+        triaged,
+        dispatched,
+        skipped,
+        dryRun,
+        slackDegraded: this.#slackDegraded,
+        ...(orphanRecoveryDegraded ? { orphanRecoveryDegraded } : {}),
+      }
       return report
     } catch (error) {
       this.#logger.warn?.('[factory] run-once failed', {
@@ -3143,6 +3157,7 @@ export class FactoryLoop implements Factory {
           dispatched: report.dispatched.length,
           skipped: report.skipped.length,
           slackDegraded: report.slackDegraded ?? false,
+          orphanRecoveryDegraded: report.orphanRecoveryDegraded,
           relayfileWaitWarnings: (this.#counters.relayfileOperationWaitWarnings ?? 0) - relayfileWaitWarningsAtStart,
           relayfileSlowOperations: (this.#counters.relayfileSlowOperations ?? 0) - relayfileSlowOperationsAtStart,
           relayfileOperationFailures: (this.#counters.relayfileOperationFailures ?? 0) - relayfileOperationFailuresAtStart,
@@ -3516,7 +3531,34 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #githubOrphanRecoveryContext(): Promise<GithubOrphanRecoveryContext | undefined> {
+  /**
+   * The safety context orphan recovery needs before it may release a leaked
+   * `factory:in-progress` claim: who is online, which issues are actively
+   * owned, and which durable lifecycle rows look abandoned.
+   *
+   * A dry run never builds it. `#reconcileOrphanedGithubInProgress` refuses to
+   * release a claim under `dryRun` before it so much as looks at the context,
+   * and `mayRecoverGithubOrphan` in `#performRunOnce` is itself `!dryRun` —
+   * so the context was already provably unused on that path. Gathering it
+   * anyway was not free: `fleet.roster()` mints this process's workspace
+   * identity on demand, which is exactly what a read-only client refuses
+   * (#343) and exactly what a dry run must not need. Deciding what a sweep
+   * WOULD do must not require an identity to do it with.
+   *
+   * Returning `undefined` is therefore the honest answer for a dry run, not a
+   * failure: the caller reports the sweep as `orphanRecoveryDegraded:
+   * 'dry-run'` and preserves in-progress issues, which is what a dry run does
+   * regardless. The failure counter and the warn below stay for the live path,
+   * where an absent context IS a degradation.
+   */
+  async #githubOrphanRecoveryContext(dryRun: boolean): Promise<GithubOrphanRecoveryContext | undefined> {
+    if (dryRun) {
+      this.#increment('githubOrphanRecoveryContextSkippedDryRun')
+      this.#logger.info?.('[factory] dry run skipped the orphan-recovery safety context; in-progress issues are preserved', {
+        reason: 'a dry run never releases an in-progress claim, so it needs no workspace identity to build one',
+      })
+      return undefined
+    }
     try {
       const [registry, roster, lifecycles, waitingClarifications] = await Promise.all([
         readFactoryInFlightRegistry(this.#config.loop.registryPath),

@@ -5033,6 +5033,147 @@ describe('FactoryLoop', () => {
     }
   })
 
+  // factory#348. `#343` gave read-only CLI commands a fleet client that refuses
+  // to mint a workspace identity, and `#githubOrphanRecoveryContext` read
+  // `fleet.roster()` regardless of `dryRun` — so a GitHub-backed
+  // `run-once --dry-run` (the container's start-disabled pre-cutover gate) hit
+  // the refusal and logged a safety-context failure on every sweep. The context
+  // was provably unused on that path: `mayRecoverGithubOrphan` is `!dryRun` and
+  // `#reconcileOrphanedGithubInProgress` refuses under `dryRun` before reading
+  // it. Deciding what a sweep WOULD do must not need an identity to do it with.
+  describe('orphan-recovery safety context under a read-only fleet client', () => {
+    // Counts the roster read without changing its answer, so the must-not-fire
+    // arm below measures the guard and not a refusal.
+    class RosterCountingFleet extends FakeFleetClient {
+      rosterCalls = 0
+
+      override async roster(): ReturnType<FakeFleetClient['roster']> {
+        this.rosterCalls += 1
+        return await super.roster()
+      }
+    }
+
+    // The production shape of #343's refusal: fleet reads are fine once an
+    // identity exists, but minting one is refused — and `roster()` mints on
+    // demand.
+    class ReadOnlyRosterFleet extends FakeFleetClient {
+      rosterCalls = 0
+
+      override async roster(): Promise<never> {
+        this.rosterCalls += 1
+        throw new Error(
+          'Refusing to register relay agent "factory-cloud-1c88bf23": this fleet client is read-only.',
+        )
+      }
+    }
+
+    // One orphan-shaped issue: `factory:in-progress`, no live agent, a stranded
+    // in-flight dispatch row. Live, this is exactly what orphan recovery exists
+    // to release; dry, it is what gets preserved.
+    const orphanFixture = async (): Promise<{
+      root: string
+      mount: FakeMountClient
+      stateStore: InMemoryStateStore
+    }> => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-348-dryrun-'))
+      const path = githubIssuePath('AgentWorkforce', 'pear', 348)
+      const payload = githubIssueFile(348, { labels: ['factory', 'pear', 'factory:in-progress'] })
+      const mount = new FakeMountClient({ [path]: payload })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const issue = parseGithubFactoryIssue(path, payload)
+      await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), {
+        attempts: 1,
+        inFlight: true,
+        terminal: false,
+        backoffUntilMs: 0,
+      })
+      return { root, mount, stateStore }
+    }
+
+    const factoryFor = (
+      root: string,
+      mount: FakeMountClient,
+      fleet: FakeFleetClient,
+      stateStore: InMemoryStateStore,
+    ): ReturnType<typeof createFactory> =>
+      createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+    // MUST NOT FIRE. The roster read is skipped because the sweep is dry, not
+    // because the client refused it: this fleet answers `roster()` normally.
+    it('does not read the roster on a dry-run sweep', async () => {
+      const { root, mount, stateStore } = await orphanFixture()
+      const fleet = new RosterCountingFleet()
+      try {
+        const factory = factoryFor(root, mount, fleet, stateStore)
+
+        const report = await factory.runOnce({ dryRun: true })
+
+        expect(fleet.rosterCalls).toBe(0)
+        expect(report.orphanRecoveryDegraded).toBe('dry-run')
+        // A deliberate skip, not a failure: the live-path failure counter must
+        // stay clear so a real degradation is still distinguishable from this.
+        expect(factory.status().counters.githubOrphanRecoveryContextFailures).toBeUndefined()
+        expect(factory.status().counters.githubOrphanRecoveryContextSkippedDryRun).toBe(1)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+
+    // MUST FIRE, and the CONTROL for the arm above. Same fixture, same fleet
+    // class, same issue — only `dryRun` differs. Without it, the zero above
+    // could mean the fixture never reaches the orphan-recovery call site at
+    // all, and would prove nothing. Swapping the two arms fails both: this one
+    // would stop recovering, that one would start reading the roster.
+    it('CONTROL: still reads the roster and recovers the orphan on a live sweep', async () => {
+      const { root, mount, stateStore } = await orphanFixture()
+      const fleet = new RosterCountingFleet()
+      try {
+        const factory = factoryFor(root, mount, fleet, stateStore)
+
+        const report = await factory.runOnce()
+
+        expect(fleet.rosterCalls).toBeGreaterThan(0)
+        expect(report.orphanRecoveryDegraded).toBeUndefined()
+        expect(report.dispatched.map((result) => result.issue.key)).toEqual(['348'])
+        expect(factory.status().counters.githubOrphanedInProgressRecovered).toBe(1)
+        expect(factory.status().counters.githubOrphanRecoveryContextSkippedDryRun).toBeUndefined()
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+
+    // The regression itself, in its production shape: the container's
+    // start-disabled `run-once --dry-run` gate, whose fleet client refuses to
+    // mint an identity. Before the guard this logged a safety-context failure
+    // every sweep; now the sweep never asks.
+    it('completes a dry-run sweep against a client that refuses to mint an identity', async () => {
+      const { root, mount, stateStore } = await orphanFixture()
+      const fleet = new ReadOnlyRosterFleet()
+      try {
+        const factory = factoryFor(root, mount, fleet, stateStore)
+
+        const report = await factory.runOnce({ dryRun: true })
+
+        expect(fleet.rosterCalls).toBe(0)
+        expect(report.orphanRecoveryDegraded).toBe('dry-run')
+        expect(factory.status().counters.githubOrphanRecoveryContextFailures).toBeUndefined()
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  })
+
   // Factory admits an issue to dispatch on EITHER the title prefix or the
   // scope label, but orphan recovery demanded the label alone. An issue
   // admitted by title could therefore be dispatched and then never un-stuck.
