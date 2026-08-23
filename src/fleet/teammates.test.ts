@@ -332,6 +332,31 @@ describe('askTeammate', () => {
     await expect(asked).resolves.toMatchObject({ reply: { body: 'answered' } })
   })
 
+  it('ignores matching messages that arrive before the question is sent', async () => {
+    const fleet = new FakeFleetClient()
+    let openTransport = () => {}
+    const observable = new Promise<void>((resolve) => { openTransport = resolve })
+    Object.assign(fleet, { whenMessagesObservable: () => observable })
+    fleet.teammates.push({
+      name: 'infra-agent',
+      address: 'infra-agent',
+      skills: [{ id: 'infra-watch', name: 'Infra Watch' }],
+      tags: [],
+      url: 'https://relay.example/a2a/rpc',
+      kind: 'native',
+    })
+    const asked = askTeammate(fleet, {
+      from: 'factory-worker', question: 'q', teammate: fleet.teammates[0], timeoutMs: 1_000,
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'proactive before send' })
+    openTransport()
+    await vi.waitFor(() => expect(fleet.messages).toHaveLength(1))
+    fleet.emitAgentMessage({ from: 'infra-agent', target: 'factory-worker', body: 'answer after send' })
+    await expect(asked).resolves.toMatchObject({ reply: { body: 'answer after send' } })
+  })
+
   // A reply to an abandoned question is indistinguishable from a reply to a
   // fresh one, and an unrelated DM cannot prove which message is the old
   // answer. A confirmed timed-out send therefore stays quarantined for this

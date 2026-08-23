@@ -234,6 +234,9 @@ export async function askTeammate(fleet: FleetClient, input: AskTeammateInput): 
       // so wait for observability BEFORE sending -- otherwise a fast reply
       // lands in the gap and is lost.
       unsubscribe = fleet.onAgentMessage((message) => {
+        // The listener is armed before transport observability, but nothing
+        // received before the send starts can answer this question.
+        if (deliveryState === 'not-started') return
         if (!sameAgent(message.from, teammate.address) && !sameAgent(message.from, teammate.name)) return
         if (!sameAgent(message.target, replyTarget)) return
         finish({ requestId, teammate, reply: message })
