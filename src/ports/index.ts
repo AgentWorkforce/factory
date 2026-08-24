@@ -33,6 +33,8 @@ export type {
   PreviewSweepInput,
   PreviewSweepResult,
   FleetClient,
+  FleetConnectState,
+  FleetConnectStatus,
   RestartPolicy,
   RosterEntry,
   SendInput,

@@ -224,7 +224,15 @@ export function isFleetControlPlaneFailure(error: unknown): boolean {
 }
 
 /** Redacts arbitrary transport text before circuit state becomes observable. */
-function describeControlPlaneError(error: unknown): string {
+/**
+ * Reduce any cause to `Name (CODE)`.
+ *
+ * Exported so the fleet CONNECT status uses the identical redaction as the
+ * control-plane circuit: both values are published through `factory status` and
+ * the authenticated `/evidence`, and neither may carry a transport message,
+ * URL or credential.
+ */
+export function describeControlPlaneError(error: unknown): string {
   if (!(error instanceof Error)) return 'unknown control-plane failure'
   const code = (error as Error & { code?: unknown }).code
   const safeCode = typeof code === 'string' && /^[A-Z0-9_]{1,80}$/u.test(code) ? ` (${code})` : ''

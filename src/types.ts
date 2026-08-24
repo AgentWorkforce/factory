@@ -15,6 +15,7 @@ import type { VerificationGate } from './environments/verification-pipeline'
 import type { CostLedger } from './cost/ledger'
 import type { TicketDispatchDelivery } from './delivery/ticket-dispatch'
 import type { FleetControlPlaneStatus } from './fleet/control-plane-circuit'
+import type { FleetConnectStatus } from './ports/fleet'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -187,6 +188,17 @@ export interface FactoryLoopHeartbeat {
   /** Daemon-owned dispatch admission state; status readers must prefer this over a fresh local Factory instance. */
   fleetControlPlane?: FleetControlPlaneStatus
   /**
+   * State of the fleet EVENT SOCKET dial that makes this Factory agent
+   * `online`. Absent when the backend has no socket. `dialed` is unconfirmed:
+   * the SDK accepted `connect()`, but no stream event has proved the socket
+   * opened, so a healthy silent workspace may remain in that state.
+   *
+   * Distinct from `eventListener`, which is the orchestrator's ISSUE
+   * subscription. Conflating the two is how a fleet client that registered an
+   * agent and never connected read as healthy on every surface.
+   */
+  fleetConnect?: FleetConnectStatus
+  /**
    * Redacted projection of this record, safe to serve unauthenticated (#295).
    *
    * The deployed container reads this file to answer `/healthz` and has no
@@ -232,22 +244,23 @@ export interface FactoryReadinessReconcileStatus {
   /** Age of a pass that started and has neither completed nor failed. */
   inFlightMs?: number
   /**
-   * Work units the last *completed* sweep pulled and evaluated (#355).
+   * Work units the last *enumerating* sweep pulled and evaluated (#355).
    *
-   * Same tense as `lastDurationMs`: written when a pass settles successfully,
-   * left alone by a pass that failed or is still running, so
-   * `lastCompletedAtMs` says which pass these describe.
+   * Written when a pass settles successfully AND enumerated; left alone by a
+   * pass that failed, one still running, and one that deferred to another
+   * process's lease. `lastEnumeratedAtMs` — not `lastCompletedAtMs` — is what
+   * dates them, because the latter advances on deferred passes too.
    *
    * Optional, and never defaulted to zero. A sweep that ran and found nothing
-   * publishes `0`; a daemon that has not completed a sweep publishes nothing
+   * publishes `0`; a daemon that has not enumerated a sweep publishes nothing
    * at all, and the whole point of the field is that those two are different
    * facts — `candidates: 0` blames discovery, an absent `candidates` blames
    * nobody yet.
    */
   candidates?: number
-  /** Work units the last completed sweep actually dispatched. */
+  /** Work units the last enumerating sweep actually dispatched. */
   dispatched?: number
-  /** Work units the last completed sweep saw and declined. */
+  /** Work units the last enumerating sweep saw and declined. */
   skipped?: number
   /**
    * `skipped` split by cause. Zero-count codes are omitted; the codes
@@ -255,7 +268,7 @@ export interface FactoryReadinessReconcileStatus {
    */
   skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
   /**
-   * Dispatch attempts the last completed sweep made that failed (#355).
+   * Dispatch attempts the last enumerating sweep made that failed (#355).
    *
    * The same number `skipReasons['dispatch-failed']` carries, published in its
    * own right so it can be a zero. `skipReasons` omits zero-count codes, so
@@ -273,12 +286,30 @@ export interface FactoryReadinessReconcileStatus {
    */
   dispatchFailureReasons?: Partial<Record<FactoryDispatchFailureReasonCode, number>>
   /**
-   * The last completed sweep never enumerated anything: another process held
-   * the discovery lease, so it returned an empty report immediately.
+   * When the pass the counts above describe finished enumerating (#359 review).
+   *
+   * NOT `lastCompletedAtMs`, and the difference is the point. That timestamp
+   * advances on every settled pass including a deferred one, which enumerates
+   * nothing; this one advances only when a pass actually enumerated. Equal on
+   * a daemon that is sweeping normally; where they differ, the gap is how
+   * stale the counts are — the freshness a reader otherwise could not
+   * recover, since retained counts sat beside an ever-fresh completion stamp.
+   */
+  lastEnumeratedAtMs?: number
+  /**
+   * The MOST RECENT pass never enumerated anything: another process held the
+   * discovery lease, so it returned an empty report immediately.
    *
    * Without this, that pass is indistinguishable from a sweep that queried the
-   * provider and legitimately found no ready work — both publish
+   * provider and legitimately found no ready work — both would publish
    * `candidates: 0` — and those are opposite diagnoses (#355).
+   *
+   * Independent of the counts above, which describe the last sweep that
+   * actually enumerated. A deferred pass records only this marker: its zeroes
+   * measure nothing and must not overwrite a real sweep's numbers, which on a
+   * persistently-held lease would erase them entirely (#358 review). So the two
+   * together mean "the counts are from an earlier pass"; this one alone means
+   * nothing has enumerated yet.
    */
   discoveryDeferred?: 'sweep-in-flight'
   /** Free text; authenticated surfaces only. */
@@ -303,11 +334,12 @@ export interface FactoryPublicReadinessReconcileHealth {
   /** `inFlightMs` expressed in sweeps that should have run and did not. */
   missedPasses?: number
   /**
-   * The last completed sweep's arithmetic, published (#355).
+   * The last enumerating sweep's arithmetic, published (#355).
    *
    * Counts only — no issue keys, no paths, no titles — and absent rather than
-   * zero until a sweep has completed, so "never ran" and "ran and found
-   * nothing" are two different readings of this surface rather than one.
+   * zero until a sweep has completed enumeration, so "never enumerated" and
+   * "enumerated and found nothing" are two different readings of this surface
+   * rather than one. A completed deferral still leaves these absent.
    */
   candidates?: number
   dispatched?: number
@@ -315,7 +347,7 @@ export interface FactoryPublicReadinessReconcileHealth {
   /** `skipped` split by a closed vocabulary of causes; zero counts omitted. */
   skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
   /**
-   * Failed dispatch attempts in the last completed sweep, and why (#355).
+   * Failed dispatch attempts in the last enumerating sweep, and why (#355).
    *
    * `dispatchFailures` is absent until a sweep completes and is a zero
    * thereafter, so it separates "never attempted" from "attempted, none
@@ -325,7 +357,24 @@ export interface FactoryPublicReadinessReconcileHealth {
    */
   dispatchFailures?: number
   dispatchFailureReasons?: Partial<Record<FactoryDispatchFailureReasonCode, number>>
-  /** The last completed sweep deferred to another process's discovery lease. */
+  /**
+   * When the pass the counts describe finished enumerating. Dates them —
+   * `lastCompletedAtMs` does not, since it advances on deferred passes too.
+   */
+  lastEnumeratedAtMs?: number
+  /**
+   * A producer supplied some enumeration counts, but the trio was incomplete
+   * or invalid and was rejected during normalization. This is not equivalent
+   * to a genuine first-pass deferral with no enumeration evidence.
+   */
+  enumerationCountsInvalid?: true
+  /**
+   * The most recent pass deferred to another process's discovery lease. Present
+   * alongside the counts it means they are from an earlier pass. Present alone
+   * means nothing has enumerated yet only when `enumerationCountsInvalid` is
+   * absent; otherwise a supplied snapshot was unusable and prior enumeration
+   * is unknown.
+   */
   discoveryDeferred?: 'sweep-in-flight'
   lastErrorClass?: string
 }
@@ -447,6 +496,22 @@ export interface FactoryPublicEventListenerHealth {
  * probe failure names sockets and paths — so only the state, the counters and
  * the retry instant cross.
  */
+/**
+ * Unauthenticated view of the fleet socket. State and counters only.
+ *
+ * `lastError` is deliberately absent for the same reason it is absent from the
+ * control-plane block: it stays behind the authenticated `/evidence`.
+ */
+export interface FactoryPublicFleetConnectHealth {
+  state: FleetConnectStatus['state'] | 'unknown'
+  attempts?: number
+  lastAttemptAtMs?: number
+  lastDialedAtMs?: number
+  firstEventAtMs?: number
+  lastConnectedAtMs?: number
+  lastFailureAtMs?: number
+}
+
 export interface FactoryPublicFleetControlPlaneHealth {
   state: FleetControlPlaneStatus['state'] | 'unknown'
   consecutiveFailures: number
@@ -487,6 +552,8 @@ export interface FactoryPublicHealth {
   readinessReconcile?: FactoryPublicReadinessReconcileHealth
   eventListener?: FactoryPublicEventListenerHealth
   fleetControlPlane?: FactoryPublicFleetControlPlaneHealth
+  /** Fleet event socket. NOT dispatch-gating: see DISPATCH_GATING_SUBSYSTEMS. */
+  fleetConnect?: FactoryPublicFleetConnectHealth
   dispatchCapacity?: FactoryPublicDispatchCapacityHealth
 }
 
@@ -674,6 +741,8 @@ export interface FactoryStatus {
   counters: Record<string, number>
   /** Broker/fleet mutation gate. An open circuit blocks new workers until a successful half-open roster probe. */
   fleetControlPlane: FleetControlPlaneStatus
+  /** Fleet event socket status. Absent when the backend has no socket. */
+  fleetConnect?: FleetConnectStatus
   slackDegraded?: boolean
   slackDegradedReason?: string
   /** Primary Relayfile subscription/poll registration, not event activity. */

@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { telemetryErrorClassName } from '../observability/error-class.js'
 import type { FleetControlPlaneStatus } from '../fleet/control-plane-circuit'
+import type { FleetConnectStatus } from '../ports/fleet'
 import { DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS, DEFAULT_CAPACITY_WAIT_WARN_MS } from '../config/schema'
 import {
   FACTORY_SWEEP_SKIP_REASON_CODES,
@@ -19,6 +20,7 @@ import type {
   FactoryPublicDispatchCapacityHealth,
   FactoryPublicDispatchSlotOccupant,
   FactoryPublicEventListenerHealth,
+  FactoryPublicFleetConnectHealth,
   FactoryPublicFleetControlPlaneHealth,
   FactoryPublicHealth,
   FactoryPublicReadinessReconcileHealth,
@@ -77,6 +79,14 @@ const EVENT_LISTENER_STATES: readonly FactoryEventListenerStatus['state'][] = [
   'starting',
   'subscribed',
   'polling',
+]
+
+const FLEET_CONNECT_STATES: readonly FleetConnectStatus['state'][] = [
+  'never-attempted',
+  'connecting',
+  'dialed',
+  'connected',
+  'failed',
 ]
 
 const FLEET_CONTROL_PLANE_STATES: readonly FleetControlPlaneStatus['state'][] = [
@@ -237,11 +247,11 @@ const dispatchFailureReasonCounts = (
 }
 
 /**
- * The last completed sweep's arithmetic, published (#355).
+ * The last enumerating sweep's arithmetic, published (#355).
  *
  * Deliberately NOT `counter()`: that coerces an absent field to `0`, which
- * would make a daemon that has never completed a sweep indistinguishable from
- * one that completed a sweep and found nothing. Those are the two halves of
+ * would make a daemon that has never enumerated a sweep indistinguishable from
+ * one that enumerated a sweep and found nothing. Those are the two halves of
  * the split this block exists to make, so the three fields travel together —
  * all present, or none — and a zero is published as a zero.
  */
@@ -259,6 +269,8 @@ const sweepOutcome = (
     dispatchFailures?: unknown
     dispatchFailureReasons?: unknown
     discoveryDeferred?: unknown
+    lastEnumeratedAtMs?: unknown
+    enumerationCountsInvalid?: unknown
   },
 ): Partial<Pick<
   FactoryPublicReadinessReconcileHealth,
@@ -269,17 +281,34 @@ const sweepOutcome = (
   | 'dispatchFailures'
   | 'dispatchFailureReasons'
   | 'discoveryDeferred'
+  | 'lastEnumeratedAtMs'
+  | 'enumerationCountsInvalid'
 >> => {
+  // Independent of the trio (#358 review, CodeRabbit): the counts describe the
+  // last sweep that ENUMERATED, and this describes the most recent pass. A
+  // daemon whose first pass deferred has no counts and still has to say why,
+  // and one that deferred after a real sweep publishes both — which is the
+  // pairing that tells a reader the numbers are from an earlier pass.
+  const deferred = status.discoveryDeferred === 'sweep-in-flight'
+    ? { discoveryDeferred: 'sweep-in-flight' as const }
+    : {}
   const candidates = optionalCount('candidates', status.candidates)
   const dispatched = optionalCount('dispatched', status.dispatched)
   const skipped = optionalCount('skipped', status.skipped)
+  const suppliedCounts = status.enumerationCountsInvalid === true ||
+    status.candidates !== undefined ||
+    status.dispatched !== undefined ||
+    status.skipped !== undefined
   // A record carrying only some of the three is a producer we do not
   // understand; publishing the fragment would invite exactly the arithmetic
   // ("candidates minus dispatched") that the missing field makes wrong.
   if (candidates.candidates === undefined ||
       dispatched.dispatched === undefined ||
       skipped.skipped === undefined) {
-    return {}
+    return {
+      ...deferred,
+      ...(suppliedCounts ? { enumerationCountsInvalid: true as const } : {}),
+    }
   }
   const skipReasons = skipReasonCounts(status.skipReasons)
   // Deliberately NOT joined to the all-or-nothing trio above. A daemon on
@@ -303,9 +332,11 @@ const sweepOutcome = (
     ...(dispatchFailures.dispatchFailures !== undefined && dispatchFailureReasons
       ? { dispatchFailureReasons }
       : {}),
-    ...(status.discoveryDeferred === 'sweep-in-flight'
-      ? { discoveryDeferred: 'sweep-in-flight' as const }
-      : {}),
+    // Part of the same atomic snapshot as the counts: it is what dates them,
+    // and without it retained counts have no freshness a reader can recover
+    // (#359 review).
+    ...optionalTimestamp('lastEnumeratedAtMs', status.lastEnumeratedAtMs),
+    ...deferred,
   }
 }
 
@@ -584,6 +615,29 @@ function dispatchCapacityHealth(
   }
 }
 
+/**
+ * Project the fleet socket for the UNAUTHENTICATED surface.
+ *
+ * Deliberately NOT added to DISPATCH_GATING_SUBSYSTEMS. A failed socket does not
+ * itself stop dispatch -- `roster()` runs over HTTP -- and listing it there would
+ * flip `ok` on a live deployment and hand the container-replacement logic a new
+ * reason to cycle. Publishing the fact is the goal; changing what `ok` means is a
+ * separate decision belonging to whoever owns dispatch behaviour.
+ */
+function fleetConnectHealth(status: FleetConnectStatus): FactoryPublicFleetConnectHealth {
+  const attempts = counter(status.attempts)
+  return {
+    state: enumValue(status.state, FLEET_CONNECT_STATES),
+    ...(attempts !== undefined ? { attempts } : {}),
+    ...optionalTimestamp('lastAttemptAtMs', status.lastAttemptAtMs),
+    ...optionalTimestamp('lastDialedAtMs', status.lastDialedAtMs),
+    ...optionalTimestamp('firstEventAtMs', status.firstEventAtMs),
+    ...optionalTimestamp('lastConnectedAtMs', status.lastConnectedAtMs),
+    ...optionalTimestamp('lastFailureAtMs', status.lastFailureAtMs),
+    // `lastError` stays behind /evidence, exactly as it does for the circuit.
+  }
+}
+
 function fleetControlPlaneHealth(
   status: FleetControlPlaneStatus,
 ): FactoryPublicFleetControlPlaneHealth {
@@ -631,6 +685,7 @@ export function publicHealthFromHeartbeat(
   const readinessReconcile = heartbeat.readinessReconcile
     ? readinessReconcileHealth(heartbeat.readinessReconcile, nowMs)
     : undefined
+  const fleetConnect = heartbeat.fleetConnect ? fleetConnectHealth(heartbeat.fleetConnect) : undefined
   const fleetControlPlane = heartbeat.fleetControlPlane
     ? fleetControlPlaneHealth(heartbeat.fleetControlPlane)
     : undefined
@@ -711,6 +766,7 @@ export function publicHealthFromHeartbeat(
     ...(readinessReconcile ? { readinessReconcile } : {}),
     ...(eventListener ? { eventListener } : {}),
     ...(fleetControlPlane ? { fleetControlPlane } : {}),
+    ...(fleetConnect ? { fleetConnect } : {}),
     ...(dispatchCapacity ? { dispatchCapacity } : {}),
   }
 }
@@ -736,6 +792,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   const readiness = plainRecord(record.readinessReconcile)
   const listener = plainRecord(record.eventListener)
   const fleet = plainRecord(record.fleetControlPlane)
+  const fleetConnect = plainRecord(record.fleetConnect)
   const capacity = plainRecord(record.dispatchCapacity)
   // Re-derive the wedge from the occupants the record carries rather than
   // trusting its own `agentlessOccupants`: a producer that published the
@@ -803,6 +860,20 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             failureThreshold: counter(fleet.failureThreshold),
             ...optionalTimestamp('lastFailureAtMs', fleet.lastFailureAtMs),
             ...optionalTimestamp('retryAtMs', fleet.retryAtMs),
+          },
+        }
+      : {}),
+    ...(fleetConnect
+      ? {
+          fleetConnect: {
+            state: enumValue(fleetConnect.state, FLEET_CONNECT_STATES),
+            ...optionalCount('attempts', fleetConnect.attempts),
+            ...optionalTimestamp('lastAttemptAtMs', fleetConnect.lastAttemptAtMs),
+            ...optionalTimestamp('lastDialedAtMs', fleetConnect.lastDialedAtMs),
+            ...optionalTimestamp('firstEventAtMs', fleetConnect.firstEventAtMs),
+            ...optionalTimestamp('lastConnectedAtMs', fleetConnect.lastConnectedAtMs),
+            ...optionalTimestamp('lastFailureAtMs', fleetConnect.lastFailureAtMs),
+            // Never retain `lastError` from a remote unauthenticated record.
           },
         }
       : {}),

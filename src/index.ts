@@ -345,6 +345,8 @@ export type {
   Subscription,
   AgentSpec,
   FleetClient,
+  FleetConnectState,
+  FleetConnectStatus,
   RestartPolicy,
   RosterEntry,
   SendInput,

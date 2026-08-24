@@ -69,11 +69,14 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
     "inFlightMs": 4560000,          // this pass has run 76 minutes
     "missedPasses": 76,
     "lastErrorClass": "TimeoutError",
-    // The last COMPLETED sweep's arithmetic (#355). Absent until one completes.
+    // The last ENUMERATING sweep's arithmetic (#355). Absent until one enumerates.
     "candidates": 7,                // work units it pulled and evaluated
     "dispatched": 0,                // work units it dispatched
     "skipped": 7,                   // work units it saw and declined
-    "skipReasons": { "dispatch-terminal": 7 }
+    "skipReasons": { "dispatch-terminal": 7 },
+    // When THOSE counts were measured. Not lastCompletedAtMs, which also
+    // advances on a deferred pass that enumerated nothing.
+    "lastEnumeratedAtMs": 1787224535802
   },
   "eventListener": { "state": "subscribed" },
   "fleetControlPlane": { "state": "closed", "consecutiveFailures": 0, "failureThreshold": 3 }
@@ -99,29 +102,61 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   - `candidates > 0` — the sweep **saw** those issues and **rejected** them. The bug is in eligibility
     evaluation, and `skipReasons` names which gate.
   - `candidates == 0` — the sweep **never pulled** them. The bug is upstream, in discovery/ingestion.
-  - **the three fields absent entirely** — this daemon has not *completed* a sweep (or predates #355).
-    That is not a zero, and must not be read as one: it says nothing about either half. Check
-    `lastCompletedAtMs` and `inFlightMs`.
+  - **the three fields absent entirely** — this daemon has not completed a sweep that **enumerated**
+    (or predates #355). That is not a zero, and must not be read as one: it says nothing about either
+    half. Check `discoveryDeferred` first, then `lastCompletedAtMs`, `lastFailureAtMs`, and `inFlightMs`
+    to distinguish a completed deferral, a failure, work still running, and a pre-counter daemon.
 
-  They describe the last sweep that settled **successfully**, the same tense as `lastDurationMs`;
-  `lastCompletedAtMs` dates them. A pass that failed leaves them untouched rather than zeroing them.
+  They describe the last sweep that settled successfully **and enumerated**. A pass that failed —
+  or that deferred — leaves them untouched rather than zeroing them.
 
-- **`discoveryDeferred: "sweep-in-flight"`** — the sweep returned immediately because another process
-  held the discovery lease, so it enumerated nothing. Without this, that pass is indistinguishable
-  from one that queried the provider and legitimately found no ready work: both publish
-  `candidates: 0`.
+- **`lastEnumeratedAtMs`** — when those counts were measured, and the field to check before acting on
+  them. It is **not** `lastCompletedAtMs`: that one advances on every settled pass including a
+  deferred one, so on a daemon contending for the discovery lease the counts would otherwise sit
+  beside an ever-fresh completion stamp with no way to tell a measurement one interval old from one
+  four days old. Equal to `lastCompletedAtMs` on a daemon sweeping normally; where they differ, the
+  gap is exactly how stale the counts are.
+
+- **`discoveryDeferred: "sweep-in-flight"`** — the **most recent** pass returned immediately because
+  another process held the discovery lease, so it enumerated nothing. It is tracked apart from the
+  three counts, which describe the last sweep that actually enumerated:
+
+  - **with the counts** — those numbers are from an *earlier* pass, not the one `lastCompletedAtMs`
+    dates. A deferred pass records only this marker; its zeroes measure nothing and must not
+    overwrite a real sweep's numbers, which under a persistently-held lease would erase them.
+  - **alone, with no counts** — nothing has enumerated successfully yet on this daemon. The most
+    recent pass deferred because another process held the lease; an earlier startup attempt may
+    instead have failed before it could publish an outcome.
+
+  `lastCompletedAtMs` *does* move for a deferred pass. That is deliberate: the stall derivation above
+  reads it against `lastStartedAtMs`, so freezing it would report a daemon that is correctly
+  deferring to another owner as hung after ten intervals.
 
 - **`skipReasons`** — `skipped` split by a closed vocabulary
   (`FACTORY_SWEEP_SKIP_REASON_CODES`); zero-count codes are omitted, so an absent key is a zero, and
-  the counts always sum to `skipped`. `dispatch-terminal` and `dispatch-retry-limit` are the two that
-  never clear on their own — a work unit in either needs a human. `dispatch-backoff`,
-  `already-tracked` and `queued-or-escalated` resolve by themselves. `out-of-scope` and `not-ready`
-  mean the gate is working as configured and the issue does not match it — check the deployed
-  `safety` config against the issue rather than the daemon.
+  the counts always sum to `skipped`. The full vocabulary, grouped by what to do about it:
+
+  | code | |
+  |---|---|
+  | `dispatch-terminal`, `dispatch-retry-limit` | **needs a human** — permanently declined, never clears on its own |
+  | `dispatch-backoff`, `dispatch-in-flight`, `already-tracked`, `queued-or-escalated` | transient; resolves by itself |
+  | `out-of-scope`, `not-ready`, `not-dispatchable` | the gate is working as configured and the issue does not match it — check the deployed `safety` config against the issue, not the daemon |
+  | `parked-dependency`, `dependency-cycle` | parked on other work; a cycle needs a human to break it |
+  | `read-failed`, `dispatch-failed` | per-item failures the sweep **absorbed and continued past** (#292/#297) — see below |
+  | `other` | a code this reader's vocabulary does not know, from a producer on another version |
+
+  `read-failed` and `dispatch-failed` count work units an otherwise-**successful** pass gave up on
+  individually. Do **not** reach for `lastErrorClass` to explain them: that field describes a pass
+  that *failed as a whole*, and the success path clears it, so it is absent in exactly this scenario.
+  The per-item messages go to the container log (`[factory] relayfile shed a ready-issue read…`,
+  `[factory] skipped a work unit whose dispatch failed…`); the count here is what tells you to go
+  looking. A rising `read-failed` alongside `state: healthy` is the #297 shedding signature.
 
   Counts only, by construction: issue keys, paths and titles carry customer project and repository
   names and never cross onto this surface. The keys are rebuilt from the reader's own copy of the
-  vocabulary, so a record from another version cannot publish an arbitrary string as one.
+  vocabulary — anything unrecognised is counted under `other` rather than dropped, so the parts keep
+  summing to `skipped` — which is also why a record from another version cannot publish an arbitrary
+  string as a key.
 
 - **`fleetControlPlane`** — an `open` circuit fails every spawn and resume fast, so it gates dispatch
   as hard as a failing sweep. `closed` is the healthy value.

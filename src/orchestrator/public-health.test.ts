@@ -744,6 +744,81 @@ describe('publicHealthFromHeartbeat (#295)', () => {
 })
 
 
+/**
+ * The fleet event socket is the dial that makes Factory's own agent `online`.
+ * It had no status on any surface, and readers substituted `eventListener` --
+ * which is the orchestrator's ISSUE subscription, a different subsystem. That
+ * conflation is why a Factory that registered an agent and never connected read
+ * as healthy everywhere.
+ */
+describe('fleet connect health', () => {
+  const withConnect = (
+    overrides: Partial<NonNullable<FactoryLoopHeartbeat['fleetConnect']>> = {},
+  ): FactoryLoopHeartbeat =>
+    heartbeat({
+      fleetConnect: {
+        state: 'failed',
+        attempts: 1,
+        lastAttemptAtMs: BOOT_MS - 5_000,
+        lastFailureAtMs: BOOT_MS - 4_000,
+        lastError: 'FactoryAgentRegistrationError',
+        ...overrides,
+      },
+    })
+
+  it('publishes the socket state unauthenticated', () => {
+    const health = publicHealthFromHeartbeat(withConnect({
+      lastDialedAtMs: BOOT_MS - 4_500,
+      firstEventAtMs: BOOT_MS - 4_250,
+    }), { nowMs: BOOT_MS })
+    expect(health.fleetConnect?.state).toBe('failed')
+    expect(health.fleetConnect?.attempts).toBe(1)
+    expect(health.fleetConnect?.lastDialedAtMs).toBe(BOOT_MS - 4_500)
+    expect(health.fleetConnect?.firstEventAtMs).toBe(BOOT_MS - 4_250)
+  })
+
+  /** `lastError` stays behind /evidence, exactly as it does for the circuit. */
+  it('never leaks the cause to the unauthenticated surface', () => {
+    const health = publicHealthFromHeartbeat(withConnect(), { nowMs: BOOT_MS })
+    expect(JSON.stringify(health.fleetConnect)).not.toContain('FactoryAgentRegistrationError')
+    expect(Object.hasOwn(health.fleetConnect ?? {}, 'lastError')).toBe(false)
+  })
+
+  /**
+   * Deliberately NOT dispatch-gating. Listing it would flip `ok` on a live
+   * deployment and hand container replacement a new reason to cycle -- a
+   * behaviour change well beyond publishing the fact.
+   */
+  it('does not change what ok means', () => {
+    const health = publicHealthFromHeartbeat(withConnect(), { nowMs: BOOT_MS })
+    expect(health.degradedSubsystems).not.toContain('fleetConnect')
+    expect(health.ok).toBe(true)
+  })
+
+  /** CONTROL: absent stays absent rather than being invented as healthy. */
+  it('omits the block entirely when the backend has no socket', () => {
+    const health = publicHealthFromHeartbeat(heartbeat(), { nowMs: BOOT_MS })
+    expect(health.fleetConnect).toBeUndefined()
+  })
+
+  it('retains a failed socket record through normalization without retaining lastError', () => {
+    const published = publicHealthFromHeartbeat(withConnect({
+      lastDialedAtMs: BOOT_MS - 4_500,
+      firstEventAtMs: BOOT_MS - 4_250,
+    }), { nowMs: BOOT_MS })
+    const normalized = normalizePublicHealth({
+      ...published,
+      fleetConnect: {
+        ...published.fleetConnect,
+        lastError: 'connect failed to wss://relay.example?token=secret',
+      },
+    })
+
+    expect(normalized?.fleetConnect).toEqual(published.fleetConnect)
+    expect(Object.hasOwn(normalized?.fleetConnect ?? {}, 'lastError')).toBe(false)
+  })
+})
+
 describe('sweep counters on the public surface (#355)', () => {
   const swept = (
     overrides: Partial<NonNullable<FactoryLoopHeartbeat['readinessReconcile']>> = {},
@@ -779,6 +854,7 @@ describe('sweep counters on the public surface (#355)', () => {
   // "candidates minus dispatched" arithmetic that the missing field makes
   // wrong, so the group travels whole or not at all.
   it('drops a partial trio rather than publishing a misleading fragment', () => {
+    expect(swept({ candidates: 4 })).toMatchObject({ enumerationCountsInvalid: true })
     expect(Object.hasOwn(swept({ candidates: 4 }) ?? {}, 'candidates')).toBe(false)
     expect(Object.hasOwn(swept({ candidates: 4, dispatched: 1 }) ?? {}, 'candidates')).toBe(false)
     expect(swept({ candidates: 4, dispatched: 1, skipped: 3 })).toMatchObject({
@@ -788,9 +864,42 @@ describe('sweep counters on the public surface (#355)', () => {
     })
   })
 
+  it('distinguishes a rejected deferred count snapshot from a genuine count-free deferral', () => {
+    const rejected = swept({
+      candidates: 4,
+      dispatched: 'invalid' as unknown as number,
+      discoveryDeferred: 'sweep-in-flight',
+    })
+    expect(rejected).toMatchObject({
+      discoveryDeferred: 'sweep-in-flight',
+      enumerationCountsInvalid: true,
+    })
+    expect(Object.hasOwn(rejected ?? {}, 'candidates')).toBe(false)
+
+    const normalizedAgain = normalizePublicHealth({
+      schemaVersion: 1,
+      ok: true,
+      status: 'ok',
+      stale: false,
+      loopStatus: 'running',
+      degradedSubsystems: [],
+      readinessReconcile: rejected,
+    })
+    expect(normalizedAgain?.readinessReconcile).toMatchObject({
+      discoveryDeferred: 'sweep-in-flight',
+      enumerationCountsInvalid: true,
+    })
+  })
+
   it('names the deferred sweep, so a zero from a held lease is not read as an empty provider', () => {
     expect(swept({ candidates: 0, dispatched: 0, skipped: 0, discoveryDeferred: 'sweep-in-flight' }))
       .toMatchObject({ candidates: 0, discoveryDeferred: 'sweep-in-flight' })
+    // Independent of the trio (#358 review). A daemon whose first pass deferred
+    // has no counts to publish and still has to say why, so dropping the marker
+    // with the counts would leave the only surface silent about it.
+    const noCounts = swept({ discoveryDeferred: 'sweep-in-flight' })
+    expect(noCounts?.discoveryDeferred).toBe('sweep-in-flight')
+    expect(Object.hasOwn(noCounts ?? {}, 'candidates')).toBe(false)
     // Only the one value the vocabulary has.
     expect(swept({
       candidates: 0,

@@ -853,14 +853,14 @@ export class FactoryLoop implements Factory {
   #readinessReconcileLastError?: string
   #readinessReconcileLastErrorClass?: string
   /**
-   * The last *completed* sweep's arithmetic (#355).
+   * The last *enumerating* sweep's arithmetic (#355).
    *
-   * Held as one record rather than four fields so it can only ever be replaced
+   * Held as one record rather than three fields so it can only ever be replaced
    * whole: publishing a `dispatched` from one pass beside a `candidates` from
    * another would be worse than publishing neither, since the whole use of
    * these numbers is comparing them to each other.
    *
-   * `undefined` until a sweep completes, and never initialised to zeroes —
+   * `undefined` until a sweep enumerates, and never initialised to zeroes —
    * "this daemon has not finished a sweep" and "a sweep finished and found
    * nothing" are the two readings #355 has to tell apart.
    */
@@ -879,8 +879,29 @@ export class FactoryLoop implements Factory {
      */
     dispatchFailures: number
     dispatchFailureReasons: Partial<Record<FactoryDispatchFailureReasonCode, number>>
-    discoveryDeferred?: 'sweep-in-flight'
+    /**
+     * When the pass these counts describe finished enumerating (#359 review).
+     *
+     * Retaining counts across a deferral without this left them with no time
+     * coordinate: `lastCompletedAtMs` moves on every deferred pass, so the
+     * payload paired arbitrarily old counts with a fresh completion stamp and
+     * a reader could not tell a measurement one interval old from one four
+     * days old. It belongs to this record, and is replaced with it.
+     */
+    enumeratedAtMs: number
   }
+  /**
+   * Whether the MOST RECENT pass deferred, tracked apart from the counts above
+   * (#358 review, CodeRabbit — Major, and right).
+   *
+   * A deferred pass enumerates nothing and settles in milliseconds, so folding
+   * it into the snapshot overwrote the last real sweep's numbers with zeroes.
+   * On a container where another process holds the lease for any length of time
+   * — the #347/#349 condition — every pass would publish `candidates: 0` and the
+   * last actual enumeration would be unrecoverable, destroying the measurement
+   * this whole change exists to provide.
+   */
+  #readinessReconcileLastSweepDeferred?: 'sweep-in-flight'
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
@@ -1650,9 +1671,11 @@ export class FactoryLoop implements Factory {
         // cold container it is the first — and for the next interval, only —
         // sweep whose counts exist. Leaving it unrecorded would make a daemon
         // that has completed a full pass still read as "never ran" (#355).
-        this.#recordReadinessSweepOutcome(await this.runOnce())
+        const report = await this.runOnce()
         this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
-        this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
+        const completedAtMs = this.#clock.now()
+        this.#readinessReconcileLastCompletedAtMs = completedAtMs
+        this.#recordReadinessSweepOutcome(report, completedAtMs)
       } catch (error) {
         this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
         this.#readinessReconcileLastFailureAtMs = this.#clock.now()
@@ -1890,22 +1913,28 @@ export class FactoryLoop implements Factory {
       const report = await this.#runOnceWithReadinessDeadline()
       this.#readinessReconcileConsecutiveFailures = 0
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
-      this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
+      const completedAtMs = this.#clock.now()
+      this.#readinessReconcileLastCompletedAtMs = completedAtMs
       this.#readinessReconcileLastError = undefined
       this.#readinessReconcileLastErrorClass = undefined
       // The three integers below have gone to stdout since this loop existed,
       // and stdout does not reach the deployed container's operator (#355).
       // Publishing them is what lets a reader tell a sweep that saw eligible
       // work and rejected it from one that never pulled it at all.
-      this.#recordReadinessSweepOutcome(report)
+      this.#recordReadinessSweepOutcome(report, completedAtMs)
       this.#logger.info?.('[factory] periodic readiness reconciliation completed', {
         durationMs: this.#readinessReconcileLastDurationMs,
         candidates: report.pulled.length,
         dispatched: report.dispatched.length,
         skipped: report.skipped.length,
-        skipReasons: this.#readinessReconcileLastSweep?.skipReasons,
-        dispatchFailures: this.#readinessReconcileLastSweep?.dispatchFailures,
-        dispatchFailureReasons: this.#readinessReconcileLastSweep?.dispatchFailureReasons,
+        // THIS pass's breakdown, never the retained snapshot (#359 review,
+        // codex P2). Logging the retained one beside a deferred pass's zeroes
+        // produced a line that contradicted its own arithmetic —
+        // `skipped: 0` next to a non-empty breakdown — and this log is what a
+        // local operator reads.
+        skipReasons: factorySweepSkipReasonCounts(report.skipped),
+        dispatchFailures: report.skipped.filter((entry) => entry.code === 'dispatch-failed').length,
+        dispatchFailureReasons: factoryDispatchFailureReasonCounts(report.skipped),
         discoveryDeferred: report.discoveryDeferred,
       })
     } catch (error) {
@@ -1928,6 +1957,10 @@ export class FactoryLoop implements Factory {
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
       this.#readinessReconcileLastFailureAtMs = this.#clock.now()
       this.#readinessReconcileLastError = errorMessage
+      // This failure is now the latest settled pass. A deferral marker left by
+      // an older pass would falsely describe this one as lease contention when
+      // the timestamps/error below prove that it acquired the lease and failed.
+      this.#readinessReconcileLastSweepDeferred = undefined
       // The class, unlike the message, is publishable: #295 puts it on the
       // unauthenticated health surface through the same allowlist.
       this.#readinessReconcileLastErrorClass = telemetryErrorClass(error)
@@ -5023,6 +5056,9 @@ export class FactoryLoop implements Factory {
       })) ?? [],
       counters: { ...this.#counters },
       fleetControlPlane: this.#fleetControlPlane.status(),
+      // Optional on the port: a backend with no socket omits it, and an absent
+      // value stays absent rather than being invented as healthy.
+      ...(this.#fleet.fleetConnectStatus ? { fleetConnect: this.#fleet.fleetConnectStatus() } : {}),
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
       eventListener: this.#eventListenerStatus(),
@@ -5061,10 +5097,23 @@ export class FactoryLoop implements Factory {
    *
    * Only successful passes reach here: a pass that threw has no report, and
    * inventing zeroes for it would publish "found nothing" for a sweep that
-   * never got to look. The previous pass's numbers stay put instead, dated by
-   * `lastCompletedAtMs`, which is the honest reading.
+   * never got to look. The previous enumerating pass's numbers stay put
+   * instead, dated by `lastEnumeratedAtMs`, which is the honest reading.
+   *
+   * A deferred pass gets the same treatment for the same reason. It settles
+   * successfully, and `lastCompletedAtMs` moves — deliberately, because the
+   * #295/#296 stall derivation reads that timestamp against `lastStartedAtMs`,
+   * and freezing it would report a functioning daemon as a hung one after ten
+   * intervals of deferring correctly to another owner. But it enumerated
+   * nothing, so its zeroes are not a measurement of anything and must not
+   * replace one. Only the marker is recorded.
    */
-  #recordReadinessSweepOutcome(report: IterationReport): void {
+  #recordReadinessSweepOutcome(report: IterationReport, completedAtMs: number): void {
+    if (report.discoveryDeferred) {
+      this.#readinessReconcileLastSweepDeferred = report.discoveryDeferred
+      return
+    }
+    this.#readinessReconcileLastSweepDeferred = undefined
     this.#readinessReconcileLastSweep = {
       candidates: report.pulled.length,
       dispatched: report.dispatched.length,
@@ -5075,7 +5124,10 @@ export class FactoryLoop implements Factory {
       // second traversal agreeing with the first.
       dispatchFailures: report.skipped.filter((entry) => entry.code === 'dispatch-failed').length,
       dispatchFailureReasons: factoryDispatchFailureReasonCounts(report.skipped),
-      ...(report.discoveryDeferred ? { discoveryDeferred: report.discoveryDeferred } : {}),
+      // The caller's completion stamp, not a fresh clock read: on a pass that
+      // enumerated, `lastEnumeratedAtMs` and `lastCompletedAtMs` describe the
+      // same instant and must not drift apart by a tick.
+      enumeratedAtMs: completedAtMs,
     }
   }
 
@@ -5173,10 +5225,13 @@ export class FactoryLoop implements Factory {
             ...(Object.keys(this.#readinessReconcileLastSweep.dispatchFailureReasons).length > 0
               ? { dispatchFailureReasons: { ...this.#readinessReconcileLastSweep.dispatchFailureReasons } }
               : {}),
-            ...(this.#readinessReconcileLastSweep.discoveryDeferred
-              ? { discoveryDeferred: this.#readinessReconcileLastSweep.discoveryDeferred }
-              : {}),
+            lastEnumeratedAtMs: this.#readinessReconcileLastSweep.enumeratedAtMs,
           }
+        : {}),
+      // Independent of the trio: a daemon whose FIRST pass deferred has no
+      // counts to publish and still needs to say why.
+      ...(this.#readinessReconcileLastSweepDeferred
+        ? { discoveryDeferred: this.#readinessReconcileLastSweepDeferred }
         : {}),
       ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
       ...(this.#readinessReconcileLastErrorClass
@@ -8243,6 +8298,9 @@ export class FactoryLoop implements Factory {
       readinessReconcile: this.#readinessReconcileStatus(),
       dispatchCapacity: this.#dispatchCapacityStatus(),
       fleetControlPlane: this.#fleetControlPlane.status(),
+      // Optional on the port: a backend with no socket omits it, and an absent
+      // value stays absent rather than being invented as healthy.
+      ...(this.#fleet.fleetConnectStatus ? { fleetConnect: this.#fleet.fleetConnectStatus() } : {}),
     }
     // The deployed container serves `/healthz` straight out of this file and
     // has no redaction logic of its own, so publish the already-safe view here

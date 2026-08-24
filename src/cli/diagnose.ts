@@ -24,6 +24,7 @@ export interface DeployedEvidenceSummary {
   reason?: string
   phase?: string
   lastError?: string
+  fleetConnectLastError?: string
   consecutiveFailures?: number
 }
 
@@ -327,28 +328,53 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
       'dispatching: readinessReconcile is healthy' +
       (readiness?.intervalMs ? ` on a ${formatDuration(readiness.intervalMs)} cadence` : '') +
       `, and the event listener is ${health.eventListener?.state ?? 'unknown'}.` +
-      ` Last completed sweep: ${formatSweepOutcome(readiness)}.`,
+      ` Last enumerating sweep: ${formatSweepOutcome(readiness)}.`,
   }
 }
 
 /**
- * The last completed sweep, as a phrase that keeps zero and absent apart (#355).
+ * The last enumerating sweep, as a phrase that keeps zero and absent apart (#355).
  *
  * `candidates: 0` says discovery pulled nothing and the bug is upstream of
- * eligibility; no `candidates` at all says this instance has not finished a
+ * eligibility; no `candidates` at all says this instance has not enumerated a
  * sweep — or predates the counters — and says nothing about either. Rendering
  * both as `0` would recreate the ambiguity the field exists to remove.
  */
 export function formatSweepOutcome(
   readiness: FactoryPublicReadinessReconcileHealth | undefined,
 ): string {
+  if (readiness?.enumerationCountsInvalid) {
+    return 'not attributable (the report supplied an incomplete or invalid count snapshot; ' +
+      'whether an earlier pass enumerated is unknown)'
+  }
   if (!readiness || readiness.candidates === undefined) {
-    return 'not reported (no sweep has completed, or this instance predates the counters)'
+    // A deferred pass publishes the marker with no counts. It proves only why
+    // the LATEST pass did not enumerate: an earlier startup attempt may have
+    // failed before it could publish any outcome (#359 review).
+    return readiness?.discoveryDeferred
+      ? 'nothing has enumerated successfully yet — the most recent pass deferred ' +
+        'to another process holding the discovery lease'
+      : 'not reported (no sweep has enumerated, or this instance predates the counters)'
+  }
+  if (readiness.discoveryDeferred && readiness.lastEnumeratedAtMs === undefined) {
+    // The immediately preceding producer overwrote its trio with zeroes on a
+    // deferral and had no enumeration timestamp. Those values cannot be
+    // attributed to a real provider read, so label the record as legacy/unknown
+    // instead of presenting it under "Last enumerating sweep" (#359 review).
+    return 'not attributable (legacy deferred report has counts without an enumeration timestamp; ' +
+      'the most recent pass deferred to another process holding the discovery lease)'
   }
   return `${readiness.candidates} candidate(s), ${readiness.dispatched ?? 0} dispatched, ` +
     `${readiness.skipped ?? 0} skipped` +
     (readiness.discoveryDeferred
-      ? ' — it deferred to another process holding the discovery lease and enumerated nothing'
+      // Name the instant, not just "an earlier pass" (#359 review): retained
+      // counts sit beside an ever-fresh `lastCompletedAtMs`, so without this
+      // an operator cannot tell a measurement one interval old from one days
+      // old, and the staleness is the whole reason to say anything at all.
+      ? `${readiness.lastEnumeratedAtMs === undefined
+          ? ''
+          : ` measured ${formatInstant(readiness.lastEnumeratedAtMs)}`} — the most recent pass deferred ` +
+        'to another process holding the discovery lease and enumerated nothing'
       : '')
 }
 
@@ -445,11 +471,15 @@ async function readEvidence(
     }
     const body = asRecord(evidence.body)
     const readiness = asRecord(body.readinessReconcile)
+    const fleetConnect = asRecord(body.fleetConnect)
     return {
       fetched: true,
       httpStatus: evidence.status,
       ...(asText(body.phase) ? { phase: asText(body.phase) } : {}),
       ...(asText(readiness.lastError) ? { lastError: asText(readiness.lastError) } : {}),
+      ...(asText(fleetConnect.lastError)
+        ? { fleetConnectLastError: asText(fleetConnect.lastError) }
+        : {}),
       ...(asCount(readiness.consecutiveFailures) !== undefined
         ? { consecutiveFailures: asCount(readiness.consecutiveFailures) }
         : {}),
@@ -503,6 +533,7 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
       // #355. `candidates === 0` and an absent `candidates` are opposite
       // diagnoses, so the renderer must not collapse them into one dash.
       lines.push(`    last sweep         : ${formatSweepOutcome(readiness)}`)
+      lines.push(`    lastEnumeratedAt   : ${formatInstant(readiness.lastEnumeratedAtMs)}`)
       if (readiness.skipReasons) {
         lines.push(`    skip reasons       : ${formatSkipReasons(readiness.skipReasons)}`)
       }
@@ -535,6 +566,20 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
         )
       }
     }
+    const fleetConnect = health.fleetConnect
+    if (fleetConnect) {
+      lines.push('  fleetConnect:')
+      lines.push(`    state              : ${fleetConnect.state}`)
+      if (fleetConnect.state === 'dialed') {
+        lines.push('    confirmation       : unconfirmed — the SDK accepted connect(), but no stream event has been observed; a healthy silent workspace may remain dialed')
+      }
+      lines.push(`    attempts           : ${fleetConnect.attempts ?? '—'}`)
+      lines.push(`    lastAttemptAt      : ${formatInstant(fleetConnect.lastAttemptAtMs)}`)
+      lines.push(`    lastDialedAt       : ${formatInstant(fleetConnect.lastDialedAtMs)}`)
+      lines.push(`    firstEventAt       : ${formatInstant(fleetConnect.firstEventAtMs)}`)
+      lines.push(`    lastConnectedAt    : ${formatInstant(fleetConnect.lastConnectedAtMs)}`)
+      lines.push(`    lastFailureAt      : ${formatInstant(fleetConnect.lastFailureAtMs)}`)
+    }
     lines.push(`  eventListener        : ${health.eventListener?.state ?? 'unknown'}`)
   } else if (diagnosis.unreadable) {
     lines.push('  health block         : none — this response carried no Factory health')
@@ -559,6 +604,9 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
       `  evidence             : ${evidence.fetched ? `read (HTTP ${evidence.httpStatus ?? 200})` : `not read — ${evidence.reason ?? 'unavailable'}`}`,
     )
     if (evidence.lastError) lines.push(`    lastError          : ${evidence.lastError}`)
+    if (evidence.fleetConnectLastError) {
+      lines.push(`    fleetConnect error : ${evidence.fleetConnectLastError}`)
+    }
   }
 
   lines.push('')
