@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -1869,6 +1869,29 @@ describe('InternalFleetClient', () => {
       const throughSymlink = new InternalFleetClient({
         client: new FakeHarnessDriverClient(),
         connectionPath: symlinkPath,
+      })
+
+      const identity = await direct.messageStreamIdentity()
+      await expect(throughSymlink.messageStreamIdentity()).resolves.toBe(identity)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('shares teammate claim identity through a symlinked parent before the connection file exists', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-internal-stream-missing-symlink-'))
+    const realDirectory = join(root, 'real-relay')
+    const symlinkDirectory = join(root, 'relay-link')
+    try {
+      await mkdir(realDirectory)
+      await symlink(realDirectory, symlinkDirectory)
+      const direct = new InternalFleetClient({
+        client: new FakeHarnessDriverClient(),
+        connectionPath: join(realDirectory, 'connection.json'),
+      })
+      const throughSymlink = new InternalFleetClient({
+        client: new FakeHarnessDriverClient(),
+        connectionPath: join(symlinkDirectory, 'connection.json'),
       })
 
       const identity = await direct.messageStreamIdentity()

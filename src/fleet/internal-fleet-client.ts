@@ -3,7 +3,7 @@ import { AgentRelay } from '@agent-relay/sdk'
 import { createHash } from 'node:crypto'
 import { accessSync, constants, readFileSync, realpathSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
@@ -132,16 +132,27 @@ const CANONICAL_PRESENCE_REGISTRATION_GRACE_MS = 60_000
 const UNKNOWN_INJECTED_BROKER_STREAM = Object.freeze({})
 const internalBrokerStreamIdentity = (receipt: string): string =>
   `internal-broker:${createHash('sha256').update(receipt).digest('base64url')}`
+const canonicalizeConnectionPath = (absolutePath: string): string => {
+  let candidate = absolutePath
+  const missingSegments: string[] = []
+  for (;;) {
+    try {
+      return join(realpathSync.native(candidate), ...missingSegments.reverse())
+    } catch {
+      const parent = dirname(candidate)
+      if (parent === candidate) return absolutePath
+      missingSegments.push(basename(candidate))
+      candidate = parent
+    }
+  }
+}
 const connectionFileStreamIdentity = (path: string): string => {
   const absolutePath = resolve(path)
-  let canonicalPath = absolutePath
-  try {
-    canonicalPath = realpathSync.native(absolutePath)
-  } catch {
-    // A missing connection file can still be supplied while the broker is
-    // starting. Preserve the previous stable absolute-path identity until it
-    // exists instead of making construction fail.
-  }
+  // The connection file may not exist while the broker is starting. Resolve
+  // its nearest existing ancestor so paths through a symlinked parent still
+  // identify the same future receipt without making construction depend on
+  // the leaf already being present.
+  const canonicalPath = canonicalizeConnectionPath(absolutePath)
   return internalBrokerStreamIdentity(`connection-file:${canonicalPath}`)
 }
 const canonicalBrokerUrl = (value: string): string => {
