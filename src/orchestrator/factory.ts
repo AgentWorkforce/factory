@@ -1689,6 +1689,49 @@ export class FactoryLoop implements Factory {
     return compensated
   }
 
+  /**
+   * Re-adopt this publisher's own lease epoch after a refused lifecycle write.
+   *
+   * `#saveDispatchLifecycle` cannot tell "the store rejected our fence" from
+   * "the store declined this row's contents", so it evicts the cached epoch for
+   * both. Only the first is a loss of ownership. Re-read the durable row and
+   * take the epoch back when the lease is still ours and still live; a row that
+   * is gone, terminal, expired, or owned by someone else keeps the eviction,
+   * because for those the eviction was correct.
+   */
+  async #recoverDispatchLifecycleLeaseEpoch(key: string): Promise<boolean> {
+    if (this.#dispatchLifecycleEpochs.has(key)) return true
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+    const lease = lifecycle?.lease
+    if (!lifecycle || !lease || isTerminalDispatchLifecycle(lifecycle)) return false
+    if (lease.owner !== this.#dispatchLifecycleOwner) return false
+    if (lease.leaseUntilMs <= this.#clock.now()) return false
+    this.#dispatchLifecycleEpochs.set(key, lease.epoch)
+    this.#increment('dispatchLifecycleLeaseEpochsRecovered')
+    return true
+  }
+
+  /**
+   * Persist a dispatch-claim fence without letting a refused write disarm the
+   * lease the next one needs.
+   *
+   * The shutdown handoff deliberately probes with a provisional
+   * `cancellationPending` fence, and a store may refuse that row on its
+   * contents while this process still holds the lease. Losing the epoch there
+   * would make every later write for this lifecycle short-circuit on
+   * `epoch === undefined` — including the conclusive compensated settlement
+   * that clears the block and frees the agents and the batch slot. That turns
+   * one refused probe into a lifecycle retained until restart, so bracket the
+   * write with epoch recovery instead.
+   */
+  async #persistDispatchClaimFence(record: InFlightIssue): Promise<boolean> {
+    const key = dispatchLifecycleKey(record.issue)
+    await this.#recoverDispatchLifecycleLeaseEpoch(key)
+    const saved = await this.#saveDispatchLifecycle(record, 'running')
+    if (!saved) await this.#recoverDispatchLifecycleLeaseEpoch(key)
+    return saved
+  }
+
   async #retainUncompensatedDispatchClaim(
     record: InFlightIssue,
     error: unknown,
@@ -1717,7 +1760,7 @@ export class FactoryLoop implements Factory {
       })
     }
     if (this.#usesDurableDispatchLifecycle()) {
-      return await this.#saveDispatchLifecycle(record, 'running')
+      return await this.#persistDispatchClaimFence(record)
     } else {
       await this.#writeDispatchClaimRegistry(record.issue)
       return true
@@ -1740,7 +1783,7 @@ export class FactoryLoop implements Factory {
     this.#dispatchClaimStatuses.set(key, claim)
     try {
       const persisted = this.#usesDurableDispatchLifecycle()
-        ? await this.#saveDispatchLifecycle(record, 'running')
+        ? await this.#persistDispatchClaimFence(record)
         : await this.#writeDispatchClaimRegistry(record.issue).then(() => true)
       if (!persisted) {
         record.dispatchClaim = previousClaim

@@ -1230,6 +1230,70 @@ class RejectingPendingClaimFenceStateStore extends FileStateStore {
   }
 }
 
+class LeaseLostPendingClaimFenceStateStore extends FileStateStore {
+  allowPendingFence = false
+  #lostLease: { workspaceId: string; key: string; owner: string } | undefined
+
+  override async saveDispatchLifecycle(
+    ...args: Parameters<FileStateStore['saveDispatchLifecycle']>
+  ): Promise<boolean> {
+    if (!this.allowPendingFence && args[5].dispatchClaim?.cancellationPending === true) {
+      if (!this.#lostLease) {
+        this.#lostLease = { workspaceId: args[0], key: args[1], owner: args[2] }
+        // Model the lifecycle lease expiring inside the shutdown drain: the row
+        // still names this publisher, but its lease is no longer live, so the
+        // evicted epoch must NOT be recoverable.
+        await super.releaseDispatchLifecycleLease(args[0], args[1], args[2], args[3])
+      }
+      return false
+    }
+    return await super.saveDispatchLifecycle(...args)
+  }
+
+  /** Teardown only: hand the lease back so the wedged factory can shut down. */
+  async restoreLostLease(nowMs: number): Promise<void> {
+    const lost = this.#lostLease
+    if (!lost) throw new Error('the lease was never taken away')
+    const lifecycle = await this.getDispatchLifecycle(lost.workspaceId, lost.key)
+    if (!lifecycle) throw new Error('the dispatch lifecycle row disappeared')
+    await this.claimDispatchLifecycle(lost.workspaceId, lost.key, lifecycle, lost.owner, nowMs, 60_000)
+  }
+}
+
+const CLAIM_FENCE_SUCCESSOR_OWNER = 'successor-publisher'
+
+class LeaseStolenPendingClaimFenceStateStore extends FileStateStore {
+  allowPendingFence = false
+  stolenFrom: string | undefined
+
+  override async saveDispatchLifecycle(
+    ...args: Parameters<FileStateStore['saveDispatchLifecycle']>
+  ): Promise<boolean> {
+    if (!this.allowPendingFence && args[5].dispatchClaim?.cancellationPending === true) {
+      if (!this.stolenFrom) {
+        this.stolenFrom = args[2]
+        // Model a successor adopting the lifecycle while this publisher is
+        // shutting down: the lease is expired out from under it and re-taken by
+        // another owner at a new epoch. That epoch is not this publisher's to
+        // take back.
+        await super.releaseDispatchLifecycleLease(args[0], args[1], args[2], args[3])
+        const current = await this.getDispatchLifecycle(args[0], args[1])
+        if (!current) throw new Error('the dispatch lifecycle row disappeared')
+        await super.claimDispatchLifecycle(
+          args[0],
+          args[1],
+          current,
+          CLAIM_FENCE_SUCCESSOR_OWNER,
+          args[4],
+          60_000,
+        )
+      }
+      return false
+    }
+    return await super.saveDispatchLifecycle(...args)
+  }
+}
+
 class ThrowOncePendingClaimFenceStateStore extends FileStateStore {
   pendingFailures = 0
 
@@ -12002,6 +12066,11 @@ describe('FactoryLoop', () => {
 
       githubWriteback.claimWriteGate.resolve()
       await withDeadline(run, 8_000, 'dispatch did not compensate after the rejected handoff')
+      // The refused provisional fence evicted this publisher's cached epoch for
+      // a lease it still holds. The conclusive settlement can only persist
+      // because that epoch was re-adopted, so assert the mechanism and not just
+      // the shutdown that depends on it.
+      expect(factory.status().counters.dispatchLifecycleLeaseEpochsRecovered).toBeGreaterThanOrEqual(1)
       await withDeadline(factory.stop(), 4_000, 'shutdown did not recover after compensation settled')
       stopped = true
       expect(fleet.releases).toEqual([
@@ -12012,6 +12081,174 @@ describe('FactoryLoop', () => {
       githubWriteback.claimWriteGate.resolve()
       if (!stopped) await factory.stop()
       await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('does not recover a dispatch-claim lease epoch that is no longer live', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-claim-handoff-lease-lost-'))
+    const number = 1271
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new LocalLifecycleFleetClient()
+    const githubWriteback = new BlockingDispatchClaimGithubWriteback()
+    const stateStore = new LeaseLostPendingClaimFenceStateStore({
+      batchSize: 2,
+      watchStatePath: join(root, 'state.json'),
+    })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 60_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+      logger: { error: () => {}, warn: () => {} },
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let bodyCompleted = false
+    try {
+      await withDeadline(githubWriteback.claimWriteStarted.promise, 4_000, 'dispatch claim did not start')
+
+      await expect(withDeadline(
+        factory.stop(),
+        6_000,
+        'shutdown did not report the rejected claim-fence handoff',
+      )).rejects.toThrow(/refusing shutdown handoff/u)
+
+      githubWriteback.claimWriteGate.resolve()
+      await withDeadline(run, 8_000, 'dispatch did not settle after the rejected handoff')
+
+      // The lease this publisher cached is gone, so the refused fence write must
+      // NOT be repaired by re-adopting its epoch. The handoff stays refused and
+      // the placements stay held for a successor rather than being released
+      // against a lifecycle this process can no longer write.
+      await expect(withDeadline(
+        factory.stop(),
+        6_000,
+        'shutdown did not re-report the rejected claim-fence handoff',
+      )).rejects.toThrow(/refusing shutdown handoff/u)
+      expect(factory.status().counters.dispatchLifecycleLeaseEpochsRecovered ?? 0).toBe(0)
+      expect(fleet.releases).toEqual([])
+      expect(factory.status().inFlight).toHaveLength(1)
+      bodyCompleted = true
+    } finally {
+      githubWriteback.claimWriteGate.resolve()
+      // Teardown: give the lease back and stop refusing the fence so the
+      // shutdown this test deliberately wedged can complete.
+      stateStore.allowPendingFence = true
+      await stateStore.restoreLostLease(Date.now())
+      const teardownError = await factory.stop().then(() => undefined, (error: unknown) => error)
+      await rm(root, { recursive: true, force: true })
+      // A teardown stop must never replace the assertion that actually failed.
+      // Masking exactly like that is what made this suite's own CI failure
+      // report the `finally` line instead of the assertion under test.
+      if (bodyCompleted && teardownError) throw teardownError
+    }
+  }, 30_000)
+
+  it('does not adopt a successor publisher\'s lease epoch to settle a claim fence', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-claim-handoff-lease-stolen-'))
+    const number = 1272
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new LocalLifecycleFleetClient()
+    const githubWriteback = new BlockingDispatchClaimGithubWriteback()
+    const stateStore = new LeaseStolenPendingClaimFenceStateStore({
+      batchSize: 2,
+      watchStatePath: join(root, 'state.json'),
+    })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 60_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+      logger: { error: () => {}, warn: () => {} },
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    const lifecycleKey = dispatchIssueIdentity({
+      uuid: `AgentWorkforce/pear#${number}`,
+      key: String(number),
+      path,
+    })
+    let bodyCompleted = false
+    try {
+      await withDeadline(githubWriteback.claimWriteStarted.promise, 4_000, 'dispatch claim did not start')
+
+      await expect(withDeadline(
+        factory.stop(),
+        6_000,
+        'shutdown did not report the rejected claim-fence handoff',
+      )).rejects.toThrow(/refusing shutdown handoff/u)
+      expect(stateStore.stolenFrom).toBeDefined()
+
+      githubWriteback.claimWriteGate.resolve()
+      await withDeadline(run, 8_000, 'dispatch did not settle after the rejected handoff')
+
+      // The lease now belongs to a successor. Re-adopting its epoch would leave
+      // this publisher believing it still owns a lifecycle another publisher is
+      // driving — every write it then attempts is a doomed fence-rejected write
+      // and a false anomaly against that row. (`FileStateStore` also compares
+      // the owner string, so a foreign epoch cannot actually clobber the row;
+      // this guard is what keeps the epoch cache honest rather than what stops
+      // the write.) Recovery must decline, so the handoff stays refused and the
+      // placements stay held for the successor.
+      await expect(withDeadline(
+        factory.stop(),
+        6_000,
+        'shutdown did not re-report the rejected claim-fence handoff',
+      )).rejects.toThrow(/refusing shutdown handoff/u)
+      expect(factory.status().counters.dispatchLifecycleLeaseEpochsRecovered ?? 0).toBe(0)
+      expect(fleet.releases).toEqual([])
+      await expect(stateStore.getDispatchLifecycle('factory-test', lifecycleKey)).resolves.toMatchObject({
+        lease: { owner: CLAIM_FENCE_SUCCESSOR_OWNER },
+      })
+      bodyCompleted = true
+    } finally {
+      githubWriteback.claimWriteGate.resolve()
+      // Teardown only: the successor's lease is what wedges this shutdown, so
+      // hand the lifecycle back before the final stop.
+      stateStore.allowPendingFence = true
+      const durable = await stateStore.getDispatchLifecycle('factory-test', lifecycleKey)
+      if (durable?.lease && stateStore.stolenFrom) {
+        await stateStore.releaseDispatchLifecycleLease(
+          'factory-test',
+          lifecycleKey,
+          durable.lease.owner,
+          durable.lease.epoch,
+        )
+        await stateStore.claimDispatchLifecycle(
+          'factory-test',
+          lifecycleKey,
+          durable,
+          stateStore.stolenFrom,
+          Date.now(),
+          60_000,
+        )
+      }
+      const teardownError = await factory.stop().then(() => undefined, (error: unknown) => error)
+      await rm(root, { recursive: true, force: true })
+      // A teardown stop must never replace the assertion that actually failed.
+      if (bodyCompleted && teardownError) throw teardownError
     }
   }, 30_000)
 
