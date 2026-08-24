@@ -5485,6 +5485,9 @@ describe('FactoryLoop', () => {
       issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: racedPath },
       reason: 'live state changed during dispatch',
       code: 'dispatch-failed',
+      // The publishable half of the same classification (#355). The bucket
+      // count says five dispatches failed; this says they raced the provider.
+      failureCode: 'live-state-changed',
     })
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
@@ -5578,6 +5581,7 @@ describe('FactoryLoop', () => {
         issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: blockedPath },
         reason: 'dispatch lifecycle already terminal',
         code: 'dispatch-failed',
+        failureCode: 'lifecycle-terminal',
       })
       expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
       expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
@@ -5612,6 +5616,10 @@ describe('FactoryLoop', () => {
         // carries a classification rather than raw provider text.
         reason: 'dispatch failed (TypeError)',
         code: 'dispatch-failed',
+        // Nothing names a `TypeError: fetch failed`, so the phase does: it
+        // threw in triage, which is a different owner from a fleet fault even
+        // though both land in the same `dispatch-failed` bucket (#355).
+        failureCode: 'unclassified-triage',
       })
       expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
       expect(factory.status().counters.dispatchItemFailuresSkipped).toBe(1)
@@ -5735,6 +5743,10 @@ describe('FactoryLoop', () => {
         issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: blockedPath },
         reason: 'dispatch failed (Error)',
         code: 'dispatch-failed',
+        // The injected fault is the `unrelated per-item fault` above, thrown
+        // from triage — not the open circuit, which this dry run is exempt
+        // from. The phase code says so rather than leaving them conflated.
+        failureCode: 'unclassified-triage',
       })
       expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
       expect(fleet.spawns).toEqual([])

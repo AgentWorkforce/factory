@@ -152,6 +152,11 @@ import {
 } from './public-health'
 import { factorySweepSkipReasonCounts } from './sweep-skip-reason'
 import type { FactorySweepSkipReasonCode } from './sweep-skip-reason'
+import {
+  factoryDispatchFailureReasonCodeForErrorClass,
+  factoryDispatchFailureReasonCounts,
+} from './dispatch-failure-reason'
+import type { FactoryDispatchFailureReasonCode } from './dispatch-failure-reason'
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
 import {
@@ -864,6 +869,16 @@ export class FactoryLoop implements Factory {
     dispatched: number
     skipped: number
     skipReasons: Partial<Record<FactorySweepSkipReasonCode, number>>
+    /**
+     * The `dispatch-failed` bucket's own total, held even when it is zero.
+     *
+     * `skipReasons` omits zero counts, so a sweep in which every dispatch
+     * succeeded and a daemon that does not report the field are the same
+     * absence there. Here they are not, and telling them apart is the whole
+     * point of the breakdown beside it (#355).
+     */
+    dispatchFailures: number
+    dispatchFailureReasons: Partial<Record<FactoryDispatchFailureReasonCode, number>>
     /**
      * When the pass these counts describe finished enumerating (#359 review).
      *
@@ -1918,6 +1933,8 @@ export class FactoryLoop implements Factory {
         // `skipped: 0` next to a non-empty breakdown — and this log is what a
         // local operator reads.
         skipReasons: factorySweepSkipReasonCounts(report.skipped),
+        dispatchFailures: report.skipped.filter((entry) => entry.code === 'dispatch-failed').length,
+        dispatchFailureReasons: factoryDispatchFailureReasonCounts(report.skipped),
         discoveryDeferred: report.discoveryDeferred,
       })
     } catch (error) {
@@ -3126,6 +3143,10 @@ export class FactoryLoop implements Factory {
           continue
         }
         const recoveredIdentity = recoveredOrphan ? githubIssueRefIdentity(issueRef(issue)) : undefined
+        // Reset per work unit, and advanced by assignment immediately before
+        // each stage rather than inferred in the catch: the whole value of the
+        // `unclassified-*` codes is that they name the stage honestly (#355).
+        let attemptPhase: DispatchAttemptPhase = 'gate'
         try {
           if (recoveredOrphan) {
             const dispatchBlock = await this.#dispatchBlockReason(issue)
@@ -3149,8 +3170,10 @@ export class FactoryLoop implements Factory {
             continue
           }
 
+          attemptPhase = 'triage'
           const decision = await this.triageIssue(issue)
           triaged.push(decision)
+          attemptPhase = 'dispatch'
           const result = await this.dispatch(decision, { dryRun })
           // A completed dispatch — even one that parks or escalates the issue —
           // proves the pipeline still works, so the fuse below starts over.
@@ -3250,6 +3273,11 @@ export class FactoryLoop implements Factory {
             issue: issueRef(issue),
             reason: perItemDispatchSkipReason(error),
             code: 'dispatch-failed',
+            // The publishable half of the same classification. `reason` is the
+            // operator's sentence and stays off the health surface; this token
+            // is what tells a reader watching `dispatch-failed: 5` which of
+            // five very different bugs they are looking at (#355).
+            failureCode: perItemDispatchFailureCode(error, attemptPhase),
           })
           continue
         } finally {
@@ -5091,6 +5119,11 @@ export class FactoryLoop implements Factory {
       dispatched: report.dispatched.length,
       skipped: report.skipped.length,
       skipReasons: factorySweepSkipReasonCounts(report.skipped),
+      // Counted from the same entries `skipReasons` counts, so the parts sum to
+      // `skipReasons['dispatch-failed']` by construction rather than by a
+      // second traversal agreeing with the first.
+      dispatchFailures: report.skipped.filter((entry) => entry.code === 'dispatch-failed').length,
+      dispatchFailureReasons: factoryDispatchFailureReasonCounts(report.skipped),
       // The caller's completion stamp, not a fresh clock read: on a pass that
       // enumerated, `lastEnumeratedAtMs` and `lastCompletedAtMs` describe the
       // same instant and must not drift apart by a tick.
@@ -5184,6 +5217,13 @@ export class FactoryLoop implements Factory {
             skipped: this.#readinessReconcileLastSweep.skipped,
             ...(Object.keys(this.#readinessReconcileLastSweep.skipReasons).length > 0
               ? { skipReasons: { ...this.#readinessReconcileLastSweep.skipReasons } }
+              : {}),
+            // Unconditional, unlike the breakdown below it: a zero here is the
+            // fact "this sweep attempted dispatches and none of them failed",
+            // which no other field on this surface can express.
+            dispatchFailures: this.#readinessReconcileLastSweep.dispatchFailures,
+            ...(Object.keys(this.#readinessReconcileLastSweep.dispatchFailureReasons).length > 0
+              ? { dispatchFailureReasons: { ...this.#readinessReconcileLastSweep.dispatchFailureReasons } }
               : {}),
             lastEnumeratedAtMs: this.#readinessReconcileLastSweep.enumeratedAtMs,
           }
@@ -20254,20 +20294,27 @@ type RelayfileOverload = {
   retryAfterSeconds?: number
 }
 
-const relayfileOverload = (error: unknown): RelayfileOverload | undefined => {
-  const flat = asRecord(error) ?? {}
+/** How far to follow wrapped provider failures without trusting an unbounded chain. */
+const RELAYFILE_OVERLOAD_CAUSE_DEPTH = 4
+
+const relayfileOverload = (error: unknown, depth = 0): RelayfileOverload | undefined => {
+  if (depth > RELAYFILE_OVERLOAD_CAUSE_DEPTH) return undefined
+  const flat = asRecord(error)
+  if (!flat) return undefined
   const response = asRecord(flat.response) ?? {}
   const data = asRecord(flat.data) ?? asRecord(response.data) ?? {}
   const details = asRecord(flat.details) ?? asRecord(data.details) ?? {}
   const statusValue = flat.status ?? flat.statusCode ?? response.status ?? response.statusCode
   const status = typeof statusValue === 'number' ? statusValue : Number(statusValue)
-  if (status !== 429) return undefined
-  const retryValue = flat.retryAfterSeconds ?? details.retryAfterSeconds ?? data.retryAfterSeconds
-  const parsedRetry = typeof retryValue === 'number' ? retryValue : Number(retryValue)
-  const retryAfterSeconds = Number.isFinite(parsedRetry) && parsedRetry >= 0 ? parsedRetry : undefined
-  const reason = stringValue(flat.reason) ?? stringValue(details.reason) ?? stringValue(data.reason) ??
-    stringValue(flat.code) ?? stringValue(data.code) ?? 'rate_limited'
-  return { status, reason, ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) }
+  if (status === 429) {
+    const retryValue = flat.retryAfterSeconds ?? details.retryAfterSeconds ?? data.retryAfterSeconds
+    const parsedRetry = typeof retryValue === 'number' ? retryValue : Number(retryValue)
+    const retryAfterSeconds = Number.isFinite(parsedRetry) && parsedRetry >= 0 ? parsedRetry : undefined
+    const reason = stringValue(flat.reason) ?? stringValue(details.reason) ?? stringValue(data.reason) ??
+      stringValue(flat.code) ?? stringValue(data.code) ?? 'rate_limited'
+    return { status, reason, ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) }
+  }
+  return relayfileOverload(flat.cause, depth + 1)
 }
 
 /**
@@ -20885,15 +20932,20 @@ const PASS_FATAL_CAUSE_DEPTH = 4
  * classification has to follow the cause chain rather than trust the outermost
  * type.
  */
+const findWrappedErrorOfType = <T extends Error>(
+  error: unknown,
+  type: abstract new (...args: never[]) => T,
+  depth = 0,
+): T | undefined => {
+  if (depth > PASS_FATAL_CAUSE_DEPTH || !(error instanceof Error)) return undefined
+  if (error instanceof type) return error
+  return findWrappedErrorOfType((error as { cause?: unknown }).cause, type, depth + 1)
+}
+
 const wrapsErrorOfType = (
   error: unknown,
   type: abstract new (...args: never[]) => Error,
-  depth = 0,
-): boolean => {
-  if (depth > PASS_FATAL_CAUSE_DEPTH || !(error instanceof Error)) return false
-  if (error instanceof type) return true
-  return wrapsErrorOfType((error as { cause?: unknown }).cause, type, depth + 1)
-}
+): boolean => findWrappedErrorOfType(error, type) !== undefined
 
 /**
  * How many *unclassified* per-item failures without an intervening successful
@@ -20960,6 +21012,64 @@ const perItemDispatchSkipReason = (error: unknown): string => {
       : 'dispatch lifecycle owned by another publisher'
   }
   return `dispatch failed (${telemetryErrorClass(error)})`
+}
+
+/**
+ * How far a work unit got before it threw, which is half of its classification.
+ *
+ * The per-issue `try` in `#performRunOnce` spans three different jobs: the
+ * durable/scope gates, triage, then dispatch. They fail for unrelated reasons
+ * and belong to unrelated owners, and once a thrown value carries no name this
+ * vocabulary knows, the phase is the only thing left that still says who should
+ * look. Tracked by assignment rather than inferred, so it cannot drift.
+ */
+type DispatchAttemptPhase = 'gate' | 'triage' | 'dispatch'
+
+const UNCLASSIFIED_PHASE_CODES: Readonly<Record<DispatchAttemptPhase, FactoryDispatchFailureReasonCode>> = {
+  gate: 'unclassified-gate',
+  triage: 'unclassified-triage',
+  dispatch: 'unclassified-dispatch',
+}
+
+/**
+ * Why a dispatch attempt failed, as a code from the published vocabulary (#355).
+ *
+ * The sibling of `perItemDispatchSkipReason`: that returns the operator's
+ * sentence, this returns the one token that may cross onto the unauthenticated
+ * health surface, and both are recorded at the skip site from the same thrown
+ * value. The token is never parsed back out of the sentence — a reworded
+ * message would silently empty a bucket, and this vocabulary is what an
+ * operator reads when the daemon's stdout does not reach them.
+ *
+ * Ordered most specific first. Every branch follows the bounded cause chain,
+ * because `contextualError` and the control-plane guard both rethrow wrapped.
+ * `relayfileOverload` is also the loop's shedding predicate, so widening it at
+ * the source keeps the health code, skip counter, fuse, and durable overload
+ * ratchet on one verdict instead of merely relabelling the published bucket.
+ */
+const perItemDispatchFailureCode = (
+  error: unknown,
+  phase: DispatchAttemptPhase,
+): FactoryDispatchFailureReasonCode => {
+  if (relayfileOverload(error) !== undefined) return 'relayfile-overloaded'
+  if (wrapsErrorOfType(error, LiveDispatchStateChangedError)) return 'live-state-changed'
+  if (wrapsErrorOfType(error, LatePlacementReleasedError)) return 'late-placement-released'
+  const refused = findWrappedErrorOfType(error, DispatchLifecycleClaimRefusedError)
+  if (refused) return refused.refusal === 'terminal' ? 'lifecycle-terminal' : 'lifecycle-owned-elsewhere'
+  if (wrapsErrorOfType(error, FleetControlPlaneCircuitOpenError)) return 'control-plane-open'
+  // The class-name tail of the vocabulary; see its own doc comment for why
+  // these five are not `instanceof`. Walked down the cause chain like the
+  // branches above, because `contextualError` wraps in a plain `Error` and
+  // reading only the outermost name would miss every wrapped spawn failure.
+  // `telemetryErrorClass` is the same allowlist that guards every other
+  // identifier leaving this process, so a hostile `name` cannot invent a key
+  // here either — it collapses to `Error`, which the map does not hold.
+  for (let cursor: unknown = error, depth = 0; cursor instanceof Error && depth <= PASS_FATAL_CAUSE_DEPTH; depth += 1) {
+    const named = factoryDispatchFailureReasonCodeForErrorClass(telemetryErrorClass(cursor))
+    if (named) return named
+    cursor = (cursor as { cause?: unknown }).cause
+  }
+  return UNCLASSIFIED_PHASE_CODES[phase]
 }
 
 const triageEscalationQuestion = (decision: TriageDecision, issue?: { title?: string }): string => {
