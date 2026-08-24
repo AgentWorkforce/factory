@@ -423,6 +423,12 @@ const CLARIFICATION_ESCALATION_LEASE_MS = 2 * 60_000
 const CLARIFICATION_ESCALATION_RETRY_MS = 5_000
 const CLARIFICATION_STALE_WARN_MS = 7 * 24 * 60 * 60_000
 const STOP_TEARDOWN_TIMEOUT_MS = 2_500
+// A rejected post-spawn dispatch normally gets a final opportunity to undo an
+// external claim before shutdown relinquishes its lifecycle lease. Provider
+// writes are not guaranteed to settle, so that opportunity must stay inside a
+// bounded shutdown budget; a successor can recover from the retained durable
+// lifecycle after this process releases its local agents.
+const STOP_REJECTED_DISPATCH_DRAIN_TIMEOUT_MS = 2_500
 const DISPATCH_LIFECYCLE_LEASE_MS = 5 * 60_000
 const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
@@ -1468,7 +1474,7 @@ export class FactoryLoop implements Factory {
       // relinquishing their lifecycle leases or tearing down the fleet/mount.
       // A pre-claim spawn hang is deliberately absent from this set, so it
       // cannot hold shutdown open.
-      await Promise.allSettled([...rejectedClaimDispatches])
+      await this.#drainRejectedClaimDispatchesForStop(rejectedClaimDispatches)
       // Relinquish durable ownership before waiting on mount-backed lifecycle
       // drives. A slow Relayfile scan must not consume the shutdown deadline
       // while every issue remains fenced to a publisher that is already
@@ -1592,6 +1598,28 @@ export class FactoryLoop implements Factory {
     while (this.#clarificationQuestionDeliveryInFlight.size > 0) {
       await Promise.allSettled([...this.#clarificationQuestionDeliveryInFlight.values()])
     }
+  }
+
+  async #drainRejectedClaimDispatchesForStop(
+    dispatches: ReadonlySet<Promise<DispatchResult>>,
+  ): Promise<void> {
+    if (dispatches.size === 0) return
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const drained = Promise.allSettled([...dispatches]).then(() => true)
+    const timedOut = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), STOP_REJECTED_DISPATCH_DRAIN_TIMEOUT_MS)
+      timer.unref?.()
+    })
+    const completed = await Promise.race([drained, timedOut])
+    if (timer) clearTimeout(timer)
+    if (completed) return
+
+    this.#increment('postSpawnDispatchClaimDrainTimeouts')
+    this.#logger.warn?.('[factory] rejected post-spawn dispatch compensation timed out; continuing shutdown', {
+      dispatches: dispatches.size,
+      timeoutMs: STOP_REJECTED_DISPATCH_DRAIN_TIMEOUT_MS,
+    })
   }
 
   async #boundedStopTeardown(label: string, teardown: () => Promise<void> | void | undefined): Promise<void> {

@@ -12317,6 +12317,62 @@ describe('FactoryLoop', () => {
     }
   }, 30_000)
 
+  it('bounds a rejected dispatch drain when the provider claim never settles', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-claim-stop-timeout-'))
+    const number = 1264
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new LocalLifecycleFleetClient()
+    const githubWriteback = new BlockingDispatchClaimGithubWriteback()
+    const warnings: unknown[][] = []
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 60_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+      triage: new StaticTriage(),
+      githubWriteback,
+      logger: { warn: (...args: unknown[]) => warnings.push(args) },
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let stopped = false
+    try {
+      await withDeadline(githubWriteback.claimWriteStarted.promise, 4_000, 'dispatch claim did not start')
+
+      await withDeadline(factory.stop(), 6_000, 'stop remained blocked on the provider claim')
+      stopped = true
+
+      expect(factory.status().counters.postSpawnDispatchClaimDrainTimeouts).toBe(1)
+      expect(warnings).toContainEqual([
+        '[factory] rejected post-spawn dispatch compensation timed out; continuing shutdown',
+        { dispatches: 1, timeoutMs: 2_500 },
+      ])
+      expect(githubWriteback.statuses).toEqual([])
+      expect(factory.status().inFlight).toEqual([
+        expect.objectContaining({ uuid: `AgentWorkforce/pear#${number}` }),
+      ])
+      expect(fleet.releases).toEqual([
+        { name: `ar-${number}-impl-pear`, reason: 'factory-stopped' },
+        { name: `ar-${number}-review-pear`, reason: 'factory-stopped' },
+      ])
+    } finally {
+      githubWriteback.claimWriteGate.resolve()
+      await withDeadline(run, 8_000, 'timed-out dispatch did not unwind after its provider recovered')
+      expect(factory.status().inFlight).toEqual([])
+      if (!stopped) await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   // #303: a lifecycle that reached a slot-occupying phase and never had a
   // live agent placement has no `heldSinceAtMs`, so both halves of the
   // held-agent reaper skipped it. With batchSize 1 that one row held the only
