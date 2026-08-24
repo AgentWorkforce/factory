@@ -743,3 +743,140 @@ describe('publicHealthFromHeartbeat (#295)', () => {
   })
 })
 
+
+describe('sweep counters on the public surface (#355)', () => {
+  const swept = (
+    overrides: Partial<NonNullable<FactoryLoopHeartbeat['readinessReconcile']>> = {},
+  ) => publicHealthFromHeartbeat(
+    heartbeat({
+      readinessReconcile: {
+        state: 'healthy',
+        consecutiveFailures: 0,
+        failureThreshold: 3,
+        intervalMs: 60_000,
+        lastStartedAtMs: BOOT_MS - 30_000,
+        lastCompletedAtMs: BOOT_MS - 29_000,
+        lastDurationMs: 1_000,
+        ...overrides,
+      },
+    }),
+    { nowMs: BOOT_MS + 1_000 },
+  ).readinessReconcile
+
+  it('publishes a completed sweep that found nothing as zero, and one that never ran as absent', () => {
+    const ran = swept({ candidates: 0, dispatched: 0, skipped: 0 })
+    expect(ran?.candidates).toBe(0)
+    expect(Object.hasOwn(ran ?? {}, 'candidates')).toBe(true)
+
+    const neverRan = swept()
+    expect(Object.hasOwn(neverRan ?? {}, 'candidates')).toBe(false)
+    expect(Object.hasOwn(neverRan ?? {}, 'dispatched')).toBe(false)
+    expect(Object.hasOwn(neverRan ?? {}, 'skipped')).toBe(false)
+  })
+
+  // A record carrying one of the three and not the others is a producer this
+  // version does not understand. Publishing the fragment would invite
+  // "candidates minus dispatched" arithmetic that the missing field makes
+  // wrong, so the group travels whole or not at all.
+  it('drops a partial trio rather than publishing a misleading fragment', () => {
+    expect(Object.hasOwn(swept({ candidates: 4 }) ?? {}, 'candidates')).toBe(false)
+    expect(Object.hasOwn(swept({ candidates: 4, dispatched: 1 }) ?? {}, 'candidates')).toBe(false)
+    expect(swept({ candidates: 4, dispatched: 1, skipped: 3 })).toMatchObject({
+      candidates: 4,
+      dispatched: 1,
+      skipped: 3,
+    })
+  })
+
+  it('names the deferred sweep, so a zero from a held lease is not read as an empty provider', () => {
+    expect(swept({ candidates: 0, dispatched: 0, skipped: 0, discoveryDeferred: 'sweep-in-flight' }))
+      .toMatchObject({ candidates: 0, discoveryDeferred: 'sweep-in-flight' })
+    // Only the one value the vocabulary has.
+    expect(swept({
+      candidates: 0,
+      dispatched: 0,
+      skipped: 0,
+      discoveryDeferred: 'whatever the producer felt like' as 'sweep-in-flight',
+    })?.discoveryDeferred).toBeUndefined()
+  })
+
+  // MUST-NOT-FIRE. `skipReasons` is the only field here whose *keys* come from
+  // a remote record, and an object key is as publishable as a value: a
+  // producer on another version could otherwise put an issue key or a
+  // filesystem path onto the unauthenticated surface by using it as one.
+  it('rebuilds the skip breakdown from its own vocabulary, so no remote key can cross', () => {
+    const readiness = swept({
+      candidates: 9,
+      dispatched: 0,
+      skipped: 9,
+      skipReasons: {
+        'out-of-scope': 4,
+        // Not in the vocabulary, and carrying exactly what must never publish.
+        ["AR-350 /linear/issues/AR-350__uuid.json"]: 3,
+        ['dispatch-terminal']: 2,
+      } as Record<string, number>,
+    })
+
+    expect(JSON.stringify(readiness)).not.toContain('AR-350')
+    expect(JSON.stringify(readiness)).not.toContain('/linear/issues')
+    // Folded into `other`, not dropped: the parts still sum to `skipped`, so a
+    // reader comparing them does not conclude the counter is broken.
+    expect(readiness?.skipReasons).toEqual({ 'out-of-scope': 4, 'dispatch-terminal': 2, other: 3 })
+    expect(Object.values(readiness?.skipReasons ?? {}).reduce((sum, n) => sum + n, 0))
+      .toBe(readiness?.skipped)
+  })
+
+  it('drops counts a reader cannot use, and the breakdown entirely when it is empty', () => {
+    expect(swept({
+      candidates: 1,
+      dispatched: 0,
+      skipped: 1,
+      skipReasons: {
+        'out-of-scope': Number.NaN,
+        'dispatch-backoff': -3,
+        'not-ready': 0,
+      } as Record<string, number>,
+    })?.skipReasons).toBeUndefined()
+    expect(swept({
+      candidates: 1,
+      dispatched: 0,
+      skipped: 1,
+      skipReasons: { 'not-ready': 1.9 } as Record<string, number>,
+    })?.skipReasons).toEqual({ 'not-ready': 1 })
+  })
+
+  it('re-reads its own published record without turning a zero back into an absence', () => {
+    const published = swept({ candidates: 0, dispatched: 0, skipped: 0 })
+    const reread = normalizePublicHealth({
+      schemaVersion: FACTORY_PUBLIC_HEALTH_SCHEMA_VERSION,
+      ok: true,
+      status: 'ok',
+      stale: false,
+      degradedSubsystems: [],
+      readinessReconcile: published,
+    })
+    expect(reread?.readinessReconcile).toMatchObject({ candidates: 0, dispatched: 0, skipped: 0 })
+    expect(Object.hasOwn(reread?.readinessReconcile ?? {}, 'candidates')).toBe(true)
+  })
+
+  it('applies the same key rebuild to a record that arrived over the wire', () => {
+    const reread = normalizePublicHealth({
+      schemaVersion: FACTORY_PUBLIC_HEALTH_SCHEMA_VERSION,
+      ok: true,
+      status: 'ok',
+      stale: false,
+      degradedSubsystems: [],
+      readinessReconcile: {
+        state: 'healthy',
+        consecutiveFailures: 0,
+        failureThreshold: 3,
+        candidates: 7,
+        dispatched: 0,
+        skipped: 7,
+        skipReasons: { '/srv/agent-workforce/.relay/workspace-key': 7 },
+      },
+    })
+    expect(JSON.stringify(reread)).not.toContain('workspace-key')
+    expect(reread?.readinessReconcile?.skipReasons).toEqual({ other: 7 })
+  })
+})

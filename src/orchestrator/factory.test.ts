@@ -3209,6 +3209,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toContainEqual({
       issue: { uuid: 'uuid-141', key: 'AR-141', path: dependentPath },
       reason: 'parked on dependencies: AgentWorkforce/pear#140',
+      code: 'parked-dependency',
     })
     expect(factory.status().parked).toEqual([
       expect.objectContaining({
@@ -3355,6 +3356,7 @@ describe('FactoryLoop', () => {
       expect(report.skipped).toContainEqual({
         issue: expect.objectContaining({ key: '36' }),
         reason: 'parked on dependencies: AgentWorkforce/pear#35',
+        code: 'parked-dependency',
       })
       expect(factory.status().parked).toEqual([
         expect.objectContaining({ issue: expect.objectContaining({ key: '36' }) }),
@@ -3512,6 +3514,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toEqual([{
       issue: { uuid: 'AgentWorkforce/pear#46', key: '46', path: canonicalPath },
       reason: 'live state is not ready-for-agent',
+      code: 'not-ready',
     }])
     expect(fleet.spawns).toEqual([])
   })
@@ -3809,6 +3812,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toEqual([{
       issue: { uuid: 'AgentWorkforce/pear#49', key: '49', path },
       reason: 'live state is not ready-for-agent',
+      code: 'not-ready',
     }])
     expect(fleet.spawns).toEqual([])
   })
@@ -5480,6 +5484,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toContainEqual({
       issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: racedPath },
       reason: 'live state changed during dispatch',
+      code: 'dispatch-failed',
     })
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
@@ -5572,6 +5577,7 @@ describe('FactoryLoop', () => {
       expect(report.skipped).toContainEqual({
         issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: blockedPath },
         reason: 'dispatch lifecycle already terminal',
+        code: 'dispatch-failed',
       })
       expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
       expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
@@ -5605,6 +5611,7 @@ describe('FactoryLoop', () => {
         // Sanitized: `run-once` prints the report as JSON, so the reason
         // carries a classification rather than raw provider text.
         reason: 'dispatch failed (TypeError)',
+        code: 'dispatch-failed',
       })
       expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
       expect(factory.status().counters.dispatchItemFailuresSkipped).toBe(1)
@@ -5727,6 +5734,7 @@ describe('FactoryLoop', () => {
       expect(report.skipped).toContainEqual({
         issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: blockedPath },
         reason: 'dispatch failed (Error)',
+        code: 'dispatch-failed',
       })
       expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
       expect(fleet.spawns).toEqual([])
@@ -5918,6 +5926,10 @@ describe('FactoryLoop', () => {
         expect(report.skipped).toEqual([{
           issue: { uuid: 'AgentWorkforce/pear#53', key: '53', path },
           reason: 'active dispatch claim or live agent still owns the issue',
+          // The batch already holds this issue, so it is the `already-tracked`
+          // gate that declines it — not the readiness gate that carries the
+          // same operator text one branch later.
+          code: 'already-tracked',
         }])
         expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-53-babysit-pear'])
         expect(fleet.spawns[0]).toMatchObject({
@@ -6234,6 +6246,7 @@ describe('FactoryLoop', () => {
           issue: '55',
           path,
           reason: 'active dispatch claim or live agent still owns the issue',
+          code: 'not-ready',
         },
       ])
     } finally {
@@ -6705,8 +6718,8 @@ describe('FactoryLoop', () => {
 
     expect(report.pulled.map((issue) => issue.key)).toEqual(['AR-1', 'AR-2', 'AR-3', 'AR-4'])
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-1', 'AR-2'])
-    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-3', key: 'AR-3', path: issuePath(3) }, reason: 'queued or escalated' })
-    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-4', key: 'AR-4', path: issuePath(4) }, reason: 'live state is not ready-for-agent' })
+    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-3', key: 'AR-3', path: issuePath(3) }, reason: 'queued or escalated', code: 'queued-or-escalated' })
+    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-4', key: 'AR-4', path: issuePath(4) }, reason: 'live state is not ready-for-agent', code: 'not-ready' })
     expect(fleet.spawns).toHaveLength(4)
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-1', 'AR-2'])
     expect(factory.status().queued.map((issue) => issue.key)).toEqual(['AR-3'])
@@ -7208,7 +7221,7 @@ describe('FactoryLoop', () => {
     expect(report.pulled).toEqual([{ uuid: 'uuid-67-canonical', key: 'AR-67', path: canonicalPath }])
     expect(report.dispatched).toEqual([])
     expect(report.skipped).toEqual([
-      { issue: { uuid: 'uuid-67-canonical', key: 'AR-67', path: canonicalPath }, reason: 'live state is not ready-for-agent' },
+      { issue: { uuid: 'uuid-67-canonical', key: 'AR-67', path: canonicalPath }, reason: 'live state is not ready-for-agent', code: 'not-ready' },
     ])
     expect(fleet.spawns).toEqual([])
   })
@@ -7287,7 +7300,7 @@ describe('FactoryLoop', () => {
 
     expect(report.dispatched).toEqual([])
     expect(report.skipped).toEqual([
-      { issue: { uuid: 'uuid-365', key: 'AR-365', path: issuePath(365) }, reason: 'dispatch already terminal' },
+      { issue: { uuid: 'uuid-365', key: 'AR-365', path: issuePath(365) }, reason: 'dispatch already terminal', code: 'dispatch-terminal' },
     ])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-365-impl-pear', 'ar-365-review'])
     expect(factory.status().counters.dispatchTerminalReopened).toBeUndefined()
@@ -7758,6 +7771,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toContainEqual({
       issue: { uuid: '40c7e780-59ad-47ee-8809-3a9b8434d8fb', key: 'AR-173', path: capturedStaleDoneCanonicalPath },
       reason: 'live state is not ready-for-agent',
+      code: 'not-ready',
     })
     expect(mount.readPaths).not.toContain(byIdBareAliasPath)
     expect(mount.readPaths).not.toContain(byIdCanonicalShapedAliasPath)
@@ -11010,6 +11024,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toContainEqual({
       issue: { uuid: 'uuid-21', key: 'AR-21', path: unscopedPath },
       reason: 'not factory-e2e scope',
+      code: 'out-of-scope',
     })
     expect(report.triaged).toEqual([])
     expect(report.dispatched).toEqual([])
@@ -11095,6 +11110,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toContainEqual({
       issue: { uuid: 'uuid-261', key: 'AR-261', path: draftPath },
       reason: 'not reconciled real Linear issue',
+      code: 'not-dispatchable',
     })
     expect(report.triaged).toEqual([])
     expect(report.dispatched).toEqual([])
@@ -19231,7 +19247,7 @@ describe('FactoryLoop', () => {
     const report = await factory.runOnce()
 
     expect(report.dispatched).toEqual([])
-    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-20', key: 'AR-20', path: issuePath(20) }, reason: 'queued or escalated' })
+    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-20', key: 'AR-20', path: issuePath(20) }, reason: 'queued or escalated', code: 'queued-or-escalated' })
     expect(fleet.spawns).toEqual([])
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)

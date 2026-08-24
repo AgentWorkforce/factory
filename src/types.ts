@@ -8,6 +8,7 @@ import type { AgentWorktreeManager } from './ports/worktree'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
 import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
+import type { FactorySweepSkipReasonCode } from './orchestrator/sweep-skip-reason'
 import type { DispatchRelayflowOptions, RelayflowPolicyRegistry } from './dispatch/relayflow-registry'
 import type { VerificationGate } from './environments/verification-pipeline'
 import type { CostLedger } from './cost/ledger'
@@ -229,6 +230,38 @@ export interface FactoryReadinessReconcileStatus {
   lastFailureAtMs?: number
   /** Age of a pass that started and has neither completed nor failed. */
   inFlightMs?: number
+  /**
+   * Work units the last *completed* sweep pulled and evaluated (#355).
+   *
+   * Same tense as `lastDurationMs`: written when a pass settles successfully,
+   * left alone by a pass that failed or is still running, so
+   * `lastCompletedAtMs` says which pass these describe.
+   *
+   * Optional, and never defaulted to zero. A sweep that ran and found nothing
+   * publishes `0`; a daemon that has not completed a sweep publishes nothing
+   * at all, and the whole point of the field is that those two are different
+   * facts — `candidates: 0` blames discovery, an absent `candidates` blames
+   * nobody yet.
+   */
+  candidates?: number
+  /** Work units the last completed sweep actually dispatched. */
+  dispatched?: number
+  /** Work units the last completed sweep saw and declined. */
+  skipped?: number
+  /**
+   * `skipped` split by cause. Zero-count codes are omitted; the codes
+   * themselves are a fixed published vocabulary, so an absent key is a zero.
+   */
+  skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
+  /**
+   * The last completed sweep never enumerated anything: another process held
+   * the discovery lease, so it returned an empty report immediately.
+   *
+   * Without this, that pass is indistinguishable from a sweep that queried the
+   * provider and legitimately found no ready work — both publish
+   * `candidates: 0` — and those are opposite diagnoses (#355).
+   */
+  discoveryDeferred?: 'sweep-in-flight'
   /** Free text; authenticated surfaces only. */
   lastError?: string
   /** Allowlisted class name of `lastError`; publishable. */
@@ -250,6 +283,20 @@ export interface FactoryPublicReadinessReconcileHealth {
   inFlightMs?: number
   /** `inFlightMs` expressed in sweeps that should have run and did not. */
   missedPasses?: number
+  /**
+   * The last completed sweep's arithmetic, published (#355).
+   *
+   * Counts only — no issue keys, no paths, no titles — and absent rather than
+   * zero until a sweep has completed, so "never ran" and "ran and found
+   * nothing" are two different readings of this surface rather than one.
+   */
+  candidates?: number
+  dispatched?: number
+  skipped?: number
+  /** `skipped` split by a closed vocabulary of causes; zero counts omitted. */
+  skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
+  /** The last completed sweep deferred to another process's discovery lease. */
+  discoveryDeferred?: 'sweep-in-flight'
   lastErrorClass?: string
 }
 
@@ -535,7 +582,11 @@ export interface IterationReport {
   pulled: IssueRef[]
   triaged: TriageDecision[]
   dispatched: DispatchResult[]
-  skipped: Array<{ issue: IssueRef; reason: string }>
+  /**
+   * `reason` is free text for an operator; `code` is the closed vocabulary
+   * that may cross onto the unauthenticated health surface (#355).
+   */
+  skipped: Array<{ issue: IssueRef; reason: string; code?: FactorySweepSkipReasonCode }>
   dryRun: boolean
   slackDegraded?: boolean
   /**
