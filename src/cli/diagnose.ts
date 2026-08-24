@@ -327,15 +327,15 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
       'dispatching: readinessReconcile is healthy' +
       (readiness?.intervalMs ? ` on a ${formatDuration(readiness.intervalMs)} cadence` : '') +
       `, and the event listener is ${health.eventListener?.state ?? 'unknown'}.` +
-      ` Last completed sweep: ${formatSweepOutcome(readiness)}.`,
+      ` Last enumerating sweep: ${formatSweepOutcome(readiness)}.`,
   }
 }
 
 /**
- * The last completed sweep, as a phrase that keeps zero and absent apart (#355).
+ * The last enumerating sweep, as a phrase that keeps zero and absent apart (#355).
  *
  * `candidates: 0` says discovery pulled nothing and the bug is upstream of
- * eligibility; no `candidates` at all says this instance has not finished a
+ * eligibility; no `candidates` at all says this instance has not enumerated a
  * sweep — or predates the counters — and says nothing about either. Rendering
  * both as `0` would recreate the ambiguity the field exists to remove.
  */
@@ -349,7 +349,7 @@ export function formatSweepOutcome(
     return readiness?.discoveryDeferred
       ? 'nothing has enumerated successfully yet — the most recent pass deferred ' +
         'to another process holding the discovery lease'
-      : 'not reported (no sweep has completed, or this instance predates the counters)'
+      : 'not reported (no sweep has enumerated, or this instance predates the counters)'
   }
   return `${readiness.candidates} candidate(s), ${readiness.dispatched ?? 0} dispatched, ` +
     `${readiness.skipped ?? 0} skipped` +

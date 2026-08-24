@@ -69,7 +69,7 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
     "inFlightMs": 4560000,          // this pass has run 76 minutes
     "missedPasses": 76,
     "lastErrorClass": "TimeoutError",
-    // The last COMPLETED sweep's arithmetic (#355). Absent until one completes.
+    // The last ENUMERATING sweep's arithmetic (#355). Absent until one enumerates.
     "candidates": 7,                // work units it pulled and evaluated
     "dispatched": 0,                // work units it dispatched
     "skipped": 7,                   // work units it saw and declined
