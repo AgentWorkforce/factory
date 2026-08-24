@@ -228,6 +228,14 @@ const sweepOutcome = (
   FactoryPublicReadinessReconcileHealth,
   'candidates' | 'dispatched' | 'skipped' | 'skipReasons' | 'discoveryDeferred'
 >> => {
+  // Independent of the trio (#358 review, CodeRabbit): the counts describe the
+  // last sweep that ENUMERATED, and this describes the most recent pass. A
+  // daemon whose first pass deferred has no counts and still has to say why,
+  // and one that deferred after a real sweep publishes both — which is the
+  // pairing that tells a reader the numbers are from an earlier pass.
+  const deferred = status.discoveryDeferred === 'sweep-in-flight'
+    ? { discoveryDeferred: 'sweep-in-flight' as const }
+    : {}
   const candidates = optionalCount('candidates', status.candidates)
   const dispatched = optionalCount('dispatched', status.dispatched)
   const skipped = optionalCount('skipped', status.skipped)
@@ -237,7 +245,7 @@ const sweepOutcome = (
   if (candidates.candidates === undefined ||
       dispatched.dispatched === undefined ||
       skipped.skipped === undefined) {
-    return {}
+    return deferred
   }
   const skipReasons = skipReasonCounts(status.skipReasons)
   return {
@@ -245,9 +253,7 @@ const sweepOutcome = (
     ...dispatched,
     ...skipped,
     ...(skipReasons ? { skipReasons } : {}),
-    ...(status.discoveryDeferred === 'sweep-in-flight'
-      ? { discoveryDeferred: 'sweep-in-flight' as const }
-      : {}),
+    ...deferred,
   }
 }
 

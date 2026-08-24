@@ -343,12 +343,16 @@ export function formatSweepOutcome(
   readiness: FactoryPublicReadinessReconcileHealth | undefined,
 ): string {
   if (!readiness || readiness.candidates === undefined) {
-    return 'not reported (no sweep has completed, or this instance predates the counters)'
+    // A deferred pass publishes the marker with no counts: nothing has
+    // enumerated, and the held lease is why (#358 review).
+    return readiness?.discoveryDeferred
+      ? 'nothing has enumerated yet — every pass so far deferred to another process holding the discovery lease'
+      : 'not reported (no sweep has completed, or this instance predates the counters)'
   }
   return `${readiness.candidates} candidate(s), ${readiness.dispatched ?? 0} dispatched, ` +
     `${readiness.skipped ?? 0} skipped` +
     (readiness.discoveryDeferred
-      ? ' — it deferred to another process holding the discovery lease and enumerated nothing'
+      ? ' (from an earlier pass — the most recent one deferred to another process holding the discovery lease)'
       : '')
 }
 

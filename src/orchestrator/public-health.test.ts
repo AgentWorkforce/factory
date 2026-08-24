@@ -791,6 +791,12 @@ describe('sweep counters on the public surface (#355)', () => {
   it('names the deferred sweep, so a zero from a held lease is not read as an empty provider', () => {
     expect(swept({ candidates: 0, dispatched: 0, skipped: 0, discoveryDeferred: 'sweep-in-flight' }))
       .toMatchObject({ candidates: 0, discoveryDeferred: 'sweep-in-flight' })
+    // Independent of the trio (#358 review). A daemon whose first pass deferred
+    // has no counts to publish and still has to say why, so dropping the marker
+    // with the counts would leave the only surface silent about it.
+    const noCounts = swept({ discoveryDeferred: 'sweep-in-flight' })
+    expect(noCounts?.discoveryDeferred).toBe('sweep-in-flight')
+    expect(Object.hasOwn(noCounts ?? {}, 'candidates')).toBe(false)
     // Only the one value the vocabulary has.
     expect(swept({
       candidates: 0,
