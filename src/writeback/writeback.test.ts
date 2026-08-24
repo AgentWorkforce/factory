@@ -86,6 +86,16 @@ describe('MountLinearWriteback', () => {
     expect(await linear.verify(issue, { stateId: 'implementing-state' })).toBe(true)
   })
 
+  it('reads the current mounted Linear state instead of the dispatch snapshot', async () => {
+    const mount = new FakeMountClient({
+      [issuePath]: wrappedIssueRecord({ stateId: 'human-review-state' }),
+    })
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.getIssueStateId(issue)).resolves.toBe('human-review-state')
+    expect(issue.stateId).toBe('ready-state')
+  })
+
   it('conditionally restores a Linear state at the exact mounted revision', async () => {
     const mount = new FakeMountClient()
     mount.files.set(issuePath, { content: wrappedIssueRecord({ stateId: 'implementing-state' }), revision: '7' })

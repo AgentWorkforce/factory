@@ -4,6 +4,8 @@ import type { LinearIssue, PrSummary } from '../types'
 export interface LinearWriteback {
   /** The immutable provider revision is the ownership token for this exact state write. */
   setState(issue: LinearIssue, stateId: string): Promise<{ claimToken: string } | void>
+  /** Read the provider's current state rather than relying on the dispatch snapshot. */
+  getIssueStateId?(issue: LinearIssue): Promise<string | undefined>
   /** Atomically restore a state only while the provider still matches this exact claim write. */
   compareAndSetState?(
     issue: LinearIssue,

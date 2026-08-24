@@ -257,6 +257,13 @@ export const MountLinearWriteback = (
   }
 
   const adapter = {
+    async getIssueStateId(issue: LinearIssue): Promise<string | undefined> {
+      const current = wrappedPayload((await mount.readFile(issuePath(issue))).content)
+      return typeof current.stateId === 'string' && current.stateId
+        ? current.stateId
+        : undefined
+    },
+
     async setState(issue: LinearIssue, stateId: string): Promise<{ claimToken: string } | void> {
       const path = issuePath(issue)
       const canonical = await canonicalForIssue(issue)

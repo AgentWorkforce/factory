@@ -1217,6 +1217,15 @@ class BlockingDispatchClaimLinearWriteback implements LinearWriteback {
   readonly states: Array<{ key: string; stateId: string }> = []
   readonly comments: Array<{ key: string; body: string }> = []
   #blocked = false
+  #currentStateId = ready
+
+  async getIssueStateId(): Promise<string> {
+    return this.#currentStateId
+  }
+
+  setProviderState(stateId: string): void {
+    this.#currentStateId = stateId
+  }
 
   async setState(issue: LinearIssue, stateId: string): Promise<{ claimToken: string }> {
     if (stateId === implementing && !this.#blocked) {
@@ -1225,6 +1234,7 @@ class BlockingDispatchClaimLinearWriteback implements LinearWriteback {
       await this.claimWriteGate.promise
     }
     this.states.push({ key: issue.key, stateId })
+    this.#currentStateId = stateId
     issue.stateId = stateId
     return { claimToken: `linear-claim-${this.states.length}` }
   }
@@ -1236,7 +1246,7 @@ class BlockingDispatchClaimLinearWriteback implements LinearWriteback {
     stateId: string,
   ): Promise<'applied' | 'superseded'> {
     if (claimToken !== `linear-claim-${this.states.length}`) return 'superseded'
-    if (issue.stateId !== expectedStateId) return 'superseded'
+    if (this.#currentStateId !== expectedStateId) return 'superseded'
     await this.setState(issue, stateId)
     return 'applied'
   }
@@ -1251,6 +1261,12 @@ class BlockingDispatchClaimLinearWriteback implements LinearWriteback {
 
   async verify(): Promise<boolean> {
     return true
+  }
+}
+
+class UnprovenRollbackDispatchClaimLinearWriteback extends BlockingDispatchClaimLinearWriteback {
+  override async compareAndSetState(): Promise<'unproven'> {
+    return 'unproven'
   }
 }
 
@@ -11982,6 +11998,86 @@ describe('FactoryLoop', () => {
         { key: `AR-${number}`, stateId: ready },
       ])
       expect(linear.comments).toEqual([])
+
+      await factory.stop()
+      stopped = true
+    } finally {
+      linear.claimWriteGate.resolve()
+      if (!stopped) await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('releases a blocked Linear claim only after the provider state is superseded', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-linear-unproven-recovery-'))
+    const number = 1267
+    const path = issuePath(number)
+    const fleet = new RemoteLifecycleFleetClient()
+    const linear = new UnprovenRollbackDispatchClaimLinearWriteback()
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const factory = createFactory(config({
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 1_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({ [path]: issueFile(number) }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      linear,
+      logger: { error: () => {}, warn: () => {} },
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let stopped = false
+    try {
+      await withDeadline(linear.claimWriteStarted.promise, 4_000, 'Linear dispatch claim did not start')
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+      await vi.waitFor(() => expect(factory.status().counters.postSpawnWaitsSettledByAbandonment)
+        .toBe(1), { timeout: 8_000 })
+
+      linear.claimWriteGate.resolve()
+      await withDeadline(run, 8_000, 'unproven Linear rollback did not unwind dispatch')
+      expect(factory.status().counters.postSpawnDispatchClaimCompensationFailures).toBe(1)
+      expect(factory.status().counters.postSpawnDispatchClaimRecoveryRetentions).toBe(1)
+      expect(factory.status().inFlight).toHaveLength(1)
+      expect(fleet.releases).toEqual([])
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity({
+        uuid: `uuid-${number}`,
+        key: `AR-${number}`,
+        path,
+      }))).resolves.toMatchObject({
+        phase: 'running',
+        dispatchClaim: {
+          state: 'degraded',
+          cancellationBlocked: true,
+          write: 'rejected dispatch claim rollback',
+          deadLettered: true,
+        },
+      })
+
+      // An unchanged Implementing state is not proof of supersession; the
+      // first abandonment retry must keep every placement retained.
+      await new Promise<void>((resolve) => { setTimeout(resolve, 1_200) })
+      expect(factory.status().inFlight).toHaveLength(1)
+      expect(fleet.releases).toEqual([])
+
+      linear.setProviderState(humanReview)
+      await vi.waitFor(() => expect(fleet.releases).toEqual([
+        { name: `ar-${number}-impl-pear`, reason: 'held-past-deadline' },
+        { name: `ar-${number}-review`, reason: 'held-past-deadline' },
+      ]), { timeout: 5_000 })
+      await vi.waitFor(async () => expect(await stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity({ uuid: `uuid-${number}`, key: `AR-${number}`, path }),
+      )).toMatchObject({
+        phase: 'abandoned',
+        dispatchClaim: expect.not.objectContaining({ cancellationBlocked: true }),
+      }), { timeout: 4_000 })
+      expect(factory.status().inFlight).toEqual([])
 
       await factory.stop()
       stopped = true

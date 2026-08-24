@@ -1723,11 +1723,19 @@ export class FactoryLoop implements Factory {
     if (!this.#uncompensatedDispatchClaims.has(key) && record.dispatchClaim?.cancellationBlocked !== true) {
       return false
     }
-    if (!this.#githubWriteback.getIssueStatus) return true
     try {
       const issue = await this.#readIssue(record.issue.path)
-      if (!issue || !isGithubIssue(issue)) return true
-      if (await this.#githubWriteback.getIssueStatus(issue) === 'in-progress') return true
+      if (!issue) return true
+      if (isGithubIssue(issue)) {
+        if (!this.#githubWriteback.getIssueStatus) return true
+        const status = await this.#githubWriteback.getIssueStatus(issue)
+        if (!status || status === 'in-progress') return true
+      } else {
+        if (!this.#linear.getIssueStateId) return true
+        const implementingStateId = this.#states.idFor(issue.team, 'agentImplementing')
+        const currentStateId = await this.#linear.getIssueStateId(issue)
+        if (!implementingStateId || !currentStateId || currentStateId === implementingStateId) return true
+      }
       await this.#clearDispatchCancellationBlock(record)
       return false
     } catch (error) {
