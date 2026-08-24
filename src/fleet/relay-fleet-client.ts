@@ -1,8 +1,9 @@
 import { AgentRelay } from '@agent-relay/sdk'
 
+import { describeControlPlaneError } from './control-plane-circuit'
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
 
-import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, FleetConnectStatus, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
 import type {
   RelayActionInvocation,
   RelayActionInvocationAck,
@@ -217,6 +218,15 @@ export class RelayFleetClient implements FleetClient {
   #authenticatedAgentName: string
   #eventsStarted = false
   #disposed = false
+  /**
+   * The fleet socket's own status.
+   *
+   * Kept here rather than inferred by callers because the dial is
+   * fire-and-forget: `#ensureEventSubscription` cannot return its outcome, so
+   * without this the ONLY trace of a failed connect was a `#log` line that no
+   * health surface reads.
+   */
+  #fleetConnect: FleetConnectStatus = { state: 'never-attempted', attempts: 0 }
   #watchTimer: ReturnType<typeof setInterval> | undefined
   #reconciling: Promise<void> | undefined
   #pendingReleaseRetry: Promise<void> | undefined
@@ -725,6 +735,7 @@ export class RelayFleetClient implements FleetClient {
     if (this.#registrationAttempts > MAX_REGISTRATION_ATTEMPTS) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'MAX_ATTEMPTS',
         `gave up after ${MAX_REGISTRATION_ATTEMPTS} registration attempts`,
       )
     }
@@ -876,6 +887,7 @@ export class RelayFleetClient implements FleetClient {
       if (!agentId) {
         throw new FactoryAgentRegistrationError(
           this.#agentName,
+          'RECORD_UNREADABLE',
           `name is taken but the record could not be read back: ${errorMessage(lastError)}`,
           { cause: lastError },
         )
@@ -889,6 +901,7 @@ export class RelayFleetClient implements FleetClient {
         if (error instanceof FactoryAgentRegistrationError) throw error
         throw new FactoryAgentRegistrationError(
           this.#agentName,
+          'TAKEOVER_FAILED',
           `could not reclaim the existing identity: ${errorMessage(error)}`,
           { cause: error },
         )
@@ -896,6 +909,7 @@ export class RelayFleetClient implements FleetClient {
     }
     throw new FactoryAgentRegistrationError(
       this.#agentName,
+      'TAKEOVER_EXHAUSTED',
       `could not reclaim the existing identity: ${errorMessage(lastError)}`,
       { cause: lastError },
     )
@@ -916,6 +930,7 @@ export class RelayFleetClient implements FleetClient {
     if (status !== 'offline') {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'STATUS_NOT_OFFLINE',
         `refusing to take over agent in status "${status ?? 'unknown'}"; another factory may still hold this identity`,
       )
     }
@@ -954,12 +969,14 @@ export class RelayFleetClient implements FleetClient {
     if (seenStatus === undefined) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
-        'presence lists this agent with no status, so it cannot be confirmed offline',
+        'PRESENCE_STATUS_MISSING',
+        'presence reported no status for this agent, so it cannot be confirmed offline',
       )
     }
     if (LIVE_AGENT_STATUSES.has(seenStatus)) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_REPORTS_LIVE',
         `presence reports this agent as "${seenStatus}"; another factory may still hold this identity`,
       )
     }
@@ -981,6 +998,7 @@ export class RelayFleetClient implements FleetClient {
     } catch (error) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_UNREADABLE',
         `presence is unreadable, so the agent cannot be confirmed offline: ${errorMessage(error)}`,
         { cause: error },
       )
@@ -988,6 +1006,7 @@ export class RelayFleetClient implements FleetClient {
     if (!Array.isArray(presence)) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_NOT_A_LIST',
         'presence is unreadable (it did not return a list), so the agent cannot be confirmed offline',
       )
     }
@@ -1004,6 +1023,7 @@ export class RelayFleetClient implements FleetClient {
     if (unnamed !== -1) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_ROW_UNNAMED',
         `presence is unreadable (row ${unnamed} carries no agent name), so the agent cannot be confirmed offline`,
       )
     }
@@ -1197,21 +1217,56 @@ export class RelayFleetClient implements FleetClient {
   #ensureEventSubscription(): void {
     if (this.#eventsStarted) return
     this.#eventsStarted = true
+    this.#fleetConnect = {
+      ...this.#fleetConnect,
+      state: 'connecting',
+      attempts: this.#fleetConnect.attempts + 1,
+      lastAttemptAtMs: this.#now(),
+    }
     void this.#subscribeEvents().catch((error) => {
       this.#eventsStarted = false
+      // The rejection now lands in a field a health surface can publish. It kept
+      // going only to `#log` before, which is why a fleet client that never
+      // connected was indistinguishable from a healthy one everywhere.
+      this.#fleetConnect = {
+        ...this.#fleetConnect,
+        state: 'failed',
+        lastFailureAtMs: this.#now(),
+        lastError: describeControlPlaneError(error),
+      }
       this.#log(`relay fleet event subscription failed: ${errorMessage(error)}`)
     })
+  }
+
+  fleetConnectStatus(): FleetConnectStatus {
+    return { ...this.#fleetConnect }
   }
 
   async #subscribeEvents(): Promise<void> {
     const messaging = await this.#ensureMessaging()
     await this.#ensureLifecycleAction(messaging)
     if (this.#disposed) return
-    messaging.events.connect()
-    this.#eventUnsubscribers.push(messaging.events.on('any', (event) => this.#handleEvent(event)))
+    // Listen before dialing so a synchronous lifecycle event cannot race past
+    // the observer. `connect()` is void: returning only proves the SDK accepted
+    // the dial, not that the WebSocket handshake completed.
+    const unsubscribe = messaging.events.on('any', (event) => this.#handleEvent(event))
+    const statusBeforeDial = this.#fleetConnect
+    try {
+      messaging.events.connect()
+    } catch (error) {
+      unsubscribe()
+      throw error
+    }
+    this.#eventUnsubscribers.push(unsubscribe)
+    this.#fleetConnect = {
+      ...this.#fleetConnect,
+      ...(this.#fleetConnect === statusBeforeDial ? { state: 'dialed' as const } : {}),
+      lastDialedAtMs: this.#now(),
+    }
   }
 
   #handleEvent(event: RelayMessagingEvent): void {
+    this.#observeFleetConnectionEvent(event)
     switch (event.type) {
       case 'dmReceived':
       case 'groupDmReceived':
@@ -1231,6 +1286,43 @@ export class RelayFleetClient implements FleetClient {
         break
       default:
         break
+    }
+  }
+
+  /** Translate the SDK's real stream lifecycle into the published status. */
+  #observeFleetConnectionEvent(event: RelayMessagingEvent): void {
+    const now = this.#now()
+    switch (event.type) {
+      case 'disconnected':
+      case 'permanentlyDisconnected':
+        this.#fleetConnect = {
+          ...this.#fleetConnect,
+          state: 'failed',
+          lastFailureAtMs: now,
+          lastError: 'RelayEventStreamDisconnected',
+        }
+        return
+      case 'error':
+        this.#fleetConnect = {
+          ...this.#fleetConnect,
+          state: 'failed',
+          lastFailureAtMs: now,
+          lastError: 'RelayEventStreamError',
+        }
+        return
+      case 'reconnecting':
+        this.#fleetConnect = { ...this.#fleetConnect, state: 'connecting' }
+        return
+      default:
+        // `connected` and every data event are confirmations that the event
+        // stream opened. A void `connect()` call alone never reaches this arm.
+        this.#fleetConnect = {
+          ...this.#fleetConnect,
+          state: 'connected',
+          firstEventAtMs: this.#fleetConnect.firstEventAtMs ?? now,
+          ...(this.#fleetConnect.state !== 'connected' ? { lastConnectedAtMs: now } : {}),
+          lastError: undefined,
+        }
     }
   }
 
@@ -1558,13 +1650,48 @@ function previewReference(value: unknown, placementNode?: string): PreviewRefere
  * Registration could not converge on a usable agent identity. Named so a
  * six-day silent 409 loop surfaces as one actionable failure instead.
  */
+/**
+ * Which of the ten registration failures happened.
+ *
+ * These exist to survive redaction. `describeControlPlaneError` reduces a cause
+ * to `${name}${code}` and appends the code ONLY when it matches
+ * /^[A-Z0-9_]{1,80}$/ -- so a bare `FactoryAgentRegistrationError` is what every
+ * published surface showed, with the sentence naming the actual throw site
+ * discarded. Production reported exactly that string and it could not be told
+ * whether the name was taken, presence was unreadable, the record was not
+ * offline, or the takeover itself failed.
+ *
+ * A constrained token carries none of the message's risk: no transport text, no
+ * URL, no credential. The reducer already validates the shape, so this widens
+ * the answer without widening the exposure.
+ */
+export type FactoryAgentRegistrationErrorCode =
+  | 'MAX_ATTEMPTS'
+  | 'RECORD_UNREADABLE'
+  | 'STATUS_NOT_OFFLINE'
+  | 'PRESENCE_UNREADABLE'
+  | 'PRESENCE_NOT_A_LIST'
+  | 'PRESENCE_ROW_UNNAMED'
+  | 'PRESENCE_STATUS_MISSING'
+  | 'PRESENCE_REPORTS_LIVE'
+  | 'TAKEOVER_FAILED'
+  | 'TAKEOVER_EXHAUSTED'
+
 export class FactoryAgentRegistrationError extends Error {
   readonly agentName: string
+  /** Uppercase token so `describeControlPlaneError` renders it after the name. */
+  readonly code: FactoryAgentRegistrationErrorCode
 
-  constructor(agentName: string, detail: string, options?: { cause?: unknown }) {
+  constructor(
+    agentName: string,
+    code: FactoryAgentRegistrationErrorCode,
+    detail: string,
+    options?: { cause?: unknown },
+  ) {
     super(`Factory agent "${agentName}" could not register with the relay workspace: ${detail}`)
     this.name = 'FactoryAgentRegistrationError'
     this.agentName = agentName
+    this.code = code
     if (options && 'cause' in options) {
       ;(this as Error & { cause?: unknown }).cause = options.cause
     }

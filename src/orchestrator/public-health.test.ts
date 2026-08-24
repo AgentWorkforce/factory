@@ -744,6 +744,81 @@ describe('publicHealthFromHeartbeat (#295)', () => {
 })
 
 
+/**
+ * The fleet event socket is the dial that makes Factory's own agent `online`.
+ * It had no status on any surface, and readers substituted `eventListener` --
+ * which is the orchestrator's ISSUE subscription, a different subsystem. That
+ * conflation is why a Factory that registered an agent and never connected read
+ * as healthy everywhere.
+ */
+describe('fleet connect health', () => {
+  const withConnect = (
+    overrides: Partial<NonNullable<FactoryLoopHeartbeat['fleetConnect']>> = {},
+  ): FactoryLoopHeartbeat =>
+    heartbeat({
+      fleetConnect: {
+        state: 'failed',
+        attempts: 1,
+        lastAttemptAtMs: BOOT_MS - 5_000,
+        lastFailureAtMs: BOOT_MS - 4_000,
+        lastError: 'FactoryAgentRegistrationError',
+        ...overrides,
+      },
+    })
+
+  it('publishes the socket state unauthenticated', () => {
+    const health = publicHealthFromHeartbeat(withConnect({
+      lastDialedAtMs: BOOT_MS - 4_500,
+      firstEventAtMs: BOOT_MS - 4_250,
+    }), { nowMs: BOOT_MS })
+    expect(health.fleetConnect?.state).toBe('failed')
+    expect(health.fleetConnect?.attempts).toBe(1)
+    expect(health.fleetConnect?.lastDialedAtMs).toBe(BOOT_MS - 4_500)
+    expect(health.fleetConnect?.firstEventAtMs).toBe(BOOT_MS - 4_250)
+  })
+
+  /** `lastError` stays behind /evidence, exactly as it does for the circuit. */
+  it('never leaks the cause to the unauthenticated surface', () => {
+    const health = publicHealthFromHeartbeat(withConnect(), { nowMs: BOOT_MS })
+    expect(JSON.stringify(health.fleetConnect)).not.toContain('FactoryAgentRegistrationError')
+    expect(Object.hasOwn(health.fleetConnect ?? {}, 'lastError')).toBe(false)
+  })
+
+  /**
+   * Deliberately NOT dispatch-gating. Listing it would flip `ok` on a live
+   * deployment and hand container replacement a new reason to cycle -- a
+   * behaviour change well beyond publishing the fact.
+   */
+  it('does not change what ok means', () => {
+    const health = publicHealthFromHeartbeat(withConnect(), { nowMs: BOOT_MS })
+    expect(health.degradedSubsystems).not.toContain('fleetConnect')
+    expect(health.ok).toBe(true)
+  })
+
+  /** CONTROL: absent stays absent rather than being invented as healthy. */
+  it('omits the block entirely when the backend has no socket', () => {
+    const health = publicHealthFromHeartbeat(heartbeat(), { nowMs: BOOT_MS })
+    expect(health.fleetConnect).toBeUndefined()
+  })
+
+  it('retains a failed socket record through normalization without retaining lastError', () => {
+    const published = publicHealthFromHeartbeat(withConnect({
+      lastDialedAtMs: BOOT_MS - 4_500,
+      firstEventAtMs: BOOT_MS - 4_250,
+    }), { nowMs: BOOT_MS })
+    const normalized = normalizePublicHealth({
+      ...published,
+      fleetConnect: {
+        ...published.fleetConnect,
+        lastError: 'connect failed to wss://relay.example?token=secret',
+      },
+    })
+
+    expect(normalized?.fleetConnect).toEqual(published.fleetConnect)
+    expect(Object.hasOwn(normalized?.fleetConnect ?? {}, 'lastError')).toBe(false)
+  })
+})
+
 describe('sweep counters on the public surface (#355)', () => {
   const swept = (
     overrides: Partial<NonNullable<FactoryLoopHeartbeat['readinessReconcile']>> = {},

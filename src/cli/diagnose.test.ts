@@ -61,6 +61,14 @@ const healthy = {
       lastStartedAtMs: NOW_MS - 30_000,
       lastCompletedAtMs: NOW_MS - 29_000,
     },
+    fleetConnect: {
+      state: 'connected',
+      attempts: 1,
+      lastAttemptAtMs: NOW_MS - 32_000,
+      lastDialedAtMs: NOW_MS - 31_000,
+      firstEventAtMs: NOW_MS - 30_500,
+      lastConnectedAtMs: NOW_MS - 30_000,
+    },
     eventListener: { state: 'subscribed' },
   },
 }
@@ -82,6 +90,40 @@ describe('factory diagnose --deployed (#295)', () => {
     expect(seen).toEqual([`${BASE}/healthz`])
     expect(out.text()).toContain('dispatching')
     expect(out.text()).toContain('readinessReconcile')
+    expect(out.text()).toContain('fleetConnect')
+    expect(out.text()).toContain('connected')
+    expect(out.text()).toContain(`lastAttemptAt      : ${new Date(NOW_MS - 32_000).toISOString()}`)
+    expect(out.text()).toContain(`lastConnectedAt    : ${new Date(NOW_MS - 30_000).toISOString()}`)
+  })
+
+  it('renders dialed as unconfirmed until a stream event is observed', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE], {
+      stdout: out,
+      stderr: buffer(),
+      env: HERMETIC_ENV,
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ...healthy,
+            health: {
+              ...healthy.health,
+              fleetConnect: {
+                ...healthy.health.fleetConnect,
+                state: 'dialed',
+                firstEventAtMs: undefined,
+                lastConnectedAtMs: undefined,
+              },
+            },
+          },
+        },
+      }),
+    })
+
+    expect(code).toBe(0)
+    expect(out.text()).toContain('unconfirmed — the SDK accepted connect()')
+    expect(out.text()).toContain('healthy silent workspace may remain dialed')
   })
 
   // The 2026-08-19/20 outage: eight consecutive failures behind `ok: true`.
@@ -314,6 +356,41 @@ describe('factory diagnose --deployed (#295)', () => {
     const report = JSON.parse(out.text()) as { evidence?: { fetched?: boolean; lastError?: string } }
     expect(report.evidence?.fetched).toBe(true)
     expect(report.evidence?.lastError).toContain('dispatch lifecycle is already terminal')
+  })
+
+  it('reads and renders fleet socket errors from authenticated evidence', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE, '--token', 'op-token'], {
+      stdout: out,
+      stderr: buffer(),
+      env: HERMETIC_ENV,
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: {
+            ...healthy,
+            health: {
+              ...healthy.health,
+              fleetConnect: {
+                state: 'failed',
+                attempts: 2,
+                lastFailureAtMs: NOW_MS - 1_000,
+              },
+            },
+          },
+        },
+        evidence: {
+          status: 200,
+          body: {
+            phase: 'running',
+            fleetConnect: { lastError: 'FactoryAgentRegistrationError (AGENT_EXISTS)' },
+          },
+        },
+      }),
+    })
+
+    expect(code).toBe(0)
+    expect(out.text()).toContain('fleetConnect error : FactoryAgentRegistrationError (AGENT_EXISTS)')
   })
 
   it('still diagnoses when the evidence token is rejected', async () => {
@@ -765,4 +842,3 @@ describe('factory diagnose --deployed (#295)', () => {
     }
   })
 })
-

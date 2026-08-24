@@ -3238,6 +3238,13 @@ describe('fleet CLI runtime', () => {
           retryAtMs: now + 59_500,
           lastError: 'TimeoutError (FACTORY_FLEET_CONTROL_TIMEOUT)',
         },
+        fleetConnect: {
+          state: 'failed',
+          attempts: 2,
+          lastAttemptAtMs: now - 2_000,
+          lastFailureAtMs: now - 400,
+          lastError: 'RelayEventStreamDisconnected',
+        },
       }))
       const output = buffer()
       const factory = {
@@ -3256,6 +3263,11 @@ describe('fleet CLI runtime', () => {
             timeoutMs: 5_000,
             failureThreshold: 2,
             resetTimeoutMs: 60_000,
+          },
+          fleetConnect: {
+            state: 'connected' as const,
+            attempts: 1,
+            firstEventAtMs: now - 5_000,
           },
         })),
       } as unknown as Factory
@@ -3280,6 +3292,11 @@ describe('fleet CLI runtime', () => {
           state: 'open',
           consecutiveFailures: 2,
           lastError: 'TimeoutError (FACTORY_FLEET_CONTROL_TIMEOUT)',
+        },
+        fleetConnect: {
+          state: 'failed',
+          attempts: 2,
+          lastError: 'RelayEventStreamDisconnected',
         },
       })
     } finally {
@@ -3315,6 +3332,10 @@ describe('fleet CLI runtime', () => {
             failureThreshold: 2,
             resetTimeoutMs: 60_000,
           },
+          fleetConnect: {
+            state: 'connected' as const,
+            attempts: 1,
+          },
         })),
       } as unknown as Factory
 
@@ -3327,7 +3348,9 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
-      expect(JSON.parse(output.text())).not.toHaveProperty('fleetControlPlane')
+      const status = JSON.parse(output.text())
+      expect(status).not.toHaveProperty('fleetControlPlane')
+      expect(status).not.toHaveProperty('fleetConnect')
     } finally {
       await rm(root, { recursive: true, force: true })
     }
