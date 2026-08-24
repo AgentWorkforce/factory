@@ -915,6 +915,7 @@ export class FactoryLoop implements Factory {
   // set closes the race before the durable dispatchClaim flag is persisted.
   readonly #uncompensatedDispatchClaims = new Set<string>()
   readonly #pendingDispatchClaims = new Set<string>()
+  readonly #dispatchClaimSettlementsInFlight = new Set<string>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   #reconciledAgentExitsActive = 0
   readonly #reconciledAgentExitWaiters: Array<() => void> = []
@@ -1314,6 +1315,7 @@ export class FactoryLoop implements Factory {
     this.#postSpawnDispatchesRejectedDuringStop.clear()
     this.#uncompensatedDispatchClaims.clear()
     this.#pendingDispatchClaims.clear()
+    this.#dispatchClaimSettlementsInFlight.clear()
     this.#stopping = false
     this.#startMode = opts.mode ?? 'live'
     const issueSource = await this.#issueSource()
@@ -1487,14 +1489,15 @@ export class FactoryLoop implements Factory {
       // and cancellation-fence handoff. Stopping renewal earlier can let the
       // lease expire before the fence is saved, allowing a successor to reap
       // agents while the old provider write can still land.
-      if (this.#dispatchLifecycleRenewTimer) clearInterval(this.#dispatchLifecycleRenewTimer)
-      this.#dispatchLifecycleRenewTimer = undefined
       // Relinquish durable ownership before waiting on mount-backed lifecycle
       // drives. A slow Relayfile scan must not consume the shutdown deadline
       // while every issue remains fenced to a publisher that is already
-      // stopping. The owner/epoch fence makes any late completion from those
-      // drives harmless; a second sweep below catches claims racing this one.
-      await this.#releaseOwnedDispatchLifecycleLeases()
+      // stopping. Preserve leases for provider claims whose bounded drain
+      // expired: the original caller still needs its epoch to persist a late
+      // conclusive settlement. A second sweep below catches claims racing this
+      // one.
+      await this.#releaseOwnedDispatchLifecycleLeases((key) =>
+        this.#pendingDispatchClaims.has(key) || this.#dispatchClaimSettlementsInFlight.has(key))
       await Promise.allSettled([...this.#dispatchLifecycleDrives])
       // Fence every source of new clarification work before touching the fleet.
       // A wake already past the fence is allowed to unwind, and is awaited
@@ -1517,7 +1520,10 @@ export class FactoryLoop implements Factory {
       // non-durable (local/internal) records; terminal completion performs the
       // normal remote release before clearing the lifecycle.
       await this.#releaseInFlightAgents('factory-stopped', { preserveDurable: true })
-      await this.#releaseOwnedDispatchLifecycleLeases()
+      if (this.#dispatchLifecycleRenewTimer) clearInterval(this.#dispatchLifecycleRenewTimer)
+      this.#dispatchLifecycleRenewTimer = undefined
+      await this.#releaseOwnedDispatchLifecycleLeases((key) =>
+        this.#pendingDispatchClaims.has(key) || this.#dispatchClaimSettlementsInFlight.has(key))
       if (this.#livePollTimer) clearTimeout(this.#livePollTimer)
       this.#livePollTimer = undefined
       this.#livePollInFlight = false
@@ -1568,11 +1574,13 @@ export class FactoryLoop implements Factory {
       this.#offUnpricedModel = undefined
       await this.#fleet.dispose()
     } finally {
+      if (this.#dispatchLifecycleRenewTimer) clearInterval(this.#dispatchLifecycleRenewTimer)
+      this.#dispatchLifecycleRenewTimer = undefined
       this.#stoppingHeartbeatRefreshActive = false
     }
   }
 
-  async #releaseOwnedDispatchLifecycleLeases(): Promise<void> {
+  async #releaseOwnedDispatchLifecycleLeases(preserve: (key: string) => boolean = () => false): Promise<void> {
     // The epoch cache is an execution optimization, not the durable ownership
     // authority. Error/fence paths may evict a cached epoch while its persisted
     // lease is still ours, so enumerate state before shutdown relinquishment.
@@ -1583,6 +1591,7 @@ export class FactoryLoop implements Factory {
       }
     }
     for (const [key, epoch] of owned) {
+      if (preserve(key)) continue
       await this.#state.releaseDispatchLifecycleLease(
         this.#workspaceId,
         key,
@@ -1715,21 +1724,35 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #clearDispatchCancellationBlock(record: InFlightIssue): Promise<void> {
+  async #clearDispatchCancellationBlock(record: InFlightIssue): Promise<boolean> {
     const key = dispatchLifecycleKey(record.issue)
-    this.#uncompensatedDispatchClaims.delete(key)
-    if (record.dispatchClaim?.cancellationBlocked !== true) return
+    if (record.dispatchClaim?.cancellationBlocked !== true) {
+      this.#uncompensatedDispatchClaims.delete(key)
+      return true
+    }
+    const previousClaim = record.dispatchClaim
     const {
       cancellationBlocked: _blocked,
       cancellationPending: _pending,
       ...claim
-    } = record.dispatchClaim
+    } = previousClaim
     record.dispatchClaim = claim
     this.#dispatchClaimStatuses.set(key, claim)
-    if (this.#usesDurableDispatchLifecycle()) {
-      await this.#saveDispatchLifecycle(record, 'running')
-    } else {
-      await this.#writeDispatchClaimRegistry(record.issue)
+    try {
+      const persisted = this.#usesDurableDispatchLifecycle()
+        ? await this.#saveDispatchLifecycle(record, 'running')
+        : await this.#writeDispatchClaimRegistry(record.issue).then(() => true)
+      if (!persisted) {
+        record.dispatchClaim = previousClaim
+        this.#dispatchClaimStatuses.set(key, previousClaim)
+        return false
+      }
+      this.#uncompensatedDispatchClaims.delete(key)
+      return true
+    } catch (error) {
+      record.dispatchClaim = previousClaim
+      this.#dispatchClaimStatuses.set(key, previousClaim)
+      throw error
     }
   }
 
@@ -1752,10 +1775,10 @@ export class FactoryLoop implements Factory {
       } else {
         if (!this.#linear.getIssueStateId) return true
         const implementingStateId = this.#states.idFor(issue.team, 'agentImplementing')
-        const currentStateId = await this.#linear.getIssueStateId(issue) ?? issue.stateId
+        const currentStateId = await this.#linear.getIssueStateId(issue)
         if (!implementingStateId || !currentStateId || currentStateId === implementingStateId) return true
       }
-      await this.#clearDispatchCancellationBlock(record)
+      if (!await this.#clearDispatchCancellationBlock(record)) return true
       return false
     } catch (error) {
       this.#logger.warn?.('[factory] unable to verify whether a blocked dispatch claim was superseded', {
@@ -5189,41 +5212,50 @@ export class FactoryLoop implements Factory {
       if (error instanceof PostSpawnDispatchWaitRejectedError) {
         settlePostSpawnIssueObservation(false)
         const compensated = error.compensationError === undefined
-        // The original provider call has conclusively returned. Remove this
-        // before any asynchronous persistence so a concurrent timeout cannot
-        // overwrite the settled outcome with an unresolved handoff fence.
+        // The original provider call has conclusively returned. Stop the
+        // timeout handoff from writing a provisional pending fence, but keep a
+        // separate lease fence until the definitive result is durable. Without
+        // that second set, shutdown can relinquish this epoch in the await
+        // below and make the late save fail after the provider compensated.
+        this.#dispatchClaimSettlementsInFlight.add(postSpawnKey)
         this.#pendingDispatchClaims.delete(postSpawnKey)
-        if (compensated) {
-          this.#uncompensatedDispatchClaims.delete(postSpawnKey)
-          await this.#clearDispatchCancellationBlock(record)
-        } else {
-          await this.#retainUncompensatedDispatchClaim(record, error.compensationError)
-        }
-        postSpawnDispatchClaimFence.settleRejection(compensated)
-        if (error.compensationError !== undefined) {
-          this.#increment('postSpawnDispatchClaimCompensationFailures')
-          this.#logger.error?.('[factory] rejected dispatch claim could not be safely compensated', {
-            issue: decision.issue.key,
-            error: describeError(error.compensationError).errorMessage,
-          })
-        }
-        // External stop/abandonment owns agent and durable-lifecycle cleanup.
-        // Remove only the process-local slot here; running the ordinary
-        // dispatch-failure path would race or duplicate that cleanup. During
-        // stop, however, retain local placements until the shutdown release
-        // sweep has captured them. If it already has, removal is safe now.
-        if (!compensated) {
-          // The provider still exposes a claim this lifecycle authored. Keep
-          // the process-local slot and durable row recoverable; releasing its
-          // agents would leave the claimed issue with no successor lifecycle.
-        } else if (this.#stopping) {
-          this.#postSpawnDispatchesRejectedDuringStop.add(postSpawnKey)
-          if (this.#shutdownReleaseCapturedDispatches.has(postSpawnKey)) {
-            batch.abandon(decision.issue)
-            this.#postSpawnDispatchesRejectedDuringStop.delete(postSpawnKey)
+        let settlementPersisted = false
+        try {
+          settlementPersisted = compensated
+            ? await this.#clearDispatchCancellationBlock(record)
+            : await this.#retainUncompensatedDispatchClaim(record, error.compensationError)
+          if (!settlementPersisted) {
+            throw new Error(`Unable to persist settled dispatch-claim compensation for ${decision.issue.key}`)
           }
-        } else {
-          batch.abandon(decision.issue)
+          postSpawnDispatchClaimFence.settleRejection(compensated)
+          if (error.compensationError !== undefined) {
+            this.#increment('postSpawnDispatchClaimCompensationFailures')
+            this.#logger.error?.('[factory] rejected dispatch claim could not be safely compensated', {
+              issue: decision.issue.key,
+              error: describeError(error.compensationError).errorMessage,
+            })
+          }
+          // External stop/abandonment owns agent and durable-lifecycle cleanup.
+          // Remove only the process-local slot here; running the ordinary
+          // dispatch-failure path would race or duplicate that cleanup. During
+          // stop, however, retain local placements until the shutdown release
+          // sweep has captured them. If it already has, removal is safe now.
+          if (!compensated) {
+            // The provider still exposes a claim this lifecycle authored. Keep
+            // the process-local slot and durable row recoverable; releasing its
+            // agents would leave the claimed issue with no successor lifecycle.
+          } else if (this.#stopping) {
+            this.#postSpawnDispatchesRejectedDuringStop.add(postSpawnKey)
+            if (this.#shutdownReleaseCapturedDispatches.has(postSpawnKey)) {
+              batch.abandon(decision.issue)
+              this.#postSpawnDispatchesRejectedDuringStop.delete(postSpawnKey)
+            }
+          } else {
+            batch.abandon(decision.issue)
+          }
+        } finally {
+          if (!settlementPersisted) this.#pendingDispatchClaims.add(postSpawnKey)
+          this.#dispatchClaimSettlementsInFlight.delete(postSpawnKey)
         }
         throw error
       }

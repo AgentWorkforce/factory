@@ -1243,7 +1243,7 @@ class BlockingDispatchClaimLinearWriteback implements LinearWriteback {
   #blocked = false
   #currentStateId = ready
 
-  async getIssueStateId(): Promise<string> {
+  async getIssueStateId(): Promise<string | undefined> {
     return this.#currentStateId
   }
 
@@ -1289,8 +1289,26 @@ class BlockingDispatchClaimLinearWriteback implements LinearWriteback {
 }
 
 class UnprovenRollbackDispatchClaimLinearWriteback extends BlockingDispatchClaimLinearWriteback {
-  override async compareAndSetState(): Promise<'unproven'> {
+  #claimIssue?: LinearIssue
+  #stateReadAvailable = true
+
+  override async getIssueStateId(issue: LinearIssue): Promise<string | undefined> {
+    if (!this.#stateReadAvailable) return undefined
+    return await super.getIssueStateId(issue)
+  }
+
+  override async compareAndSetState(issue: LinearIssue): Promise<'unproven'> {
+    this.#claimIssue = issue
     return 'unproven'
+  }
+
+  setSparseDispatchSnapshotState(stateId: string): void {
+    if (!this.#claimIssue) throw new Error('dispatch claim issue was not captured')
+    this.#claimIssue.stateId = stateId
+  }
+
+  setStateReadAvailable(available: boolean): void {
+    this.#stateReadAvailable = available
   }
 }
 
@@ -12310,13 +12328,17 @@ describe('FactoryLoop', () => {
         },
       })
 
-      // An unchanged Implementing state is not proof of supersession; the
+      // A sparse dispatch snapshot cannot substitute for an unavailable
+      // canonical read, even when that stale snapshot appears superseded. The
       // first abandonment retry must keep every placement retained.
+      linear.setProviderState(humanReview)
+      linear.setSparseDispatchSnapshotState(humanReview)
+      linear.setStateReadAvailable(false)
       await new Promise<void>((resolve) => { setTimeout(resolve, 1_200) })
       expect(factory.status().inFlight).toHaveLength(1)
       expect(fleet.releases).toEqual([])
 
-      linear.setProviderState(humanReview)
+      linear.setStateReadAvailable(true)
       await vi.waitFor(() => expect(fleet.releases).toEqual([
         { name: `ar-${number}-impl-pear`, reason: 'held-past-deadline' },
         { name: `ar-${number}-review`, reason: 'held-past-deadline' },
@@ -12828,6 +12850,10 @@ describe('FactoryLoop', () => {
         path,
       }))).resolves.toMatchObject({
         phase: 'running',
+        lease: {
+          owner: expect.any(String),
+          epoch: expect.any(Number),
+        },
         dispatchClaim: {
           state: 'degraded',
           cancellationBlocked: true,
@@ -12854,6 +12880,15 @@ describe('FactoryLoop', () => {
       // the lifecycle and placements for successor adoption rather than
       // silently abandoning agents that were never released.
       expect(factory.status().inFlight).toHaveLength(1)
+      await vi.waitFor(async () => {
+        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity({
+          uuid: `AgentWorkforce/pear#${number}`,
+          key: String(number),
+          path,
+        }))
+        expect(lifecycle).toBeDefined()
+        expect(lifecycle?.dispatchClaim?.cancellationPending).toBeUndefined()
+      }, { timeout: 4_000 })
       if (!stopped) await factory.stop()
       await rm(root, { recursive: true, force: true })
     }
