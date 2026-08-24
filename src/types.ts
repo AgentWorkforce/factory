@@ -258,6 +258,22 @@ export interface FactoryReadinessReconcileStatus {
    * nobody yet.
    */
   candidates?: number
+  /**
+   * Tree reads the last enumerating sweep made, and how many were served empty
+   * (#351 follow-up).
+   *
+   * Read as a pair, against `candidates`. An empty read on its own is ordinary
+   * — a healthy sweep lists two path forms per repo and only one exists. The
+   * fault is `emptyTreeReads === treeReads` with `treeReads > 0`: the mount
+   * served nothing at all, which raises no timeout, no failure and no
+   * `lastError`, and is otherwise indistinguishable on a `healthy` surface from
+   * a workspace that simply has no ready work.
+   *
+   * Optional and never defaulted, like `candidates`: absent means no sweep has
+   * enumerated *or* the producer predates the fields.
+   */
+  treeReads?: number
+  emptyTreeReads?: number
   /** Work units the last enumerating sweep actually dispatched. */
   dispatched?: number
   /** Work units the last enumerating sweep saw and declined. */
@@ -707,6 +723,17 @@ export interface IterationReport {
    * sweep tried to build the context and could not.
    */
   orphanRecoveryDegraded?: 'dry-run' | 'context-unavailable'
+  /**
+   * Tree reads this sweep issued that the backend served, and how many of them
+   * came back with zero entries (#351 follow-up).
+   *
+   * The companion to the per-call timeout: a bounded read that hangs is loud, a
+   * bounded read served with nothing is not, and both end in a sweep that
+   * dispatches nothing. Meaningful only as a pair — an empty read is ordinary,
+   * `emptyTreeReads === treeReads` is the mount serving nothing at all.
+   */
+  treeReads?: number
+  emptyTreeReads?: number
   /** A cross-process owner was already enumerating this workspace. */
   discoveryDeferred?: 'sweep-in-flight'
   error?: { message: string; stack?: string }

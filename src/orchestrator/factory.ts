@@ -866,6 +866,9 @@ export class FactoryLoop implements Factory {
    */
   #readinessReconcileLastSweep?: {
     candidates: number
+    /** Served tree reads, and how many were empty. Held even at zero. */
+    treeReads: number
+    emptyTreeReads: number
     dispatched: number
     skipped: number
     skipReasons: Partial<Record<FactorySweepSkipReasonCode, number>>
@@ -1002,6 +1005,10 @@ export class FactoryLoop implements Factory {
   #discoveryOverloadError?: unknown
   /** Relayfile operations this sweep has been shed on. */
   #discoverySweepOverloads = 0
+  /** Tree reads this sweep issued that the backend served (#351 follow-up). */
+  #discoverySweepTreeReads = 0
+  /** How many of those were served with zero entries. */
+  #discoverySweepEmptyTreeReads = 0
   /**
    * The longest `Retry-After` any operation in this sweep advertised.
    *
@@ -2745,6 +2752,8 @@ export class FactoryLoop implements Factory {
     this.#discoverySweepLeaseLost = false
     this.#discoveryOverloadError = undefined
     this.#discoverySweepOverloads = 0
+    this.#discoverySweepTreeReads = 0
+    this.#discoverySweepEmptyTreeReads = 0
     this.#discoverySweepRetryAfterSeconds = undefined
     this.#discoverySweepProgress = false
     this.#startDiscoverySweepRenewal(claim.lease.epoch)
@@ -2828,6 +2837,8 @@ export class FactoryLoop implements Factory {
       this.#discoverySweepStartedAtMs = undefined
       this.#discoveryOverloadError = undefined
       this.#discoverySweepOverloads = 0
+      this.#discoverySweepTreeReads = 0
+      this.#discoverySweepEmptyTreeReads = 0
       this.#discoverySweepRetryAfterSeconds = undefined
       this.#discoverySweepProgress = false
       // This sweep is over either way (committed, deferred, or lease lost) —
@@ -3291,6 +3302,10 @@ export class FactoryLoop implements Factory {
         dispatched,
         skipped,
         dryRun,
+        // Read before `#runOnceWithDiscoveryFence`'s finally resets them: this
+        // is still inside that try, so the counts are this sweep's own.
+        treeReads: this.#discoverySweepTreeReads,
+        emptyTreeReads: this.#discoverySweepEmptyTreeReads,
         slackDegraded: this.#slackDegraded,
         ...(orphanRecoveryDegraded ? { orphanRecoveryDegraded } : {}),
       }
@@ -4373,6 +4388,27 @@ export class FactoryLoop implements Factory {
       )
       const elapsedMs = this.#elapsedSince(startedAtMs)
       const count = opts.count?.(result)
+      // #351 follow-up: tree reads the backend SERVED, and how many of them it
+      // answered with nothing.
+      //
+      // The per-call deadline made a hung dependency loud. This is its
+      // companion: a mount that starts returning empty trees instead of hanging
+      // raises no timeout, no failure and no `lastError`, and produces a sweep
+      // that completes `healthy` having dispatched nothing.
+      //
+      // BOTH numbers, because one is not a signal. A healthy sweep lists two
+      // path forms per repo and only one of them exists, so an empty read is
+      // ordinary and a bare count of them fires constantly. What separates the
+      // fault is the RATIO: `emptyTreeReads === treeReads` means the mount
+      // served nothing at all, which `candidates: 0` cannot distinguish from a
+      // workspace that simply has no ready work.
+      if (count !== undefined) {
+        this.#discoverySweepTreeReads += 1
+        if (count === 0) {
+          this.#increment('relayfileEmptyTreeReads')
+          this.#discoverySweepEmptyTreeReads += 1
+        }
+      }
       if (opts.logComplete) {
         this.#logger.info?.(`[factory] relayfile ${operation} completed`, {
           ...metadata,
@@ -5116,6 +5152,8 @@ export class FactoryLoop implements Factory {
     this.#readinessReconcileLastSweepDeferred = undefined
     this.#readinessReconcileLastSweep = {
       candidates: report.pulled.length,
+      treeReads: report.treeReads ?? 0,
+      emptyTreeReads: report.emptyTreeReads ?? 0,
       dispatched: report.dispatched.length,
       skipped: report.skipped.length,
       skipReasons: factorySweepSkipReasonCounts(report.skipped),
@@ -5213,6 +5251,13 @@ export class FactoryLoop implements Factory {
       ...(this.#readinessReconcileLastSweep
         ? {
             candidates: this.#readinessReconcileLastSweep.candidates,
+            // Unconditional for the same reason `dispatchFailures` is: these
+            // are only meaningful as a pair, and only a published zero lets a
+            // reader see that `emptyTreeReads < treeReads` — i.e. that the
+            // mount served real content and a zero `candidates` beside it means
+            // an empty workspace, not a silent mount (#351 follow-up).
+            treeReads: this.#readinessReconcileLastSweep.treeReads,
+            emptyTreeReads: this.#readinessReconcileLastSweep.emptyTreeReads,
             dispatched: this.#readinessReconcileLastSweep.dispatched,
             skipped: this.#readinessReconcileLastSweep.skipped,
             ...(Object.keys(this.#readinessReconcileLastSweep.skipReasons).length > 0

@@ -185,6 +185,17 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   not running the loop at all, or it predates #351 — on a current build a hung call fails within
   `relayfileOperationTimeoutMs`.
 
+- **`treeReads` / `emptyTreeReads`** — the case a timeout cannot catch. A mount that starts serving
+  *empty* trees instead of hanging raises no timeout, no failure and no `lastError`: the sweep
+  completes `healthy` and dispatches nothing, which on every other field is indistinguishable from a
+  workspace that simply has no ready work.
+
+  Read them as a pair, against `candidates`. An empty read on its own is ordinary — a healthy sweep
+  lists two path forms per repo and only one of them exists. The fault is
+  `emptyTreeReads === treeReads` with `treeReads > 0`: the mount served nothing at all. So
+  `candidates: 0, treeReads: 3, emptyTreeReads: 1` is an empty workspace, and
+  `candidates: 0, treeReads: 3, emptyTreeReads: 3` is a silent mount.
+
 ### Why `ok` stays `true` while `status` goes amber
 
 `/healthz` is the Cloudflare **Container ping endpoint** (`pingEndpoint = 'localhost/healthz'` in the
