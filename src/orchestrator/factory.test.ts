@@ -1245,6 +1245,34 @@ class BlockingDispatchLifecycleRunningStateStore extends FileStateStore {
   }
 }
 
+class BlockingPreFenceDispatchStateStore extends FileStateStore {
+  readonly preFenceStarted = Promise.withResolvers<void>()
+  readonly preFenceGate = Promise.withResolvers<void>()
+  #blocked = false
+
+  /**
+   * Parks the dispatch in `#ensureGithubAgentQuestionWatch`, which is the last
+   * await before the post-spawn fence is registered and is already past the
+   * `dispatching` lifecycle save. That is the only window in which shutdown can
+   * snapshot the fence maps without this dispatch in them, and the durable
+   * lease fence on that save has already been cleared.
+   */
+  override async listGithubIssueCommentWatches(
+    ...args: Parameters<FileStateStore['listGithubIssueCommentWatches']>
+  ): ReturnType<FileStateStore['listGithubIssueCommentWatches']> {
+    // Key on the caller, not a call count: `#rearmGithubIssueCommentWatchers`
+    // reads this same table at startup, and blocking that one parks the
+    // dispatch before its `dispatching` save — a window the durable lease
+    // fence already closes.
+    if (!this.#blocked && new Error().stack?.includes('ensureGithubAgentQuestionWatch')) {
+      this.#blocked = true
+      this.preFenceStarted.resolve()
+      await this.preFenceGate.promise
+    }
+    return await super.listGithubIssueCommentWatches(...args)
+  }
+}
+
 class RejectingPendingClaimFenceStateStore extends FileStateStore {
   override async saveDispatchLifecycle(
     ...args: Parameters<FileStateStore['saveDispatchLifecycle']>
@@ -1274,13 +1302,20 @@ class LeaseLostPendingClaimFenceStateStore extends FileStateStore {
     return await super.saveDispatchLifecycle(...args)
   }
 
-  /** Teardown only: hand the lease back so the wedged factory can shut down. */
-  async restoreLostLease(nowMs: number): Promise<void> {
+  /**
+   * Teardown only: hand the lease back so the wedged factory can shut down.
+   *
+   * Never throws. A body that failed before the fixture revoked anything has
+   * nothing to restore, and raising from `finally` would replace the assertion
+   * that actually failed (#346 review, cubic).
+   */
+  async restoreLostLease(nowMs: number): Promise<boolean> {
     const lost = this.#lostLease
-    if (!lost) throw new Error('the lease was never taken away')
+    if (!lost) return false
     const lifecycle = await this.getDispatchLifecycle(lost.workspaceId, lost.key)
-    if (!lifecycle) throw new Error('the dispatch lifecycle row disappeared')
+    if (!lifecycle) return false
     await this.claimDispatchLifecycle(lost.workspaceId, lost.key, lifecycle, lost.owner, nowMs, 60_000)
+    return true
   }
 }
 
@@ -12169,10 +12204,12 @@ describe('FactoryLoop', () => {
       // Teardown: give the lease back and stop refusing the fence so the
       // shutdown this test deliberately wedged can complete.
       stateStore.allowPendingFence = true
-      await stateStore.restoreLostLease(Date.now())
-      const teardownError = await factory.stop().then(() => undefined, (error: unknown) => error)
+      const teardownError = await (async () => {
+        await stateStore.restoreLostLease(Date.now())
+        await factory.stop()
+      })().then(() => undefined, (error: unknown) => error)
       await rm(root, { recursive: true, force: true })
-      // A teardown stop must never replace the assertion that actually failed.
+      // No teardown step may replace the assertion that actually failed.
       // Masking exactly like that is what made this suite's own CI failure
       // report the `finally` line instead of the assertion under test.
       if (bodyCompleted && teardownError) throw teardownError
@@ -12252,26 +12289,28 @@ describe('FactoryLoop', () => {
       // Teardown only: the successor's lease is what wedges this shutdown, so
       // hand the lifecycle back before the final stop.
       stateStore.allowPendingFence = true
-      const durable = await stateStore.getDispatchLifecycle('factory-test', lifecycleKey)
-      if (durable?.lease && stateStore.stolenFrom) {
-        await stateStore.releaseDispatchLifecycleLease(
-          'factory-test',
-          lifecycleKey,
-          durable.lease.owner,
-          durable.lease.epoch,
-        )
-        await stateStore.claimDispatchLifecycle(
-          'factory-test',
-          lifecycleKey,
-          durable,
-          stateStore.stolenFrom,
-          Date.now(),
-          60_000,
-        )
-      }
-      const teardownError = await factory.stop().then(() => undefined, (error: unknown) => error)
+      const teardownError = await (async () => {
+        const durable = await stateStore.getDispatchLifecycle('factory-test', lifecycleKey)
+        if (durable?.lease && stateStore.stolenFrom) {
+          await stateStore.releaseDispatchLifecycleLease(
+            'factory-test',
+            lifecycleKey,
+            durable.lease.owner,
+            durable.lease.epoch,
+          )
+          await stateStore.claimDispatchLifecycle(
+            'factory-test',
+            lifecycleKey,
+            durable,
+            stateStore.stolenFrom,
+            Date.now(),
+            60_000,
+          )
+        }
+        await factory.stop()
+      })().then(() => undefined, (error: unknown) => error)
       await rm(root, { recursive: true, force: true })
-      // A teardown stop must never replace the assertion that actually failed.
+      // No teardown step may replace the assertion that actually failed.
       if (bodyCompleted && teardownError) throw teardownError
     }
   }, 30_000)
@@ -12451,6 +12490,125 @@ describe('FactoryLoop', () => {
       stateStore.runningSaveGate.resolve()
       if (!stopped) await factory.stop()
       await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('refuses a provider claim armed after shutdown snapshotted the fence maps', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-claim-after-stop-snapshot-'))
+    const number = 1275
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    // Deliberately non-durable: a durable fleet is already fenced three times
+    // over before the claim boundary (the two `dispatching` saves and the
+    // per-agent save in `#spawnAgent`), because each rides the lifecycle lease
+    // shutdown relinquishes. A local fleet has no lease, so nothing but the
+    // guard under test stands between a post-snapshot dispatch and a provider
+    // claim.
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const stateStore = new BlockingPreFenceDispatchStateStore({
+      batchSize: 2,
+      watchStatePath: join(root, 'state.json'),
+    })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 60_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+      logger: { error: () => {}, warn: () => {} },
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let bodyCompleted = false
+    try {
+      await withDeadline(
+        stateStore.preFenceStarted.promise,
+        4_000,
+        'dispatch did not reach the pre-fence window',
+      )
+      // `stop()` sets `#stopping` and snapshots the post-spawn fence maps before
+      // its first await, so this dispatch is provably pre-fence when shutdown
+      // takes that snapshot — it will arm a fence nothing is left to settle.
+      const stopped = factory.stop().then(() => undefined, (error: unknown) => error)
+      stateStore.preFenceGate.resolve()
+      await withDeadline(run, 8_000, 'post-snapshot dispatch did not unwind')
+
+      // MUST-FIRE (#346 review, cubic): no provider claim is written against a
+      // fleet already disposed and leases already relinquished.
+      expect(githubWriteback.statuses).toEqual([])
+      expect(factory.status().counters.postSpawnDispatchClaimsRefusedDuringStop).toBe(1)
+      await withDeadline(stopped, 8_000, 'shutdown did not settle')
+      bodyCompleted = true
+    } finally {
+      stateStore.preFenceGate.resolve()
+      const teardownError = await factory.stop().then(() => undefined, (error: unknown) => error)
+      await rm(root, { recursive: true, force: true })
+      if (bodyCompleted && teardownError) throw teardownError
+    }
+  }, 30_000)
+
+  it('still claims the provider when the same dispatch resumes without a shutdown', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-claim-after-resume-'))
+    const number = 1276
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const stateStore = new BlockingPreFenceDispatchStateStore({
+      batchSize: 2,
+      watchStatePath: join(root, 'state.json'),
+    })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 60_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+      logger: { error: () => {}, warn: () => {} },
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let bodyCompleted = false
+    try {
+      await withDeadline(
+        stateStore.preFenceStarted.promise,
+        4_000,
+        'dispatch did not reach the pre-fence window',
+      )
+      // MUST-NOT-FIRE: the identical park-and-resume, with no shutdown in
+      // between, still reaches the claim boundary and claims normally.
+      stateStore.preFenceGate.resolve()
+      await withDeadline(run, 8_000, 'resumed dispatch did not complete')
+
+      expect(githubWriteback.statuses).toEqual([
+        { key: String(number), status: 'in-progress' },
+      ])
+      expect(factory.status().counters.postSpawnDispatchClaimsRefusedDuringStop).toBeUndefined()
+      bodyCompleted = true
+    } finally {
+      stateStore.preFenceGate.resolve()
+      const teardownError = await factory.stop().then(() => undefined, (error: unknown) => error)
+      await rm(root, { recursive: true, force: true })
+      if (bodyCompleted && teardownError) throw teardownError
     }
   }, 30_000)
 
@@ -12773,7 +12931,7 @@ describe('FactoryLoop', () => {
 
   it('does not retry a Linear dispatch comment after shutdown rejects its claim fence', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-linear-comment-retry-stop-'))
-    const number = 1264
+    const number = 1274
     const fleet = new LocalLifecycleFleetClient()
     const linear = new FailOnceDispatchCommentLinearWriteback()
     const clock = new BlockingDispatchWritebackRetryClock()

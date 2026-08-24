@@ -118,6 +118,27 @@ const issueFile = {
   },
 }
 
+/**
+ * Remote fleet whose implementer exit is emitted by the test, not by a timer.
+ *
+ * Kept separate from `CompletingRemoteFleetClient`: that one races completion
+ * against dispatch on a timer, while every user of this class drives the exit
+ * from a specific point in its own mount fixture. Collapsing the two behind a
+ * flag would put the timer in scope for tests whose whole point is that no
+ * timer decides the ordering (#346 review, cubic).
+ */
+class ControlledCompletingRemoteFleetClient extends FakeFleetClient {
+  override readonly placementLocality = 'remote' as const
+  implementerName?: string
+  exitEmitted = false
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    const result = await super.spawn(input)
+    if (input.name.includes('-impl-')) this.implementerName = input.name
+    return { ...result, node: 'sf-mini', locality: 'remote' }
+  }
+}
+
 class CompletingRemoteFleetClient extends FakeFleetClient {
   override readonly placementLocality = 'remote' as const
   readonly lifecycleOrder: string[] = []
@@ -2008,17 +2029,6 @@ describe('fleet CLI runtime', () => {
         }),
         closePullRequest: async () => undefined,
       }
-      class ControlledCompletingRemoteFleetClient extends FakeFleetClient {
-        override readonly placementLocality = 'remote' as const
-        implementerName?: string
-        exitEmitted = false
-
-        override async spawn(input: SpawnInput): Promise<SpawnResult> {
-          const result = await super.spawn(input)
-          if (input.name.includes('-impl-')) this.implementerName = input.name
-          return { ...result, node: 'sf-mini', locality: 'remote' }
-        }
-      }
       const fleet = new ControlledCompletingRemoteFleetClient()
       // `setState` writes `stateId` at the top level of the record; the initial
       // fixture carries it under `payload`. Read either.
@@ -2132,18 +2142,7 @@ describe('fleet CLI runtime', () => {
         }),
         closePullRequest: async () => undefined,
       }
-      class ControlledCompletingGithubFleetClient extends FakeFleetClient {
-        override readonly placementLocality = 'remote' as const
-        implementerName?: string
-        exitEmitted = false
-
-        override async spawn(input: SpawnInput): Promise<SpawnResult> {
-          const result = await super.spawn(input)
-          if (input.name.includes('-impl-')) this.implementerName = input.name
-          return { ...result, node: 'sf-mini', locality: 'remote' }
-        }
-      }
-      const fleet = new ControlledCompletingGithubFleetClient()
+      const fleet = new ControlledCompletingRemoteFleetClient()
       let thirdPartyParked = false
       let terminalLabelProvisioned = false
       let terminalViews = 0
@@ -2312,18 +2311,7 @@ describe('fleet CLI runtime', () => {
         }),
         closePullRequest: async () => undefined,
       }
-      class ControlledCompletingGithubFleetClient extends FakeFleetClient {
-        override readonly placementLocality = 'remote' as const
-        implementerName?: string
-        exitEmitted = false
-
-        override async spawn(input: SpawnInput): Promise<SpawnResult> {
-          const result = await super.spawn(input)
-          if (input.name.includes('-impl-')) this.implementerName = input.name
-          return { ...result, node: 'sf-mini', locality: 'remote' }
-        }
-      }
-      const fleet = new ControlledCompletingGithubFleetClient()
+      const fleet = new ControlledCompletingRemoteFleetClient()
       let thirdPartyClosed = false
 
       class ThirdPartyGithubCloseMount extends FakeMountClient {
@@ -2483,18 +2471,7 @@ describe('fleet CLI runtime', () => {
         },
       })
       const githubPath = '/github/repos/AgentWorkforce__pear/issues/by-id/48.json'
-      class CompletingDuringClaimFleetClient extends FakeFleetClient {
-        override readonly placementLocality = 'remote' as const
-        implementerName?: string
-        exitEmitted = false
-
-        override async spawn(input: SpawnInput): Promise<SpawnResult> {
-          const result = await super.spawn(input)
-          if (input.name.includes('-impl-')) this.implementerName = input.name
-          return { ...result, node: 'sf-mini', locality: 'remote' }
-        }
-      }
-      const fleet = new CompletingDuringClaimFleetClient()
+      const fleet = new ControlledCompletingRemoteFleetClient()
       let resolveCompletionRead!: () => void
       const completionRead = new Promise<void>((resolve) => {
         resolveCompletionRead = resolve

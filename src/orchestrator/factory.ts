@@ -5174,6 +5174,20 @@ export class FactoryLoop implements Factory {
           }
           // The claim is moot and would be wrong to write: it would drag an
           // issue our own lifecycle has already parked back to `implementing`.
+        } else if (this.#stopping) {
+          // Shutdown snapshots the post-spawn fence maps once and settles only
+          // what it finds there. A dispatch that armed its fence after that
+          // snapshot — it can still be inside the preview render, the
+          // `dispatching` save or the question-watch setup when `stop()`
+          // begins — would otherwise enter the claim boundary below against a
+          // fleet already being disposed and leases already relinquished,
+          // leaving a claimed issue with no lifecycle to recover it. Reject
+          // here instead. No claim has started, so there is nothing to
+          // compensate, and this stays synchronous so the completion-race
+          // invariant documented below is untouched (#346 review, cubic).
+          this.#increment('postSpawnDispatchClaimsRefusedDuringStop')
+          postSpawnDispatchClaimFence.settle(false)
+          throw new PostSpawnDispatchWaitRejectedError(dispatchDecision.issue.key)
         } else {
           // This assignment is synchronous with the preceding completion flag
           // check. Completion either arrived first (the branch above) or will
