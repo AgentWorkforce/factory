@@ -8,6 +8,7 @@ import {
 } from '../github/writeback-paths'
 import type {
   GithubConnectionIssueUpdateInput,
+  GithubIssueLookup,
   GithubConnectionMutationReceipt,
   GithubConnectionWrite,
   GithubPublishPullRequestInput,
@@ -49,6 +50,35 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     this.#receiptReadAttempts = positiveInteger(config.receiptReadAttempts) ?? RECEIPT_READ_ATTEMPTS
     this.#receiptReadDelayMs = nonNegativeInteger(config.receiptReadDelayMs) ?? RECEIPT_READ_DELAY_MS
     this.#operationIdFactory = config.operationIdFactory ?? randomUUID
+  }
+
+  async getIssue(repo: string, number: number): Promise<GithubIssueLookup> {
+    const { owner, repo: name } = githubRepoParts(repo)
+    assertPositiveGithubNumber(number, 'issue')
+    // Provider projections use the encoded owner__repo canonical tree, while
+    // connected write paths use the nested owner/repo tree. Accept both so the
+    // authenticated workspace connection remains authoritative across mount
+    // layouts and migrations.
+    const paths = [
+      `/github/repos/${encodeURIComponent(owner)}__${encodeURIComponent(name)}/issues/by-id/${number}.json`,
+      `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/issues/by-id/${number}.json`,
+    ]
+    for (const path of paths) {
+      try {
+        const { content } = await this.#mount.readFile(path)
+        return {
+          outcome: 'found',
+          issue: { repo: `${owner}/${name}`, number, path, content },
+        }
+      } catch {
+        // Try the alternate canonical layout. If neither is readable, absence
+        // and transient sync failure are intentionally indistinguishable.
+      }
+    }
+    return {
+      outcome: 'indeterminate',
+      reason: `connected GitHub projection did not expose ${owner}/${name}#${number}`,
+    }
   }
 
   async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {

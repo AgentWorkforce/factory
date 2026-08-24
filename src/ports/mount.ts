@@ -137,6 +137,8 @@ export interface FactoryIntegrationConnections {
  * writeback drafts interpreted by the server-side GitHub adapter.
  */
 export interface GithubConnectionWrite {
+  /** Authenticated issue read through the same connected GitHub App, when supported. */
+  getIssue?(repo: string, number: number): Promise<GithubIssueLookup>
   publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
   closePullRequest(input: { repo: string; number: number }): Promise<void>
   /** App-authored issue comment through the workspace GitHub connection. */

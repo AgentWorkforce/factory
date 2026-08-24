@@ -10503,6 +10503,28 @@ export class FactoryLoop implements Factory {
     // enter concurrently can release the same placements twice when provider
     // supersession becomes visible.
     this.#abandonedDispatchReasons.set(key, reason)
+    try {
+      await this.#abandonStuckDispatchFenced(record, reason, key)
+    } catch (error) {
+      // The early fence above suppresses the periodic held sweep. Any
+      // exceptional exit must therefore install the keyed retry before
+      // propagating, or one transient persistence/read failure becomes a
+      // permanent absorbing state.
+      this.#increment('abandonedDispatchReleaseRetries')
+      this.#logger.warn?.('[factory] abandoned dispatch cleanup failed before retry was armed', {
+        issue: record.issue.key,
+        error: describeError(error).errorMessage,
+      })
+      this.#scheduleAbandonedDispatchRetry(record, reason)
+      throw error
+    }
+  }
+
+  async #abandonStuckDispatchFenced(
+    record: InFlightIssue,
+    reason: string,
+    key: string,
+  ): Promise<void> {
     const claimFence = this.#postSpawnDispatchClaimFences.get(key)
     const rejectedClaimCompensation = claimFence?.claimStarted
       ? claimFence.rejectionSettled

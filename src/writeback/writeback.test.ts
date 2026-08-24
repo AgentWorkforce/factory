@@ -1100,6 +1100,35 @@ describe('AppGithubWriteback', () => {
     await expect(app.setStatus(appIssue, 'in-progress')).resolves.toBe('applied')
   })
 
+  it('prefers the connected App issue reader over an unauthenticated fallback', async () => {
+    const connectedGetIssue = vi.fn(async () => ({
+      outcome: 'found' as const,
+      issue: {
+        repo: 'AgentWorkforce/factory',
+        number: 221,
+        path: appIssue.path,
+        content: { payload: { labels: [{ name: 'factory:human-review' }] } },
+      },
+    }))
+    const fallbackGetIssue = vi.fn(async () => ({
+      outcome: 'indeterminate' as const,
+      reason: 'repository is private',
+    }))
+    const app = new AppGithubWriteback({
+      getIssue: connectedGetIssue,
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel: async () => undefined,
+      updateIssue: async () => undefined,
+    }, { getIssue: fallbackGetIssue })
+
+    await expect(app.getIssueStatus(appIssue)).resolves.toBe('human-review')
+    expect(connectedGetIssue).toHaveBeenCalledWith('AgentWorkforce/factory', 221)
+    expect(fallbackGetIssue).not.toHaveBeenCalled()
+  })
+
   it('refuses to roll back an App claim from acknowledgement alone', async () => {
     const mutateIssueLabel = vi.fn(async () => undefined)
     const getIssue = vi.fn<GithubConnectionRead['getIssue']>()

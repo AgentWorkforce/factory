@@ -1221,6 +1221,20 @@ class RejectingPendingClaimFenceStateStore extends FileStateStore {
   }
 }
 
+class ThrowOncePendingClaimFenceStateStore extends FileStateStore {
+  pendingFailures = 0
+
+  override async saveDispatchLifecycle(
+    ...args: Parameters<FileStateStore['saveDispatchLifecycle']>
+  ): Promise<boolean> {
+    if (args[5].dispatchClaim?.cancellationPending === true && this.pendingFailures === 0) {
+      this.pendingFailures += 1
+      throw new Error('transient cancellation fence persistence failure')
+    }
+    return await super.saveDispatchLifecycle(...args)
+  }
+}
+
 class BlockingDispatchClaimLinearWriteback implements LinearWriteback {
   readonly claimWriteStarted = Promise.withResolvers<void>()
   readonly claimWriteGate = Promise.withResolvers<void>()
@@ -11717,6 +11731,60 @@ describe('FactoryLoop', () => {
       await factory.stop()
       stopped = true
       expect(factory.status().counters.postSpawnWaitsSettledByStop).toBeUndefined()
+    } finally {
+      githubWriteback.claimWriteGate.resolve()
+      if (!stopped) await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('re-arms abandonment after an early cancellation-fence persistence failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-claim-retry-arm-'))
+    const number = 1270
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new RemoteLifecycleFleetClient()
+    const githubWriteback = new BlockingDispatchClaimGithubWriteback()
+    const stateStore = new ThrowOncePendingClaimFenceStateStore({
+      batchSize: 2,
+      watchStatePath: join(root, 'state.json'),
+    })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 1_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+      logger: { error: () => {}, warn: () => {} },
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let stopped = false
+    try {
+      await withDeadline(githubWriteback.claimWriteStarted.promise, 4_000, 'dispatch claim did not start')
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+      await vi.waitFor(() => expect(stateStore.pendingFailures).toBe(1), { timeout: 6_000 })
+      expect(fleet.releases).toEqual([])
+
+      githubWriteback.claimWriteGate.resolve()
+      await withDeadline(run, 8_000, 'dispatch did not settle after the persistence failure')
+      await vi.waitFor(() => expect(fleet.releases).toEqual([
+        { name: `ar-${number}-impl-pear`, reason: 'held-past-deadline' },
+        { name: `ar-${number}-review-pear`, reason: 'held-past-deadline' },
+      ]), { timeout: 5_000 })
+      expect(factory.status().inFlight).toEqual([])
+
+      await factory.stop()
+      stopped = true
     } finally {
       githubWriteback.claimWriteGate.resolve()
       if (!stopped) await factory.stop()

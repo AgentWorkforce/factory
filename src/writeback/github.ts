@@ -115,7 +115,12 @@ export class AppGithubWriteback implements GithubWriteback {
       )
     }
     this.#write = write as AppIssueConnectionWrite
-    this.#read = read
+    // Prefer the authenticated read carried by the connected App surface.
+    // The fallback reader may be deliberately unauthenticated and therefore
+    // cannot observe private repositories.
+    this.#read = write.getIssue
+      ? { getIssue: write.getIssue.bind(write) }
+      : read
   }
 
   async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {
