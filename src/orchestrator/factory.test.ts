@@ -12434,6 +12434,8 @@ describe('FactoryLoop', () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', number)
     const fleet = new LocalLifecycleFleetClient()
     const githubWriteback = new BlockingDispatchClaimGithubWriteback()
+    const registryPath = join(root, 'registry.json')
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
     const warnings: unknown[][] = []
     const factory = createFactory(config({
       issueSource: 'github',
@@ -12442,14 +12444,14 @@ describe('FactoryLoop', () => {
       dispatch: { agentHoldTimeoutMs: 60_000, agentlessHoldTimeoutMs: 60_000 },
       loop: {
         heartbeatPath: join(root, 'heartbeat.json'),
-        registryPath: join(root, 'registry.json'),
+        registryPath,
       },
     }), {
       mount: new FakeMountClient({
         [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
       }),
       fleet,
-      stateStore: new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+      stateStore,
       triage: new StaticTriage(),
       githubWriteback,
       logger: { warn: (...args: unknown[]) => warnings.push(args) },
@@ -12463,6 +12465,7 @@ describe('FactoryLoop', () => {
       stopped = true
 
       expect(factory.status().counters.postSpawnDispatchClaimDrainTimeouts).toBe(1)
+      expect(factory.status().counters.postSpawnDispatchClaimRecoveryRetentions).toBe(1)
       expect(warnings).toContainEqual([
         '[factory] rejected post-spawn dispatch compensation timed out; continuing shutdown',
         { dispatches: 1, timeoutMs: 2_500 },
@@ -12472,6 +12475,29 @@ describe('FactoryLoop', () => {
         expect.objectContaining({ uuid: `AgentWorkforce/pear#${number}` }),
       ])
       expect(fleet.releases).toEqual([])
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity({
+        uuid: `AgentWorkforce/pear#${number}`,
+        key: String(number),
+        path,
+      }))).resolves.toMatchObject({
+        phase: 'running',
+        dispatchClaim: {
+          state: 'degraded',
+          cancellationBlocked: true,
+          write: 'rejected dispatch claim rollback',
+          deadLettered: true,
+        },
+      })
+      expect((await readFactoryInFlightRegistry(registryPath))?.agents).toEqual([
+        expect.objectContaining({
+          name: `ar-${number}-impl-pear`,
+          dispatchClaim: expect.objectContaining({ cancellationBlocked: true }),
+        }),
+        expect.objectContaining({
+          name: `ar-${number}-review-pear`,
+          dispatchClaim: expect.objectContaining({ cancellationBlocked: true }),
+        }),
+      ])
     } finally {
       githubWriteback.claimWriteGate.resolve()
       await withDeadline(run, 8_000, 'timed-out dispatch did not unwind after its provider recovered')

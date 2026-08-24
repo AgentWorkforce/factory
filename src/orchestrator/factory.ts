@@ -1482,6 +1482,7 @@ export class FactoryLoop implements Factory {
       // A pre-claim spawn hang is deliberately absent from this set, so it
       // cannot hold shutdown open.
       await this.#drainRejectedClaimDispatchesForStop(rejectedClaimDispatches)
+      await this.#persistOutstandingClaimCancellationBlocks()
       // Relinquish durable ownership before waiting on mount-backed lifecycle
       // drives. A slow Relayfile scan must not consume the shutdown deadline
       // while every issue remains fenced to a publisher that is already
@@ -1637,6 +1638,25 @@ export class FactoryLoop implements Factory {
       dispatches: dispatches.size,
       timeoutMs: STOP_REJECTED_DISPATCH_DRAIN_TIMEOUT_MS,
     })
+  }
+
+  async #persistOutstandingClaimCancellationBlocks(): Promise<void> {
+    const batch = await this.#batch()
+    for (const record of batch.inFlight) {
+      const key = dispatchLifecycleKey(record.issue)
+      if (!this.#uncompensatedDispatchClaims.has(key) || record.dispatchClaim?.cancellationBlocked === true) {
+        continue
+      }
+      // The bounded durable drain expired before the provider operation could
+      // report whether rollback was safe. Persist the provisional release
+      // fence while this publisher still owns the lifecycle lease, so a
+      // successor cannot mistake the unresolved claim for abandonable work.
+      await this.#retainUncompensatedDispatchClaim(
+        record,
+        new Error('Rejected dispatch claim compensation did not settle before shutdown'),
+        { preferExistingError: true },
+      )
+    }
   }
 
   async #awaitRejectedClaimCompensation(settled: Promise<boolean>): Promise<boolean> {
