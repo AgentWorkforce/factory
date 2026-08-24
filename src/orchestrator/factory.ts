@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
@@ -647,6 +648,27 @@ const realClock: Clock = {
 export function createFactory(config: FactoryConfig, ports: FactoryPorts): Factory {
   return new FactoryLoop(FactoryConfigSchema.parse(config), ports)
 }
+
+/**
+ * The discovery pass a tree read was issued by, carried per async call (#363
+ * review, CodeRabbit).
+ *
+ * `#discoverySweepEpoch` says a sweep is in flight; it cannot say the read in
+ * hand belongs to it. In live mode an event drain reaches the very same
+ * enumeration helpers — `#handlePrChange` -> `#advanceMergedPrToDone` ->
+ * `#findMergeAdvanceIssueForPr` -> `#githubIssuePaths()` is the concrete path —
+ * so a drain's full-root walk would land in a concurrent sweep's ratio while
+ * measuring a different instant. That is enough to hide a mount that went
+ * silent mid-sweep.
+ *
+ * A drain does not inherit this store: its continuation begins at the
+ * subscription callback, outside the `run()` below. Threading an epoch argument
+ * through `#ingestGithubIssues` / `#handleGithubIssueChange` /
+ * `#findGithubIssueMirror` / `#loadLinearMirrorCandidates` would express the
+ * same fact and put a parameter on every hot path that must never be passed
+ * wrong.
+ */
+const discoveryEnumerationPass = new AsyncLocalStorage<{ epoch: number }>()
 
 export class FactoryLoop implements Factory {
   readonly #config: FactoryConfig
@@ -2987,12 +3009,19 @@ export class FactoryLoop implements Factory {
       this.#dependencyGithubPathsByIdentity = undefined
       this.#dependencyLinearTreeLoaded = false
       const issueSource = await this.#issueSource()
+      // The sweep's own discovery pass, and the only region whose full-root
+      // walks may enter the tree-read ratio (#363 review). Everything reached
+      // from here inherits the marker; a concurrently running drain does not.
+      const enumerate = <T>(fn: () => Promise<T>): Promise<T> =>
+        this.#discoverySweepEpoch === undefined
+          ? fn()
+          : discoveryEnumerationPass.run({ epoch: this.#discoverySweepEpoch }, fn)
       if (issueSource === 'linear') {
-        await this.#ingestGithubIssues({ dryRun })
+        await enumerate(() => this.#ingestGithubIssues({ dryRun }))
       } else {
         await this.#ensureGithubIngestionReady()
       }
-      const paths = await this.#readyIssuePaths()
+      const paths = await enumerate(() => this.#readyIssuePaths())
       const orphanRecovery = issueSource === 'github'
         ? await this.#githubOrphanRecoveryContext(dryRun)
         : undefined
@@ -4328,7 +4357,15 @@ export class FactoryLoop implements Factory {
     // keeps the numerator and denominator to the discovery pass; the epoch
     // check keeps a discovery walk issued outside any sweep — startup
     // backfill, most obviously — out of a sweep's totals.
-    if (opts.enumeration && this.#discoverySweepEpoch !== undefined) {
+    // `enumeration` says this is a full-root discovery walk rather than a point
+    // lookup; the context says THIS sweep's discovery pass is what issued it.
+    // Both, because either alone admits a read the ratio cannot use. Compared
+    // by value rather than presence: an absent store and an absent epoch are
+    // both `undefined` and must not read as a match.
+    const issuingPass = discoveryEnumerationPass.getStore()
+    if (opts.enumeration &&
+        issuingPass !== undefined &&
+        issuingPass.epoch === this.#discoverySweepEpoch) {
       this.#discoverySweepTreeReads += 1
       if (paths.length === 0) {
         this.#increment('relayfileEmptyTreeReads')

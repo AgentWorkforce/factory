@@ -258,9 +258,14 @@ const dispatchFailureReasonCounts = (
  *
  * `emptyTreeReads > treeReads` is arithmetically impossible and means the
  * producer is not one we understand; both numbers go rather than publishing a
- * ratio a reader would take at face value. Deliberately independent of the
- * `candidates` trio, for the same reason `dispatchFailures` is: a producer
- * that publishes the trio and has never heard of these must keep its trio.
+ * ratio a reader would take at face value.
+ *
+ * Independent of the `candidates` trio in the direction that matters, for the
+ * same reason `dispatchFailures` is: a producer that publishes the trio and has
+ * never heard of this pair keeps its trio. Not the other way round — a rejected
+ * trio takes the pair with it, at `sweepOutcome`'s early return, because the
+ * pair is only ever read against `candidates` and a ratio with nothing to
+ * compare it to is not the signal.
  */
 const treeReadOutcome = (
   status: { treeReads?: unknown; emptyTreeReads?: unknown },
