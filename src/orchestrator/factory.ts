@@ -157,6 +157,7 @@ import {
   factoryDispatchFailureReasonCounts,
 } from './dispatch-failure-reason'
 import type { FactoryDispatchFailureReasonCode } from './dispatch-failure-reason'
+import { isAgentAlreadyGoneOnRelease } from './release-error'
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
 import {
@@ -8618,17 +8619,41 @@ export class FactoryLoop implements Factory {
         }
         if (record) await this.#reportAgent(record, tracked, 'agent.released', { releaseReason: reason })
       } catch (error) {
-        failed.push(agentName)
-        this.#logger.warn?.(`[factory] failed to release ${agentName} during ${context}`, error)
-        if (record) {
-          const lifecycle = await this.#state
-            .getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
-            .catch(() => undefined)
-          if (lifecycle) {
-            await this.#reportLifecycle(lifecycle, 'factory.failure', {
-              level: 'error',
-              errorCode: 'release_failed',
-            })
+        if (isAgentAlreadyGoneOnRelease(error)) {
+          // Do the same bookkeeping the success path does — the agent IS
+          // gone. Skipping this would leave `batch.recordRelease` unset and
+          // the next retry attempt would think the invocation is still
+          // dispatchable.
+          this.#increment('releaseAgentAlreadyGone')
+          this.#logger.info?.(
+            `[factory] release skipped: agent already gone during ${context}`,
+            { agentName, reason },
+          )
+          if (record && batch && context !== 'stop') {
+            const releasedInvocationId = batch.recordRelease(record, agentName, this.#clock.now())
+            if (releasedInvocationId) {
+              this.#logger.debug?.('[factory] released agent invocation is no longer dispatchable', {
+                issue: record.issue.key,
+                agentName,
+                reason,
+                invocationId: releasedInvocationId,
+              })
+            }
+          }
+          if (record) await this.#reportAgent(record, tracked, 'agent.released', { releaseReason: reason })
+        } else {
+          failed.push(agentName)
+          this.#logger.warn?.(`[factory] failed to release ${agentName} during ${context}`, error)
+          if (record) {
+            const lifecycle = await this.#state
+              .getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
+              .catch(() => undefined)
+            if (lifecycle) {
+              await this.#reportLifecycle(lifecycle, 'factory.failure', {
+                level: 'error',
+                errorCode: 'release_failed',
+              })
+            }
           }
         }
       }
@@ -20579,6 +20604,7 @@ const isRegistrationLagInjectionError = (error: unknown): boolean => {
   return /agent_not_found|recipient unavailable|not registered|unknown recipient|no such (agent|recipient)|timed out waiting for delivery_injected/i
     .test(errorMessage)
 }
+
 
 const isDispatchDeliveryError = (error: unknown): boolean => {
   if (isRegistrationLagInjectionError(error)) return true
