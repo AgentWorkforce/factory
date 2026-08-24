@@ -321,9 +321,17 @@ export interface FactoryPublicReadinessReconcileHealth {
    */
   lastEnumeratedAtMs?: number
   /**
+   * A producer supplied some enumeration counts, but the trio was incomplete
+   * or invalid and was rejected during normalization. This is not equivalent
+   * to a genuine first-pass deferral with no enumeration evidence.
+   */
+  enumerationCountsInvalid?: true
+  /**
    * The most recent pass deferred to another process's discovery lease. Present
-   * alongside the counts it means they are from an earlier pass; present alone
-   * it means nothing has enumerated yet.
+   * alongside the counts it means they are from an earlier pass. Present alone
+   * means nothing has enumerated yet only when `enumerationCountsInvalid` is
+   * absent; otherwise a supplied snapshot was unusable and prior enumeration
+   * is unknown.
    */
   discoveryDeferred?: 'sweep-in-flight'
   lastErrorClass?: string

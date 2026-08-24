@@ -779,12 +779,40 @@ describe('sweep counters on the public surface (#355)', () => {
   // "candidates minus dispatched" arithmetic that the missing field makes
   // wrong, so the group travels whole or not at all.
   it('drops a partial trio rather than publishing a misleading fragment', () => {
+    expect(swept({ candidates: 4 })).toMatchObject({ enumerationCountsInvalid: true })
     expect(Object.hasOwn(swept({ candidates: 4 }) ?? {}, 'candidates')).toBe(false)
     expect(Object.hasOwn(swept({ candidates: 4, dispatched: 1 }) ?? {}, 'candidates')).toBe(false)
     expect(swept({ candidates: 4, dispatched: 1, skipped: 3 })).toMatchObject({
       candidates: 4,
       dispatched: 1,
       skipped: 3,
+    })
+  })
+
+  it('distinguishes a rejected deferred count snapshot from a genuine count-free deferral', () => {
+    const rejected = swept({
+      candidates: 4,
+      dispatched: 'invalid' as unknown as number,
+      discoveryDeferred: 'sweep-in-flight',
+    })
+    expect(rejected).toMatchObject({
+      discoveryDeferred: 'sweep-in-flight',
+      enumerationCountsInvalid: true,
+    })
+    expect(Object.hasOwn(rejected ?? {}, 'candidates')).toBe(false)
+
+    const normalizedAgain = normalizePublicHealth({
+      schemaVersion: 1,
+      ok: true,
+      status: 'ok',
+      stale: false,
+      loopStatus: 'running',
+      degradedSubsystems: [],
+      readinessReconcile: rejected,
+    })
+    expect(normalizedAgain?.readinessReconcile).toMatchObject({
+      discoveryDeferred: 'sweep-in-flight',
+      enumerationCountsInvalid: true,
     })
   })
 

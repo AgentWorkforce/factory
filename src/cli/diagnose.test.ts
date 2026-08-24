@@ -99,6 +99,22 @@ describe('formatSweepOutcome (#359)', () => {
     )
     expect(outcome).not.toContain('candidate(s)')
   })
+
+  it('renders a rejected count snapshot as unknown rather than never enumerated', () => {
+    const outcome = formatSweepOutcome({
+      state: 'healthy',
+      consecutiveFailures: 0,
+      failureThreshold: 3,
+      discoveryDeferred: 'sweep-in-flight',
+      enumerationCountsInvalid: true,
+    })
+
+    expect(outcome).toBe(
+      'not attributable (the report supplied an incomplete or invalid count snapshot; ' +
+      'whether an earlier pass enumerated is unknown)',
+    )
+    expect(outcome).not.toContain('nothing has enumerated successfully yet')
+  })
 })
 
 describe('factory diagnose --deployed (#295)', () => {

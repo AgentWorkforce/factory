@@ -342,6 +342,10 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
 export function formatSweepOutcome(
   readiness: FactoryPublicReadinessReconcileHealth | undefined,
 ): string {
+  if (readiness?.enumerationCountsInvalid) {
+    return 'not attributable (the report supplied an incomplete or invalid count snapshot; ' +
+      'whether an earlier pass enumerated is unknown)'
+  }
   if (!readiness || readiness.candidates === undefined) {
     // A deferred pass publishes the marker with no counts. It proves only why
     // the LATEST pass did not enumerate: an earlier startup attempt may have

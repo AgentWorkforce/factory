@@ -224,10 +224,12 @@ const sweepOutcome = (
     skipReasons?: unknown
     discoveryDeferred?: unknown
     lastEnumeratedAtMs?: unknown
+    enumerationCountsInvalid?: unknown
   },
 ): Partial<Pick<
   FactoryPublicReadinessReconcileHealth,
-  'candidates' | 'dispatched' | 'skipped' | 'skipReasons' | 'discoveryDeferred' | 'lastEnumeratedAtMs'
+  'candidates' | 'dispatched' | 'skipped' | 'skipReasons' | 'discoveryDeferred' | 'lastEnumeratedAtMs' |
+  'enumerationCountsInvalid'
 >> => {
   // Independent of the trio (#358 review, CodeRabbit): the counts describe the
   // last sweep that ENUMERATED, and this describes the most recent pass. A
@@ -240,13 +242,20 @@ const sweepOutcome = (
   const candidates = optionalCount('candidates', status.candidates)
   const dispatched = optionalCount('dispatched', status.dispatched)
   const skipped = optionalCount('skipped', status.skipped)
+  const suppliedCounts = status.enumerationCountsInvalid === true ||
+    status.candidates !== undefined ||
+    status.dispatched !== undefined ||
+    status.skipped !== undefined
   // A record carrying only some of the three is a producer we do not
   // understand; publishing the fragment would invite exactly the arithmetic
   // ("candidates minus dispatched") that the missing field makes wrong.
   if (candidates.candidates === undefined ||
       dispatched.dispatched === undefined ||
       skipped.skipped === undefined) {
-    return deferred
+    return {
+      ...deferred,
+      ...(suppliedCounts ? { enumerationCountsInvalid: true as const } : {}),
+    }
   }
   const skipReasons = skipReasonCounts(status.skipReasons)
   return {
