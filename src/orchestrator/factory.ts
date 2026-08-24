@@ -7684,6 +7684,17 @@ export class FactoryLoop implements Factory {
 
     record.dispatchClaim = {
       state: 'verified',
+      // Cancellation can still arrive after this returns — while the running
+      // lifecycle save, the dispatch hook or the Slack publication is pending.
+      // The rejection fence rebuilds the claim from this record, so a verified
+      // state that drops the claim-start stamp leaves `cancellationBlocked`
+      // with no watermark for `getIssueStatus(..., { requireFresh: true })`.
+      // A private repository has no unauthenticated fallback to fall back on,
+      // so that lifecycle, its agents and its batch slot would then be retained
+      // for good, even once a human superseded the claim (#346 review, codex).
+      ...(record.dispatchClaim?.claimStartedAtMs === undefined
+        ? {}
+        : { claimStartedAtMs: record.dispatchClaim.claimStartedAtMs }),
       updatedAtMs: this.#clock.now(),
     }
     this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)

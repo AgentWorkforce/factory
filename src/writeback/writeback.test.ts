@@ -114,6 +114,27 @@ describe('MountLinearWriteback', () => {
     await expect(linear.getIssueStateId(currentIssue)).resolves.toBe('human-review-state')
   })
 
+  it('refuses a name-only canonical state that disagrees with the issue projection', async () => {
+    // MUST-NOT-FIRE (#346 review, CodeRabbit): the name match IS the proof.
+    // A canonical record whose state name has moved on cannot lend its
+    // authority to the id the caller's state catalog resolved for a different
+    // name, so this must fail closed rather than reuse it.
+    const currentIssue: LinearIssue = {
+      ...issue,
+      stateId: 'human-review-state',
+      state: { name: 'In Human Review' },
+    }
+    const mount = new FakeMountClient({
+      [issuePath]: { payload: { stateId: 'ready-state' } },
+      [linearByIdPath(issueKey)]: wrappedIssueRecord({
+        stateId: undefined,
+        state: { name: 'Done' },
+      }),
+    })
+
+    await expect(MountLinearWriteback(mount).getIssueStateId(currentIssue)).resolves.toBeUndefined()
+  })
+
   it('fails closed when only a sparse Linear state alias is readable', async () => {
     const mount = new FakeMountClient({
       [issuePath]: { payload: { stateId: 'human-review-state' } },
@@ -1211,6 +1232,116 @@ describe('AppGithubWriteback', () => {
     }
     await expect(app.getIssueStatus(privateIssue, opts)).resolves.toBe('human-review')
     expect(fallbackGetIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('refuses a ready projection whose only evidence is the generic issue timestamp', async () => {
+    // MUST-NOT-FIRE (#346 review, codex): `updated_at` moves for an unrelated
+    // description or assignee edit, so a `ready` projection newer than the
+    // local claim-start instant is NOT proof the claim mutation has landed —
+    // it is equally what "the claim write has not reached this projection yet"
+    // looks like. Releasing on it strands the issue with no lifecycle once the
+    // real `factory:in-progress` projection arrives.
+    const content: unknown = {
+      payload: {
+        updated_at: '2026-08-24T06:00:00.000Z',
+        labels: [{ name: 'factory' }],
+      },
+    }
+    const connectedGetIssue = vi.fn(async () => ({
+      outcome: 'found' as const,
+      issue: { repo: 'PrivateOrg/private-repo', number: 221, path: appIssue.path, content },
+    }))
+    const fallbackGetIssue = vi.fn(async () => ({
+      outcome: 'indeterminate' as const,
+      reason: 'repository is private',
+    }))
+    const app = new AppGithubWriteback({
+      getIssue: connectedGetIssue,
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel: async () => undefined,
+      updateIssue: async () => undefined,
+    }, { getIssue: fallbackGetIssue })
+    const privateIssue: LinearIssue = {
+      ...appIssue,
+      path: '/github/repos/PrivateOrg/private-repo/issues/by-id/221.json',
+      raw: {
+        payload: {
+          source: {
+            provider: 'github',
+            id: 'github-221',
+            owner: 'PrivateOrg',
+            repo: 'private-repo',
+            number: 221,
+            url: 'https://github.com/PrivateOrg/private-repo/issues/221',
+          },
+        },
+      },
+    }
+
+    await expect(app.getIssueStatus(privateIssue, {
+      requireFresh: true,
+      freshAfterMs: Date.parse('2026-08-24T05:30:00.000Z'),
+    })).resolves.toBeUndefined()
+    expect(fallbackGetIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('accepts a ready projection newer than one observed carrying the claim', async () => {
+    // MUST-FIRE: once this adapter has seen the projection actually carrying
+    // the claim, a strictly newer projection without it is causally after the
+    // claim mutation, so supersession is proven and the block may clear.
+    let content: unknown = {
+      payload: {
+        updated_at: '2026-08-24T05:45:00.000Z',
+        labels: [{ name: 'factory' }, { name: 'factory:in-progress' }],
+      },
+    }
+    const connectedGetIssue = vi.fn(async () => ({
+      outcome: 'found' as const,
+      issue: { repo: 'PrivateOrg/private-repo', number: 221, path: appIssue.path, content },
+    }))
+    const fallbackGetIssue = vi.fn(async () => ({
+      outcome: 'indeterminate' as const,
+      reason: 'repository is private',
+    }))
+    const app = new AppGithubWriteback({
+      getIssue: connectedGetIssue,
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel: async () => undefined,
+      updateIssue: async () => undefined,
+    }, { getIssue: fallbackGetIssue })
+    const privateIssue: LinearIssue = {
+      ...appIssue,
+      path: '/github/repos/PrivateOrg/private-repo/issues/by-id/221.json',
+      raw: {
+        payload: {
+          source: {
+            provider: 'github',
+            id: 'github-221',
+            owner: 'PrivateOrg',
+            repo: 'private-repo',
+            number: 221,
+            url: 'https://github.com/PrivateOrg/private-repo/issues/221',
+          },
+        },
+      },
+    }
+    const opts = { requireFresh: true, freshAfterMs: Date.parse('2026-08-24T05:30:00.000Z') }
+
+    await expect(app.getIssueStatus(privateIssue, opts)).resolves.toBe('in-progress')
+    content = {
+      payload: {
+        updated_at: '2026-08-24T06:00:00.000Z',
+        labels: [{ name: 'factory' }],
+      },
+    }
+    await expect(app.getIssueStatus(privateIssue, opts)).resolves.toBe('ready')
+    expect(fallbackGetIssue).not.toHaveBeenCalled()
   })
 
   it('refuses to roll back an App claim from acknowledgement alone', async () => {

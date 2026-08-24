@@ -108,6 +108,13 @@ export class AppGithubWriteback implements GithubWriteback {
   readonly #write: AppIssueConnectionWrite
   readonly #connectedRead?: GithubConnectionRead
   readonly #fallbackRead?: GithubConnectionRead
+  /**
+   * Newest connected projection this adapter has observed actually carrying a
+   * Factory claim, per issue. GitHub label mutations expose no immutable event
+   * identity (see `claimStatus`), so a projection that shows the claim is the
+   * only mutation-relative anchor this surface can produce.
+   */
+  readonly #claimProjections = new Map<string, number>()
 
   constructor(write: GithubConnectionWrite, read?: GithubConnectionRead) {
     if (!write.postIssueComment || !write.ensureRepositoryLabel || !write.mutateIssueLabel || !write.updateIssue) {
@@ -150,20 +157,57 @@ export class AppGithubWriteback implements GithubWriteback {
       if (connected.outcome === 'found') {
         const status = githubStatusFromLabels(githubLabelsFromContent(connected.issue.content))
         const updatedAtMs = githubIssueUpdatedAtMs(connected.issue.content)
-        if (
-          status === 'in-progress' ||
-          !opts.requireFresh ||
-          (opts.freshAfterMs !== undefined && updatedAtMs !== undefined && updatedAtMs > opts.freshAfterMs)
-        ) return status
-        // The canonical projection is readable but predates the ambiguous
-        // mutation. A public direct read can still supply a live provider
-        // observation; a private repository fails closed below.
+        const projection = `${ref.repo}#${ref.number}`
+        if (status === 'in-progress') {
+          this.#anchorClaimProjection(projection, updatedAtMs)
+          return status
+        }
+        if (!opts.requireFresh || this.#postdatesClaimMutation(projection, status, updatedAtMs, opts.freshAfterMs)) {
+          return status
+        }
+        // The canonical projection is readable but cannot be shown to postdate
+        // the ambiguous mutation. A public direct read can still supply a live
+        // provider observation; a private repository fails closed below.
       }
     }
     if (!this.#fallbackRead) return undefined
     const fallback = await this.#fallbackRead.getIssue(ref.repo, ref.number)
     if (fallback.outcome !== 'found') return undefined
     return githubStatusFromLabels(githubLabelsFromContent(fallback.issue.content))
+  }
+
+  #anchorClaimProjection(projection: string, updatedAtMs: number | undefined): void {
+    if (updatedAtMs === undefined) return
+    const anchored = this.#claimProjections.get(projection)
+    if (anchored === undefined || updatedAtMs > anchored) this.#claimProjections.set(projection, updatedAtMs)
+  }
+
+  /**
+   * Whether a non-in-progress connected projection can be trusted to postdate
+   * an ambiguous claim mutation.
+   *
+   * The issue's generic `updated_at` is not causal evidence by itself: an
+   * unrelated description or assignee edit bumps it after the claim request
+   * starts but before the acknowledged label write reaches the projection, so a
+   * timestamp merely newer than the local claim-start instant says nothing
+   * about the claim. `ready` is exactly what BOTH "the claim has not landed in
+   * this projection yet" and "the claim was removed after it did" look like, so
+   * it counts only when it is strictly newer than a projection this adapter saw
+   * carrying the claim. Any other Factory status label is positive evidence of
+   * a later lifecycle decision on its own — no incidental edit produces one
+   * (#346 review, codex).
+   */
+  #postdatesClaimMutation(
+    projection: string,
+    status: GithubIssueStatus,
+    updatedAtMs: number | undefined,
+    freshAfterMs: number | undefined,
+  ): boolean {
+    if (updatedAtMs === undefined) return false
+    if (freshAfterMs !== undefined && updatedAtMs <= freshAfterMs) return false
+    const anchored = this.#claimProjections.get(projection)
+    if (anchored !== undefined && updatedAtMs > anchored) return true
+    return status !== 'ready' && freshAfterMs !== undefined
   }
 
   async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult> {

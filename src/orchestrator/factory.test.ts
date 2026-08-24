@@ -532,7 +532,10 @@ class RecordingGithubWriteback implements GithubWriteback {
   readonly statuses: Array<{ key: string; status: GithubIssueStatus }> = []
   readonly closes: Array<{ key: string; body: string }> = []
 
-  async getIssueStatus(issue: LinearIssue): Promise<GithubIssueStatus> {
+  async getIssueStatus(
+    issue: LinearIssue,
+    _opts?: { requireFresh?: boolean; freshAfterMs?: number },
+  ): Promise<GithubIssueStatus> {
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()))
     if (labels.has('factory:human-review')) return 'human-review'
     if (labels.has('factory:in-progress')) return 'in-progress'
@@ -1064,7 +1067,10 @@ class BlockingDispatchClaimGithubWriteback extends RecordingGithubWriteback {
   #currentClaimToken: string | undefined
   #claimSequence = 0
 
-  override async getIssueStatus(): Promise<GithubIssueStatus> {
+  override async getIssueStatus(
+    _issue?: LinearIssue,
+    _opts?: { requireFresh?: boolean; freshAfterMs?: number },
+  ): Promise<GithubIssueStatus> {
     return this.#currentStatus
   }
 
@@ -1166,6 +1172,24 @@ class UnprovenRollbackDispatchClaimGithubWriteback extends RejectingBlockingDisp
   ): Promise<GithubIssueStatus> {
     this.statusReadOptions.push(opts ?? {})
     return await super.getIssueStatus(issue)
+  }
+
+  override async rollbackStatusClaim(): Promise<'unproven'> {
+    this.rollbackAttempts += 1
+    return 'unproven'
+  }
+}
+
+class UnprovenRollbackAfterVerifiedGithubWriteback extends BlockingDispatchClaimGithubWriteback {
+  rollbackAttempts = 0
+  readonly statusReadOptions: Array<{ requireFresh?: boolean; freshAfterMs?: number }> = []
+
+  override async getIssueStatus(
+    issue: LinearIssue,
+    opts?: { requireFresh?: boolean; freshAfterMs?: number },
+  ): Promise<GithubIssueStatus> {
+    this.statusReadOptions.push(opts ?? {})
+    return await super.getIssueStatus()
   }
 
   override async rollbackStatusClaim(): Promise<'unproven'> {
@@ -1316,7 +1340,7 @@ class BlockingDispatchClaimLinearWriteback implements LinearWriteback {
   #blocked = false
   #currentStateId = ready
 
-  async getIssueStateId(): Promise<string | undefined> {
+  async getIssueStateId(_issue?: LinearIssue): Promise<string | undefined> {
     return this.#currentStateId
   }
 
@@ -1341,7 +1365,7 @@ class BlockingDispatchClaimLinearWriteback implements LinearWriteback {
     expectedStateId: string,
     claimToken: string,
     stateId: string,
-  ): Promise<'applied' | 'superseded'> {
+  ): Promise<'applied' | 'superseded' | 'unproven'> {
     if (claimToken !== `linear-claim-${this.states.length}`) return 'superseded'
     if (this.#currentStateId !== expectedStateId) return 'superseded'
     await this.setState(issue, stateId)
@@ -12422,6 +12446,80 @@ describe('FactoryLoop', () => {
 
       await factory.stop()
       stopped = true
+    } finally {
+      githubWriteback.claimWriteGate.resolve()
+      stateStore.runningSaveGate.resolve()
+      if (!stopped) await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('keeps the claim-start watermark on a fence raised after the claim verified', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-verified-claim-watermark-'))
+    const number = 1273
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new RemoteLifecycleFleetClient()
+    const githubWriteback = new UnprovenRollbackAfterVerifiedGithubWriteback()
+    const stateStore = new BlockingDispatchLifecycleRunningStateStore({
+      batchSize: 2,
+      watchStatePath: join(root, 'state.json'),
+    })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 1_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+      logger: { error: () => {}, warn: () => {} },
+    })
+    githubWriteback.claimWriteGate.resolve()
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let stopped = false
+    try {
+      // Block on the running lifecycle save, which is the first await AFTER
+      // `#applyDispatchClaim` has returned and stamped `state: 'verified'`.
+      await withDeadline(stateStore.runningSaveStarted.promise, 4_000, 'running lifecycle save did not start')
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+      await vi.waitFor(() => expect(factory.status().counters.postSpawnWaitsSettledByAbandonment)
+        .toBe(1), { timeout: 8_000 })
+      stateStore.runningSaveGate.resolve()
+      await withDeadline(run, 8_000, 'late running lifecycle save did not unwind the verified claim')
+      expect(githubWriteback.rollbackAttempts).toBeGreaterThanOrEqual(1)
+
+      // MUST-FIRE (#346 review, codex): the fence is raised from the verified
+      // claim, so the verified state has to carry the claim-start stamp
+      // forward. Without it the retained block has no watermark at all.
+      const lifecycles = await stateStore.listDispatchLifecycles('factory-test')
+      expect(lifecycles).toHaveLength(1)
+      expect(lifecycles[0]![1]).toMatchObject({
+        dispatchClaim: {
+          cancellationBlocked: true,
+          claimStartedAtMs: expect.any(Number),
+        },
+      })
+
+      // MUST-NOT-FIRE: the supersession probe must never be issued without a
+      // watermark. `getIssueStatus(..., { requireFresh: true })` cannot accept
+      // any non-in-progress connected projection when `freshAfterMs` is
+      // undefined, and a private repository has no unauthenticated fallback —
+      // so such a probe retains the lifecycle, its agents and its batch slot
+      // for good.
+      await vi.waitFor(() => expect(githubWriteback.statusReadOptions
+        .some((opts) => opts.requireFresh === true)).toBe(true), { timeout: 8_000 })
+      expect(githubWriteback.statusReadOptions
+        .filter((opts) => opts.requireFresh === true)
+        .every((opts) => typeof opts.freshAfterMs === 'number')).toBe(true)
     } finally {
       githubWriteback.claimWriteGate.resolve()
       stateStore.runningSaveGate.resolve()
