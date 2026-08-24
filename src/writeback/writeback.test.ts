@@ -978,7 +978,7 @@ describe('AppGithubWriteback', () => {
     },
   }
 
-  it('delegates PRs and lifecycle writes to the app connection without exposing read methods', async () => {
+  it('delegates PRs and lifecycle writes to the app connection and fails closed without a reader', async () => {
     const publishPullRequest: GithubConnectionWrite['publishPullRequest'] = vi.fn(async (input) => ({
       repo: input.repo,
       number: 322,
@@ -1046,7 +1046,7 @@ describe('AppGithubWriteback', () => {
     })
     const writeback: GithubWriteback = app
     expect(writeback.getIssueAuthor).toBeUndefined()
-    expect(writeback.getIssueStatus).toBeUndefined()
+    await expect(writeback.getIssueStatus?.(appIssue)).resolves.toBeUndefined()
     expect(writeback.hasCommentMarker).toBeUndefined()
   })
 
@@ -1115,6 +1115,7 @@ describe('AppGithubWriteback', () => {
 
     await expect(app.rollbackStatusClaim(appIssue, 'in-progress', 'provider-event-1'))
       .resolves.toBe('unproven')
+    await expect(app.getIssueStatus(appIssue)).resolves.toBe('in-progress')
     expect(mutateIssueLabel).not.toHaveBeenCalled()
   })
 
@@ -1147,6 +1148,7 @@ describe('AppGithubWriteback', () => {
 
     await expect(app.rollbackStatusClaim(appIssue, 'in-progress', 'provider-event-1'))
       .resolves.toBe('unproven')
+    await expect(app.getIssueStatus(appIssue)).resolves.toBe('human-review')
     expect(mutateIssueLabel).not.toHaveBeenCalled()
   })
 })

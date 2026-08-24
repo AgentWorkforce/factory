@@ -132,6 +132,14 @@ export class AppGithubWriteback implements GithubWriteback {
     })
   }
 
+  async getIssueStatus(issue: LinearIssue): Promise<GithubIssueStatus | undefined> {
+    if (!this.#read) return undefined
+    const ref = githubIssueRef(issue)
+    const lookup = await this.#read.getIssue(ref.repo, ref.number)
+    if (lookup.outcome !== 'found') return undefined
+    return githubStatusFromLabels(githubLabelsFromContent(lookup.issue.content))
+  }
+
   async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult> {
     const ref = githubIssueRef(issue)
     if (status === 'ready') {

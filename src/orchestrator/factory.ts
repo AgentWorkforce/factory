@@ -10472,6 +10472,11 @@ export class FactoryLoop implements Factory {
   // record leaves the batch.
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
     const key = dispatchLifecycleKey(record.issue)
+    // Fence the periodic held sweep before any await below. A blocked claim is
+    // retried by the single keyed abandonment timer; letting the held sweep
+    // enter concurrently can release the same placements twice when provider
+    // supersession becomes visible.
+    this.#abandonedDispatchReasons.set(key, reason)
     const claimFence = this.#postSpawnDispatchClaimFences.get(key)
     const rejectedClaimCompensation = claimFence?.claimStarted
       ? claimFence.rejectionSettled
@@ -10499,7 +10504,6 @@ export class FactoryLoop implements Factory {
     }
     const heldPastDeadline = reason === HELD_PAST_DEADLINE_RELEASE_REASON
     const agentReleaseReason = heldPastDeadline ? HELD_PAST_DEADLINE_RELEASE_REASON : 'issue-abandoned'
-    this.#abandonedDispatchReasons.set(key, reason)
     if (!await this.#saveDispatchLifecycle(
       record,
       'abandoning',

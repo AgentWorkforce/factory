@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import type { BrokerEvent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
 import {
+  AppGithubWriteback,
   FactoryConfigSchema,
   checkFactoryLoopLiveness,
   closeProbePr,
@@ -11827,6 +11828,106 @@ describe('FactoryLoop', () => {
     } finally {
       githubWriteback.claimWriteGate.resolve()
       githubWriteback.commentWriteGate.resolve()
+      if (!stopped) await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('recovers an App-backed cancellation block after provider status supersession', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-app-status-recovery-'))
+    const number = 1268
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const commentWriteStarted = Promise.withResolvers<void>()
+    const commentWriteGate = Promise.withResolvers<void>()
+    let providerStatus: GithubIssueStatus = 'ready'
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => {
+        commentWriteStarted.resolve()
+        await commentWriteGate.promise
+      },
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel: async ({ operation, label }) => {
+        if (operation === 'add' && label === 'factory:in-progress') providerStatus = 'in-progress'
+        if (operation === 'add' && label === 'factory:human-review') providerStatus = 'human-review'
+        return operation === 'add' ? 'applied' : 'already-matched'
+      },
+      updateIssue: async () => undefined,
+    }
+    const githubRead: GithubConnectionRead = {
+      getIssue: async () => ({
+        outcome: 'found',
+        issue: {
+          repo: 'AgentWorkforce/pear',
+          number,
+          path,
+          content: {
+            payload: {
+              labels: providerStatus === 'ready'
+                ? [{ name: 'factory' }]
+                : [{ name: 'factory' }, { name: `factory:${providerStatus}` }],
+            },
+          },
+        },
+      }),
+    }
+    const factory = createFactory(config({
+      issueSource: 'github',
+      github: { identity: 'app' },
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 1_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new AppGithubWriteback(githubWrite, githubRead),
+      logger: { error: () => {}, warn: () => {} },
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let stopped = false
+    try {
+      await withDeadline(commentWriteStarted.promise, 4_000, 'App dispatch comment did not start')
+      expect(providerStatus).toBe('in-progress')
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+      await vi.waitFor(() => expect(factory.status().counters.postSpawnWaitsSettledByAbandonment)
+        .toBe(1), { timeout: 8_000 })
+
+      commentWriteGate.resolve()
+      await withDeadline(run, 8_000, 'App-backed cancellation did not unwind dispatch')
+      expect(factory.status().counters.postSpawnDispatchClaimCompensationFailures).toBe(1)
+      expect(factory.status().counters.postSpawnDispatchClaimRecoveryRetentions).toBe(1)
+      expect(factory.status().inFlight).toHaveLength(1)
+      expect(fleet.releases).toEqual([])
+
+      providerStatus = 'human-review'
+      await vi.waitFor(() => expect(fleet.releases).toEqual([
+        { name: `ar-${number}-impl-pear`, reason: 'held-past-deadline' },
+        { name: `ar-${number}-review-pear`, reason: 'held-past-deadline' },
+      ]), { timeout: 5_000 })
+      await vi.waitFor(async () => expect(await stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity({ uuid: `AgentWorkforce/pear#${number}`, key: String(number), path }),
+      )).toMatchObject({
+        phase: 'abandoned',
+        dispatchClaim: expect.not.objectContaining({ cancellationBlocked: true }),
+      }), { timeout: 4_000 })
+      expect(factory.status().inFlight).toEqual([])
+
+      await factory.stop()
+      stopped = true
+    } finally {
+      commentWriteGate.resolve()
       if (!stopped) await factory.stop()
       await rm(root, { recursive: true, force: true })
     }
