@@ -351,6 +351,14 @@ export function formatSweepOutcome(
         'to another process holding the discovery lease'
       : 'not reported (no sweep has enumerated, or this instance predates the counters)'
   }
+  if (readiness.discoveryDeferred && readiness.lastEnumeratedAtMs === undefined) {
+    // The immediately preceding producer overwrote its trio with zeroes on a
+    // deferral and had no enumeration timestamp. Those values cannot be
+    // attributed to a real provider read, so label the record as legacy/unknown
+    // instead of presenting it under "Last enumerating sweep" (#359 review).
+    return 'not attributable (legacy deferred report has counts without an enumeration timestamp; ' +
+      'the most recent pass deferred to another process holding the discovery lease)'
+  }
   return `${readiness.candidates} candidate(s), ${readiness.dispatched ?? 0} dispatched, ` +
     `${readiness.skipped ?? 0} skipped` +
     (readiness.discoveryDeferred

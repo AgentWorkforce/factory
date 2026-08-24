@@ -124,7 +124,9 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   - **with the counts** — those numbers are from an *earlier* pass, not the one `lastCompletedAtMs`
     dates. A deferred pass records only this marker; its zeroes measure nothing and must not
     overwrite a real sweep's numbers, which under a persistently-held lease would erase them.
-  - **alone, with no counts** — nothing has enumerated yet on this daemon, and a held lease is why.
+  - **alone, with no counts** — nothing has enumerated successfully yet on this daemon. The most
+    recent pass deferred because another process held the lease; an earlier startup attempt may
+    instead have failed before it could publish an outcome.
 
   `lastCompletedAtMs` *does* move for a deferred pass. That is deliberate: the stall derivation above
   reads it against `lastStartedAtMs`, so freezing it would report a daemon that is correctly

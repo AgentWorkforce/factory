@@ -82,22 +82,22 @@ describe('formatSweepOutcome (#359)', () => {
     expect(outcome).not.toContain('every pass')
   })
 
-  it('omits the measurement clause when an older daemon has counts but no enumeration stamp', () => {
+  it('does not present an older daemon\'s unstamped deferred zeroes as a measurement', () => {
     const outcome = formatSweepOutcome({
       state: 'healthy',
       consecutiveFailures: 0,
       failureThreshold: 3,
-      candidates: 2,
-      dispatched: 1,
-      skipped: 1,
+      candidates: 0,
+      dispatched: 0,
+      skipped: 0,
       discoveryDeferred: 'sweep-in-flight',
     })
 
     expect(outcome).toBe(
-      '2 candidate(s), 1 dispatched, 1 skipped — the most recent pass deferred ' +
-      'to another process holding the discovery lease and enumerated nothing',
+      'not attributable (legacy deferred report has counts without an enumeration timestamp; ' +
+      'the most recent pass deferred to another process holding the discovery lease)',
     )
-    expect(outcome).not.toContain('measured —')
+    expect(outcome).not.toContain('candidate(s)')
   })
 })
 
