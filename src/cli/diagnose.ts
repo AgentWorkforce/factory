@@ -24,6 +24,7 @@ export interface DeployedEvidenceSummary {
   reason?: string
   phase?: string
   lastError?: string
+  fleetConnectLastError?: string
   consecutiveFailures?: number
 }
 
@@ -445,11 +446,15 @@ async function readEvidence(
     }
     const body = asRecord(evidence.body)
     const readiness = asRecord(body.readinessReconcile)
+    const fleetConnect = asRecord(body.fleetConnect)
     return {
       fetched: true,
       httpStatus: evidence.status,
       ...(asText(body.phase) ? { phase: asText(body.phase) } : {}),
       ...(asText(readiness.lastError) ? { lastError: asText(readiness.lastError) } : {}),
+      ...(asText(fleetConnect.lastError)
+        ? { fleetConnectLastError: asText(fleetConnect.lastError) }
+        : {}),
       ...(asCount(readiness.consecutiveFailures) !== undefined
         ? { consecutiveFailures: asCount(readiness.consecutiveFailures) }
         : {}),
@@ -527,6 +532,9 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
     if (fleetConnect) {
       lines.push('  fleetConnect:')
       lines.push(`    state              : ${fleetConnect.state}`)
+      if (fleetConnect.state === 'dialed') {
+        lines.push('    confirmation       : unconfirmed — the SDK accepted connect(), but no stream event has been observed; a healthy silent workspace may remain dialed')
+      }
       lines.push(`    attempts           : ${fleetConnect.attempts ?? '—'}`)
       lines.push(`    lastAttemptAt      : ${formatInstant(fleetConnect.lastAttemptAtMs)}`)
       lines.push(`    lastDialedAt       : ${formatInstant(fleetConnect.lastDialedAtMs)}`)
@@ -558,6 +566,9 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
       `  evidence             : ${evidence.fetched ? `read (HTTP ${evidence.httpStatus ?? 200})` : `not read — ${evidence.reason ?? 'unavailable'}`}`,
     )
     if (evidence.lastError) lines.push(`    lastError          : ${evidence.lastError}`)
+    if (evidence.fleetConnectLastError) {
+      lines.push(`    fleetConnect error : ${evidence.fleetConnectLastError}`)
+    }
   }
 
   lines.push('')

@@ -187,8 +187,10 @@ export interface FactoryLoopHeartbeat {
   /** Daemon-owned dispatch admission state; status readers must prefer this over a fresh local Factory instance. */
   fleetControlPlane?: FleetControlPlaneStatus
   /**
-   * Whether the fleet EVENT SOCKET is connected -- the dial that makes this
-   * Factory's agent `online`. Absent when the backend has no socket.
+   * State of the fleet EVENT SOCKET dial that makes this Factory agent
+   * `online`. Absent when the backend has no socket. `dialed` is unconfirmed:
+   * the SDK accepted `connect()`, but no stream event has proved the socket
+   * opened, so a healthy silent workspace may remain in that state.
    *
    * Distinct from `eventListener`, which is the orchestrator's ISSUE
    * subscription. Conflating the two is how a fleet client that registered an
