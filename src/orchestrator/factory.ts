@@ -20236,20 +20236,27 @@ type RelayfileOverload = {
   retryAfterSeconds?: number
 }
 
-const relayfileOverload = (error: unknown): RelayfileOverload | undefined => {
-  const flat = asRecord(error) ?? {}
+/** How far to follow wrapped provider failures without trusting an unbounded chain. */
+const RELAYFILE_OVERLOAD_CAUSE_DEPTH = 4
+
+const relayfileOverload = (error: unknown, depth = 0): RelayfileOverload | undefined => {
+  if (depth > RELAYFILE_OVERLOAD_CAUSE_DEPTH) return undefined
+  const flat = asRecord(error)
+  if (!flat) return undefined
   const response = asRecord(flat.response) ?? {}
   const data = asRecord(flat.data) ?? asRecord(response.data) ?? {}
   const details = asRecord(flat.details) ?? asRecord(data.details) ?? {}
   const statusValue = flat.status ?? flat.statusCode ?? response.status ?? response.statusCode
   const status = typeof statusValue === 'number' ? statusValue : Number(statusValue)
-  if (status !== 429) return undefined
-  const retryValue = flat.retryAfterSeconds ?? details.retryAfterSeconds ?? data.retryAfterSeconds
-  const parsedRetry = typeof retryValue === 'number' ? retryValue : Number(retryValue)
-  const retryAfterSeconds = Number.isFinite(parsedRetry) && parsedRetry >= 0 ? parsedRetry : undefined
-  const reason = stringValue(flat.reason) ?? stringValue(details.reason) ?? stringValue(data.reason) ??
-    stringValue(flat.code) ?? stringValue(data.code) ?? 'rate_limited'
-  return { status, reason, ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) }
+  if (status === 429) {
+    const retryValue = flat.retryAfterSeconds ?? details.retryAfterSeconds ?? data.retryAfterSeconds
+    const parsedRetry = typeof retryValue === 'number' ? retryValue : Number(retryValue)
+    const retryAfterSeconds = Number.isFinite(parsedRetry) && parsedRetry >= 0 ? parsedRetry : undefined
+    const reason = stringValue(flat.reason) ?? stringValue(details.reason) ?? stringValue(data.reason) ??
+      stringValue(flat.code) ?? stringValue(data.code) ?? 'rate_limited'
+    return { status, reason, ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) }
+  }
+  return relayfileOverload(flat.cause, depth + 1)
 }
 
 /**
@@ -20976,8 +20983,11 @@ const UNCLASSIFIED_PHASE_CODES: Readonly<Record<DispatchAttemptPhase, FactoryDis
  * message would silently empty a bucket, and this vocabulary is what an
  * operator reads when the daemon's stdout does not reach them.
  *
- * Ordered most specific first. Every branch follows the cause chain, because
- * `contextualError` and the control-plane guard both rethrow wrapped.
+ * Ordered most specific first. Every branch follows the bounded cause chain,
+ * because `contextualError` and the control-plane guard both rethrow wrapped.
+ * `relayfileOverload` is also the loop's shedding predicate, so widening it at
+ * the source keeps the health code, skip counter, fuse, and durable overload
+ * ratchet on one verdict instead of merely relabelling the published bucket.
  */
 const perItemDispatchFailureCode = (
   error: unknown,

@@ -108,10 +108,19 @@ class StaticTriage implements TriageEngine {
   }
 }
 
-/** Triage that throws, so the failure happens before the fleet is ever asked. */
+/**
+ * Triage that throws, so the failure happens before the fleet is ever asked.
+ *
+ * Also the one dispatch-attempt path that does NOT wrap what it throws, which
+ * makes it the only way to drive an unwrapped error all the way to the skip
+ * site — see the shed test below.
+ */
 class ThrowingTriage implements TriageEngine {
+  constructor(private readonly error?: Error) {}
+
   async triage(issue: LinearIssue): Promise<TriageDecision> {
-    throw new Error(`triage backend refused ${issue.key} at /linear/issues/${issue.key}.json`)
+    throw this.error ??
+      new Error(`triage backend refused ${issue.key} at /linear/issues/${issue.key}.json`)
   }
 }
 
@@ -329,6 +338,40 @@ describe('dispatch failure reasons (#355)', () => {
       { fleet: new SpawnFailingFleetClient(() => wrapped) },
     )
     expect(status?.dispatchFailureReasons).toEqual({ 'spawn-ack-timeout': 1 })
+  })
+
+  // #361 review (P2, codex): overload classification must follow the same
+  // bounded cause chain as every named error. These two pin the direct and
+  // wrapped paths to the loop's single shedding predicate.
+  it('reports an unwrapped relayfile shed as a shed', async () => {
+    const shed = Object.assign(new Error('workspace durable object is busy'), {
+      status: 429,
+      reason: 'inflight_limit',
+    })
+    const status = await sweepReadiness(
+      { [issuePath(1001)]: issueFile(1001) },
+      { triage: new ThrowingTriage(shed) },
+    )
+    expect(status).toMatchObject({
+      dispatchFailures: 1,
+      dispatchFailureReasons: { 'relayfile-overloaded': 1 },
+    })
+  })
+
+  it('treats a relayfile shed wrapped by spawn context as the same shed', async () => {
+    // `#spawnAgent` wraps this provider failure before the skip site. The
+    // source overload predicate must still drive the loop's counter/fuse path
+    // and the published reason; relabelling only the surface would lie.
+    const wrapped = Object.assign(new Error('workspace durable object is busy'), {
+      status: 429,
+      reason: 'inflight_limit',
+    })
+    const status = await sweepReadiness(
+      { [issuePath(1002)]: issueFile(1002) },
+      { fleet: new SpawnFailingFleetClient(() => wrapped) },
+    )
+    expect(status?.dispatchFailureReasons).toEqual({ 'relayfile-overloaded': 1 })
+    expect(status?.dispatchFailures).toBe(1)
   })
 
   it('publishes counts only: no issue key, path, title or error message crosses', async () => {
