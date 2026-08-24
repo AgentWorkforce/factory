@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -1846,6 +1846,33 @@ describe('InternalFleetClient', () => {
       expect(identity).toMatch(/^internal-broker:/u)
       await expect(two.messageStreamIdentity()).resolves.toBe(identity)
       expect(String(identity)).not.toContain('broker-key')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('shares teammate claim identity across real and symlinked connection paths', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-internal-stream-symlink-'))
+    const connectionPath = join(root, 'connection.json')
+    const symlinkPath = join(root, 'connection-link.json')
+    try {
+      await writeFile(connectionPath, JSON.stringify({
+        url: 'http://127.0.0.1:6789',
+        api_key: 'broker-key',
+        pid: 6789,
+      }))
+      await symlink(connectionPath, symlinkPath)
+      const direct = new InternalFleetClient({
+        client: new FakeHarnessDriverClient(),
+        connectionPath,
+      })
+      const throughSymlink = new InternalFleetClient({
+        client: new FakeHarnessDriverClient(),
+        connectionPath: symlinkPath,
+      })
+
+      const identity = await direct.messageStreamIdentity()
+      await expect(throughSymlink.messageStreamIdentity()).resolves.toBe(identity)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
