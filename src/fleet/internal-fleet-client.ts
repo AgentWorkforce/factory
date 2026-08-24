@@ -105,6 +105,10 @@ type PendingInjectedWait = {
   resendInFlight: boolean
   resendTriggered: boolean
   duplicateDeliveryPossible: boolean
+  // Sends that left this process under an event id we never learned, because
+  // their transport rejected after the provider may already have accepted
+  // them. They stay viable forever: no correlated failure can retire one.
+  untrackedSends: number
   confirmed?: { eventId: string; targets: string[]; duplicateDeliveryPossible?: true }
   settled: boolean
 }
@@ -770,6 +774,7 @@ export class InternalFleetClient implements FleetClient {
         resendInFlight: false,
         resendTriggered: false,
         duplicateDeliveryPossible: false,
+        untrackedSends: 0,
         settled: false,
       }
       this.#pendingInjected.set(eventId, pending)
@@ -1039,13 +1044,30 @@ export class InternalFleetClient implements FleetClient {
     return undefined
   }
 
-  #resolvePendingInjected(pending: PendingInjectedWait, eventId: string): void {
-    if (pending.settled) return
-    const confirmation = {
-      eventId,
-      targets: pending.targets,
+  // The only writer of `duplicateDeliveryPossible`. The marker is a statement
+  // about how many sends can still deliver this one uncorrelated question, so
+  // it is derived rather than latched: a resend raises it, and a correlated
+  // `delivery_failed` that retires a send can lower it again. Nothing else may
+  // set it, or a proven-dead send keeps quarantining the pair for the lifetime
+  // of the stream.
+  #recomputeDuplicateRisk(pending: PendingInjectedWait): void {
+    pending.duplicateDeliveryPossible = pending.eventIds.size + pending.untrackedSends > 1
+  }
+
+  #confirmationFor(
+    pending: PendingInjectedWait,
+    base: { eventId: string; targets: string[] },
+  ): { eventId: string; targets: string[]; duplicateDeliveryPossible?: true } {
+    return {
+      eventId: base.eventId,
+      targets: base.targets,
       ...(pending.duplicateDeliveryPossible ? { duplicateDeliveryPossible: true as const } : {}),
     }
+  }
+
+  #resolvePendingInjected(pending: PendingInjectedWait, eventId: string): void {
+    if (pending.settled) return
+    const confirmation = this.#confirmationFor(pending, { eventId, targets: pending.targets })
     if (pending.resendInFlight) {
       // A readiness-triggered resend has already left the process. Keep this
       // logical delivery pending until that send returns so callers cannot
@@ -1099,24 +1121,23 @@ export class InternalFleetClient implements FleetClient {
   async #resendPendingInjected(pending: PendingInjectedWait): Promise<void> {
     try {
       const result = await this.#callBroker('sendMessage', (client) => client.sendMessage(messageInputFrom(pending.input)))
-      // Every still-viable event id predates this resend response. Once the
-      // resend is accepted, either that earlier send or the resend can deliver
-      // the same uncorrelated question, so callers must quarantine the pair.
-      pending.duplicateDeliveryPossible ||= pending.eventIds.size > 0
+      const eventId = result.event_id
+      // Track the resend before recomputing: every event id still in the set
+      // predates this response, so once the resend joins them, either it or an
+      // earlier send can deliver the same uncorrelated question and callers
+      // must quarantine the pair. A send already retired by a correlated
+      // failure is absent here, and correctly does not raise the marker.
+      pending.eventIds.add(eventId)
+      this.#recomputeDuplicateRisk(pending)
       pending.resendInFlight = false
       if (pending.settled) return
       if (pending.confirmed) {
-        this.#settlePendingInjected(pending, {
-          ...pending.confirmed,
-          ...(pending.duplicateDeliveryPossible ? { duplicateDeliveryPossible: true } : {}),
-        })
+        this.#settlePendingInjected(pending, this.#confirmationFor(pending, pending.confirmed))
         return
       }
 
-      const eventId = result.event_id
       pending.currentEventId = eventId
       pending.targets = result.targets ?? []
-      pending.eventIds.add(eventId)
       this.#pendingInjected.set(eventId, pending)
 
       if (this.#injectedEventIdSet.has(eventId)) {
@@ -1128,18 +1149,17 @@ export class InternalFleetClient implements FleetClient {
         this.#failPendingInjectedEvent(pending, eventId, priorFailure)
       }
     } catch (error) {
-      // A transport failure can follow provider acceptance. Preserve the same
-      // conservative duplicate signal whenever an earlier send is still live.
-      pending.duplicateDeliveryPossible ||= pending.eventIds.size > 0
+      // A transport failure can follow provider acceptance, so this resend may
+      // still deliver under an event id we never learned. Count it as viable
+      // forever: no correlated `delivery_failed` can ever retire it, which is
+      // what keeps the conservative duplicate signal alive whenever another
+      // send is still live.
+      pending.untrackedSends += 1
+      this.#recomputeDuplicateRisk(pending)
       pending.resendInFlight = false
       if (pending.settled) return
       if (pending.confirmed) {
-        // A transport rejection can follow provider acceptance. Once a resend
-        // left this process, conservatively assume it may still deliver.
-        this.#settlePendingInjected(pending, {
-          ...pending.confirmed,
-          ...(pending.duplicateDeliveryPossible ? { duplicateDeliveryPossible: true } : {}),
-        })
+        this.#settlePendingInjected(pending, this.#confirmationFor(pending, pending.confirmed))
         return
       }
       if (pending.eventIds.size === 0) {
@@ -1177,6 +1197,13 @@ export class InternalFleetClient implements FleetClient {
   #failPendingInjectedEvent(pending: PendingInjectedWait, eventId: string, error: Error): void {
     this.#pendingInjected.delete(eventId)
     pending.eventIds.delete(eventId)
+    // A correlated failure is definitive: this send cannot deliver, so it can
+    // no longer be half of an ambiguous pair. Recompute rather than leave a
+    // marker raised by a resend that returned before this failure arrived —
+    // otherwise the sole surviving delivery is reported as a possible
+    // duplicate and quarantines the requester/teammate pair for the lifetime
+    // of the stream.
+    this.#recomputeDuplicateRisk(pending)
     // A readiness-triggered re-send aliases the old and new broker event ids
     // into one logical waiter. A late failure for the superseded id must not
     // reject a newer send that can still be acknowledged.

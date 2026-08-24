@@ -1511,6 +1511,94 @@ describe('InternalFleetClient', () => {
     })
   })
 
+  it('clears the duplicate marker when the original delivery fails after the re-send returns', async () => {
+    class BlockingResendHarnessDriverClient extends FakeHarnessDriverClient {
+      resolveResend?: (result: { event_id: string; targets: string[] }) => void
+
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        if (this.sent.length === 1) {
+          return { event_id: 'event-1', targets: [input.to] }
+        }
+        return await new Promise((resolve) => {
+          this.resolveResend = resolve
+        })
+      }
+    }
+    const harness = new BlockingResendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+    harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+
+    // The re-send is accepted while the first event id is still viable, so the
+    // duplicate marker is raised: at this instant either send could deliver.
+    harness.resolveResend?.({ event_id: 'event-2', targets: ['ar-1-impl'] })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // Only afterwards does the broker prove the first send never landed. That
+    // correlated failure leaves the re-send as the sole viable delivery, so the
+    // confirmation must not quarantine the pair as a possible duplicate.
+    harness.emit({
+      kind: 'delivery_failed',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-1',
+      event_id: 'event-1',
+      reason: 'recipient unavailable',
+    })
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-2',
+      event_id: 'event-2',
+    })
+
+    await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+  })
+
+  it('keeps the duplicate marker while both the original and its re-send stay viable', async () => {
+    class BlockingResendHarnessDriverClient extends FakeHarnessDriverClient {
+      resolveResend?: (result: { event_id: string; targets: string[] }) => void
+
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        if (this.sent.length === 1) {
+          return { event_id: 'event-1', targets: [input.to] }
+        }
+        return await new Promise((resolve) => {
+          this.resolveResend = resolve
+        })
+      }
+    }
+    const harness = new BlockingResendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+    harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+
+    harness.resolveResend?.({ event_id: 'event-2', targets: ['ar-1-impl'] })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // No failure retires the first send, so the same uncorrelated question can
+    // still be delivered twice and the caller must quarantine the pair.
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-2',
+      event_id: 'event-2',
+    })
+
+    await expect(injected).resolves.toEqual({
+      eventId: 'event-2',
+      targets: ['ar-1-impl'],
+      duplicateDeliveryPossible: true,
+    })
+  })
+
   it('keeps the ready-before-injection fast path to one send when the first send is acknowledged', async () => {
     vi.useFakeTimers()
     try {
