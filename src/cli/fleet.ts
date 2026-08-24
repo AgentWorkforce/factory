@@ -2875,6 +2875,11 @@ async function readFactoryVersion(): Promise<string> {
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
+  if (argv[0] === 'teammate-mcp') {
+    const { startFactoryTeammateMcpStdio } = await import('./teammate-mcp')
+    await startFactoryTeammateMcpStdio()
+    return
+  }
   const code = await runFleetCli(argv)
   process.exitCode = code
 }

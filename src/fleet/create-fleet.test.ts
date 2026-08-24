@@ -40,6 +40,16 @@ describe('createFleet', () => {
     expect(createFleet({ backend: 'internal' }, { harnessClient: fakeHarness })).toBeInstanceOf(InternalFleetClient)
   })
 
+  it('forwards a proven injected message-stream scope to the internal backend', async () => {
+    const scope = {}
+    const fleet = createFleet(
+      { backend: 'internal' },
+      { harnessClient: { ...fakeHarness }, messageStreamScope: scope },
+    )
+
+    await expect(fleet.messageStreamIdentity()).resolves.toBe(scope)
+  })
+
   it('forwards the owned-broker agent exit timeout to the internal client', async () => {
     vi.useFakeTimers()
     try {

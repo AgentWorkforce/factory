@@ -112,6 +112,7 @@ describe('factory node definition', () => {
     const definition = createFactoryNodeDefinition({
       config: nodeConfig(),
       name: 'factory-node',
+      workspaceKey: 'rk_live_node_worker',
       resolveAgentRelayMcpCommand: () => ({ command: '/usr/local/bin/node', args: ['/repo/agent-relay.js', 'mcp'] }),
     })
 
@@ -156,6 +157,8 @@ describe('factory node definition', () => {
           cwd: '/work/factory',
           env: expect.objectContaining({
             RELAY_AGENT_IDENTITY_KEY: 'factory:dispatch:v1:github:agentworkforce/factory#13:implementer',
+            RELAY_WORKSPACE_KEY: 'rk_live_node_worker',
+            RELAY_API_KEY: 'rk_live_node_worker',
           }),
           metadata: {
             factoryRelayMcp: true,
@@ -170,7 +173,9 @@ describe('factory node definition', () => {
     expect(spawns[0].agent.harness_config.env?.RELAY_AGENT_IDENTITY_KEY).toBe(
       'factory:dispatch:v1:github:agentworkforce/factory#13:implementer',
     )
+    expect(spawns[0].agent.harness_config.env?.RELAY_WORKSPACE_KEY).toBe('rk_live_node_worker')
     expect(spawns[0].agent.harness_config.args.join('\n')).toContain('mcp_servers.agent-relay.command="/usr/local/bin/node"')
+    expect(spawns[0].agent.harness_config.args.join('\n')).toContain('"RELAY_WORKSPACE_KEY" = "rk_live_node_worker"')
   })
 
   it('runs workflow:run through the Relayflows SDK in the mapped checkout', async () => {
@@ -439,6 +444,7 @@ describe('factory node definition', () => {
     const pkg = await import('../index')
     expect(typeof pkg.createFactoryNodeDefinition).toBe('function')
     expect(typeof pkg.readFactoryNodeConfigSync).toBe('function')
+    expect(typeof pkg.startFactoryNode).toBe('function')
 
     const definition = pkg.createFactoryNodeDefinition({
       config: nodeConfig({ capabilities: ['spawn:claude', 'workflow:run'] }),

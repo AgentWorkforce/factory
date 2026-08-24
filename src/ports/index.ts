@@ -19,7 +19,9 @@ export type {
   SubscribeOptions,
   Subscription,
 } from './mount'
+export { FleetDeliveryRejectedError } from './fleet'
 export type {
+  A2aSkill,
   AgentLifecycleSignal,
   AgentMessage,
   AgentPidResolution,
@@ -40,6 +42,8 @@ export type {
   SendInput,
   SpawnInput,
   SpawnResult,
+  TeammateAgent,
+  TeammateQuery,
 } from './fleet'
 export type {
   GithubRead,

@@ -3,6 +3,16 @@
   "intent": "relay-orchestrator",
   "tags": ["factory", "verification", "proactive", "health", "release-safety", "durability"],
   "description": "Traverses the Factory feature catalog hourly to exercise the manifest/model/state chain with log-only healthy evidence, without claiming per-feature E2E verification; genuine run failures surface through deployment monitoring, while scoped Slack response events retain exact-revision incident handling.",
+  "skills": [
+    {
+      "id": "factory-feature-verification",
+      "source": ".agentworkforce/features/verify/procedures.md",
+      "description": "Verify Factory features against their named end-to-end procedures and supported safety boundaries."
+    }
+  ],
+  "relay": {
+    "agentName": "factory-feature-guardian"
+  },
   "cloud": true,
   "harness": "opencode",
   "model": "deepseek-v4-flash-free",

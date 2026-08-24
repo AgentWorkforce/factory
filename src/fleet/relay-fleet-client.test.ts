@@ -45,6 +45,9 @@ class FakeMessaging {
   readonly agentListFilters: unknown[] = []
   agentPresenceCalls = 0
   meName = 'relay-controller'
+  workspaceId = 'workspace-test'
+  workspaceInfoCalls = 0
+  workspaceInfoError: Error | undefined
 
   readonly agents = {
     list: async (filter: unknown) => {
@@ -64,6 +67,14 @@ class FakeMessaging {
 
   readonly nodes = {
     list: async () => this.nodeRows as RelayNode[],
+  }
+
+  readonly workspace = {
+    info: async () => {
+      this.workspaceInfoCalls += 1
+      if (this.workspaceInfoError) throw this.workspaceInfoError
+      return { id: this.workspaceId }
+    },
   }
 
   readonly messages = {
@@ -815,6 +826,50 @@ describe('RelayFleetClient', () => {
     expect(messaging.channelSends).toEqual([{ channel: 'wf-factory', text: 'update', mode: 'steer' }])
   })
 
+  it('identifies message streams by Relay workspace rather than client wrapper', async () => {
+    const messagingOne = new FakeMessaging()
+    const messagingTwo = new FakeMessaging()
+    const messagingOther = new FakeMessaging()
+    messagingOne.workspaceId = 'shared-workspace'
+    messagingTwo.workspaceId = 'shared-workspace'
+    messagingOther.workspaceId = 'other-workspace'
+
+    const one = createClient(messagingOne)
+    const two = createClient(messagingTwo)
+    const other = createClient(messagingOther)
+
+    const oneIdentity = await one.messageStreamIdentity()
+    await expect(two.messageStreamIdentity()).resolves.toBe(oneIdentity)
+    await expect(other.messageStreamIdentity()).resolves.not.toBe(await one.messageStreamIdentity())
+    expect(messagingOne.workspaceInfoCalls).toBe(1)
+  })
+
+  it('shares a conservative fallback across unidentified injected wrappers', async () => {
+    const messagingOne = new FakeMessaging()
+    const messagingTwo = new FakeMessaging()
+    messagingOne.workspaceInfoError = new Error('workspace.info unavailable')
+    messagingTwo.workspaceInfoError = new Error('workspace.info unavailable')
+
+    const one = createClient(messagingOne)
+    const two = createClient(messagingTwo)
+
+    await expect(one.messageStreamIdentity()).resolves.toBe(await two.messageStreamIdentity())
+  })
+
+  it('preserves known-distinct injected streams through explicit scopes', async () => {
+    const messagingOne = new FakeMessaging()
+    const messagingTwo = new FakeMessaging()
+    messagingOne.workspaceInfoError = new Error('workspace.info unavailable')
+    messagingTwo.workspaceInfoError = new Error('workspace.info unavailable')
+
+    const one = createClient(messagingOne, { messageStreamScope: 'workspace-one' })
+    const two = createClient(messagingTwo, { messageStreamScope: 'workspace-two' })
+
+    await expect(one.messageStreamIdentity()).resolves.not.toBe(await two.messageStreamIdentity())
+    expect(messagingOne.workspaceInfoCalls).toBe(0)
+    expect(messagingTwo.workspaceInfoCalls).toBe(0)
+  })
+
   it('confirms injected tasks with the sent message id', async () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging)
@@ -874,6 +929,50 @@ describe('RelayFleetClient', () => {
     expect(exits).toEqual([{ name: 'ar-1-impl', reason: 'offline' }])
     expect(messaging.connected).toBe(1)
     expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
+  })
+
+  it('lets a worker-side teammate client observe replies without claiming the Factory lifecycle action', async () => {
+    const messaging = new FakeMessaging()
+    messaging.connectEvent = { type: 'connected' }
+    const fleet = createClient(messaging, { registerLifecycleAction: false })
+    const messages: Array<{ from: string; target: string; body: string }> = []
+    fleet.onAgentMessage((message) => messages.push(message))
+
+    await fleet.whenMessagesObservable()
+    expect(messaging.connected).toBe(1)
+    expect(messaging.commandRegistrations).toEqual([])
+
+    messaging.emit('any', {
+      type: 'dmReceived',
+      message: relayMessage({
+        text: 'answer',
+        from: { name: 'infra-agent' },
+        target: { kind: 'agent', agentName: 'factory-worker' },
+      }),
+    })
+    expect(messages).toEqual([expect.objectContaining({
+      from: 'infra-agent',
+      target: 'factory-worker',
+      body: 'answer',
+    })])
+  })
+
+  it('does not report teammate replies observable until the socket handshake is confirmed', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging, { registerLifecycleAction: false })
+    const ready = fleet.whenMessagesObservable()
+    let settled = false
+    void ready.then(() => { settled = true })
+
+    await flush()
+    expect(messaging.connected).toBe(1)
+    expect(fleet.fleetConnectStatus().state).toBe('dialed')
+    expect(settled).toBe(false)
+
+    messaging.emit('any', { type: 'connected' })
+    await ready
+    expect(settled).toBe(true)
+    expect(fleet.fleetConnectStatus().state).toBe('connected')
   })
 
   it('routes durable lifecycle actions through the authenticated identity when factory and broker are absent', async () => {

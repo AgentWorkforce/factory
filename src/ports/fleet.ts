@@ -5,6 +5,7 @@ export type Capability = 'spawn:codex' | 'spawn:claude' | 'workflow:run'
 export type PreviewCapability = 'preview:tailscale-serve'
 export type NodeCapability = Capability | PreviewCapability
 export type RestartPolicy = import('@agent-relay/harness-driver').SpawnPtyInput['restartPolicy']
+export type A2aSkill = import('@relaycast/a2a').A2aSkill
 
 export type PreviewReference = {
   id: string
@@ -99,6 +100,32 @@ export interface RosterEntry {
   nodes: Array<{ name: string; capabilities: NodeCapability[]; live: boolean }>
 }
 
+export interface TeammateQuery {
+  /** Exact A2A skill id/name to match. */
+  skill?: string
+  /** Exact agent- or skill-level tag to match. */
+  tag?: string
+  /** Free-text directory query. */
+  q?: string
+}
+
+export interface TeammateAgent {
+  /** Directory identity shown to workers. */
+  name: string
+  /** Human-readable card description, when the directory provides one. */
+  description?: string
+  /** Canonical A2A skill records from the agent card. */
+  skills: A2aSkill[]
+  /** A2A endpoint advertised by the directory. */
+  url: string
+  kind: 'native' | 'a2a'
+  /** Relay/A2A target used for the discover -> engage hop. */
+  address: string
+  tags: string[]
+  status?: string
+  certification?: string
+}
+
 export type AgentPidResolution =
   | { status: 'found'; pid: number }
   | { status: 'missing' }
@@ -111,6 +138,18 @@ export type SendInput = {
   data?: Record<string, unknown>
   mode?: 'wait' | 'steer'
 }
+
+/**
+ * Positive transport evidence that a correlated message cannot be delivered.
+ * Unlike a delivery-confirmation timeout, this makes an uncorrelated retry safe.
+ */
+export class FleetDeliveryRejectedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'FleetDeliveryRejectedError'
+  }
+}
+
 export type AgentMessage = { from: string; target: string; body: string; threadId?: string; eventId?: string }
 export type AgentLifecycleSignal = {
   name: string
@@ -191,6 +230,8 @@ export interface FleetClient {
   }): Promise<SpawnResult>
   release(name: string, reason?: string): Promise<void>
   roster(): Promise<RosterEntry>
+  /** Find addressable teammate agents by their published A2A cards. */
+  discoverTeammates(query: TeammateQuery): Promise<TeammateAgent[]>
   /**
    * Whether this backend's event socket is connected, and why not when it is not.
    * Optional: backends with no socket (the internal fleet) simply omit it, and an
@@ -200,11 +241,46 @@ export interface FleetClient {
   resolveAgentPid?(name: string): Promise<AgentPidResolution>
   protectedPids?(): Promise<number[]>
   sendMessage(input: SendInput): Promise<void>
-  waitForInjected?(input: SendInput, opts?: { timeoutMs?: number }): Promise<{ eventId: string; targets: string[] }>
+  /**
+   * Identity this backend actually authors sends as, when it cannot honour
+   * `SendInput.from`. A teammate replies to that identity, not to the caller's
+   * requested `from`, so a reply waiter must match against this instead.
+   * Backends that faithfully carry `from` leave it undefined.
+   *
+   * Async because the real identity may only be knowable after an
+   * authentication round trip: a configured name can differ from the one the
+   * server actually authenticated, and matching on the pre-auth guess would
+   * reject every reply.
+   */
+  effectiveSender?(): Promise<string | undefined>
+  /**
+   * Stable, opaque identity of the inbound message stream used by this backend.
+   * Distinct client objects that receive the same messages must return the
+   * same identity so uncorrelated reply claims are shared across them. Clients
+   * for genuinely separate streams must return different identities.
+   *
+   * The result must remain referentially/string-equal across calls. Backends
+   * that omit this method are conservatively scoped to the client object.
+   */
+  messageStreamIdentity?(): Promise<string | object | undefined>
+  waitForInjected?(input: SendInput, opts?: { timeoutMs?: number }): Promise<{
+    eventId: string
+    targets: string[]
+    /** A separately accepted resend can still produce an uncorrelated duplicate reply. */
+    duplicateDeliveryPossible?: true
+  }>
   sendInput?(name: string, data: string): Promise<void>
   markAgentTerminal?(name: string, reason?: string): void
   onDeliveryFailed?(listener: (info: { to: string; msgId?: string; reason?: string }) => void): () => void
   onAgentMessage?(listener: (message: AgentMessage) => void): () => void
+  /**
+   * Resolves once the inbound-message transport is genuinely listening.
+   * `onAgentMessage` may return before that is true on a backend whose
+   * subscription is established asynchronously, so a caller that registers a
+   * listener and then sends must await this in between or risk losing a reply
+   * that arrives first.
+   */
+  whenMessagesObservable?(): Promise<void>
   onAgentLifecycleSignal?(listener: (signal: AgentLifecycleSignal) => void | Promise<void>): () => void
   onAgentUsage?(listener: (usage: AgentUsage) => void | Promise<void>): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void

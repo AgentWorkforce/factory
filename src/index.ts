@@ -7,6 +7,7 @@ export { DocumentStateStore, FileStateStore, githubWatchStatePath } from './stat
 export type { DocumentStateStoreOptions, FileStateStoreOptions } from './state/file-state-store.js'
 export { WatchStateDocumentConflictError } from './state/document-store.js'
 export { parseWatchStateDocument } from './state/watch-state-document.js'
+export { FleetDeliveryRejectedError } from './ports'
 export type {
   PersistedWorkspaceState,
   WatchStateDocument,
@@ -94,6 +95,19 @@ export type {
   InternalFleetClientOptions,
 } from './fleet/internal-fleet-client'
 export { RelayFleetClient } from './fleet/relay-fleet-client'
+export {
+  askTeammate,
+  DEFAULT_ASK_TEAMMATE_TIMEOUT_MS,
+  DEFAULT_RELAYCAST_BASE_URL,
+  DEFAULT_TEAMMATE_DIRECTORY_TIMEOUT_MS,
+  RelaycastTeammateDirectory,
+} from './fleet/teammates'
+export type {
+  AskTeammateInput,
+  AskTeammateResult,
+  RelaycastTeammateDirectoryOptions,
+  TeammateDirectory,
+} from './fleet/teammates'
 export {
   RelayfileCloudMountClient,
   resolveFactoryWorkspace,
@@ -233,6 +247,11 @@ export {
   resolveFactoryNodeConfigPath,
   runRelayflowsWorkflow,
 } from './node/factory-node'
+export {
+  deriveFactoryPersonaCard,
+  RelaycastAgentCardPublisher,
+} from './node/factory-persona-card'
+export { startFactoryNode } from './node/factory-node-runtime'
 export { TailscalePreviewManager } from './node/tailscale-preview'
 export type {
   PreviewCommandRunner,
@@ -242,12 +261,23 @@ export type {
 } from './node/tailscale-preview'
 export type {
   FactoryNodeDefinitionOptions,
+  FactoryNodeDefinition,
   FactoryNodeInventoryAgent,
   FactoryNodeInventorySync,
   WorkflowRunner,
   WorkflowRunnerInput,
   WorkflowRunnerResult,
 } from './node/factory-node'
+export type {
+  AgentCardPublisher,
+  FactoryPersonaCardInput,
+  PublishedAgentCard,
+  RelaycastAgentCardPublisherOptions,
+} from './node/factory-persona-card'
+export type {
+  RunningFactoryNode,
+  StartFactoryNodeOptions,
+} from './node/factory-node-runtime'
 export {
   assertInFactoryScope,
   factoryScopeSafety,
@@ -314,6 +344,7 @@ export type {
   ResourceSubscriptionsSdkClientOptions,
 } from './subscriptions'
 export type {
+  A2aSkill,
   Capability,
   Environment,
   EnvironmentProvider,
@@ -353,6 +384,8 @@ export type {
   SpawnInput,
   SpawnResult,
   AgentUsage,
+  TeammateAgent,
+  TeammateQuery,
   GithubRead,
   GithubIssueStatus,
   GithubWriteback,

@@ -1,9 +1,12 @@
+import { createHash } from 'node:crypto'
+
 import { AgentRelay } from '@agent-relay/sdk'
 
 import { describeControlPlaneError } from './control-plane-circuit'
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
 
-import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, FleetConnectStatus, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult } from '../ports/fleet'
+import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, FleetConnectStatus, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult, TeammateAgent, TeammateQuery } from '../ports/fleet'
+import { RelaycastTeammateDirectory, type TeammateDirectory } from './teammates'
 import type {
   RelayActionInvocation,
   RelayActionInvocationAck,
@@ -41,6 +44,12 @@ export interface RelayClientFactoryOptions {
 export interface RelayFleetClientOptions {
   /** Agent-scoped messaging surface. When provided, identity bootstrap is skipped. */
   messaging?: RelayMessaging
+  /**
+   * Stable identity for an injected inbound message stream when the messaging
+   * surface cannot report its Relay workspace. Reuse it across wrappers for
+   * the same stream; use distinct values only for known-distinct streams.
+   */
+  messageStreamScope?: string | object
   workspaceKey?: string
   agentToken?: string
   /** Workspace agent identity the factory registers/rotates for itself. */
@@ -51,8 +60,14 @@ export interface RelayFleetClientOptions {
   fetch?: typeof globalThis.fetch
   /** Stable workspace action used for durable agent lifecycle reports. */
   lifecycleActionName?: string
+  /** Worker-side teammate clients observe DMs but do not own Factory's lifecycle action. */
+  registerLifecycleAction?: boolean
   /** Engine base URL override. Absent means the SDK default (cast.agentrelay.com). */
   baseUrl?: string
+  /** Card-aware directory seam. Defaults to Relaycast GET /v1/a2a/directory. */
+  teammateDirectory?: TeammateDirectory
+  directoryFetch?: typeof globalThis.fetch
+  directoryTimeoutMs?: number
   /** Timeout for a spawn/release invocation to reach a terminal ack status. */
   spawnAckTimeoutMs?: number
   pollIntervalMs?: number
@@ -213,10 +228,16 @@ export class RelayFleetClient implements FleetClient {
   // therefore createFleet({ backend: 'relay' })) never throws merely because no
   // token is configured.
   #messaging: RelayMessaging | undefined
+  #teammateDirectory: TeammateDirectory | undefined
   #messagingReady: Promise<RelayMessaging> | undefined
+  #messageStreamIdentityReady: Promise<string | object> | undefined
   #lifecycleActionReady: Promise<void> | undefined
   #authenticatedAgentName: string
   #eventsStarted = false
+  #eventSubscriptionReady?: Promise<void>
+  #messageObservabilityReady?: Promise<void>
+  #resolveMessageObservability?: () => void
+  #rejectMessageObservability?: (error: Error) => void
   #disposed = false
   /**
    * The fleet socket's own status.
@@ -258,6 +279,7 @@ export class RelayFleetClient implements FleetClient {
     this.#log = options.log ?? (() => {})
     this.#readOnly = options.readOnly ?? false
     this.#messaging = options.messaging
+    this.#teammateDirectory = options.teammateDirectory
   }
 
   /** Agents spawned through this client that have not exited or been released. */
@@ -552,8 +574,87 @@ export class RelayFleetClient implements FleetClient {
     }
   }
 
+  async discoverTeammates(query: TeammateQuery): Promise<TeammateAgent[]> {
+    this.#teammateDirectory ??= this.#createTeammateDirectory()
+    return await this.#teammateDirectory.discover(query)
+  }
+
   // `from`/`data` are not representable on the agent-scoped messaging surface:
   // every send is authored by the factory's own agent identity.
+  //
+  // That identity is also the `target` stamped on every inbound message (see
+  // `#emitAgentMessage`), so a reply waiter must match against it rather than
+  // against the `from` its caller asked to send as.
+  //
+  // `#authenticatedAgentName` starts life as the CONFIGURED `agentName` and is
+  // only replaced with the server's answer once something has called
+  // `agents.me()`. Returning it synchronously would hand out that pre-auth
+  // guess, which is wrong whenever an injected `messaging` or an existing
+  // `agentToken` authenticates as a different name. Resolve it for real.
+  async effectiveSender(): Promise<string | undefined> {
+    const messaging = await this.#ensureMessaging()
+    const identity = await messaging.agents.me()
+    const resolved = identity.name?.trim()
+    if (resolved) this.#authenticatedAgentName = resolved
+    return this.#authenticatedAgentName
+  }
+
+  /**
+   * Identify the actual Relay workspace stream rather than this wrapper.
+   * Multiple clients authenticated to one workspace receive the same direct
+   * messages, so their uncorrelated ask/reply claims must contend.
+   */
+  async messageStreamIdentity(): Promise<string | object | undefined> {
+    this.#messageStreamIdentityReady ??= (async () => {
+      const messaging = await this.#ensureMessaging()
+      const baseUrl = canonicalRelayBaseUrl(this.#options.baseUrl)
+
+      const explicitScope = this.#options.messageStreamScope
+      if (this.#options.messaging && explicitScope !== undefined) {
+        if (typeof explicitScope === 'string') {
+          const fingerprint = createHash('sha256').update(explicitScope).digest('base64url')
+          return `relay:${baseUrl}:explicit:${fingerprint}`
+        }
+        return explicitScope
+      }
+
+      try {
+        const workspace = await messaging.workspace.info()
+        const workspaceId = typeof workspace.id === 'string' ? workspace.id.trim() : ''
+        if (workspaceId) return `relay:${baseUrl}:workspace:${workspaceId}`
+      } catch (error) {
+        // Older/injected messaging surfaces may not expose workspace.info(). A
+        // credential fingerprint or the injected object below still preserves
+        // a stable boundary without failing an otherwise usable message path.
+        this.#log(`Unable to resolve Relay workspace identity for teammate claims: ${errorMessage(error)}`)
+      }
+
+      // Separate injected wrappers are not evidence of separate streams. If
+      // the surface cannot identify its workspace and the caller supplied no
+      // explicit scope, fail closed by sharing one endpoint-scoped registry.
+      // This may conservatively serialize identical participants in two legacy
+      // workspaces, but it cannot admit two waiters for one unknown stream.
+      if (this.#options.messaging) return `relay:${baseUrl}:injected:unknown`
+
+      const env = this.#options.env
+      const agentToken = resolveRelayAgentToken({
+        agentToken: this.#registeredAgentToken ?? this.#options.agentToken,
+        ...(env ? { env } : {}),
+      })
+      const workspaceKey = resolveRelayWorkspaceKey({
+        workspaceKey: this.#options.workspaceKey,
+        ...(env ? { env, activeWorkspaceKey: () => undefined } : {}),
+      })
+      const credential = agentToken ?? workspaceKey
+      if (credential) {
+        const fingerprint = createHash('sha256').update(credential).digest('base64url')
+        return `relay:${baseUrl}:credential:${fingerprint}`
+      }
+      return messaging
+    })()
+    return await this.#messageStreamIdentityReady
+  }
+
   async sendMessage(input: SendInput): Promise<void> {
     await this.#send(input)
   }
@@ -630,6 +731,7 @@ export class RelayFleetClient implements FleetClient {
     }
 
     this.#disposed = true
+    this.#settleMessageObservability(new Error('Relay fleet client disposed before its event stream connected'))
     if (this.#watchTimer) {
       clearInterval(this.#watchTimer)
       this.#watchTimer = undefined
@@ -672,6 +774,26 @@ export class RelayFleetClient implements FleetClient {
       }
       throw error
     }
+  }
+
+  #createTeammateDirectory(): TeammateDirectory {
+    const env = this.#options.env
+    const token = resolveRelayWorkspaceKey({
+      workspaceKey: this.#options.workspaceKey,
+      ...(env ? { env, activeWorkspaceKey: () => undefined } : {}),
+    }) ?? resolveRelayAgentToken({
+      agentToken: this.#options.agentToken,
+      ...(env ? { env } : {}),
+    })
+    if (!token) {
+      throw new Error('RelayFleetClient teammate discovery requires a workspace key or agent token')
+    }
+    return new RelaycastTeammateDirectory({
+      baseUrl: this.#options.baseUrl,
+      token,
+      fetch: this.#options.directoryFetch,
+      timeoutMs: this.#options.directoryTimeoutMs,
+    })
   }
 
   #ensureMessaging(): Promise<RelayMessaging> {
@@ -1223,8 +1345,9 @@ export class RelayFleetClient implements FleetClient {
       attempts: this.#fleetConnect.attempts + 1,
       lastAttemptAtMs: this.#now(),
     }
-    void this.#subscribeEvents().catch((error) => {
+    this.#eventSubscriptionReady = this.#subscribeEvents().catch((error) => {
       this.#eventsStarted = false
+      this.#eventSubscriptionReady = undefined
       // The rejection now lands in a field a health surface can publish. It kept
       // going only to `#log` before, which is why a fleet client that never
       // connected was indistinguishable from a healthy one everywhere.
@@ -1235,7 +1358,51 @@ export class RelayFleetClient implements FleetClient {
         lastError: describeControlPlaneError(error),
       }
       this.#log(`relay fleet event subscription failed: ${errorMessage(error)}`)
+      throw error
     })
+    // Nothing here awaits it -- callers that must not miss an inbound message
+    // use `whenMessagesObservable()`. The rejection is re-thrown for them and
+    // swallowed here so a background subscription failure stays non-fatal.
+    void this.#eventSubscriptionReady.catch(() => {})
+  }
+
+  // `onAgentMessage` returns as soon as the listener is in the local set, but
+  // the SDK handler behind it is installed by an async chain (messaging
+  // bootstrap, then lifecycle registration, then `events.connect()`). A caller
+  // that registers a listener and immediately sends can therefore lose a fast
+  // reply that lands before the transport is actually listening. Await this
+  // between the two.
+  async whenMessagesObservable(): Promise<void> {
+    this.#ensureEventSubscription()
+    await this.#eventSubscriptionReady
+    if (this.#fleetConnect.state === 'connected') return
+    await this.#messageObservabilityPromise()
+  }
+
+  #messageObservabilityPromise(): Promise<void> {
+    if (this.#fleetConnect.state === 'connected') return Promise.resolve()
+    if (!this.#messageObservabilityReady) {
+      const pending = new Promise<void>((resolve, reject) => {
+        this.#resolveMessageObservability = resolve
+        this.#rejectMessageObservability = reject
+      })
+      this.#messageObservabilityReady = pending
+      // The ask-level deadline may stop awaiting this shared handshake first.
+      // Retain the waiter for another caller, but never surface its later
+      // transport rejection as an unhandled promise.
+      void pending.catch(() => {})
+    }
+    return this.#messageObservabilityReady
+  }
+
+  #settleMessageObservability(error?: Error): void {
+    const resolve = this.#resolveMessageObservability
+    const reject = this.#rejectMessageObservability
+    this.#messageObservabilityReady = undefined
+    this.#resolveMessageObservability = undefined
+    this.#rejectMessageObservability = undefined
+    if (error) reject?.(error)
+    else resolve?.()
   }
 
   fleetConnectStatus(): FleetConnectStatus {
@@ -1244,7 +1411,9 @@ export class RelayFleetClient implements FleetClient {
 
   async #subscribeEvents(): Promise<void> {
     const messaging = await this.#ensureMessaging()
-    await this.#ensureLifecycleAction(messaging)
+    if (this.#options.registerLifecycleAction !== false) {
+      await this.#ensureLifecycleAction(messaging)
+    }
     if (this.#disposed) return
     // Listen before dialing so a synchronous lifecycle event cannot race past
     // the observer. `connect()` is void: returning only proves the SDK accepted
@@ -1301,6 +1470,7 @@ export class RelayFleetClient implements FleetClient {
           lastFailureAtMs: now,
           lastError: 'RelayEventStreamDisconnected',
         }
+        this.#settleMessageObservability(new Error('Relay event stream disconnected before becoming observable'))
         return
       case 'error':
         this.#fleetConnect = {
@@ -1309,6 +1479,7 @@ export class RelayFleetClient implements FleetClient {
           lastFailureAtMs: now,
           lastError: 'RelayEventStreamError',
         }
+        this.#settleMessageObservability(new Error('Relay event stream failed before becoming observable'))
         return
       case 'reconnecting':
         this.#fleetConnect = { ...this.#fleetConnect, state: 'connecting' }
@@ -1323,6 +1494,7 @@ export class RelayFleetClient implements FleetClient {
           ...(this.#fleetConnect.state !== 'connected' ? { lastConnectedAtMs: now } : {}),
           lastError: undefined,
         }
+        this.#settleMessageObservability()
     }
   }
 
@@ -1717,6 +1889,15 @@ function isIdentityMovedError(error: unknown): boolean {
   const record = asRecord(error)
   if (record?.code === 'agent_identity_conflict') return true
   return /agent_identity_conflict|no longer has expected id/i.test(errorMessage(error))
+}
+
+function canonicalRelayBaseUrl(value: string | undefined): string {
+  const candidate = value ?? DEFAULT_RELAY_BASE_URL
+  try {
+    return new URL(candidate).toString().replace(/\/$/u, '')
+  } catch {
+    return candidate.replace(/\/$/u, '')
+  }
 }
 
 function isUnknownRecipientError(error: unknown): boolean {

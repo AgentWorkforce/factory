@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import type { BrokerEvent, SendMessageInput, SpawnPtyInput } from '@agent-relay/harness-driver'
 
@@ -298,7 +301,7 @@ describe('InternalFleetClient', () => {
     })).rejects.toThrow(/identity proof cannot be installed/)
   })
 
-  it('resolves the default agent-relay CLI mcp command from node_modules', async () => {
+  it('resolves the Factory-extended Agent Relay MCP command from the packed entrypoint', async () => {
     const harness = new FakeHarnessDriverClient()
     const fleet = new InternalFleetClient({ client: harness, cwd: '/worktree' })
 
@@ -313,8 +316,8 @@ describe('InternalFleetClient', () => {
     if (config?.runtime !== 'pty') throw new Error('expected pty harness config')
     const args = config.args
     expect(args).toContain(`mcp_servers.agent-relay.command=${JSON.stringify(process.execPath)}`)
-    expect(args.join('\n')).toContain('node_modules/agent-relay/dist/cli/index.js')
-    expect(args.join('\n')).toContain('"mcp"')
+    expect(args.join('\n')).toContain('bin/factory.mjs')
+    expect(args.join('\n')).toContain('"teammate-mcp"')
   })
 
   it('resolves an agent PID from the broker roster', async () => {
@@ -914,7 +917,11 @@ describe('InternalFleetClient', () => {
         event_id: 'event-2',
       })
 
-      await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+      await expect(injected).resolves.toEqual({
+        eventId: 'event-2',
+        targets: ['ar-1-impl'],
+        duplicateDeliveryPossible: true,
+      })
     } finally {
       vi.useRealTimers()
     }
@@ -1218,7 +1225,11 @@ describe('InternalFleetClient', () => {
       event_id: 'event-2',
     })
 
-    await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+    await expect(injected).resolves.toEqual({
+      eventId: 'event-2',
+      targets: ['ar-1-impl'],
+      duplicateDeliveryPossible: true,
+    })
   })
 
   it('re-sends an unconfirmed injection when the matching worker becomes ready', async () => {
@@ -1251,7 +1262,10 @@ describe('InternalFleetClient', () => {
       event_id: 'event-2',
     })
 
-    await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+    await expect(injected).resolves.toEqual({
+      eventId: 'event-2',
+      targets: ['ar-1-impl'],
+    })
     expect(harness.sent).toEqual([
       { to: 'ar-1-impl', text: 'do work', from: undefined, data: undefined },
       { to: 'ar-1-impl', text: 'do work', from: undefined, data: undefined },
@@ -1281,7 +1295,11 @@ describe('InternalFleetClient', () => {
       event_id: 'event-2',
     })
 
-    await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+    await expect(injected).resolves.toEqual({
+      eventId: 'event-2',
+      targets: ['ar-1-impl'],
+      duplicateDeliveryPossible: true,
+    })
   })
 
   it('re-sends when delivery failure races initial waiter installation for a ready worker', async () => {
@@ -1357,6 +1375,50 @@ describe('InternalFleetClient', () => {
     })
 
     await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+  })
+
+  it('keeps a confirmed injection pending until its readiness re-send returns', async () => {
+    class BlockingResendHarnessDriverClient extends FakeHarnessDriverClient {
+      resolveResend?: (result: { event_id: string; targets: string[] }) => void
+
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        if (this.sent.length === 1) {
+          return { event_id: 'event-1', targets: [input.to] }
+        }
+        return await new Promise((resolve) => {
+          this.resolveResend = resolve
+        })
+      }
+    }
+    const harness = new BlockingResendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+    harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+
+    let settled = false
+    void injected.finally(() => {
+      settled = true
+    })
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-1',
+      event_id: 'event-1',
+    })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    harness.resolveResend?.({ event_id: 'event-2', targets: ['ar-1-impl'] })
+    await expect(injected).resolves.toEqual({
+      eventId: 'event-1',
+      targets: ['ar-1-impl'],
+      duplicateDeliveryPossible: true,
+    })
+    expect(settled).toBe(true)
   })
 
   it('disposes a logical waiter while its readiness re-send response is blocked', async () => {
@@ -1442,7 +1504,99 @@ describe('InternalFleetClient', () => {
       event_id: 'event-1',
     })
 
-    await expect(injected).resolves.toEqual({ eventId: 'event-1', targets: ['ar-1-impl'] })
+    await expect(injected).resolves.toEqual({
+      eventId: 'event-1',
+      targets: ['ar-1-impl'],
+      duplicateDeliveryPossible: true,
+    })
+  })
+
+  it('clears the duplicate marker when the original delivery fails after the re-send returns', async () => {
+    class BlockingResendHarnessDriverClient extends FakeHarnessDriverClient {
+      resolveResend?: (result: { event_id: string; targets: string[] }) => void
+
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        if (this.sent.length === 1) {
+          return { event_id: 'event-1', targets: [input.to] }
+        }
+        return await new Promise((resolve) => {
+          this.resolveResend = resolve
+        })
+      }
+    }
+    const harness = new BlockingResendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+    harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+
+    // The re-send is accepted while the first event id is still viable, so the
+    // duplicate marker is raised: at this instant either send could deliver.
+    harness.resolveResend?.({ event_id: 'event-2', targets: ['ar-1-impl'] })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // Only afterwards does the broker prove the first send never landed. That
+    // correlated failure leaves the re-send as the sole viable delivery, so the
+    // confirmation must not quarantine the pair as a possible duplicate.
+    harness.emit({
+      kind: 'delivery_failed',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-1',
+      event_id: 'event-1',
+      reason: 'recipient unavailable',
+    })
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-2',
+      event_id: 'event-2',
+    })
+
+    await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+  })
+
+  it('keeps the duplicate marker while both the original and its re-send stay viable', async () => {
+    class BlockingResendHarnessDriverClient extends FakeHarnessDriverClient {
+      resolveResend?: (result: { event_id: string; targets: string[] }) => void
+
+      override async sendMessage(input: SendMessageInput): Promise<{ event_id: string; targets: string[] }> {
+        this.sent.push(input)
+        if (this.sent.length === 1) {
+          return { event_id: 'event-1', targets: [input.to] }
+        }
+        return await new Promise((resolve) => {
+          this.resolveResend = resolve
+        })
+      }
+    }
+    const harness = new BlockingResendHarnessDriverClient()
+    const fleet = new InternalFleetClient({ client: harness })
+
+    const injected = fleet.waitForInjected({ to: 'ar-1-impl', text: 'do work' }, { timeoutMs: 1000 })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(1))
+    harness.emit({ kind: 'worker_ready', name: 'ar-1-impl', runtime: 'pty' })
+    await vi.waitFor(() => expect(harness.sent).toHaveLength(2))
+
+    harness.resolveResend?.({ event_id: 'event-2', targets: ['ar-1-impl'] })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // No failure retires the first send, so the same uncorrelated question can
+    // still be delivered twice and the caller must quarantine the pair.
+    harness.emit({
+      kind: 'delivery_injected',
+      name: 'ar-1-impl',
+      delivery_id: 'delivery-2',
+      event_id: 'event-2',
+    })
+
+    await expect(injected).resolves.toEqual({
+      eventId: 'event-2',
+      targets: ['ar-1-impl'],
+      duplicateDeliveryPossible: true,
+    })
   })
 
   it('keeps the ready-before-injection fast path to one send when the first send is acknowledged', async () => {
@@ -1491,7 +1645,11 @@ describe('InternalFleetClient', () => {
         event_id: 'event-2',
       })
 
-      await expect(injected).resolves.toEqual({ eventId: 'event-2', targets: ['ar-1-impl'] })
+      await expect(injected).resolves.toEqual({
+        eventId: 'event-2',
+        targets: ['ar-1-impl'],
+        duplicateDeliveryPossible: true,
+      })
     } finally {
       vi.useRealTimers()
     }
@@ -1690,6 +1848,145 @@ describe('InternalFleetClient', () => {
       threadId: 'thread-1',
       eventId: 'inbound-1',
     }])
+  })
+
+  it('shares teammate claim identity across wrappers on one injected broker client', async () => {
+    const harness = new FakeHarnessDriverClient()
+    const one = new InternalFleetClient({ client: harness })
+    const two = new InternalFleetClient({ client: harness })
+
+    const oneIdentity = await one.messageStreamIdentity()
+    const twoIdentity = await two.messageStreamIdentity()
+
+    expect(twoIdentity).toBe(oneIdentity)
+  })
+
+  it('conservatively shares teammate claim identity across unknown injected clients', async () => {
+    const one = new InternalFleetClient({ client: new FakeHarnessDriverClient() })
+    const two = new InternalFleetClient({ client: new FakeHarnessDriverClient() })
+
+    await expect(one.messageStreamIdentity()).resolves.toBe(await two.messageStreamIdentity())
+  })
+
+  it('shares teammate claim identity across separate clients on one broker URL', async () => {
+    const oneHarness = Object.assign(new FakeHarnessDriverClient(), { baseUrl: 'http://127.0.0.1:6789' })
+    const twoHarness = Object.assign(new FakeHarnessDriverClient(), { baseUrl: 'http://127.0.0.1:6789/' })
+    const one = new InternalFleetClient({ client: oneHarness })
+    const two = new InternalFleetClient({ client: twoHarness })
+
+    const identity = await one.messageStreamIdentity()
+    expect(identity).toMatch(/^internal-broker:/u)
+    await expect(two.messageStreamIdentity()).resolves.toBe(identity)
+  })
+
+  it('keeps explicitly proven injected broker streams independent', async () => {
+    const oneScope = {}
+    const twoScope = {}
+    const one = new InternalFleetClient({
+      client: new FakeHarnessDriverClient(),
+      messageStreamScope: oneScope,
+    })
+    const two = new InternalFleetClient({
+      client: new FakeHarnessDriverClient(),
+      messageStreamScope: twoScope,
+    })
+
+    await expect(one.messageStreamIdentity()).resolves.toBe(oneScope)
+    await expect(two.messageStreamIdentity()).resolves.toBe(twoScope)
+  })
+
+  it('honors a proven injected stream scope before derived working-directory paths', async () => {
+    const sharedScope = {}
+    const one = new InternalFleetClient({
+      client: new FakeHarnessDriverClient(),
+      cwd: '/work/one',
+      messageStreamScope: sharedScope,
+    })
+    const two = new InternalFleetClient({
+      client: new FakeHarnessDriverClient(),
+      cwd: '/work/two',
+      messageStreamScope: sharedScope,
+    })
+
+    await expect(one.messageStreamIdentity()).resolves.toBe(sharedScope)
+    await expect(two.messageStreamIdentity()).resolves.toBe(sharedScope)
+  })
+
+  it('shares teammate claim identity across separate clients bound by one connection file', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-internal-stream-identity-'))
+    const connectionPath = join(root, 'connection.json')
+    try {
+      await writeFile(connectionPath, JSON.stringify({
+        url: 'http://127.0.0.1:6789',
+        api_key: 'broker-key',
+        pid: 6789,
+      }))
+      const one = new InternalFleetClient({
+        client: new FakeHarnessDriverClient(),
+        connectionPath,
+      })
+      const two = new InternalFleetClient({
+        client: new FakeHarnessDriverClient(),
+        connectionPath,
+      })
+
+      const identity = await one.messageStreamIdentity()
+      expect(identity).toMatch(/^internal-broker:/u)
+      await expect(two.messageStreamIdentity()).resolves.toBe(identity)
+      expect(String(identity)).not.toContain('broker-key')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('shares teammate claim identity across real and symlinked connection paths', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-internal-stream-symlink-'))
+    const connectionPath = join(root, 'connection.json')
+    const symlinkPath = join(root, 'connection-link.json')
+    try {
+      await writeFile(connectionPath, JSON.stringify({
+        url: 'http://127.0.0.1:6789',
+        api_key: 'broker-key',
+        pid: 6789,
+      }))
+      await symlink(connectionPath, symlinkPath)
+      const direct = new InternalFleetClient({
+        client: new FakeHarnessDriverClient(),
+        connectionPath,
+      })
+      const throughSymlink = new InternalFleetClient({
+        client: new FakeHarnessDriverClient(),
+        connectionPath: symlinkPath,
+      })
+
+      const identity = await direct.messageStreamIdentity()
+      await expect(throughSymlink.messageStreamIdentity()).resolves.toBe(identity)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('shares teammate claim identity through a symlinked parent before the connection file exists', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-internal-stream-missing-symlink-'))
+    const realDirectory = join(root, 'real-relay')
+    const symlinkDirectory = join(root, 'relay-link')
+    try {
+      await mkdir(realDirectory)
+      await symlink(realDirectory, symlinkDirectory)
+      const direct = new InternalFleetClient({
+        client: new FakeHarnessDriverClient(),
+        connectionPath: join(realDirectory, 'connection.json'),
+      })
+      const throughSymlink = new InternalFleetClient({
+        client: new FakeHarnessDriverClient(),
+        connectionPath: join(symlinkDirectory, 'connection.json'),
+      })
+
+      const identity = await direct.messageStreamIdentity()
+      await expect(throughSymlink.messageStreamIdentity()).resolves.toBe(identity)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('latches one agent death by name across lagged exit callbacks', () => {
