@@ -854,6 +854,7 @@ describe('sweep counters on the public surface (#355)', () => {
   // "candidates minus dispatched" arithmetic that the missing field makes
   // wrong, so the group travels whole or not at all.
   it('drops a partial trio rather than publishing a misleading fragment', () => {
+    expect(swept({ candidates: 4 })).toMatchObject({ enumerationCountsInvalid: true })
     expect(Object.hasOwn(swept({ candidates: 4 }) ?? {}, 'candidates')).toBe(false)
     expect(Object.hasOwn(swept({ candidates: 4, dispatched: 1 }) ?? {}, 'candidates')).toBe(false)
     expect(swept({ candidates: 4, dispatched: 1, skipped: 3 })).toMatchObject({
@@ -863,9 +864,42 @@ describe('sweep counters on the public surface (#355)', () => {
     })
   })
 
+  it('distinguishes a rejected deferred count snapshot from a genuine count-free deferral', () => {
+    const rejected = swept({
+      candidates: 4,
+      dispatched: 'invalid' as unknown as number,
+      discoveryDeferred: 'sweep-in-flight',
+    })
+    expect(rejected).toMatchObject({
+      discoveryDeferred: 'sweep-in-flight',
+      enumerationCountsInvalid: true,
+    })
+    expect(Object.hasOwn(rejected ?? {}, 'candidates')).toBe(false)
+
+    const normalizedAgain = normalizePublicHealth({
+      schemaVersion: 1,
+      ok: true,
+      status: 'ok',
+      stale: false,
+      loopStatus: 'running',
+      degradedSubsystems: [],
+      readinessReconcile: rejected,
+    })
+    expect(normalizedAgain?.readinessReconcile).toMatchObject({
+      discoveryDeferred: 'sweep-in-flight',
+      enumerationCountsInvalid: true,
+    })
+  })
+
   it('names the deferred sweep, so a zero from a held lease is not read as an empty provider', () => {
     expect(swept({ candidates: 0, dispatched: 0, skipped: 0, discoveryDeferred: 'sweep-in-flight' }))
       .toMatchObject({ candidates: 0, discoveryDeferred: 'sweep-in-flight' })
+    // Independent of the trio (#358 review). A daemon whose first pass deferred
+    // has no counts to publish and still has to say why, so dropping the marker
+    // with the counts would leave the only surface silent about it.
+    const noCounts = swept({ discoveryDeferred: 'sweep-in-flight' })
+    expect(noCounts?.discoveryDeferred).toBe('sweep-in-flight')
+    expect(Object.hasOwn(noCounts ?? {}, 'candidates')).toBe(false)
     // Only the one value the vocabulary has.
     expect(swept({
       candidates: 0,

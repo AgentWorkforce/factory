@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { formatSweepOutcome } from './diagnose'
 import { runFleetCli } from './fleet'
 
 const BASE = 'https://factory.example.com'
@@ -72,6 +73,57 @@ const healthy = {
     eventListener: { state: 'subscribed' },
   },
 }
+
+describe('formatSweepOutcome (#359)', () => {
+  it('attributes a count-free deferral only to the latest pass', () => {
+    const outcome = formatSweepOutcome({
+      state: 'healthy',
+      consecutiveFailures: 0,
+      failureThreshold: 3,
+      discoveryDeferred: 'sweep-in-flight',
+    })
+
+    expect(outcome).toBe(
+      'nothing has enumerated successfully yet — the most recent pass deferred ' +
+      'to another process holding the discovery lease',
+    )
+    expect(outcome).not.toContain('every pass')
+  })
+
+  it('does not present an older daemon\'s unstamped deferred zeroes as a measurement', () => {
+    const outcome = formatSweepOutcome({
+      state: 'healthy',
+      consecutiveFailures: 0,
+      failureThreshold: 3,
+      candidates: 0,
+      dispatched: 0,
+      skipped: 0,
+      discoveryDeferred: 'sweep-in-flight',
+    })
+
+    expect(outcome).toBe(
+      'not attributable (legacy deferred report has counts without an enumeration timestamp; ' +
+      'the most recent pass deferred to another process holding the discovery lease)',
+    )
+    expect(outcome).not.toContain('candidate(s)')
+  })
+
+  it('renders a rejected count snapshot as unknown rather than never enumerated', () => {
+    const outcome = formatSweepOutcome({
+      state: 'healthy',
+      consecutiveFailures: 0,
+      failureThreshold: 3,
+      discoveryDeferred: 'sweep-in-flight',
+      enumerationCountsInvalid: true,
+    })
+
+    expect(outcome).toBe(
+      'not attributable (the report supplied an incomplete or invalid count snapshot; ' +
+      'whether an earlier pass enumerated is unknown)',
+    )
+    expect(outcome).not.toContain('nothing has enumerated successfully yet')
+  })
+})
 
 describe('factory diagnose --deployed (#295)', () => {
   it('reports a healthy deployed instance and exits zero without any credential', async () => {

@@ -184,6 +184,9 @@ describe('readiness sweep counters (#355)', () => {
     expect(spawns).toEqual(['ar-901-impl-pear', 'ar-901-review', 'ar-902-impl-pear', 'ar-902-review'])
     expect(status).toMatchObject({ candidates: 2, dispatched: 2, skipped: 0 })
     expect(published(status)).toMatchObject({ candidates: 2, dispatched: 2, skipped: 0 })
+    // On a pass that enumerated, the two stamps describe the same instant.
+    expect(status.lastEnumeratedAtMs).toBe(status.lastCompletedAtMs)
+    expect(published(status).lastEnumeratedAtMs).toBe(status.lastCompletedAtMs)
   })
 
   it('publishes zero — not undefined — for a sweep that completed and found nothing', async () => {
@@ -239,6 +242,7 @@ describe('readiness sweep counters (#355)', () => {
       const status = factory.status().readinessReconcile
       expect(status?.state).toBe('not-running')
       expect(status && Object.hasOwn(status, 'candidates')).toBe(false)
+      expect(status && Object.hasOwn(status, 'lastEnumeratedAtMs')).toBe(false)
       // The projection must not invent a zero for it either — that would make
       // an instance that has never swept indistinguishable from one that swept
       // and found nothing, which is the ambiguity #355 was stuck on.
@@ -323,12 +327,13 @@ describe('readiness sweep counters (#355)', () => {
     }
 
     const root = await mkdtemp(join(tmpdir(), 'factory-sweep-counters-'))
+    const stateStore = new LeaseHeldElsewhereStateStore({ batchSize: 4 })
     const factory = createFactory(
       config({ loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') } }),
       {
         mount: new FakeMountClient({ [issuePath(941)]: issueFile(941) }),
         fleet: new FakeFleetClient(),
-        stateStore: new LeaseHeldElsewhereStateStore({ batchSize: 4 }),
+        stateStore,
         triage: new StaticTriage(),
         logger: {},
       },
@@ -339,22 +344,274 @@ describe('readiness sweep counters (#355)', () => {
         liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 600_000 },
       })
       const status = factory.status().readinessReconcile
-      expect(status).toMatchObject({
-        state: 'healthy',
-        candidates: 0,
-        dispatched: 0,
-        skipped: 0,
-        discoveryDeferred: 'sweep-in-flight',
-      })
-      expect(published(status!)).toMatchObject({
-        candidates: 0,
-        discoveryDeferred: 'sweep-in-flight',
-      })
+      // Nothing has enumerated, so there are NO counts to publish — and the
+      // marker still has to say why. A `0` here would claim a sweep queried the
+      // provider and found nothing, which is the opposite diagnosis.
+      expect(status).toMatchObject({ state: 'healthy', discoveryDeferred: 'sweep-in-flight' })
+      expect(status && Object.hasOwn(status, 'candidates')).toBe(false)
+      const readiness = published(status!)
+      expect(readiness.discoveryDeferred).toBe('sweep-in-flight')
+      expect(Object.hasOwn(readiness, 'candidates')).toBe(false)
     } finally {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it('a deferred pass does not overwrite the last enumerating sweep it followed', async () => {
+    // #358 review, CodeRabbit (Major). A deferred pass settles healthy in
+    // milliseconds having read nothing. Folding its zeroes into the snapshot
+    // erased the last real measurement — and where another process holds the
+    // lease for any length of time, EVERY pass would publish `candidates: 0`
+    // and the numbers this change exists to provide would be unrecoverable.
+    class DeferrableStateStore extends InMemoryStateStore {
+      deferClaims = false
+
+      override async claimDiscoverySweep(
+        workspaceId: string,
+        owner: string,
+        nowMs: number,
+        leaseMs: number,
+      ): Promise<DiscoverySweepClaim> {
+        const claim = await super.claimDiscoverySweep(
+          workspaceId,
+          this.deferClaims ? 'another-process' : owner,
+          nowMs,
+          leaseMs,
+        )
+        return this.deferClaims ? { ...claim, acquired: false, lease: undefined } : claim
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-counters-'))
+    const mount = new FakeMountClient({ [issuePath(961)]: issueFile(961) })
+    const stateStore = new DeferrableStateStore({ batchSize: 4 })
+    const factory = createFactory(
+      config({ loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') } }),
+      { mount, fleet: new FakeFleetClient(), stateStore, triage: new StaticTriage(), logger: {} },
+    )
+    try {
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+      })
+      // A real enumeration first.
+      await vi.waitFor(() => expect(factory.status().readinessReconcile).toMatchObject({
+        candidates: 1,
+        dispatched: 1,
+        skipped: 0,
+      }), { timeout: 5_000 })
+
+      stateStore.deferClaims = true
+
+      // Then deferred passes, for long enough that several land.
+      await vi.waitFor(() => {
+        const deferred = factory.status().readinessReconcile
+        expect(deferred?.discoveryDeferred).toBe('sweep-in-flight')
+        expect(deferred?.lastEnumeratedAtMs).toBeDefined()
+        expect(deferred?.lastCompletedAtMs).toBeGreaterThan(deferred?.lastEnumeratedAtMs ?? 0)
+      }, { timeout: 5_000 })
+
+      const status = factory.status().readinessReconcile
+      // Capture the enumerating baseline only after deferral is observable. A
+      // 50ms pass can land between the first wait and flipping `deferClaims`,
+      // so a pre-toggle completion timestamp is inherently racy.
+      const completedAtMs = status?.lastEnumeratedAtMs
+      expect(completedAtMs).toBeDefined()
+      // The measurement survives, and the marker says it is from an earlier pass.
+      expect(status).toMatchObject({
+        state: 'healthy',
+        candidates: 1,
+        dispatched: 1,
+        skipped: 0,
+        discoveryDeferred: 'sweep-in-flight',
+      })
+      // `lastCompletedAtMs` DOES move for a deferred pass, deliberately: the
+      // #295/#296 stall derivation reads it against `lastStartedAtMs`, so
+      // freezing it would report a daemon that is correctly deferring as hung
+      // after ten intervals.
+      expect(status?.lastCompletedAtMs).toBeGreaterThan(completedAtMs ?? 0)
+      // ...which is exactly why the counts need their own stamp (#359 review).
+      // It stays pinned to the pass that enumerated, so the gap between the
+      // two IS the staleness of the retained measurement — without it, old
+      // counts sat beside an ever-fresh completion time and a reader could not
+      // tell a measurement one interval old from one four days old.
+      expect(status?.lastEnumeratedAtMs).toBe(completedAtMs)
+      expect(status?.lastEnumeratedAtMs).toBeLessThan(status?.lastCompletedAtMs ?? 0)
+      expect(published(status!)).toMatchObject({
+        candidates: 1,
+        dispatched: 1,
+        discoveryDeferred: 'sweep-in-flight',
+        lastEnumeratedAtMs: completedAtMs,
+      })
+
+      // And it holds across FURTHER deferrals rather than creeping forward.
+      const pinned = status?.lastEnumeratedAtMs
+      await vi.waitFor(() => {
+        expect(factory.status().readinessReconcile?.lastCompletedAtMs)
+          .toBeGreaterThan(status?.lastCompletedAtMs ?? 0)
+      }, { timeout: 5_000 })
+      expect(factory.status().readinessReconcile?.lastEnumeratedAtMs).toBe(pinned)
+      expect(factory.status().readinessReconcile?.candidates).toBe(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('logs THIS pass\'s breakdown on a deferred completion, never the retained one', async () => {
+    // #359 review, codex P2. The completion log is what a local operator reads,
+    // and it drew `skipReasons` from the retained snapshot while drawing the
+    // counts from the current report. On a deferred pass that printed
+    // `skipped: 0` beside a non-empty breakdown — a line contradicting its own
+    // arithmetic, on the surface meant to explain the arithmetic.
+    class DeferrableStateStore extends InMemoryStateStore {
+      deferClaims = false
+
+      override async claimDiscoverySweep(
+        workspaceId: string,
+        owner: string,
+        nowMs: number,
+        leaseMs: number,
+      ): Promise<DiscoverySweepClaim> {
+        const claim = await super.claimDiscoverySweep(
+          workspaceId,
+          this.deferClaims ? 'another-process' : owner,
+          nowMs,
+          leaseMs,
+        )
+        return this.deferClaims ? { ...claim, acquired: false, lease: undefined } : claim
+      }
+    }
+
+    const completions: Array<Record<string, unknown>> = []
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-counters-'))
+    const stateStore = new DeferrableStateStore({ batchSize: 4 })
+    const factory = createFactory(
+      config({ loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') } }),
+      {
+        mount: new FakeMountClient({
+          [issuePath(971)]: issueFile(971),
+          [issuePath(972)]: issueFile(972, 'Ordinary product issue, not in factory scope'),
+        }),
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        logger: {
+          info: (message: string, detail?: unknown) => {
+            if (message === '[factory] periodic readiness reconciliation completed') {
+              completions.push(detail as Record<string, unknown>)
+            }
+          },
+        },
+      },
+    )
+    try {
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+      })
+      // One real pass that skips something, so a retained breakdown exists.
+      // (The startup backfill dispatches 971 and skips 972; a periodic pass
+      // then skips both — 971 as `already-tracked` — so assert on the shape,
+      // not on an exact count.)
+      await vi.waitFor(() => {
+        expect(completions.some((entry) => (entry.skipped as number) > 0)).toBe(true)
+      }, { timeout: 5_000 })
+      const enumerated = completions.find((entry) => (entry.skipped as number) > 0)
+      expect(enumerated?.skipReasons).toMatchObject({ 'out-of-scope': 1 })
+      // Internally consistent: the breakdown sums to the count beside it.
+      expect(Object.values(enumerated?.skipReasons as Record<string, number>)
+        .reduce((sum, n) => sum + n, 0)).toBe(enumerated?.skipped)
+
+      stateStore.deferClaims = true
+      await vi.waitFor(() => {
+        expect(completions.some((entry) => entry.discoveryDeferred === 'sweep-in-flight')).toBe(true)
+      }, { timeout: 5_000 })
+
+      // Every deferred line is internally consistent: zero skips, no breakdown.
+      const deferredLines = completions.filter((entry) => entry.discoveryDeferred === 'sweep-in-flight')
+      expect(deferredLines.length).toBeGreaterThan(0)
+      for (const entry of deferredLines) {
+        expect(entry).toMatchObject({ candidates: 0, dispatched: 0, skipped: 0 })
+        expect(entry.skipReasons).toEqual({})
+      }
+      // ...while the published surface still retains the real measurement.
+      const retained = factory.status().readinessReconcile
+      expect(retained?.candidates).toBe(2)
+      expect((retained?.skipped ?? 0)).toBeGreaterThan(0)
+      expect(retained?.skipReasons).toMatchObject({ 'out-of-scope': 1 })
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+    // Two sequential waits on a live 50ms loop; vitest's 5s default is not a
+    // budget this fits in, and this repo configures no `testTimeout`.
+  }, 30_000)
+
+  it('clears an older deferral marker when the next pass fails', async () => {
+    class ControllableStateStore extends InMemoryStateStore {
+      mode: 'enumerate' | 'defer' | 'fail' = 'enumerate'
+
+      override async claimDiscoverySweep(
+        workspaceId: string,
+        owner: string,
+        nowMs: number,
+        leaseMs: number,
+      ): Promise<DiscoverySweepClaim> {
+        if (this.mode === 'fail') throw new Error('discovery failed after deferral')
+        const claim = await super.claimDiscoverySweep(
+          workspaceId,
+          this.mode === 'defer' ? 'another-process' : owner,
+          nowMs,
+          leaseMs,
+        )
+        return this.mode === 'defer' ? { ...claim, acquired: false, lease: undefined } : claim
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-counters-'))
+    const stateStore = new ControllableStateStore({ batchSize: 4 })
+    const factory = createFactory(
+      config({ loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') } }),
+      {
+        mount: new FakeMountClient({ [issuePath(981)]: issueFile(981) }),
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        logger: {},
+      },
+    )
+    try {
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+      })
+      await vi.waitFor(() => {
+        expect(factory.status().readinessReconcile?.lastEnumeratedAtMs).toBeDefined()
+      }, { timeout: 5_000 })
+
+      stateStore.mode = 'defer'
+      await vi.waitFor(() => {
+        expect(factory.status().readinessReconcile?.discoveryDeferred).toBe('sweep-in-flight')
+      }, { timeout: 5_000 })
+
+      stateStore.mode = 'fail'
+      await vi.waitFor(() => {
+        const failed = factory.status().readinessReconcile
+        expect(failed?.lastErrorClass).toBe('Error')
+        expect(failed?.lastFailureAtMs).toBeDefined()
+        expect(failed && Object.hasOwn(failed, 'discoveryDeferred')).toBe(false)
+      }, { timeout: 5_000 })
+
+      // The last real measurement remains useful; only the stale attribution
+      // to lease contention is removed by the newer failed pass.
+      expect(factory.status().readinessReconcile).toMatchObject({ candidates: 1 })
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
 
   it('publishes counts only: no issue key, path or title reaches the unauthenticated record', async () => {
     const { status } = await sweepReadiness({

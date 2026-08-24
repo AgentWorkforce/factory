@@ -213,11 +213,11 @@ const skipReasonCounts = (
 }
 
 /**
- * The last completed sweep's arithmetic, published (#355).
+ * The last enumerating sweep's arithmetic, published (#355).
  *
  * Deliberately NOT `counter()`: that coerces an absent field to `0`, which
- * would make a daemon that has never completed a sweep indistinguishable from
- * one that completed a sweep and found nothing. Those are the two halves of
+ * would make a daemon that has never enumerated a sweep indistinguishable from
+ * one that enumerated a sweep and found nothing. Those are the two halves of
  * the split this block exists to make, so the three fields travel together —
  * all present, or none — and a zero is published as a zero.
  */
@@ -233,21 +233,39 @@ const sweepOutcome = (
     skipped?: unknown
     skipReasons?: unknown
     discoveryDeferred?: unknown
+    lastEnumeratedAtMs?: unknown
+    enumerationCountsInvalid?: unknown
   },
 ): Partial<Pick<
   FactoryPublicReadinessReconcileHealth,
-  'candidates' | 'dispatched' | 'skipped' | 'skipReasons' | 'discoveryDeferred'
+  'candidates' | 'dispatched' | 'skipped' | 'skipReasons' | 'discoveryDeferred' | 'lastEnumeratedAtMs' |
+  'enumerationCountsInvalid'
 >> => {
+  // Independent of the trio (#358 review, CodeRabbit): the counts describe the
+  // last sweep that ENUMERATED, and this describes the most recent pass. A
+  // daemon whose first pass deferred has no counts and still has to say why,
+  // and one that deferred after a real sweep publishes both — which is the
+  // pairing that tells a reader the numbers are from an earlier pass.
+  const deferred = status.discoveryDeferred === 'sweep-in-flight'
+    ? { discoveryDeferred: 'sweep-in-flight' as const }
+    : {}
   const candidates = optionalCount('candidates', status.candidates)
   const dispatched = optionalCount('dispatched', status.dispatched)
   const skipped = optionalCount('skipped', status.skipped)
+  const suppliedCounts = status.enumerationCountsInvalid === true ||
+    status.candidates !== undefined ||
+    status.dispatched !== undefined ||
+    status.skipped !== undefined
   // A record carrying only some of the three is a producer we do not
   // understand; publishing the fragment would invite exactly the arithmetic
   // ("candidates minus dispatched") that the missing field makes wrong.
   if (candidates.candidates === undefined ||
       dispatched.dispatched === undefined ||
       skipped.skipped === undefined) {
-    return {}
+    return {
+      ...deferred,
+      ...(suppliedCounts ? { enumerationCountsInvalid: true as const } : {}),
+    }
   }
   const skipReasons = skipReasonCounts(status.skipReasons)
   return {
@@ -255,9 +273,11 @@ const sweepOutcome = (
     ...dispatched,
     ...skipped,
     ...(skipReasons ? { skipReasons } : {}),
-    ...(status.discoveryDeferred === 'sweep-in-flight'
-      ? { discoveryDeferred: 'sweep-in-flight' as const }
-      : {}),
+    // Part of the same atomic snapshot as the counts: it is what dates them,
+    // and without it retained counts have no freshness a reader can recover
+    // (#359 review).
+    ...optionalTimestamp('lastEnumeratedAtMs', status.lastEnumeratedAtMs),
+    ...deferred,
   }
 }
 
