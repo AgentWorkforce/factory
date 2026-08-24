@@ -433,6 +433,8 @@ export interface FactoryInFlightRegistryAgent {
 
 export interface FactoryDispatchClaimStatus {
   state: 'pending' | 'verified' | 'degraded'
+  /** Local instant immediately before the provider claim began; recovery requires a newer connected projection. */
+  claimStartedAtMs?: number
   /** Cancellation could not safely undo the provider claim; keep its lifecycle and placements recoverable. */
   cancellationBlocked?: boolean
   /** The provider claim call itself had not settled when ownership was handed off. */

@@ -1770,7 +1770,10 @@ export class FactoryLoop implements Factory {
       if (!issue) return true
       if (isGithubIssue(issue)) {
         if (!this.#githubWriteback.getIssueStatus) return true
-        const status = await this.#githubWriteback.getIssueStatus(issue)
+        const status = await this.#githubWriteback.getIssueStatus(issue, {
+          requireFresh: true,
+          freshAfterMs: record.dispatchClaim?.claimStartedAtMs,
+        })
         if (!status || status === 'in-progress') return true
       } else {
         if (!this.#linear.getIssueStateId) return true
@@ -5071,9 +5074,11 @@ export class FactoryLoop implements Factory {
         agents.push({ name: spawned.name, role: spec.role })
       }
       if (!dryRun) {
+        const claimStartedAtMs = this.#clock.now()
         record.dispatchClaim = {
           state: 'pending',
-          updatedAtMs: this.#clock.now(),
+          claimStartedAtMs,
+          updatedAtMs: claimStartedAtMs,
         }
         this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
       }
@@ -7197,9 +7202,11 @@ export class FactoryLoop implements Factory {
     const comment = dispatchComment(record.decision, agents)
     let implementingStateId: string | undefined
     if (!record.dryRun) {
+      const claimStartedAtMs = this.#clock.now()
       record.dispatchClaim = {
         state: 'pending',
-        updatedAtMs: this.#clock.now(),
+        claimStartedAtMs,
+        updatedAtMs: claimStartedAtMs,
       }
       this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
     }
@@ -7769,6 +7776,9 @@ export class FactoryLoop implements Factory {
         this.#increment('dispatchWritebackFailures')
         record.dispatchClaim = {
           state: 'degraded',
+          ...(record.dispatchClaim?.claimStartedAtMs === undefined
+            ? {}
+            : { claimStartedAtMs: record.dispatchClaim.claimStartedAtMs }),
           write,
           attempts: attempt,
           maxAttempts: DISPATCH_WRITEBACK_MAX_ATTEMPTS,

@@ -1158,6 +1158,15 @@ class RejectingBlockingDispatchClaimGithubWriteback extends BlockingDispatchClai
 
 class UnprovenRollbackDispatchClaimGithubWriteback extends RejectingBlockingDispatchCommentGithubWriteback {
   rollbackAttempts = 0
+  readonly statusReadOptions: Array<{ requireFresh?: boolean; freshAfterMs?: number }> = []
+
+  override async getIssueStatus(
+    issue: LinearIssue,
+    opts?: { requireFresh?: boolean; freshAfterMs?: number },
+  ): Promise<GithubIssueStatus> {
+    this.statusReadOptions.push(opts ?? {})
+    return await super.getIssueStatus(issue)
+  }
 
   override async rollbackStatusClaim(): Promise<'unproven'> {
     this.rollbackAttempts += 1
@@ -11926,11 +11935,16 @@ describe('FactoryLoop', () => {
         phase: 'running',
         dispatchClaim: {
           state: 'degraded',
+          claimStartedAtMs: expect.any(Number),
           cancellationBlocked: true,
           write: 'rejected dispatch claim rollback',
           deadLettered: true,
         },
       })
+      await vi.waitFor(() => expect(githubWriteback.statusReadOptions).toContainEqual({
+        requireFresh: true,
+        freshAfterMs: expect.any(Number),
+      }), { timeout: 4_000 })
 
       await withDeadline(factory.stop(), 4_000, 'stop did not retain the uncompensated held dispatch')
       stopped = true

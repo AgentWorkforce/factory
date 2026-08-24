@@ -106,7 +106,8 @@ type AppIssueConnectionWrite = GithubConnectionWrite & Required<Pick<
  */
 export class AppGithubWriteback implements GithubWriteback {
   readonly #write: AppIssueConnectionWrite
-  readonly #read?: GithubConnectionRead
+  readonly #connectedRead?: GithubConnectionRead
+  readonly #fallbackRead?: GithubConnectionRead
 
   constructor(write: GithubConnectionWrite, read?: GithubConnectionRead) {
     if (!write.postIssueComment || !write.ensureRepositoryLabel || !write.mutateIssueLabel || !write.updateIssue) {
@@ -115,12 +116,13 @@ export class AppGithubWriteback implements GithubWriteback {
       )
     }
     this.#write = write as AppIssueConnectionWrite
-    // Prefer the authenticated read carried by the connected App surface.
-    // The fallback reader may be deliberately unauthenticated and therefore
-    // cannot observe private repositories.
-    this.#read = write.getIssue
+    // Prefer the authenticated read carried by the connected App surface, but
+    // retain the direct reader for public repositories when the projection is
+    // indeterminate or has not advanced past an ambiguous claim.
+    this.#connectedRead = write.getIssue
       ? { getIssue: write.getIssue.bind(write) }
-      : read
+      : undefined
+    this.#fallbackRead = read
   }
 
   async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {
@@ -137,12 +139,31 @@ export class AppGithubWriteback implements GithubWriteback {
     })
   }
 
-  async getIssueStatus(issue: LinearIssue): Promise<GithubIssueStatus | undefined> {
-    if (!this.#read) return undefined
+  async getIssueStatus(
+    issue: LinearIssue,
+    opts: { requireFresh?: boolean; freshAfterMs?: number } = {},
+  ): Promise<GithubIssueStatus | undefined> {
     const ref = githubIssueRef(issue)
-    const lookup = await this.#read.getIssue(ref.repo, ref.number)
-    if (lookup.outcome !== 'found') return undefined
-    return githubStatusFromLabels(githubLabelsFromContent(lookup.issue.content))
+    if (this.#connectedRead) {
+      const connected = await this.#connectedRead.getIssue(ref.repo, ref.number)
+      if (connected.outcome === 'not-found') return undefined
+      if (connected.outcome === 'found') {
+        const status = githubStatusFromLabels(githubLabelsFromContent(connected.issue.content))
+        const updatedAtMs = githubIssueUpdatedAtMs(connected.issue.content)
+        if (
+          status === 'in-progress' ||
+          !opts.requireFresh ||
+          (opts.freshAfterMs !== undefined && updatedAtMs !== undefined && updatedAtMs > opts.freshAfterMs)
+        ) return status
+        // The canonical projection is readable but predates the ambiguous
+        // mutation. A public direct read can still supply a live provider
+        // observation; a private repository fails closed below.
+      }
+    }
+    if (!this.#fallbackRead) return undefined
+    const fallback = await this.#fallbackRead.getIssue(ref.repo, ref.number)
+    if (fallback.outcome !== 'found') return undefined
+    return githubStatusFromLabels(githubLabelsFromContent(fallback.issue.content))
   }
 
   async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult> {
@@ -677,6 +698,15 @@ const githubLabelsFromContent = (content: unknown): Set<string> => {
     const name = stringValue(asRecord(label)?.name)?.trim().toLowerCase()
     return name ? [name] : []
   }))
+}
+
+const githubIssueUpdatedAtMs = (content: unknown): number | undefined => {
+  const payload = wrappedPayload(content)
+  const raw = payload.updatedAt ?? payload.updated_at
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+  if (typeof raw !== 'string' || !raw.trim()) return undefined
+  const parsed = Date.parse(raw)
+  return Number.isFinite(parsed) ? parsed : undefined
 }
 
 const githubStatusTransitionEvent = (
