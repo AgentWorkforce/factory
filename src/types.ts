@@ -254,12 +254,19 @@ export interface FactoryReadinessReconcileStatus {
    */
   skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
   /**
-   * The last completed sweep never enumerated anything: another process held
-   * the discovery lease, so it returned an empty report immediately.
+   * The MOST RECENT pass never enumerated anything: another process held the
+   * discovery lease, so it returned an empty report immediately.
    *
    * Without this, that pass is indistinguishable from a sweep that queried the
-   * provider and legitimately found no ready work — both publish
+   * provider and legitimately found no ready work — both would publish
    * `candidates: 0` — and those are opposite diagnoses (#355).
+   *
+   * Independent of the counts above, which describe the last sweep that
+   * actually enumerated. A deferred pass records only this marker: its zeroes
+   * measure nothing and must not overwrite a real sweep's numbers, which on a
+   * persistently-held lease would erase them entirely (#358 review). So the two
+   * together mean "the counts are from an earlier pass"; this one alone means
+   * nothing has enumerated yet.
    */
   discoveryDeferred?: 'sweep-in-flight'
   /** Free text; authenticated surfaces only. */
@@ -295,7 +302,11 @@ export interface FactoryPublicReadinessReconcileHealth {
   skipped?: number
   /** `skipped` split by a closed vocabulary of causes; zero counts omitted. */
   skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
-  /** The last completed sweep deferred to another process's discovery lease. */
+  /**
+   * The most recent pass deferred to another process's discovery lease. Present
+   * alongside the counts it means they are from an earlier pass; present alone
+   * it means nothing has enumerated yet.
+   */
   discoveryDeferred?: 'sweep-in-flight'
   lastErrorClass?: string
 }

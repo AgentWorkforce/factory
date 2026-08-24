@@ -848,14 +848,14 @@ export class FactoryLoop implements Factory {
   #readinessReconcileLastError?: string
   #readinessReconcileLastErrorClass?: string
   /**
-   * The last *completed* sweep's arithmetic (#355).
+   * The last *enumerating* sweep's arithmetic (#355).
    *
-   * Held as one record rather than four fields so it can only ever be replaced
+   * Held as one record rather than three fields so it can only ever be replaced
    * whole: publishing a `dispatched` from one pass beside a `candidates` from
    * another would be worse than publishing neither, since the whole use of
    * these numbers is comparing them to each other.
    *
-   * `undefined` until a sweep completes, and never initialised to zeroes —
+   * `undefined` until a sweep enumerates, and never initialised to zeroes —
    * "this daemon has not finished a sweep" and "a sweep finished and found
    * nothing" are the two readings #355 has to tell apart.
    */
@@ -864,8 +864,19 @@ export class FactoryLoop implements Factory {
     dispatched: number
     skipped: number
     skipReasons: Partial<Record<FactorySweepSkipReasonCode, number>>
-    discoveryDeferred?: 'sweep-in-flight'
   }
+  /**
+   * Whether the MOST RECENT pass deferred, tracked apart from the counts above
+   * (#358 review, CodeRabbit — Major, and right).
+   *
+   * A deferred pass enumerates nothing and settles in milliseconds, so folding
+   * it into the snapshot overwrote the last real sweep's numbers with zeroes.
+   * On a container where another process holds the lease for any length of time
+   * — the #347/#349 condition — every pass would publish `candidates: 0` and the
+   * last actual enumeration would be unrecoverable, destroying the measurement
+   * this whole change exists to provide.
+   */
+  #readinessReconcileLastSweepDeferred?: 'sweep-in-flight'
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
@@ -5035,14 +5046,26 @@ export class FactoryLoop implements Factory {
    * inventing zeroes for it would publish "found nothing" for a sweep that
    * never got to look. The previous pass's numbers stay put instead, dated by
    * `lastCompletedAtMs`, which is the honest reading.
+   *
+   * A deferred pass gets the same treatment for the same reason. It settles
+   * successfully, and `lastCompletedAtMs` moves — deliberately, because the
+   * #295/#296 stall derivation reads that timestamp against `lastStartedAtMs`,
+   * and freezing it would report a functioning daemon as a hung one after ten
+   * intervals of deferring correctly to another owner. But it enumerated
+   * nothing, so its zeroes are not a measurement of anything and must not
+   * replace one. Only the marker is recorded.
    */
   #recordReadinessSweepOutcome(report: IterationReport): void {
+    if (report.discoveryDeferred) {
+      this.#readinessReconcileLastSweepDeferred = report.discoveryDeferred
+      return
+    }
+    this.#readinessReconcileLastSweepDeferred = undefined
     this.#readinessReconcileLastSweep = {
       candidates: report.pulled.length,
       dispatched: report.dispatched.length,
       skipped: report.skipped.length,
       skipReasons: factorySweepSkipReasonCounts(report.skipped),
-      ...(report.discoveryDeferred ? { discoveryDeferred: report.discoveryDeferred } : {}),
     }
   }
 
@@ -5133,10 +5156,12 @@ export class FactoryLoop implements Factory {
             ...(Object.keys(this.#readinessReconcileLastSweep.skipReasons).length > 0
               ? { skipReasons: { ...this.#readinessReconcileLastSweep.skipReasons } }
               : {}),
-            ...(this.#readinessReconcileLastSweep.discoveryDeferred
-              ? { discoveryDeferred: this.#readinessReconcileLastSweep.discoveryDeferred }
-              : {}),
           }
+        : {}),
+      // Independent of the trio: a daemon whose FIRST pass deferred has no
+      // counts to publish and still needs to say why.
+      ...(this.#readinessReconcileLastSweepDeferred
+        ? { discoveryDeferred: this.#readinessReconcileLastSweepDeferred }
         : {}),
       ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
       ...(this.#readinessReconcileLastErrorClass

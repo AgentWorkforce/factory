@@ -106,22 +106,37 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   They describe the last sweep that settled **successfully**, the same tense as `lastDurationMs`;
   `lastCompletedAtMs` dates them. A pass that failed leaves them untouched rather than zeroing them.
 
-- **`discoveryDeferred: "sweep-in-flight"`** — the sweep returned immediately because another process
-  held the discovery lease, so it enumerated nothing. Without this, that pass is indistinguishable
-  from one that queried the provider and legitimately found no ready work: both publish
-  `candidates: 0`.
+- **`discoveryDeferred: "sweep-in-flight"`** — the **most recent** pass returned immediately because
+  another process held the discovery lease, so it enumerated nothing. It is tracked apart from the
+  three counts, which describe the last sweep that actually enumerated:
+
+  - **with the counts** — those numbers are from an *earlier* pass, not the one `lastCompletedAtMs`
+    dates. A deferred pass records only this marker; its zeroes measure nothing and must not
+    overwrite a real sweep's numbers, which under a persistently-held lease would erase them.
+  - **alone, with no counts** — nothing has enumerated yet on this daemon, and a held lease is why.
+
+  `lastCompletedAtMs` *does* move for a deferred pass. That is deliberate: the stall derivation above
+  reads it against `lastStartedAtMs`, so freezing it would report a daemon that is correctly
+  deferring to another owner as hung after ten intervals.
 
 - **`skipReasons`** — `skipped` split by a closed vocabulary
   (`FACTORY_SWEEP_SKIP_REASON_CODES`); zero-count codes are omitted, so an absent key is a zero, and
-  the counts always sum to `skipped`. `dispatch-terminal` and `dispatch-retry-limit` are the two that
-  never clear on their own — a work unit in either needs a human. `dispatch-backoff`,
-  `already-tracked` and `queued-or-escalated` resolve by themselves. `out-of-scope` and `not-ready`
-  mean the gate is working as configured and the issue does not match it — check the deployed
-  `safety` config against the issue rather than the daemon.
+  the counts always sum to `skipped`. The full vocabulary, grouped by what to do about it:
+
+  | code | |
+  |---|---|
+  | `dispatch-terminal`, `dispatch-retry-limit` | **needs a human** — permanently declined, never clears on its own |
+  | `dispatch-backoff`, `dispatch-in-flight`, `already-tracked`, `queued-or-escalated` | transient; resolves by itself |
+  | `out-of-scope`, `not-ready`, `not-dispatchable` | the gate is working as configured and the issue does not match it — check the deployed `safety` config against the issue, not the daemon |
+  | `parked-dependency`, `dependency-cycle` | parked on other work; a cycle needs a human to break it |
+  | `read-failed`, `dispatch-failed` | the dependency or the dispatch threw — pair with `lastErrorClass` |
+  | `other` | a code this reader's vocabulary does not know, from a producer on another version |
 
   Counts only, by construction: issue keys, paths and titles carry customer project and repository
   names and never cross onto this surface. The keys are rebuilt from the reader's own copy of the
-  vocabulary, so a record from another version cannot publish an arbitrary string as one.
+  vocabulary — anything unrecognised is counted under `other` rather than dropped, so the parts keep
+  summing to `skipped` — which is also why a record from another version cannot publish an arbitrary
+  string as a key.
 
 - **`fleetControlPlane`** — an `open` circuit fails every spawn and resume fast, so it gates dispatch
   as hard as a failing sweep. `closed` is the healthy value.

@@ -323,12 +323,13 @@ describe('readiness sweep counters (#355)', () => {
     }
 
     const root = await mkdtemp(join(tmpdir(), 'factory-sweep-counters-'))
+    const stateStore = new LeaseHeldElsewhereStateStore({ batchSize: 4 })
     const factory = createFactory(
       config({ loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') } }),
       {
         mount: new FakeMountClient({ [issuePath(941)]: issueFile(941) }),
         fleet: new FakeFleetClient(),
-        stateStore: new LeaseHeldElsewhereStateStore({ batchSize: 4 }),
+        stateStore,
         triage: new StaticTriage(),
         logger: {},
       },
@@ -339,15 +340,91 @@ describe('readiness sweep counters (#355)', () => {
         liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 600_000 },
       })
       const status = factory.status().readinessReconcile
+      // Nothing has enumerated, so there are NO counts to publish — and the
+      // marker still has to say why. A `0` here would claim a sweep queried the
+      // provider and found nothing, which is the opposite diagnosis.
+      expect(status).toMatchObject({ state: 'healthy', discoveryDeferred: 'sweep-in-flight' })
+      expect(status && Object.hasOwn(status, 'candidates')).toBe(false)
+      const readiness = published(status!)
+      expect(readiness.discoveryDeferred).toBe('sweep-in-flight')
+      expect(Object.hasOwn(readiness, 'candidates')).toBe(false)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a deferred pass does not overwrite the last enumerating sweep it followed', async () => {
+    // #358 review, CodeRabbit (Major). A deferred pass settles healthy in
+    // milliseconds having read nothing. Folding its zeroes into the snapshot
+    // erased the last real measurement — and where another process holds the
+    // lease for any length of time, EVERY pass would publish `candidates: 0`
+    // and the numbers this change exists to provide would be unrecoverable.
+    class DeferrableStateStore extends InMemoryStateStore {
+      deferClaims = false
+
+      override async claimDiscoverySweep(
+        workspaceId: string,
+        owner: string,
+        nowMs: number,
+        leaseMs: number,
+      ): Promise<DiscoverySweepClaim> {
+        const claim = await super.claimDiscoverySweep(
+          workspaceId,
+          this.deferClaims ? 'another-process' : owner,
+          nowMs,
+          leaseMs,
+        )
+        return this.deferClaims ? { ...claim, acquired: false, lease: undefined } : claim
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-counters-'))
+    const mount = new FakeMountClient({ [issuePath(961)]: issueFile(961) })
+    const stateStore = new DeferrableStateStore({ batchSize: 4 })
+    const factory = createFactory(
+      config({ loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') } }),
+      { mount, fleet: new FakeFleetClient(), stateStore, triage: new StaticTriage(), logger: {} },
+    )
+    try {
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+      })
+      // A real enumeration first.
+      await vi.waitFor(() => expect(factory.status().readinessReconcile).toMatchObject({
+        candidates: 1,
+        dispatched: 1,
+        skipped: 0,
+      }), { timeout: 5_000 })
+      const completedAtMs = factory.status().readinessReconcile?.lastCompletedAtMs
+
+      stateStore.deferClaims = true
+
+      // Then deferred passes, for long enough that several land.
+      await vi.waitFor(() => {
+        expect(factory.status().readinessReconcile?.discoveryDeferred).toBe('sweep-in-flight')
+        expect(factory.status().readinessReconcile?.lastCompletedAtMs)
+          .toBeGreaterThan(completedAtMs ?? 0)
+      }, { timeout: 5_000 })
+
+      const status = factory.status().readinessReconcile
+      // The measurement survives, and the marker says it is from an earlier pass.
       expect(status).toMatchObject({
         state: 'healthy',
-        candidates: 0,
-        dispatched: 0,
+        candidates: 1,
+        dispatched: 1,
         skipped: 0,
         discoveryDeferred: 'sweep-in-flight',
       })
+      // `lastCompletedAtMs` DOES move for a deferred pass, deliberately: the
+      // #295/#296 stall derivation reads it against `lastStartedAtMs`, so
+      // freezing it would report a daemon that is correctly deferring as hung
+      // after ten intervals.
+      expect(status?.lastCompletedAtMs).toBeGreaterThan(completedAtMs ?? 0)
       expect(published(status!)).toMatchObject({
-        candidates: 0,
+        candidates: 1,
+        dispatched: 1,
         discoveryDeferred: 'sweep-in-flight',
       })
     } finally {
