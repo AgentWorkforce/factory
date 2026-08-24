@@ -11956,8 +11956,10 @@ describe('FactoryLoop', () => {
     const watchStatePath = join(root, 'state.json')
     const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
     const gate = Promise.withResolvers<void>()
+    const spawnStarted = Promise.withResolvers<void>()
     class HangingSpawnFleetClient extends RemoteLifecycleFleetClient {
       override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        spawnStarted.resolve()
         await gate.promise
         return super.spawn(input)
       }
@@ -11980,16 +11982,17 @@ describe('FactoryLoop', () => {
       const key = dispatchIssueIdentity(decision.issue)
       const dispatched = factory.dispatch(decision)
 
-      const claimed = await vi.waitFor(async () => {
-        const lifecycle = await state().getDispatchLifecycle('factory-test', key)
-        expect(lifecycle).toMatchObject({ phase: 'dispatching' })
-        return lifecycle!
-      }, { timeout: 6_000 })
+      // `phase: dispatching` is also persisted before the spawn starts. Wait
+      // for the fleet call itself so this test exercises a genuinely late
+      // placement rather than racing an earlier ownership fence (#359 CI).
+      await spawnStarted.promise
+      const claimed = await state().getDispatchLifecycle('factory-test', key)
+      expect(claimed).toMatchObject({ phase: 'dispatching' })
 
       // Another owner reclaims the row once this process's lease has lapsed.
       // Claiming on a future clock is what lets it past the live-lease guard.
       const takeover = await state().claimDispatchLifecycle(
-        'factory-test', key, claimed, 'other-owner', Date.now() + 10 * 60_000, 10 * 60_000,
+        'factory-test', key, claimed!, 'other-owner', Date.now() + 10 * 60_000, 10 * 60_000,
       )
       expect(takeover.acquired).toBe(true)
 
