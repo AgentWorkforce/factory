@@ -435,6 +435,8 @@ export interface FactoryDispatchClaimStatus {
   state: 'pending' | 'verified' | 'degraded'
   /** Cancellation could not safely undo the provider claim; keep its lifecycle and placements recoverable. */
   cancellationBlocked?: boolean
+  /** The provider claim call itself had not settled when ownership was handed off. */
+  cancellationPending?: boolean
   write?: string
   attempts?: number
   maxAttempts?: number

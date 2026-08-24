@@ -914,6 +914,7 @@ export class FactoryLoop implements Factory {
   // rollback succeeds or a newer provider status supersedes it. This runtime
   // set closes the race before the durable dispatchClaim flag is persisted.
   readonly #uncompensatedDispatchClaims = new Set<string>()
+  readonly #pendingDispatchClaims = new Set<string>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   #reconciledAgentExitsActive = 0
   readonly #reconciledAgentExitWaiters: Array<() => void> = []
@@ -1312,6 +1313,7 @@ export class FactoryLoop implements Factory {
     this.#shutdownReleaseCapturedDispatches.clear()
     this.#postSpawnDispatchesRejectedDuringStop.clear()
     this.#uncompensatedDispatchClaims.clear()
+    this.#pendingDispatchClaims.clear()
     this.#stopping = false
     this.#startMode = opts.mode ?? 'live'
     const issueSource = await this.#issueSource()
@@ -1447,8 +1449,6 @@ export class FactoryLoop implements Factory {
     this.#babysitterResourceDeliveryRetryTimer = undefined
     if (this.#babysitterResourceSubscriptionRenewTimer) clearTimeout(this.#babysitterResourceSubscriptionRenewTimer)
     this.#babysitterResourceSubscriptionRenewTimer = undefined
-    if (this.#dispatchLifecycleRenewTimer) clearInterval(this.#dispatchLifecycleRenewTimer)
-    this.#dispatchLifecycleRenewTimer = undefined
     if (this.#heldAgentDeadlineTimer) clearTimeout(this.#heldAgentDeadlineTimer)
     this.#heldAgentDeadlineTimer = undefined
     this.#heldAgentDeadlineDueAtMs = undefined
@@ -1483,6 +1483,12 @@ export class FactoryLoop implements Factory {
       // cannot hold shutdown open.
       await this.#drainRejectedClaimDispatchesForStop(rejectedClaimDispatches)
       await this.#persistOutstandingClaimCancellationBlocks()
+      // Keep renewing ownership through the potentially slow provider drain
+      // and cancellation-fence handoff. Stopping renewal earlier can let the
+      // lease expire before the fence is saved, allowing a successor to reap
+      // agents while the old provider write can still land.
+      if (this.#dispatchLifecycleRenewTimer) clearInterval(this.#dispatchLifecycleRenewTimer)
+      this.#dispatchLifecycleRenewTimer = undefined
       // Relinquish durable ownership before waiting on mount-backed lifecycle
       // drives. A slow Relayfile scan must not consume the shutdown deadline
       // while every issue remains fenced to a publisher that is already
@@ -1644,24 +1650,26 @@ export class FactoryLoop implements Factory {
     const batch = await this.#batch()
     for (const record of batch.inFlight) {
       const key = dispatchLifecycleKey(record.issue)
-      if (!this.#uncompensatedDispatchClaims.has(key) || record.dispatchClaim?.cancellationBlocked === true) {
-        continue
-      }
+      if (!this.#pendingDispatchClaims.has(key)) continue
       // The bounded durable drain expired before the provider operation could
       // report whether rollback was safe. Persist the provisional release
       // fence while this publisher still owns the lifecycle lease, so a
       // successor cannot mistake the unresolved claim for abandonable work.
-      await this.#retainUncompensatedDispatchClaim(
+      const persisted = await this.#retainUncompensatedDispatchClaim(
         record,
         new Error('Rejected dispatch claim compensation did not settle before shutdown'),
-        { preferExistingError: true },
+        { preferExistingError: true, pending: true },
       )
+      if (!persisted) {
+        const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+        if (durable?.dispatchClaim?.cancellationPending !== true) {
+          throw new Error(`Unable to persist unresolved dispatch-claim fence for ${record.issue.key}; refusing shutdown handoff`)
+        }
+      }
     }
   }
 
   async #awaitRejectedClaimCompensation(settled: Promise<boolean>): Promise<boolean> {
-    if (this.#fleet.durableOwnership !== true) return await settled
-
     let timer: ReturnType<typeof setTimeout> | undefined
     const timedOut = new Promise<false>((resolve) => {
       timer = setTimeout(() => resolve(false), STOP_REJECTED_DISPATCH_DRAIN_TIMEOUT_MS)
@@ -1675,16 +1683,18 @@ export class FactoryLoop implements Factory {
   async #retainUncompensatedDispatchClaim(
     record: InFlightIssue,
     error: unknown,
-    opts: { preferExistingError?: boolean } = {},
-  ): Promise<void> {
+    opts: { preferExistingError?: boolean; pending?: boolean } = {},
+  ): Promise<boolean> {
     const key = dispatchLifecycleKey(record.issue)
     const alreadyBlocked = record.dispatchClaim?.cancellationBlocked === true
     const errorMessage = describeError(error).errorMessage
     this.#uncompensatedDispatchClaims.add(key)
+    const { cancellationPending: _pending, ...existingClaim } = record.dispatchClaim ?? { state: 'degraded' as const }
     record.dispatchClaim = {
-      ...record.dispatchClaim,
+      ...existingClaim,
       state: 'degraded',
       cancellationBlocked: true,
+      ...(opts.pending ? { cancellationPending: true } : {}),
       write: 'rejected dispatch claim rollback',
       error: opts.preferExistingError ? record.dispatchClaim?.error ?? errorMessage : errorMessage,
       deadLettered: true,
@@ -1698,9 +1708,10 @@ export class FactoryLoop implements Factory {
       })
     }
     if (this.#usesDurableDispatchLifecycle()) {
-      await this.#saveDispatchLifecycle(record, 'running')
+      return await this.#saveDispatchLifecycle(record, 'running')
     } else {
       await this.#writeDispatchClaimRegistry(record.issue)
+      return true
     }
   }
 
@@ -1708,7 +1719,11 @@ export class FactoryLoop implements Factory {
     const key = dispatchLifecycleKey(record.issue)
     this.#uncompensatedDispatchClaims.delete(key)
     if (record.dispatchClaim?.cancellationBlocked !== true) return
-    const { cancellationBlocked: _blocked, ...claim } = record.dispatchClaim
+    const {
+      cancellationBlocked: _blocked,
+      cancellationPending: _pending,
+      ...claim
+    } = record.dispatchClaim
     record.dispatchClaim = claim
     this.#dispatchClaimStatuses.set(key, claim)
     if (this.#usesDurableDispatchLifecycle()) {
@@ -1723,6 +1738,10 @@ export class FactoryLoop implements Factory {
     if (!this.#uncompensatedDispatchClaims.has(key) && record.dispatchClaim?.cancellationBlocked !== true) {
       return false
     }
+    // A provider request that was still unresolved at handoff can land after
+    // any current-state read. No observation is proof of supersession until
+    // the original caller records that the operation conclusively settled.
+    if (record.dispatchClaim?.cancellationPending === true) return true
     try {
       const issue = await this.#readIssue(record.issue.path)
       if (!issue) return true
@@ -1733,7 +1752,7 @@ export class FactoryLoop implements Factory {
       } else {
         if (!this.#linear.getIssueStateId) return true
         const implementingStateId = this.#states.idFor(issue.team, 'agentImplementing')
-        const currentStateId = await this.#linear.getIssueStateId(issue)
+        const currentStateId = await this.#linear.getIssueStateId(issue) ?? issue.stateId
         if (!implementingStateId || !currentStateId || currentStateId === implementingStateId) return true
       }
       await this.#clearDispatchCancellationBlock(record)
@@ -5170,6 +5189,10 @@ export class FactoryLoop implements Factory {
       if (error instanceof PostSpawnDispatchWaitRejectedError) {
         settlePostSpawnIssueObservation(false)
         const compensated = error.compensationError === undefined
+        // The original provider call has conclusively returned. Remove this
+        // before any asynchronous persistence so a concurrent timeout cannot
+        // overwrite the settled outcome with an unresolved handoff fence.
+        this.#pendingDispatchClaims.delete(postSpawnKey)
         if (compensated) {
           this.#uncompensatedDispatchClaims.delete(postSpawnKey)
           await this.#clearDispatchCancellationBlock(record)
@@ -7598,15 +7621,17 @@ export class FactoryLoop implements Factory {
     let compensationError: unknown
     if (claim.result !== 'already-matched') {
       try {
+        const claimToken = claim.claimToken
+        if (!claimToken) {
+          throw new Error('GitHub rejected dispatch claim has no immutable ownership token')
+        }
+        const rollbackStatusClaim = this.#githubWriteback.rollbackStatusClaim?.bind(this.#githubWriteback)
+        if (!rollbackStatusClaim) {
+          throw new Error('GitHub writeback cannot conditionally roll back a rejected dispatch claim')
+        }
         let outcome: Awaited<ReturnType<NonNullable<GithubWriteback['rollbackStatusClaim']>>> = 'unproven'
         await this.#retryDispatchWriteback(record, issue, 'GitHub rejected dispatch claim rollback', async () => {
-          if (!claim.claimToken) {
-            throw new Error('GitHub rejected dispatch claim has no immutable ownership token')
-          }
-          if (!this.#githubWriteback.rollbackStatusClaim) {
-            throw new Error('GitHub writeback cannot conditionally roll back a rejected dispatch claim')
-          }
-          outcome = await this.#githubWriteback.rollbackStatusClaim(issue, 'in-progress', claim.claimToken)
+          outcome = await rollbackStatusClaim(issue, 'in-progress', claimToken)
           if (outcome === 'unproven') {
             throw new Error('GitHub rejected dispatch claim rollback could not prove ownership')
           }
@@ -7656,14 +7681,15 @@ export class FactoryLoop implements Factory {
   ): Promise<never> {
     let compensationError: unknown
     try {
+      const compareAndSetState = this.#linear.compareAndSetState?.bind(this.#linear)
+      if (!compareAndSetState) {
+        throw new Error('Linear writeback cannot conditionally roll back a rejected dispatch claim')
+      }
+      if (!claimToken) {
+        throw new Error('Linear rejected dispatch claim has no immutable ownership token')
+      }
       await this.#retryDispatchWriteback(record, issue, `Linear rejected dispatch claim rollback to ${readyStateId}`, async () => {
-        if (!this.#linear.compareAndSetState) {
-          throw new Error('Linear writeback cannot conditionally roll back a rejected dispatch claim')
-        }
-        if (!claimToken) {
-          throw new Error('Linear rejected dispatch claim has no immutable ownership token')
-        }
-        const outcome = await this.#linear.compareAndSetState(issue, implementingStateId, claimToken, readyStateId)
+        const outcome = await compareAndSetState(issue, implementingStateId, claimToken, readyStateId)
         if (outcome === 'unproven') {
           throw new Error('Linear rejected dispatch claim rollback could not prove an atomic provider transition')
         }
@@ -10489,10 +10515,16 @@ export class FactoryLoop implements Factory {
     if (rejectedClaimCompensation) {
       const compensated = await this.#awaitRejectedClaimCompensation(rejectedClaimCompensation)
       if (!compensated) {
+        if (!this.#pendingDispatchClaims.has(key)) {
+          // The provider call settled while this bounded wait expired; its
+          // caller is recording the definitive compensated/unproven result.
+          this.#scheduleAbandonedDispatchRetry(record, reason)
+          return
+        }
         await this.#retainUncompensatedDispatchClaim(
           record,
           new Error('Rejected dispatch claim compensation did not complete before abandonment'),
-          { preferExistingError: true },
+          { preferExistingError: true, pending: true },
         )
         this.#scheduleAbandonedDispatchRetry(record, reason)
         return
@@ -15139,6 +15171,7 @@ export class FactoryLoop implements Factory {
       // conditional provider rollback succeeds. Until then, shutdown and held
       // abandonment must not release the lifecycle's agents.
       this.#uncompensatedDispatchClaims.add(key)
+      this.#pendingDispatchClaims.add(key)
     }
     observation?.settle(accepted)
     claimFence?.settle(accepted)

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { FactoryConfigSchema } from '../config/schema'
-import { linearCommentPath } from '../constants/linear'
+import { linearByIdPath, linearCommentPath } from '../constants/linear'
 import { slackReplyPath } from '../constants/slack'
 import { AppGithubWriteback, createFactory, GhCliGithubWriteback, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubWriteback, MountClient } from '../ports'
@@ -94,6 +94,32 @@ describe('MountLinearWriteback', () => {
 
     await expect(linear.getIssueStateId(issue)).resolves.toBe('human-review-state')
     expect(issue.stateId).toBe('ready-state')
+  })
+
+  it('reads a name-only current state from the canonical record behind a sparse primary alias', async () => {
+    const currentIssue: LinearIssue = {
+      ...issue,
+      stateId: 'human-review-state',
+      state: { name: 'In Human Review' },
+    }
+    const mount = new FakeMountClient({
+      [issuePath]: { payload: { stateId: 'ready-state' } },
+      [linearByIdPath(issueKey)]: wrappedIssueRecord({
+        stateId: undefined,
+        state: { name: 'In Human Review' },
+      }),
+    })
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.getIssueStateId(currentIssue)).resolves.toBe('human-review-state')
+  })
+
+  it('fails closed when only a sparse Linear state alias is readable', async () => {
+    const mount = new FakeMountClient({
+      [issuePath]: { payload: { stateId: 'human-review-state' } },
+    })
+
+    await expect(MountLinearWriteback(mount).getIssueStateId(issue)).resolves.toBeUndefined()
   })
 
   it('conditionally restores a Linear state at the exact mounted revision', async () => {
@@ -457,6 +483,8 @@ describe('MountLinearWriteback', () => {
     })
 
     await expect(linear.setState(issue, 'implementing-state')).rejects.toThrow(/read-back never confirmed it landed/u)
+    expect(issue.stateId).toBe('ready-state')
+    expect((issue.raw.payload as Record<string, unknown>).stateId).toBe('ready-state')
     await expect(linear.postComment(issue, 'Agent dispatched after stale mirror')).rejects.toThrow(/read-back never confirmed it landed/u)
     await expect(linear.createIssue({
       id: 'uuid-stale-create',

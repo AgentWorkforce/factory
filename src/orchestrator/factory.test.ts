@@ -1212,6 +1212,15 @@ class BlockingDispatchLifecycleRunningStateStore extends FileStateStore {
   }
 }
 
+class RejectingPendingClaimFenceStateStore extends FileStateStore {
+  override async saveDispatchLifecycle(
+    ...args: Parameters<FileStateStore['saveDispatchLifecycle']>
+  ): Promise<boolean> {
+    if (args[5].dispatchClaim?.cancellationPending === true) return false
+    return await super.saveDispatchLifecycle(...args)
+  }
+}
+
 class BlockingDispatchClaimLinearWriteback implements LinearWriteback {
   readonly claimWriteStarted = Promise.withResolvers<void>()
   readonly claimWriteGate = Promise.withResolvers<void>()
@@ -11628,12 +11637,13 @@ describe('FactoryLoop', () => {
     }
   }, 30_000)
 
-  it('settles a completion blocked on the dispatch-claim fence at the held-agent deadline', async () => {
+  it('retains held agents until an unresolved dispatch claim conclusively compensates', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-claim-deadline-'))
     const number = 1254
     const path = githubIssuePath('AgentWorkforce', 'pear', number)
     const fleet = new RemoteLifecycleFleetClient()
     const githubWriteback = new BlockingDispatchClaimGithubWriteback()
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
     const factory = createFactory(config({
       issueSource: 'github',
       mergePolicy: 'never',
@@ -11648,7 +11658,7 @@ describe('FactoryLoop', () => {
         [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
       }),
       fleet,
-      stateStore: new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+      stateStore,
       triage: new StaticTriage(),
       githubWriteback,
     })
@@ -11669,25 +11679,40 @@ describe('FactoryLoop', () => {
 
       await vi.waitFor(() => expect(factory.status().counters.postSpawnWaitsSettledByAbandonment)
         .toBe(1), { timeout: 8_000 })
-      await vi.waitFor(() => expect(fleet.releases).toContainEqual({
-        name: `ar-${number}-impl-pear`,
-        reason: 'held-past-deadline',
+      await vi.waitFor(() => expect(factory.status().counters.postSpawnDispatchClaimRecoveryRetentions)
+        .toBe(1), { timeout: 5_000 })
+      expect(fleet.releases).toEqual([])
+      await vi.waitFor(async () => expect(await stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity({
+          uuid: `AgentWorkforce/pear#${number}`,
+          key: String(number),
+          path,
+        }),
+      )).toMatchObject({
+        dispatchClaim: {
+          cancellationBlocked: true,
+          cancellationPending: true,
+        },
       }), { timeout: 4_000 })
       expect(githubWriteback.statuses).not.toContainEqual({ key: String(number), status: 'human-review' })
       expect(fleet.releases).not.toContainEqual(expect.objectContaining({ reason: 'issue-human-review' }))
 
-      // The rejected fence has already let completion exit. The provider call
-      // may still return later, but its dispatch stack must unwind without
-      // retaining lifecycle work or creating a terminal completion release.
+      // Only the original caller can turn the unresolved handoff into a
+      // conclusively compensated claim. A pre-claim Ready observation cannot
+      // release the agents while this write may still land.
       githubWriteback.claimWriteGate.resolve()
       await withDeadline(run, 8_000, 'blocked dispatch claim did not unwind after abandonment')
-      expect(factory.status().inFlight).toEqual([])
       expect(githubWriteback.statuses).toEqual([
         { key: String(number), status: 'in-progress' },
         { key: String(number), status: 'ready' },
       ])
       expect(githubWriteback.comments).toEqual([])
-      expect(fleet.releases).not.toContainEqual(expect.objectContaining({ reason: 'issue-human-review' }))
+      await vi.waitFor(() => expect(fleet.releases).toEqual([
+        { name: `ar-${number}-impl-pear`, reason: 'held-past-deadline' },
+        { name: `ar-${number}-review-pear`, reason: 'held-past-deadline' },
+      ]), { timeout: 5_000 })
+      expect(factory.status().inFlight).toEqual([])
 
       await factory.stop()
       stopped = true
@@ -11828,6 +11853,63 @@ describe('FactoryLoop', () => {
     } finally {
       githubWriteback.claimWriteGate.resolve()
       githubWriteback.commentWriteGate.resolve()
+      if (!stopped) await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('refuses a durable shutdown handoff when the unresolved claim fence is not saved', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-claim-handoff-rejected-'))
+    const number = 1269
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new LocalLifecycleFleetClient()
+    const githubWriteback = new BlockingDispatchClaimGithubWriteback()
+    const stateStore = new RejectingPendingClaimFenceStateStore({
+      batchSize: 2,
+      watchStatePath: join(root, 'state.json'),
+    })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 60_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+      logger: { error: () => {}, warn: () => {} },
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let stopped = false
+    try {
+      await withDeadline(githubWriteback.claimWriteStarted.promise, 4_000, 'dispatch claim did not start')
+
+      await expect(withDeadline(
+        factory.stop(),
+        6_000,
+        'shutdown did not report the rejected claim-fence handoff',
+      )).rejects.toThrow(/refusing shutdown handoff/u)
+      expect(fleet.releases).toEqual([])
+      expect(factory.status().inFlight).toHaveLength(1)
+
+      githubWriteback.claimWriteGate.resolve()
+      await withDeadline(run, 8_000, 'dispatch did not compensate after the rejected handoff')
+      await withDeadline(factory.stop(), 4_000, 'shutdown did not recover after compensation settled')
+      stopped = true
+      expect(fleet.releases).toEqual([
+        { name: `ar-${number}-impl-pear`, reason: 'factory-stopped' },
+        { name: `ar-${number}-review-pear`, reason: 'factory-stopped' },
+      ])
+    } finally {
+      githubWriteback.claimWriteGate.resolve()
       if (!stopped) await factory.stop()
       await rm(root, { recursive: true, force: true })
     }
@@ -12681,6 +12763,7 @@ describe('FactoryLoop', () => {
         dispatchClaim: {
           state: 'degraded',
           cancellationBlocked: true,
+          cancellationPending: true,
           write: 'rejected dispatch claim rollback',
           deadLettered: true,
         },

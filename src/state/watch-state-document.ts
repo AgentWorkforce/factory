@@ -531,7 +531,9 @@ const validDispatchClaimStatus = (value: unknown): boolean => isRecord(value) &&
   (value.state === 'pending' || value.state === 'verified' || value.state === 'degraded') &&
   validNumber(value.updatedAtMs) && validOptionalString(value.write) && validOptionalString(value.error) &&
   validOptionalNumber(value.attempts) && validOptionalNumber(value.maxAttempts) &&
-  validOptionalBoolean(value.deadLettered) && validOptionalBoolean(value.cancellationBlocked)
+  validOptionalBoolean(value.deadLettered) &&
+  validOptionalBoolean(value.cancellationBlocked) &&
+  validOptionalBoolean(value.cancellationPending)
 
 const validPullRequest = (value: unknown): boolean => isRecord(value) &&
   typeof value.repo === 'string' && Number.isSafeInteger(value.number) && (value.number as number) > 0 &&

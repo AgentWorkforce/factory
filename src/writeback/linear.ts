@@ -258,10 +258,27 @@ export const MountLinearWriteback = (
 
   const adapter = {
     async getIssueStateId(issue: LinearIssue): Promise<string | undefined> {
-      const current = wrappedPayload((await mount.readFile(issuePath(issue))).content)
-      return typeof current.stateId === 'string' && current.stateId
-        ? current.stateId
-        : undefined
+      // The primary issue path may be only a sparse change-event stub. Reuse
+      // the guarded canonical lookup so recovery observes the effective
+      // by-id/by-uuid record rather than a stale or state-less alias.
+      const current = await readIssuePayloadForGuard(mount, issue)
+      // A state-only primary was not a canonical issue read. Without guard
+      // fields from the full record, treating its state as authoritative could
+      // release a cancellation fence on stale sparse-sync data.
+      if (!hasGuardFields(current)) return undefined
+      if (typeof current.stateId === 'string' && current.stateId) return current.stateId
+      const state = asRecord(current.state)
+      if (typeof state?.id === 'string' && state.id) return state.id
+      // The orchestrator already resolves name-only canonical records through
+      // its state catalog. Reuse that resolved id only when the live canonical
+      // name still matches the issue projection it supplied.
+      if (
+        typeof state?.name === 'string' &&
+        state.name &&
+        state.name === issue.state?.name &&
+        issue.stateId
+      ) return issue.stateId
+      return undefined
     },
 
     async setState(issue: LinearIssue, stateId: string): Promise<{ claimToken: string } | void> {
@@ -272,8 +289,8 @@ export const MountLinearWriteback = (
         ...canonical.writable,
         stateId,
       }, { guarded: true })
-      updateCanonicalState(path, issue, canonical, stateId)
       await confirmWriteback(mount, path, () => verifyStateReadback(mount, issue, stateId), logger, readbackConfirm)
+      updateCanonicalState(path, issue, canonical, stateId)
       return receipt?.targetRevision
         ? { claimToken: receipt.targetRevision }
         : undefined
@@ -325,8 +342,8 @@ export const MountLinearWriteback = (
         }
         throw error
       }
-      updateCanonicalState(path, issue, currentCanonical, stateId)
       await confirmWriteback(mount, path, () => verifyStateReadback(mount, issue, stateId), logger, readbackConfirm)
+      updateCanonicalState(path, issue, currentCanonical, stateId)
       return 'applied'
     },
 
