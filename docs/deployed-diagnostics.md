@@ -68,7 +68,12 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
     "inFlightSinceMs": 1787224595805,   // when the oldest sweep still running began
     "inFlightMs": 4560000,          // this pass has run 76 minutes
     "missedPasses": 76,
-    "lastErrorClass": "TimeoutError"
+    "lastErrorClass": "TimeoutError",
+    // The last COMPLETED sweep's arithmetic (#355). Absent until one completes.
+    "candidates": 7,                // work units it pulled and evaluated
+    "dispatched": 0,                // work units it dispatched
+    "skipped": 7,                   // work units it saw and declined
+    "skipReasons": { "dispatch-terminal": 7 }
   },
   "eventListener": { "state": "subscribed" },
   "fleetControlPlane": { "state": "closed", "consecutiveFailures": 0, "failureThreshold": 3 }
@@ -86,6 +91,38 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   #296 — fall back to `lastStarted > lastCompleted`, which infers the same thing from timestamp order.
   Prefer the published field: once a sweep has passed its deadline (below) the wait records a failure
   while the sweep underneath it keeps running, and order alone then reports nothing in flight.
+- **`candidates` / `dispatched` / `skipped`** — the *green-but-idle* case, and the fastest question to
+  ask when nothing is being dispatched and every state above reads healthy. On 2026-08-23 a sub-second
+  sweep with `state: healthy`, `consecutiveFailures: 0` and a free dispatch slot declined seven
+  eligible issues, and no surface anyone could reach said which half of the pipeline was at fault.
+
+  - `candidates > 0` — the sweep **saw** those issues and **rejected** them. The bug is in eligibility
+    evaluation, and `skipReasons` names which gate.
+  - `candidates == 0` — the sweep **never pulled** them. The bug is upstream, in discovery/ingestion.
+  - **the three fields absent entirely** — this daemon has not *completed* a sweep (or predates #355).
+    That is not a zero, and must not be read as one: it says nothing about either half. Check
+    `lastCompletedAtMs` and `inFlightMs`.
+
+  They describe the last sweep that settled **successfully**, the same tense as `lastDurationMs`;
+  `lastCompletedAtMs` dates them. A pass that failed leaves them untouched rather than zeroing them.
+
+- **`discoveryDeferred: "sweep-in-flight"`** — the sweep returned immediately because another process
+  held the discovery lease, so it enumerated nothing. Without this, that pass is indistinguishable
+  from one that queried the provider and legitimately found no ready work: both publish
+  `candidates: 0`.
+
+- **`skipReasons`** — `skipped` split by a closed vocabulary
+  (`FACTORY_SWEEP_SKIP_REASON_CODES`); zero-count codes are omitted, so an absent key is a zero, and
+  the counts always sum to `skipped`. `dispatch-terminal` and `dispatch-retry-limit` are the two that
+  never clear on their own — a work unit in either needs a human. `dispatch-backoff`,
+  `already-tracked` and `queued-or-escalated` resolve by themselves. `out-of-scope` and `not-ready`
+  mean the gate is working as configured and the issue does not match it — check the deployed
+  `safety` config against the issue rather than the daemon.
+
+  Counts only, by construction: issue keys, paths and titles carry customer project and repository
+  names and never cross onto this surface. The keys are rebuilt from the reader's own copy of the
+  vocabulary, so a record from another version cannot publish an arbitrary string as one.
+
 - **`fleetControlPlane`** — an `open` circuit fails every spawn and resume fast, so it gates dispatch
   as hard as a failing sweep. `closed` is the healthy value.
 - **`state: "stalled"`** — derived, not written: an in-flight pass older than ten sweep intervals.

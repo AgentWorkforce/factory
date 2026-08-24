@@ -490,6 +490,12 @@ export type {
   TriageDecision,
   TriageEngine,
 } from './types'
+export {
+  FACTORY_SWEEP_SKIP_REASON_CODES,
+  factorySweepSkipReasonCode,
+  factorySweepSkipReasonCounts,
+} from './orchestrator/sweep-skip-reason'
+export type { FactorySweepSkipReasonCode } from './orchestrator/sweep-skip-reason'
 export type { FleetControlPlaneState, FleetControlPlaneStatus } from './fleet/control-plane-circuit'
 export {
   LOAD_EVIDENCE_CONTRACT,
