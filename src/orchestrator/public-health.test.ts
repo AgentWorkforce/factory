@@ -879,4 +879,148 @@ describe('sweep counters on the public surface (#355)', () => {
     expect(JSON.stringify(reread)).not.toContain('workspace-key')
     expect(reread?.readinessReconcile?.skipReasons).toEqual({ other: 7 })
   })
+
+  // The measurement this whole block exists for: the live container publishes
+  // `skipReasons: { 'dispatch-failed': 5 }` on every sweep, with the breaker
+  // closed and readiness healthy, and that bucket is a count with no cause
+  // attached. The daemon knows the cause; it writes it to stdout, which does
+  // not reach the deployed operator.
+  it('breaks the dispatch-failed bucket down by cause, and the parts sum to its total', () => {
+    const readiness = swept({
+      candidates: 27,
+      dispatched: 0,
+      skipped: 27,
+      skipReasons: { 'not-ready': 21, 'parked-dependency': 1, 'dispatch-failed': 5 },
+      dispatchFailures: 5,
+      dispatchFailureReasons: { 'spawn-ack-timeout': 3, 'unclassified-dispatch': 2 },
+    })
+
+    expect(readiness?.dispatchFailures).toBe(5)
+    expect(readiness?.dispatchFailureReasons)
+      .toEqual({ 'spawn-ack-timeout': 3, 'unclassified-dispatch': 2 })
+    expect(Object.values(readiness?.dispatchFailureReasons ?? {}).reduce((sum, n) => sum + n, 0))
+      .toBe(readiness?.dispatchFailures)
+    // ...and to the bucket it refines, which is the integrity check a reader
+    // holding both numbers can actually run.
+    expect(readiness?.dispatchFailures).toBe(readiness?.skipReasons?.['dispatch-failed'])
+  })
+
+  // THE CONTROL. `skipReasons` omits zero counts, so on that field alone
+  // "every dispatch succeeded" is the same absence as "this producer has never
+  // heard of dispatch failures" — and 0.1.72 is in production right now being
+  // exactly the second thing. `dispatchFailures` is the field that separates
+  // them, and it only does that if nothing coerces its absence to a zero or
+  // its zero to an absence.
+  it('keeps a zero, an absence and a producer without the field three different readings', () => {
+    const noneFailed = swept({
+      candidates: 4,
+      dispatched: 4,
+      skipped: 0,
+      dispatchFailures: 0,
+    })
+    expect(noneFailed?.dispatchFailures).toBe(0)
+    expect(Object.hasOwn(noneFailed ?? {}, 'dispatchFailures')).toBe(true)
+    // No breakdown, because there is nothing to break down — and the total
+    // still says so out loud.
+    expect(Object.hasOwn(noneFailed ?? {}, 'dispatchFailureReasons')).toBe(false)
+
+    // A 0.1.72 daemon: the trio it does publish must survive intact, or this
+    // change would delete the counters that are currently the only view of the
+    // outage.
+    const olderProducer = swept({ candidates: 4, dispatched: 4, skipped: 0 })
+    expect(olderProducer).toMatchObject({ candidates: 4, dispatched: 4, skipped: 0 })
+    expect(Object.hasOwn(olderProducer ?? {}, 'dispatchFailures')).toBe(false)
+
+    // No sweep has completed at all.
+    const neverRan = swept()
+    expect(Object.hasOwn(neverRan ?? {}, 'dispatchFailures')).toBe(false)
+  })
+
+  it('re-reads its own published zero without turning it back into an absence', () => {
+    const published = swept({ candidates: 4, dispatched: 4, skipped: 0, dispatchFailures: 0 })
+    const reread = normalizePublicHealth({
+      schemaVersion: FACTORY_PUBLIC_HEALTH_SCHEMA_VERSION,
+      ok: true,
+      status: 'ok',
+      stale: false,
+      degradedSubsystems: [],
+      readinessReconcile: published,
+    })
+    expect(reread?.readinessReconcile?.dispatchFailures).toBe(0)
+    expect(Object.hasOwn(reread?.readinessReconcile ?? {}, 'dispatchFailures')).toBe(true)
+  })
+
+  // MUST-NOT-FIRE, the same leak vector #358 closed one level up: the
+  // breakdown's *keys* arrive from a remote record, and an object key is as
+  // publishable as a value.
+  it('rebuilds the dispatch-failure breakdown from its own vocabulary', () => {
+    const readiness = swept({
+      candidates: 9,
+      dispatched: 0,
+      skipped: 9,
+      dispatchFailures: 9,
+      dispatchFailureReasons: {
+        'spawn-ack-timeout': 4,
+        // Not in the vocabulary, and carrying exactly what must never publish.
+        ['AR-350 /linear/issues/AR-350__uuid.json']: 3,
+        ['Error: connect ECONNREFUSED 10.0.0.4:443']: 2,
+      } as Record<string, number>,
+    })
+
+    expect(JSON.stringify(readiness)).not.toContain('AR-350')
+    expect(JSON.stringify(readiness)).not.toContain('/linear/issues')
+    expect(JSON.stringify(readiness)).not.toContain('ECONNREFUSED')
+    // Folded into `other`, not dropped, so the parts still sum to the total and
+    // a reader comparing them detects a newer producer rather than a broken
+    // counter.
+    expect(readiness?.dispatchFailureReasons).toEqual({ 'spawn-ack-timeout': 4, other: 5 })
+    expect(Object.values(readiness?.dispatchFailureReasons ?? {}).reduce((sum, n) => sum + n, 0))
+      .toBe(9)
+  })
+
+  it('drops counts a reader cannot use, and a breakdown that has lost its total', () => {
+    expect(swept({
+      candidates: 1,
+      dispatched: 0,
+      skipped: 1,
+      dispatchFailures: 1,
+      dispatchFailureReasons: {
+        'spawn-ack-timeout': Number.NaN,
+        'timed-out': -3,
+        'live-state-changed': 0,
+      } as Record<string, number>,
+    })?.dispatchFailureReasons).toBeUndefined()
+
+    // A breakdown with no total is an orphan: nothing to check the parts
+    // against, which is the one integrity check this surface offers.
+    const orphaned = swept({
+      candidates: 1,
+      dispatched: 0,
+      skipped: 1,
+      dispatchFailureReasons: { 'timed-out': 1 } as Record<string, number>,
+    })
+    expect(Object.hasOwn(orphaned ?? {}, 'dispatchFailureReasons')).toBe(false)
+  })
+
+  it('applies the same key rebuild to a record that arrived over the wire', () => {
+    const reread = normalizePublicHealth({
+      schemaVersion: FACTORY_PUBLIC_HEALTH_SCHEMA_VERSION,
+      ok: true,
+      status: 'ok',
+      stale: false,
+      degradedSubsystems: [],
+      readinessReconcile: {
+        state: 'healthy',
+        consecutiveFailures: 0,
+        failureThreshold: 3,
+        candidates: 7,
+        dispatched: 0,
+        skipped: 7,
+        dispatchFailures: 7,
+        dispatchFailureReasons: { '/srv/agent-workforce/.relay/workspace-key': 7 },
+      },
+    })
+    expect(JSON.stringify(reread)).not.toContain('workspace-key')
+    expect(reread?.readinessReconcile?.dispatchFailureReasons).toEqual({ other: 7 })
+  })
 })

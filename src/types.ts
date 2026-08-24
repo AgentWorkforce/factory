@@ -9,6 +9,7 @@ import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-close
 import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
 import type { FactorySweepSkipReasonCode } from './orchestrator/sweep-skip-reason'
+import type { FactoryDispatchFailureReasonCode } from './orchestrator/dispatch-failure-reason'
 import type { DispatchRelayflowOptions, RelayflowPolicyRegistry } from './dispatch/relayflow-registry'
 import type { VerificationGate } from './environments/verification-pipeline'
 import type { CostLedger } from './cost/ledger'
@@ -254,6 +255,24 @@ export interface FactoryReadinessReconcileStatus {
    */
   skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
   /**
+   * Dispatch attempts the last completed sweep made that failed (#355).
+   *
+   * The same number `skipReasons['dispatch-failed']` carries, published in its
+   * own right so it can be a zero. `skipReasons` omits zero-count codes, so
+   * "every dispatch succeeded" and "this daemon does not report the field" are
+   * the same absence there; here they are not.
+   *
+   * Optional and never defaulted, exactly like `candidates`: absent means no
+   * sweep has completed *or* the producer predates the field, `0` means a sweep
+   * completed and nothing it dispatched failed.
+   */
+  dispatchFailures?: number
+  /**
+   * `dispatchFailures` split by cause. Zero-count codes are omitted; the codes
+   * are a fixed published vocabulary, so an absent key is a zero.
+   */
+  dispatchFailureReasons?: Partial<Record<FactoryDispatchFailureReasonCode, number>>
+  /**
    * The last completed sweep never enumerated anything: another process held
    * the discovery lease, so it returned an empty report immediately.
    *
@@ -295,6 +314,17 @@ export interface FactoryPublicReadinessReconcileHealth {
   skipped?: number
   /** `skipped` split by a closed vocabulary of causes; zero counts omitted. */
   skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
+  /**
+   * Failed dispatch attempts in the last completed sweep, and why (#355).
+   *
+   * `dispatchFailures` is absent until a sweep completes and is a zero
+   * thereafter, so it separates "never attempted" from "attempted, none
+   * failed" — which `skipReasons` alone cannot, since it drops zero counts.
+   * The breakdown is counts only, keyed by a fixed vocabulary, and its parts
+   * sum to `dispatchFailures`.
+   */
+  dispatchFailures?: number
+  dispatchFailureReasons?: Partial<Record<FactoryDispatchFailureReasonCode, number>>
   /** The last completed sweep deferred to another process's discovery lease. */
   discoveryDeferred?: 'sweep-in-flight'
   lastErrorClass?: string
@@ -586,7 +616,17 @@ export interface IterationReport {
    * `reason` is free text for an operator; `code` is the closed vocabulary
    * that may cross onto the unauthenticated health surface (#355).
    */
-  skipped: Array<{ issue: IssueRef; reason: string; code?: FactorySweepSkipReasonCode }>
+  skipped: Array<{
+    issue: IssueRef
+    reason: string
+    code?: FactorySweepSkipReasonCode
+    /**
+     * Why the dispatch *attempt* failed, for `code: 'dispatch-failed'` only
+     * (#355). Recorded at the skip site by type, never parsed back out of
+     * `reason`, and absent on every other skip code.
+     */
+    failureCode?: FactoryDispatchFailureReasonCode
+  }>
   dryRun: boolean
   slackDegraded?: boolean
   /**

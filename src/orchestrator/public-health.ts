@@ -7,6 +7,11 @@ import {
   factorySweepSkipReasonCode,
 } from './sweep-skip-reason'
 import type { FactorySweepSkipReasonCode } from './sweep-skip-reason'
+import {
+  FACTORY_DISPATCH_FAILURE_REASON_CODES,
+  factoryDispatchFailureReasonCode,
+} from './dispatch-failure-reason'
+import type { FactoryDispatchFailureReasonCode } from './dispatch-failure-reason'
 import type {
   FactoryDispatchCapacityStatus,
   FactoryEventListenerStatus,
@@ -203,6 +208,35 @@ const skipReasonCounts = (
 }
 
 /**
+ * The last sweep's dispatch-failure breakdown, rebuilt key by key (#355).
+ *
+ * Identical discipline to `skipReasonCounts` and for the identical reason: the
+ * keys come from this module's own copy of the vocabulary, never from the
+ * record, so a producer on another version cannot put an arbitrary string onto
+ * an unauthenticated surface by using it as an object key. Unknown keys fold
+ * into `other` rather than being dropped, so the parts still sum to
+ * `dispatchFailures`.
+ */
+const dispatchFailureReasonCounts = (
+  value: unknown,
+): Partial<Record<FactoryDispatchFailureReasonCode, number>> | undefined => {
+  const record = plainRecord(value)
+  if (!record) return undefined
+  const counts: Partial<Record<FactoryDispatchFailureReasonCode, number>> = {}
+  for (const [key, raw] of Object.entries(record)) {
+    const parsed = finiteNumber(raw)
+    if (parsed === undefined || parsed < 0) continue
+    const floored = Math.floor(parsed)
+    if (floored === 0) continue
+    const code = factoryDispatchFailureReasonCode(key)
+    counts[code] = (counts[code] ?? 0) + floored
+  }
+  const ordered = FACTORY_DISPATCH_FAILURE_REASON_CODES.filter((code) => counts[code] !== undefined)
+  if (ordered.length === 0) return undefined
+  return Object.fromEntries(ordered.map((code) => [code, counts[code] as number]))
+}
+
+/**
  * The last completed sweep's arithmetic, published (#355).
  *
  * Deliberately NOT `counter()`: that coerces an absent field to `0`, which
@@ -222,11 +256,19 @@ const sweepOutcome = (
     dispatched?: unknown
     skipped?: unknown
     skipReasons?: unknown
+    dispatchFailures?: unknown
+    dispatchFailureReasons?: unknown
     discoveryDeferred?: unknown
   },
 ): Partial<Pick<
   FactoryPublicReadinessReconcileHealth,
-  'candidates' | 'dispatched' | 'skipped' | 'skipReasons' | 'discoveryDeferred'
+  | 'candidates'
+  | 'dispatched'
+  | 'skipped'
+  | 'skipReasons'
+  | 'dispatchFailures'
+  | 'dispatchFailureReasons'
+  | 'discoveryDeferred'
 >> => {
   const candidates = optionalCount('candidates', status.candidates)
   const dispatched = optionalCount('dispatched', status.dispatched)
@@ -240,11 +282,27 @@ const sweepOutcome = (
     return {}
   }
   const skipReasons = skipReasonCounts(status.skipReasons)
+  // Deliberately NOT joined to the all-or-nothing trio above. A daemon on
+  // 0.1.72 publishes the trio and knows nothing about this field, and requiring
+  // it would drop that producer's whole sweep block — deleting the counters
+  // that are currently the only view of the outage. Independently optional, and
+  // `optionalCount` keeps a zero a zero: absent means "no completed sweep, or a
+  // producer without the field", `0` means "a sweep completed and no dispatch
+  // it attempted failed". Those are the two facts a bucket count cannot tell
+  // apart, which is why this number exists next to the breakdown.
+  const dispatchFailures = optionalCount('dispatchFailures', status.dispatchFailures)
+  const dispatchFailureReasons = dispatchFailureReasonCounts(status.dispatchFailureReasons)
   return {
     ...candidates,
     ...dispatched,
     ...skipped,
     ...(skipReasons ? { skipReasons } : {}),
+    ...dispatchFailures,
+    // A breakdown with no total is an orphan: a reader cannot check that the
+    // parts sum, which is the one integrity check this surface offers.
+    ...(dispatchFailures.dispatchFailures !== undefined && dispatchFailureReasons
+      ? { dispatchFailureReasons }
+      : {}),
     ...(status.discoveryDeferred === 'sweep-in-flight'
       ? { discoveryDeferred: 'sweep-in-flight' as const }
       : {}),

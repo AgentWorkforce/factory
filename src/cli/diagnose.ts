@@ -506,6 +506,18 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
       if (readiness.skipReasons) {
         lines.push(`    skip reasons       : ${formatSkipReasons(readiness.skipReasons)}`)
       }
+      // Rendered whenever the producer reports it, zero included: `skipReasons`
+      // drops a zero bucket, so without this line "no dispatch failed" and "this
+      // daemon cannot tell you" look identical to a reader (#355).
+      if (readiness.dispatchFailures !== undefined) {
+        lines.push(
+          `    dispatch failures  : ${readiness.dispatchFailures}${
+            readiness.dispatchFailureReasons
+              ? ` (${formatSkipReasons(readiness.dispatchFailureReasons)})`
+              : ''
+          }`,
+        )
+      }
     }
     const capacity = health.dispatchCapacity
     if (capacity) {

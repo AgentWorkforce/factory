@@ -496,6 +496,13 @@ export {
   factorySweepSkipReasonCounts,
 } from './orchestrator/sweep-skip-reason'
 export type { FactorySweepSkipReasonCode } from './orchestrator/sweep-skip-reason'
+export {
+  FACTORY_DISPATCH_FAILURE_REASON_CODES,
+  factoryDispatchFailureReasonCode,
+  factoryDispatchFailureReasonCodeForErrorClass,
+  factoryDispatchFailureReasonCounts,
+} from './orchestrator/dispatch-failure-reason'
+export type { FactoryDispatchFailureReasonCode } from './orchestrator/dispatch-failure-reason'
 export type { FleetControlPlaneState, FleetControlPlaneStatus } from './fleet/control-plane-circuit'
 export {
   LOAD_EVIDENCE_CONTRACT,
