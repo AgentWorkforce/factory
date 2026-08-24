@@ -1,6 +1,7 @@
 import type { AgentSpec, SpawnResult } from '../ports'
 import type { DispatchLifecyclePhase } from '../ports/state'
 import type { DispatchResult, FactoryDispatchClaimStatus, IssueRef, TriageDecision } from '../types'
+import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
 import { githubRepositoriesMatch } from '../github/repo-identity'
 
 export interface TrackedAgent {
@@ -113,7 +114,7 @@ export class BatchTracker {
   }
 
   getIssue(issue: IssueRef): InFlightIssue | undefined {
-    return this.#inFlight.get(issueKey(issue))
+    return this.#inFlight.get(trackerKey(issue))
   }
 
   getIssueByAgent(name: string): InFlightIssue | undefined {
@@ -121,19 +122,19 @@ export class BatchTracker {
   }
 
   isInFlight(issue: IssueRef): boolean {
-    return this.#inFlight.has(issueKey(issue))
+    return this.#inFlight.has(trackerKey(issue))
   }
 
   isQueued(issue: IssueRef): boolean {
-    return this.#queued.has(issueKey(issue))
+    return this.#queued.has(trackerKey(issue))
   }
 
   isParked(issue: IssueRef): boolean {
-    return this.#parked.has(issueKey(issue))
+    return this.#parked.has(trackerKey(issue))
   }
 
   getParked(issue: IssueRef): ParkedIssue | undefined {
-    return this.#parked.get(issueKey(issue))
+    return this.#parked.get(trackerKey(issue))
   }
 
   canStart(): boolean {
@@ -145,7 +146,7 @@ export class BatchTracker {
     dryRun: boolean,
     dependencyAdmission: DependencyAdmission = { blockers: [] },
   ): InFlightIssue | undefined {
-    const key = issueKey(decision.issue)
+    const key = trackerKey(decision.issue)
     const existing = this.#inFlight.get(key)
     if (existing) {
       return existing
@@ -180,7 +181,7 @@ export class BatchTracker {
     dryRun: boolean,
     dependencyAdmission: DependencyAdmission = { blockers: [] },
   ): boolean {
-    const key = issueKey(decision.issue)
+    const key = trackerKey(decision.issue)
     if (this.#inFlight.has(key)) {
       return false
     }
@@ -197,11 +198,11 @@ export class BatchTracker {
   }
 
   clearPark(issue: IssueRef): void {
-    this.#parked.delete(issueKey(issue))
+    this.#parked.delete(trackerKey(issue))
   }
 
   complete(issue: IssueRef): QueuedIssue | undefined {
-    const key = issueKey(issue)
+    const key = trackerKey(issue)
     const record = this.#inFlight.get(key)
     if (record) {
       for (const invocationId of record.invocationIds) {
@@ -217,14 +218,14 @@ export class BatchTracker {
 
     const next = this.#queued.values().next().value as QueuedIssue | undefined
     if (next) {
-      this.#queued.delete(issueKey(next.issue))
+      this.#queued.delete(trackerKey(next.issue))
     }
 
     return next
   }
 
   abandon(issue: IssueRef): void {
-    const key = issueKey(issue)
+    const key = trackerKey(issue)
     const record = this.#inFlight.get(key)
     if (record) {
       for (const invocationId of record.invocationIds) {
@@ -316,7 +317,7 @@ export class BatchTracker {
 
   /** Restore a crash-safe lifecycle before the fleet emits reconciled exits. */
   restore(record: InFlightIssue): InFlightIssue {
-    const key = issueKey(record.issue)
+    const key = trackerKey(record.issue)
     const existing = this.#inFlight.get(key)
     if (existing) return existing
     const restored: InFlightIssue = {
@@ -342,7 +343,7 @@ export class BatchTracker {
   }
 
   #park(decision: TriageDecision, dryRun: boolean, admission: DependencyAdmission): boolean {
-    const key = issueKey(decision.issue)
+    const key = trackerKey(decision.issue)
     const existing = this.#parked.get(key)
     const parked: ParkedIssue = {
       issue: decision.issue,
@@ -359,7 +360,22 @@ export class BatchTracker {
   }
 }
 
+/**
+ * Legacy surface-scoped composite. Still the key for the correlation maps that
+ * are persisted per surface — waiting clarifications, babysitter sessions,
+ * Slack threads — and for display and log correlation.
+ *
+ * It is NOT a claim key: it composes the Relayfile sense path, so one work unit
+ * reaching Factory through two surfaces produces two of them (#211).
+ */
 export const issueKey = (issue: IssueRef): string => `${issue.key}:${issue.uuid}:${issue.path}`
+
+/**
+ * Admission/dedup identity for the batch. In-flight, queued and parked
+ * membership answer "is this work unit already being worked on", which must be
+ * true for a mirror of an issue already in flight.
+ */
+const trackerKey = (issue: IssueRef): string => dispatchIssueIdentity(issue)
 
 const parkedSignature = (issue: ParkedIssue): string => JSON.stringify({
   blockers: issue.blockers.map(({ identity, key }) => ({ identity, key })),

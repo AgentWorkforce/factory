@@ -30,9 +30,11 @@ import {
 } from '../index'
 import { LatePlacementReleasedError, changeEventPath } from './factory'
 import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
+import { RelayfileOperationTimeoutError } from '../mount/relayfile-operation-timeout'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
+import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
@@ -54,6 +56,76 @@ import {
   DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
   FleetControlPlaneCircuitOpenError,
 } from '../fleet/control-plane-circuit'
+
+describe('read-only construction', () => {
+  // Every fleet subscription the Factory installs at construction. On the relay
+  // backend the first of these mints this process's workspace identity, so a
+  // read-only command that constructs a Factory registers an agent it then
+  // abandons before presence — the boot-unique orphan the live daemon can never
+  // reclaim (factory-cloud#55).
+  class SubscriptionCountingFleet extends FakeFleetClient {
+    subscriptions = 0
+
+    override onAgentExit(listener: Parameters<FakeFleetClient['onAgentExit']>[0]): () => void {
+      this.subscriptions += 1
+      return super.onAgentExit(listener)
+    }
+
+    override onAgentMessage(listener: Parameters<NonNullable<FakeFleetClient['onAgentMessage']>>[0]): () => void {
+      this.subscriptions += 1
+      return super.onAgentMessage(listener)
+    }
+
+    override onAgentLifecycleSignal(
+      listener: Parameters<NonNullable<FakeFleetClient['onAgentLifecycleSignal']>>[0],
+    ): () => void {
+      this.subscriptions += 1
+      return super.onAgentLifecycleSignal(listener)
+    }
+
+    override onAgentUsage(listener: Parameters<NonNullable<FakeFleetClient['onAgentUsage']>>[0]): () => void {
+      this.subscriptions += 1
+      return super.onAgentUsage(listener)
+    }
+  }
+
+  // The control arm. Without it the must-not-fire test below could pass because
+  // the fixture never subscribes at all, and would prove nothing.
+  it('subscribes to fleet events when the instance is live', () => {
+    const fleet = new SubscriptionCountingFleet()
+    createFactory(config(), { mount: new FakeMountClient(), fleet, triage: new StaticTriage(), logger: {} })
+
+    expect(fleet.subscriptions).toBeGreaterThan(0)
+  })
+
+  it('touches the fleet not at all when the instance is read-only', () => {
+    const fleet = new SubscriptionCountingFleet()
+    createFactory(config(), {
+      mount: new FakeMountClient(),
+      fleet,
+      triage: new StaticTriage(),
+      logger: {},
+      readOnly: true,
+    })
+
+    expect(fleet.subscriptions).toBe(0)
+  })
+
+  // A read-only instance is built with no event wiring and, in the CLI, with a
+  // fleet client that cannot register. Starting one would be a half-live daemon,
+  // so refuse rather than quietly reintroduce the side effect this mode removes.
+  it('refuses to start a read-only instance', async () => {
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient(),
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      logger: {},
+      readOnly: true,
+    })
+
+    await expect(factory.start()).rejects.toThrow('constructed read-only')
+  })
+})
 
 describe('fleet control-plane admission', () => {
   class StalledRosterFleet extends FakeFleetClient {
@@ -3137,6 +3209,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toContainEqual({
       issue: { uuid: 'uuid-141', key: 'AR-141', path: dependentPath },
       reason: 'parked on dependencies: AgentWorkforce/pear#140',
+      code: 'parked-dependency',
     })
     expect(factory.status().parked).toEqual([
       expect.objectContaining({
@@ -3283,6 +3356,7 @@ describe('FactoryLoop', () => {
       expect(report.skipped).toContainEqual({
         issue: expect.objectContaining({ key: '36' }),
         reason: 'parked on dependencies: AgentWorkforce/pear#35',
+        code: 'parked-dependency',
       })
       expect(factory.status().parked).toEqual([
         expect.objectContaining({ issue: expect.objectContaining({ key: '36' }) }),
@@ -3440,6 +3514,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toEqual([{
       issue: { uuid: 'AgentWorkforce/pear#46', key: '46', path: canonicalPath },
       reason: 'live state is not ready-for-agent',
+      code: 'not-ready',
     }])
     expect(fleet.spawns).toEqual([])
   })
@@ -3570,8 +3645,8 @@ describe('FactoryLoop', () => {
       await state.claimDispatchLifecycle(
         'factory-test', issueKey(staleDecision.issue), lifecycle(staleDecision, 'stale-run'), 'expired-owner', 0, 1,
       )
-      // Simulate a document written before alias-aware claims were atomic. A
-      // current store would adopt the first row instead of creating this one.
+      // Simulate a document written before the #211 rekey, under the legacy
+      // composite keys, with both rows still carrying an expired lease.
       const legacyDocument = JSON.parse(await readFile(watchStatePath, 'utf8')) as {
         workspaces: Record<string, { dispatchLifecycles: Record<string, unknown> }>
       }
@@ -3593,7 +3668,7 @@ describe('FactoryLoop', () => {
         .listDispatchLifecycles('factory-test')
       expect(lifecycles).toHaveLength(1)
       expect(lifecycles[0]).toMatchObject([
-        issueKey(stableDecision.issue),
+        dispatchIssueIdentity(stableDecision.issue),
         { runId: 'stable-run', issue: { path: stablePath } },
       ])
       expect(restarted.status().counters.dispatchLifecycleGithubAliasesCollapsed).toBe(1)
@@ -3737,6 +3812,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toEqual([{
       issue: { uuid: 'AgentWorkforce/pear#49', key: '49', path },
       reason: 'live state is not ready-for-agent',
+      code: 'not-ready',
     }])
     expect(fleet.spawns).toEqual([])
   })
@@ -4962,6 +5038,147 @@ describe('FactoryLoop', () => {
     }
   })
 
+  // factory#348. `#343` gave read-only CLI commands a fleet client that refuses
+  // to mint a workspace identity, and `#githubOrphanRecoveryContext` read
+  // `fleet.roster()` regardless of `dryRun` — so a GitHub-backed
+  // `run-once --dry-run` (the container's start-disabled pre-cutover gate) hit
+  // the refusal and logged a safety-context failure on every sweep. The context
+  // was provably unused on that path: `mayRecoverGithubOrphan` is `!dryRun` and
+  // `#reconcileOrphanedGithubInProgress` refuses under `dryRun` before reading
+  // it. Deciding what a sweep WOULD do must not need an identity to do it with.
+  describe('orphan-recovery safety context under a read-only fleet client', () => {
+    // Counts the roster read without changing its answer, so the must-not-fire
+    // arm below measures the guard and not a refusal.
+    class RosterCountingFleet extends FakeFleetClient {
+      rosterCalls = 0
+
+      override async roster(): ReturnType<FakeFleetClient['roster']> {
+        this.rosterCalls += 1
+        return await super.roster()
+      }
+    }
+
+    // The production shape of #343's refusal: fleet reads are fine once an
+    // identity exists, but minting one is refused — and `roster()` mints on
+    // demand.
+    class ReadOnlyRosterFleet extends FakeFleetClient {
+      rosterCalls = 0
+
+      override async roster(): Promise<never> {
+        this.rosterCalls += 1
+        throw new Error(
+          'Refusing to register relay agent "factory-cloud-1c88bf23": this fleet client is read-only.',
+        )
+      }
+    }
+
+    // One orphan-shaped issue: `factory:in-progress`, no live agent, a stranded
+    // in-flight dispatch row. Live, this is exactly what orphan recovery exists
+    // to release; dry, it is what gets preserved.
+    const orphanFixture = async (): Promise<{
+      root: string
+      mount: FakeMountClient
+      stateStore: InMemoryStateStore
+    }> => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-348-dryrun-'))
+      const path = githubIssuePath('AgentWorkforce', 'pear', 348)
+      const payload = githubIssueFile(348, { labels: ['factory', 'pear', 'factory:in-progress'] })
+      const mount = new FakeMountClient({ [path]: payload })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const issue = parseGithubFactoryIssue(path, payload)
+      await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), {
+        attempts: 1,
+        inFlight: true,
+        terminal: false,
+        backoffUntilMs: 0,
+      })
+      return { root, mount, stateStore }
+    }
+
+    const factoryFor = (
+      root: string,
+      mount: FakeMountClient,
+      fleet: FakeFleetClient,
+      stateStore: InMemoryStateStore,
+    ): ReturnType<typeof createFactory> =>
+      createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+    // MUST NOT FIRE. The roster read is skipped because the sweep is dry, not
+    // because the client refused it: this fleet answers `roster()` normally.
+    it('does not read the roster on a dry-run sweep', async () => {
+      const { root, mount, stateStore } = await orphanFixture()
+      const fleet = new RosterCountingFleet()
+      try {
+        const factory = factoryFor(root, mount, fleet, stateStore)
+
+        const report = await factory.runOnce({ dryRun: true })
+
+        expect(fleet.rosterCalls).toBe(0)
+        expect(report.orphanRecoveryDegraded).toBe('dry-run')
+        // A deliberate skip, not a failure: the live-path failure counter must
+        // stay clear so a real degradation is still distinguishable from this.
+        expect(factory.status().counters.githubOrphanRecoveryContextFailures).toBeUndefined()
+        expect(factory.status().counters.githubOrphanRecoveryContextSkippedDryRun).toBe(1)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+
+    // MUST FIRE, and the CONTROL for the arm above. Same fixture, same fleet
+    // class, same issue — only `dryRun` differs. Without it, the zero above
+    // could mean the fixture never reaches the orphan-recovery call site at
+    // all, and would prove nothing. Swapping the two arms fails both: this one
+    // would stop recovering, that one would start reading the roster.
+    it('CONTROL: still reads the roster and recovers the orphan on a live sweep', async () => {
+      const { root, mount, stateStore } = await orphanFixture()
+      const fleet = new RosterCountingFleet()
+      try {
+        const factory = factoryFor(root, mount, fleet, stateStore)
+
+        const report = await factory.runOnce()
+
+        expect(fleet.rosterCalls).toBeGreaterThan(0)
+        expect(report.orphanRecoveryDegraded).toBeUndefined()
+        expect(report.dispatched.map((result) => result.issue.key)).toEqual(['348'])
+        expect(factory.status().counters.githubOrphanedInProgressRecovered).toBe(1)
+        expect(factory.status().counters.githubOrphanRecoveryContextSkippedDryRun).toBeUndefined()
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+
+    // The regression itself, in its production shape: the container's
+    // start-disabled `run-once --dry-run` gate, whose fleet client refuses to
+    // mint an identity. Before the guard this logged a safety-context failure
+    // every sweep; now the sweep never asks.
+    it('completes a dry-run sweep against a client that refuses to mint an identity', async () => {
+      const { root, mount, stateStore } = await orphanFixture()
+      const fleet = new ReadOnlyRosterFleet()
+      try {
+        const factory = factoryFor(root, mount, fleet, stateStore)
+
+        const report = await factory.runOnce({ dryRun: true })
+
+        expect(fleet.rosterCalls).toBe(0)
+        expect(report.orphanRecoveryDegraded).toBe('dry-run')
+        expect(factory.status().counters.githubOrphanRecoveryContextFailures).toBeUndefined()
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  })
+
   // Factory admits an issue to dispatch on EITHER the title prefix or the
   // scope label, but orphan recovery demanded the label alone. An issue
   // admitted by title could therefore be dispatched and then never un-stuck.
@@ -5059,7 +5276,7 @@ describe('FactoryLoop', () => {
       ]
       await stateStore.claimDispatchLifecycle(
         'factory-test',
-        issueKey(issue),
+        dispatchIssueIdentity(issue),
         {
           runId: 'crashed-run-242',
           issue: { uuid: issue.uuid, key: issue.key, path: issue.path },
@@ -5106,7 +5323,7 @@ describe('FactoryLoop', () => {
       ])
       expect(factory.status().counters.githubOrphanedLifecycleClaimsReleased).toBe(1)
       expect(factory.status().counters.githubOrphanedLifecycleAgentReleaseFailures).toBe(2)
-      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(issue))).resolves.toMatchObject({
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(issue))).resolves.toMatchObject({
         phase: 'running',
         runId: expect.not.stringMatching(/^crashed-run-242$/u),
       })
@@ -5267,6 +5484,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toContainEqual({
       issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: racedPath },
       reason: 'live state changed during dispatch',
+      code: 'dispatch-failed',
     })
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
@@ -5359,6 +5577,7 @@ describe('FactoryLoop', () => {
       expect(report.skipped).toContainEqual({
         issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: blockedPath },
         reason: 'dispatch lifecycle already terminal',
+        code: 'dispatch-failed',
       })
       expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
       expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
@@ -5392,6 +5611,7 @@ describe('FactoryLoop', () => {
         // Sanitized: `run-once` prints the report as JSON, so the reason
         // carries a classification rather than raw provider text.
         reason: 'dispatch failed (TypeError)',
+        code: 'dispatch-failed',
       })
       expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
       expect(factory.status().counters.dispatchItemFailuresSkipped).toBe(1)
@@ -5514,6 +5734,7 @@ describe('FactoryLoop', () => {
       expect(report.skipped).toContainEqual({
         issue: { uuid: 'AgentWorkforce/pear#59', key: '59', path: blockedPath },
         reason: 'dispatch failed (Error)',
+        code: 'dispatch-failed',
       })
       expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
       expect(fleet.spawns).toEqual([])
@@ -5705,6 +5926,10 @@ describe('FactoryLoop', () => {
         expect(report.skipped).toEqual([{
           issue: { uuid: 'AgentWorkforce/pear#53', key: '53', path },
           reason: 'active dispatch claim or live agent still owns the issue',
+          // The batch already holds this issue, so it is the `already-tracked`
+          // gate that declines it — not the readiness gate that carries the
+          // same operator text one branch later.
+          code: 'already-tracked',
         }])
         expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-53-babysit-pear'])
         expect(fleet.spawns[0]).toMatchObject({
@@ -5723,7 +5948,7 @@ describe('FactoryLoop', () => {
         expect(factory.status().counters.githubOrphanRecoveriesBlockedOpenPr).toBe(1)
         expect(factory.status().counters.githubOrphanedPullRequestsAdopted).toBe(1)
         expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['53'])
-        expect(await stateStore.getDispatchLifecycle('factory-test', issueKey({
+        expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity({
           uuid: 'AgentWorkforce/pear#53',
           key: '53',
           path,
@@ -5924,7 +6149,7 @@ describe('FactoryLoop', () => {
 
       expect(firstFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-54-impl-pear', 'ar-54-review-pear'])
       const adoptedRef = { uuid: 'AgentWorkforce/pear#53', key: '53', path: adoptedPath }
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(adoptedRef))).toMatchObject({
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(adoptedRef))).toMatchObject({
         phase: 'queued',
         pullRequest: {
           repo: 'AgentWorkforce/pear',
@@ -5937,7 +6162,7 @@ describe('FactoryLoop', () => {
       await first.stop()
       clock.advance(5 * 60_000)
       const runningRef = { uuid: 'AgentWorkforce/pear#54', key: '54', path: runningPath }
-      const runningKey = issueKey(runningRef)
+      const runningKey = dispatchIssueIdentity(runningRef)
       const running = await stateStore.getDispatchLifecycle('factory-test', runningKey)
       expect(running).toBeDefined()
       const completion = await stateStore.claimDispatchLifecycle(
@@ -6021,6 +6246,7 @@ describe('FactoryLoop', () => {
           issue: '55',
           path,
           reason: 'active dispatch claim or live agent still owns the issue',
+          code: 'not-ready',
         },
       ])
     } finally {
@@ -6080,7 +6306,7 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.legacyLocalWorkersAdopted).toBe(3)
       expect(factory.status().counters.githubOrphanedPullRequestsAdopted).toBe(1)
       expect(factory.status().inFlight.map((inFlight) => inFlight.key)).toEqual(['55'])
-      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(issue))).resolves.toMatchObject({
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(issue))).resolves.toMatchObject({
         phase: 'running',
         pullRequest: {
           repo: 'AgentWorkforce/pear',
@@ -6492,8 +6718,8 @@ describe('FactoryLoop', () => {
 
     expect(report.pulled.map((issue) => issue.key)).toEqual(['AR-1', 'AR-2', 'AR-3', 'AR-4'])
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-1', 'AR-2'])
-    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-3', key: 'AR-3', path: issuePath(3) }, reason: 'queued or escalated' })
-    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-4', key: 'AR-4', path: issuePath(4) }, reason: 'live state is not ready-for-agent' })
+    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-3', key: 'AR-3', path: issuePath(3) }, reason: 'queued or escalated', code: 'queued-or-escalated' })
+    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-4', key: 'AR-4', path: issuePath(4) }, reason: 'live state is not ready-for-agent', code: 'not-ready' })
     expect(fleet.spawns).toHaveLength(4)
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-1', 'AR-2'])
     expect(factory.status().queued.map((issue) => issue.key)).toEqual(['AR-3'])
@@ -6995,7 +7221,7 @@ describe('FactoryLoop', () => {
     expect(report.pulled).toEqual([{ uuid: 'uuid-67-canonical', key: 'AR-67', path: canonicalPath }])
     expect(report.dispatched).toEqual([])
     expect(report.skipped).toEqual([
-      { issue: { uuid: 'uuid-67-canonical', key: 'AR-67', path: canonicalPath }, reason: 'live state is not ready-for-agent' },
+      { issue: { uuid: 'uuid-67-canonical', key: 'AR-67', path: canonicalPath }, reason: 'live state is not ready-for-agent', code: 'not-ready' },
     ])
     expect(fleet.spawns).toEqual([])
   })
@@ -7074,7 +7300,7 @@ describe('FactoryLoop', () => {
 
     expect(report.dispatched).toEqual([])
     expect(report.skipped).toEqual([
-      { issue: { uuid: 'uuid-365', key: 'AR-365', path: issuePath(365) }, reason: 'dispatch already terminal' },
+      { issue: { uuid: 'uuid-365', key: 'AR-365', path: issuePath(365) }, reason: 'dispatch already terminal', code: 'dispatch-terminal' },
     ])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-365-impl-pear', 'ar-365-review'])
     expect(factory.status().counters.dispatchTerminalReopened).toBeUndefined()
@@ -7545,6 +7771,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toContainEqual({
       issue: { uuid: '40c7e780-59ad-47ee-8809-3a9b8434d8fb', key: 'AR-173', path: capturedStaleDoneCanonicalPath },
       reason: 'live state is not ready-for-agent',
+      code: 'not-ready',
     })
     expect(mount.readPaths).not.toContain(byIdBareAliasPath)
     expect(mount.readPaths).not.toContain(byIdCanonicalShapedAliasPath)
@@ -7603,7 +7830,19 @@ describe('FactoryLoop', () => {
       expect(factory.status().inFlight).toHaveLength(5)
       expect(factory.status().queued).toHaveLength(1)
       const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
-      expect(heartbeat).toMatchObject({ status: 'idle', iteration: 3, maxIterations: 3, pid: process.pid })
+      expect(heartbeat).toMatchObject({
+        status: 'idle',
+        source: 'bounded-loop',
+        progressContract: 'discovery-sweep-v1',
+        iteration: 3,
+        maxIterations: 3,
+        pid: process.pid,
+        progress: {
+          sequence: 3,
+          operation: 'discovery-sweep',
+          updatedAtMs: expect.any(Number),
+        },
+      })
       expect(checkFactoryLoopLiveness(heartbeat, { nowMs: heartbeat!.updatedAtMs + 500, staleMs: 10_000 })).toMatchObject({
         ok: true,
         stale: false,
@@ -7685,7 +7924,7 @@ describe('FactoryLoop', () => {
 
     await expect(factory.dispatch(decision)).rejects.toThrow('daemon crashed immediately after lifecycle claim')
 
-    const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+    const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
     const implementerTask = lifecycle?.decision.implementers[0]?.task
     const reviewerTask = lifecycle?.decision.reviewer.task
     expect(implementerTask).toContain('Full Linear issue description:')
@@ -7734,7 +7973,7 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(path, issue))
 
     await expect(factory.dispatch(decision)).rejects.toThrow('ownership lost before spawning')
-    const key = issueKey(decision.issue)
+    const key = dispatchIssueIdentity(decision.issue)
     const beforeStop = await stateStore.getDispatchLifecycle('factory-test', key)
     expect(beforeStop?.lease?.leaseUntilMs).toBeGreaterThan(Date.now())
     expect(fleet.previewStarts).toHaveLength(1)
@@ -7843,12 +8082,12 @@ describe('FactoryLoop', () => {
       await restarted.start({ mode: 'dispatch-owner' })
 
       expect(cleanupFleet.previewRemovals).toHaveLength(1)
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'running' })
 
       await vi.waitFor(() => expect(cleanupFleet.previewRemovals).toHaveLength(2), { timeout: 4_000 })
       await vi.waitFor(async () => expect(
-        await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)),
+        await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)),
       ).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
       expect(cleanupFleet.spawns).toEqual([])
     } finally {
@@ -7896,7 +8135,7 @@ describe('FactoryLoop', () => {
     let restarted: ReturnType<typeof createFactory> | undefined
     try {
       const decision = await first.triageIssue(parseLinearIssue(path, issue))
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
 
       await expect(first.dispatch(decision)).rejects.toThrow('terminal spawn failure')
       await expect(state().getDispatchLifecycle('factory-test', key)).resolves.toMatchObject({
@@ -7963,7 +8202,7 @@ describe('FactoryLoop', () => {
       const decision = await first.triageIssue(parseLinearIssue(issuePath(85), issueFile(85)))
       const originalResult = await first.dispatch(decision)
 
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       const crashedState = new FileStateStore({ batchSize: 2, watchStatePath })
       const beforeCrash = await crashedState.getDispatchLifecycle('factory-test', key)
       expect(beforeCrash?.phase).toBe('running')
@@ -8088,7 +8327,7 @@ describe('FactoryLoop', () => {
       releasePublish()
       await start
 
-      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({ phase: 'complete', pullRequest: { number: 86 } })
     } finally {
       releasePublish()
@@ -8153,12 +8392,12 @@ describe('FactoryLoop', () => {
 
       expect(restarted.status().counters.startupAgentExitDrainTimeouts).toBe(1)
       expect(restarted.status().counters.liveStartupBackfills).toBe(1)
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'publishing' })
 
       releasePublish()
       await vi.waitFor(async () => {
-        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
         expect(lifecycle).toMatchObject({ pullRequest: { number: 87 } })
         expect(['published', 'complete']).toContain(lifecycle?.phase)
       })
@@ -8232,7 +8471,7 @@ describe('FactoryLoop', () => {
         // nominal foreign-lease window an ungraceful crash would expose.
         await first.stop()
         const persisted = state()
-        const key = issueKey(decision.issue)
+        const key = dispatchIssueIdentity(decision.issue)
         const waitingLifecycle = await persisted.getDispatchLifecycle('factory-test', key)
         expect(waitingLifecycle).toMatchObject({ phase: 'waiting-for-human' })
         const crashLease = await persisted.claimDispatchLifecycle(
@@ -8269,7 +8508,7 @@ describe('FactoryLoop', () => {
       // Both waiters report the phase the row settled in, not `undefined` and
       // not each other's opposite.
       expect(await Promise.all([terminal, secondWaiter])).toEqual(['complete', 'complete'])
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'complete' })
       expect(attachedFleet.spawns).toEqual([])
       expect(attached.status().counters.githubPullRequestsPublished).toBeUndefined()
@@ -8370,7 +8609,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(queued)
       expect(firstFleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-985-impl-pear', 'ar-985-review'])
       expect(firstFleet.previewStarts.map((preview) => preview.issueKey)).toEqual(['AR-985'])
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(queued.issue))).toMatchObject({ phase: 'queued' })
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(queued.issue))).toMatchObject({ phase: 'queued' })
 
       clock.advance(5 * 60_000 + 1)
       const restartedFleet = new RemoteLifecycleFleetClient()
@@ -8429,7 +8668,7 @@ describe('FactoryLoop', () => {
 
       expect(firstFleet.spawns).toHaveLength(2)
       expect(secondFleet.spawns).toEqual([])
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(secondDecision.issue))).toMatchObject({ phase: 'queued' })
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(secondDecision.issue))).toMatchObject({ phase: 'queued' })
     } finally {
       await second.stop()
       await first.stop()
@@ -8469,19 +8708,19 @@ describe('FactoryLoop', () => {
       })
       await firstFleet.clarificationReleaseStarted
       await vi.waitFor(async () => {
-        expect(await state().getDispatchLifecycle('factory-test', issueKey(firstDecision.issue)))
+        expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(firstDecision.issue)))
           .toMatchObject({ phase: 'parking' })
       })
 
       await second.dispatch(secondDecision)
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(secondDecision.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(secondDecision.issue)))
         .toMatchObject({ phase: 'queued' })
       await new Promise((resolve) => setTimeout(resolve, 1_200))
       expect(secondFleet.spawns).toEqual([])
 
       firstFleet.allowClarificationRelease()
       await vi.waitFor(async () => {
-        expect(await state().getDispatchLifecycle('factory-test', issueKey(firstDecision.issue)))
+        expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(firstDecision.issue)))
           .toMatchObject({ phase: 'waiting-for-human' })
       })
       await vi.waitFor(() => expect(secondFleet.spawns.map((spawn) => spawn.name))
@@ -8524,12 +8763,12 @@ describe('FactoryLoop', () => {
       })
       await vi.waitFor(() => expect(first.status().counters.clarificationParkReleasePending).toBe(1))
       await vi.waitFor(async () => {
-        expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
           .toMatchObject({ phase: 'parking' })
       })
       const queuedDecision = await first.triageIssue(parseLinearIssue(issuePath(992), issueFile(992)))
       await first.dispatch(queuedDecision)
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(queuedDecision.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(queuedDecision.issue)))
         .toMatchObject({ phase: 'queued' })
       await first.stop()
 
@@ -8547,13 +8786,13 @@ describe('FactoryLoop', () => {
       expect(restartedFleet.resumes).toEqual([])
       expect(restartedFleet.spawns).toEqual([])
       expect(restarted.status().counters.exitPrPublishSkipped).toBeUndefined()
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'parking' })
 
       restartedFleet.allowClarificationRelease()
       await starting
       await vi.waitFor(async () => {
-        expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
           .toMatchObject({ phase: 'waiting-for-human' })
       })
       expect(restartedFleet.releases.map((release) => release.name).sort())
@@ -8657,7 +8896,7 @@ describe('FactoryLoop', () => {
       const decision = await first.triageIssue(parseLinearIssue(issuePath(590), issue))
       await first.dispatch(decision)
       const names = ['ar-590-impl-pear', 'ar-590-review']
-      await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+      await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).resolves.toMatchObject({
         phase: 'running',
         agents: names.map((name) => expect.objectContaining({
           name,
@@ -8731,7 +8970,7 @@ describe('FactoryLoop', () => {
         'ar-595-impl-pear',
         'ar-595-review',
       ])
-      await expect(state().getDispatchLifecycle(factoryConfig.workspaceId, issueKey(decision.issue)))
+      await expect(state().getDispatchLifecycle(factoryConfig.workspaceId, dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({ phase: 'running' })
       expect(restarted.status().counters.startupRosterMissingExitsSynthesized).toBe(synthesizedCount)
     } finally {
@@ -8846,12 +9085,12 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(591), issue))
 
     await factory.dispatch(decision)
-    branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+    branch = (await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))!
       .decision.implementers[0]!.branch!
     fleet.emitAgentExit('ar-591-impl-pear', 'reconciled-missing')
 
     await vi.waitFor(async () => {
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).toMatchObject({
         phase: 'running',
         pullRequest: {
           repo: 'AgentWorkforce/pear',
@@ -8904,12 +9143,12 @@ describe('FactoryLoop', () => {
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(597), issue))
 
     await factory.dispatch(decision)
-    branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+    branch = (await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))!
       .decision.implementers[0]!.branch!
     fleet.emitAgentExit('ar-597-impl-pear', 'reconciled-missing')
 
     await vi.waitFor(async () => {
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).toMatchObject({
         pullRequest: {
           repo: 'AgentWorkforce/pear',
           number: 1597,
@@ -8950,12 +9189,12 @@ describe('FactoryLoop', () => {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(585), issueFile(585)))
       await expect(factory.dispatch(decision)).rejects.toThrow('owner crashed after remote spawn ack')
       await vi.waitFor(async () => expect(await new FileStateStore({ batchSize: 2, watchStatePath })
-        .getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({ phase: 'running' }), { timeout: 4_000 })
+        .getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).toMatchObject({ phase: 'running' }), { timeout: 4_000 })
 
       expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-585-impl-pear')).toHaveLength(1)
       expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-585-review')).toHaveLength(1)
       expect((await new FileStateStore({ batchSize: 2, watchStatePath })
-        .getDispatchLifecycle('factory-test', issueKey(decision.issue)))?.agents
+        .getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))?.agents
         .find((agent) => agent.name === 'ar-585-impl-pear')?.tracked.result?.node).toBe('sf-mini')
     } finally {
       await factory.stop()
@@ -9031,7 +9270,7 @@ describe('FactoryLoop', () => {
           ? 'owner crashed after durable lifecycle claim'
           : 'owner crashed after remote spawn ack',
       )
-      await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({
           phase: persistedPhase,
           agents: persistedPhase === 'retryable'
@@ -9060,7 +9299,7 @@ describe('FactoryLoop', () => {
 
       if (liveState === 'unreadable') {
         await new Promise((resolve) => setTimeout(resolve, 1_200))
-        await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+        await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
           .resolves.toMatchObject({ phase: persistedPhase })
         expect(fleet.spawns).toEqual([])
         expect(fleet.releases).toEqual([])
@@ -9070,7 +9309,7 @@ describe('FactoryLoop', () => {
 
       await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
         'factory-test',
-        issueKey(decision.issue),
+        dispatchIssueIdentity(decision.issue),
       )).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
       await vi.waitFor(() => expect(restarted?.status().counters.dispatchLifecycleStaleIssuesAbandoned).toBe(1))
       expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(
@@ -9143,7 +9382,7 @@ describe('FactoryLoop', () => {
 
       await expect(first.dispatch(decision)).rejects.toThrow('owner crashed after remote spawn ack')
       expect(githubRead.getIssue).toHaveBeenCalledWith('AgentWorkforce/pear', number)
-      await expect(state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({ phase: 'retryable' })
       await first.stop()
 
@@ -9163,7 +9402,7 @@ describe('FactoryLoop', () => {
 
       await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
         'factory-test',
-        issueKey(decision.issue),
+        dispatchIssueIdentity(decision.issue),
       )).toMatchObject({ phase: 'running' }), { timeout: 4_000 })
 
       expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
@@ -9240,7 +9479,7 @@ describe('FactoryLoop', () => {
       // The read inside #publishImplementerPullRequest succeeds here too —
       // still the same process, the cache warmed during dispatch covers it.
       await vi.waitFor(() => expect(attempts).toBe(1))
-      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'publishing' }))
       await first.stop()
 
@@ -9274,7 +9513,7 @@ describe('FactoryLoop', () => {
       // The lifecycle can race straight past 'published' to 'complete' by
       // the time this polls — either proves the read (and publish) succeeded.
       await vi.waitFor(async () => {
-        const lifecycle = await state().getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        const lifecycle = await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
         expect(['published', 'complete']).toContain(lifecycle?.phase)
       }, { timeout: 4_000 })
     } finally {
@@ -9364,7 +9603,7 @@ describe('FactoryLoop', () => {
     try {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(186), issueFile(186)))
       await factory.dispatch(decision)
-      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
       expect(lifecycle?.decision.implementers[0]?.branch)
         .toEqual(expect.stringMatching(/^factory\/ar-186-agentworkforce-pear-[0-9a-f]{8}$/u))
 
@@ -9585,7 +9824,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
       firstFleet.emitAgentExit('ar-485-impl-pear', 'exited')
       await vi.waitFor(() => expect(attempts).toBe(1))
-      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'publishing' }))
       await first.stop()
 
@@ -9733,7 +9972,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
       firstFleet.emitAgentExit('ar-785-impl-pear', 'exited')
       await vi.waitFor(async () => {
-        const lifecycle = await state().getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        const lifecycle = await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
         expect(lifecycle).toMatchObject({ phase: 'releasing' })
         expect(lifecycle?.agents.find((agent) => agent.name === 'ar-785-review')?.releasedAtMs)
           .toEqual(expect.any(Number))
@@ -9749,7 +9988,7 @@ describe('FactoryLoop', () => {
         probePrResolver: async () => undefined,
       })
       await restarted.start({ mode: 'dispatch-owner' })
-      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'complete' }), { timeout: 4_000 })
       // The reviewer acknowledgement was fenced before the first owner
       // stopped, so takeover retries only the failed implementer release.
@@ -9781,10 +10020,18 @@ describe('FactoryLoop', () => {
       const initial = await readFactoryLoopHeartbeat(heartbeatPath)
       expect(initial).toMatchObject({
         status: 'running',
+        source: 'live-timer',
+        progressContract: 'discovery-sweep-v1',
         iteration: 0,
         maxIterations: 0,
+        startedAtMs: 0,
         updatedAtMs: 0,
         registryPath,
+        progress: {
+          sequence: 1,
+          operation: 'discovery-sweep',
+          updatedAtMs: 0,
+        },
       })
       expect(checkFactoryLoopLiveness(initial, { nowMs: 900, staleMs: 1_000 })).toMatchObject({
         ok: true,
@@ -9799,6 +10046,9 @@ describe('FactoryLoop', () => {
         status: 'running',
         updatedAtMs: 500,
       })
+      // MUST NOT ADVANCE: the timer proves the process is alive, but no new
+      // dependency-backed sweep committed between these two records.
+      expect(refreshed?.progress).toEqual(initial?.progress)
 
       await factory.stop()
 
@@ -10774,6 +11024,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toContainEqual({
       issue: { uuid: 'uuid-21', key: 'AR-21', path: unscopedPath },
       reason: 'not factory-e2e scope',
+      code: 'out-of-scope',
     })
     expect(report.triaged).toEqual([])
     expect(report.dispatched).toEqual([])
@@ -10859,6 +11110,7 @@ describe('FactoryLoop', () => {
     expect(report.skipped).toContainEqual({
       issue: { uuid: 'uuid-261', key: 'AR-261', path: draftPath },
       reason: 'not reconciled real Linear issue',
+      code: 'not-dispatchable',
     })
     expect(report.triaged).toEqual([])
     expect(report.dispatched).toEqual([])
@@ -11011,7 +11263,7 @@ describe('FactoryLoop', () => {
         { name: 'ar-252-review', reason: 'held-past-deadline' },
       ]), { timeout: 4_000 })
       await vi.waitFor(async () => expect(
-        await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)),
+        await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)),
       ).toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 4_000 })
       expect(factory.status().heldAgents).toEqual([])
       await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith(
@@ -11068,7 +11320,7 @@ describe('FactoryLoop', () => {
         invocationIds: [],
         updatedAtMs: 0,
       }
-      const wedgedKey = issueKey(wedgedDecision.issue)
+      const wedgedKey = dispatchIssueIdentity(wedgedDecision.issue)
       await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
       const seeded = await state().getDispatchLifecycle('factory-test', wedgedKey)
       expect(seeded?.phase).toBe('dispatching')
@@ -11168,7 +11420,7 @@ describe('FactoryLoop', () => {
         invocationIds: [],
         updatedAtMs: 0,
       }
-      const wedgedKey = issueKey(wedgedDecision.issue)
+      const wedgedKey = dispatchIssueIdentity(wedgedDecision.issue)
       await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
       const seeded = await state().getDispatchLifecycle('factory-test', wedgedKey)
       expect(seeded).toMatchObject({ phase: 'running' })
@@ -11256,7 +11508,7 @@ describe('FactoryLoop', () => {
       invocationIds: [],
       updatedAtMs: 0,
     }
-    const wedgedKey = issueKey(wedgedDecision.issue)
+    const wedgedKey = dispatchIssueIdentity(wedgedDecision.issue)
     await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
 
     // relayfile sheds this row's issue read for the whole run.
@@ -11333,7 +11585,7 @@ describe('FactoryLoop', () => {
       invocationIds: [],
       updatedAtMs: 0,
     }
-    const wedgedKey = issueKey(wedgedDecision.issue)
+    const wedgedKey = dispatchIssueIdentity(wedgedDecision.issue)
     await state().claimDispatchLifecycle('factory-test', wedgedKey, wedged, 'dead-owner', 0, 1)
 
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
@@ -11387,7 +11639,7 @@ describe('FactoryLoop', () => {
     await seed.stop()
 
     const plannedSpec = decision.implementers[0]!
-    const key = issueKey(decision.issue)
+    const key = dispatchIssueIdentity(decision.issue)
     const wedged: DispatchLifecycle = {
       runId: 'lagging-run',
       issue: { ...decision.issue },
@@ -11573,10 +11825,10 @@ describe('FactoryLoop', () => {
       },
     }], Date.now())
     const nowMs = Date.now()
-    await state().claimDispatchLifecycle('factory-test', issueKey(holder.issue), holder, 'dead-owner', nowMs, 1)
+    await state().claimDispatchLifecycle('factory-test', dispatchIssueIdentity(holder.issue), holder, 'dead-owner', nowMs, 1)
     for (const number of [315, 316]) {
       const queued = lifecycleFor(number, 'queued', [])
-      await state().claimDispatchLifecycle('factory-test', issueKey(queued.issue), queued, 'dead-owner', nowMs, 1)
+      await state().claimDispatchLifecycle('factory-test', dispatchIssueIdentity(queued.issue), queued, 'dead-owner', nowMs, 1)
     }
 
     // AR-316's source went terminal while it sat queued. Its read is delayed so
@@ -11608,10 +11860,10 @@ describe('FactoryLoop', () => {
       await factory.start({ mode: 'dispatch-owner' })
 
       await vi.waitFor(async () => expect(
-        await state().getDispatchLifecycle('factory-test', issueKey(decisions.get(316)!.issue)),
+        await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decisions.get(316)!.issue)),
       ).toMatchObject({ phase: 'abandoned' }), { timeout: 15_000 })
       // AR-314 still holds the only slot, so nothing was freed.
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(decisions.get(314)!.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decisions.get(314)!.issue)))
         .toMatchObject({ phase: 'running' })
       // Establishes that a waiter really was parked at that moment — without
       // this the assertion below passes vacuously.
@@ -11654,7 +11906,7 @@ describe('FactoryLoop', () => {
     })
     try {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(317), issueFile(317)))
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       // Nothing else is in flight, so no other record's deadline can sweep
       // this one in by side effect.
       const dispatched = factory.dispatch(decision).catch(() => undefined)
@@ -11704,8 +11956,10 @@ describe('FactoryLoop', () => {
     const watchStatePath = join(root, 'state.json')
     const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
     const gate = Promise.withResolvers<void>()
+    const spawnStarted = Promise.withResolvers<void>()
     class HangingSpawnFleetClient extends RemoteLifecycleFleetClient {
       override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        spawnStarted.resolve()
         await gate.promise
         return super.spawn(input)
       }
@@ -11725,19 +11979,20 @@ describe('FactoryLoop', () => {
     })
     try {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(318), issueFile(318)))
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       const dispatched = factory.dispatch(decision)
 
-      const claimed = await vi.waitFor(async () => {
-        const lifecycle = await state().getDispatchLifecycle('factory-test', key)
-        expect(lifecycle).toMatchObject({ phase: 'dispatching' })
-        return lifecycle!
-      }, { timeout: 6_000 })
+      // `phase: dispatching` is also persisted before the spawn starts. Wait
+      // for the fleet call itself so this test exercises a genuinely late
+      // placement rather than racing an earlier ownership fence (#359 CI).
+      await spawnStarted.promise
+      const claimed = await state().getDispatchLifecycle('factory-test', key)
+      expect(claimed).toMatchObject({ phase: 'dispatching' })
 
       // Another owner reclaims the row once this process's lease has lapsed.
       // Claiming on a future clock is what lets it past the live-lease guard.
       const takeover = await state().claimDispatchLifecycle(
-        'factory-test', key, claimed, 'other-owner', Date.now() + 10 * 60_000, 10 * 60_000,
+        'factory-test', key, claimed!, 'other-owner', Date.now() + 10 * 60_000, 10 * 60_000,
       )
       expect(takeover.acquired).toBe(true)
 
@@ -11780,7 +12035,7 @@ describe('FactoryLoop', () => {
     }), { mount, fleet, stateStore: state(), triage: new StaticTriage() })
     try {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(305), issueFile(305)))
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       const dispatched = factory.dispatch(decision)
 
       // `recordPlanned` writes the spec before the spawn returns, so the row
@@ -11844,7 +12099,7 @@ describe('FactoryLoop', () => {
       const waiting = await factory.triageIssue(parseLinearIssue(issuePath(307), issueFile(307)))
       await factory.dispatch(running)
       await factory.dispatch(waiting)
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(waiting.issue)))
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(waiting.issue)))
         .toMatchObject({ phase: 'queued' })
 
       // Deliverable 2: the wait escalates instead of going silent after one
@@ -13156,6 +13411,209 @@ describe('FactoryLoop', () => {
       }
     })
 
+    // #351: the sweep deadline above cannot reach a call that never returns.
+    // It is 90 minutes in production — sized above #36's cold-mirror
+    // measurement on purpose — and it rejects only the WAIT, leaving
+    // `runOnce()` holding its discovery lease so the next cycle coalesces onto
+    // the same wedged promise. On 2026-08-23 one relayfile read stopped
+    // answering and the loop sat for 22 minutes with `consecutiveFailures: 0`.
+    // Only a bound on the CALL ends the pass, and ending it is what releases
+    // the lease and lets the next cycle actually run.
+    class HangingListTreeMount extends CountingEventsMount {
+      readonly hangStarted: Promise<void>
+      hangListTree = false
+      #signalHangStarted: () => void = () => undefined
+      readonly #releases: Array<() => void> = []
+
+      constructor() {
+        super()
+        this.hangStarted = new Promise((resolve) => { this.#signalHangStarted = resolve })
+        this.setSubRoot('/linear/issues', 'absent')
+      }
+
+      /** Frees every parked read so teardown never inherits the wedge. */
+      release(): void {
+        this.hangListTree = false
+        while (this.#releases.length > 0) this.#releases.pop()?.()
+      }
+
+      override async listTree(prefix: string): Promise<string[]> {
+        if (this.hangListTree) {
+          this.#signalHangStarted()
+          // Never settles: the shape of a relayfile fetch() issued with no
+          // AbortSignal, which is what the SDK does when no caller supplies one.
+          await new Promise<void>((resolve) => { this.#releases.push(resolve) })
+        }
+        return super.listTree(prefix)
+      }
+    }
+
+    it('aborts a cycle whose relayfile read never returns, names it, and starts the next cycle', async () => {
+      const mount = new HangingListTreeMount()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: {
+          transport: 'subscribe',
+          reconcileIntervalMs: 20,
+          // Far past this test's horizon, so the sweep deadline cannot be what
+          // ends the pass. Whatever recovers here is the per-call bound.
+          reconcileTimeoutMs: 60_000,
+          relayfileOperationTimeoutMs: 50,
+        },
+      })
+      try {
+        mount.hangListTree = true
+        await mount.hangStarted
+        const sweepsWhileHung = factory.status().counters.readinessReconcileSweeps ?? 0
+
+        await vi.waitFor(() => {
+          const status = factory.status()
+          // Loud: a counter an operator can alert on, not a silent `stalled`.
+          expect(status.readinessReconcile?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(1)
+          // Named: which call it was waiting on. During the outage `lastError`
+          // was absent entirely, which gave the operator nothing to act on.
+          expect(status.readinessReconcile?.lastError)
+            .toMatch(/relayfile listTree did not respond within \d+ms/u)
+          expect(status.readinessReconcile?.lastErrorClass).toBe('RelayfileOperationTimeoutError')
+          // Self-healing: a later cycle STARTED while the dependency is still
+          // hung. This is the number that stayed frozen for 22 minutes.
+          expect(status.counters.readinessReconcileSweeps ?? 0).toBeGreaterThan(sweepsWhileHung)
+        }, { timeout: 5_000 })
+
+        // And it recovers on its own once the dependency answers again — no
+        // restart, which is the only thing that cleared this in production.
+        mount.release()
+        await vi.waitFor(() => {
+          const readiness = factory.status().readinessReconcile
+          expect(readiness?.consecutiveFailures).toBe(0)
+          expect(readiness?.lastCompletedAtMs ?? 0)
+            .toBeGreaterThan(readiness?.lastFailureAtMs ?? Number.POSITIVE_INFINITY)
+        }, { timeout: 5_000 })
+      } finally {
+        mount.release()
+        await factory.stop()
+      }
+      // Two sequential `vi.waitFor` windows do not fit the suite's 5s default.
+    }, 20_000)
+
+    // With the real cloud mount the TRANSPORT deadline wins the race by design,
+    // and the mount does not know which phase it was serving — so without the
+    // orchestrator enriching it, `lastError` names the call but not the context
+    // and an operator cannot tell one of many list/read sites from another
+    // (codex on #354).
+    it('names the phase on a timeout the transport raised, not just its own', async () => {
+      class TransportTimeoutMount extends CountingEventsMount {
+        readonly hangStarted: Promise<void>
+        failListTree = false
+        #signalHangStarted: () => void = () => undefined
+
+        constructor() {
+          super()
+          this.hangStarted = new Promise((resolve) => { this.#signalHangStarted = resolve })
+          this.setSubRoot('/linear/issues', 'absent')
+        }
+
+        override async listTree(prefix: string): Promise<string[]> {
+          if (this.failListTree) {
+            this.#signalHangStarted()
+            // Exactly what RelayfileCloudMountClient raises when its own signal
+            // fires: named operation, no phase.
+            throw new RelayfileOperationTimeoutError('listTree', 300_000)
+          }
+          return super.listTree(prefix)
+        }
+      }
+
+      const mount = new TransportTimeoutMount()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: {
+          transport: 'subscribe',
+          reconcileIntervalMs: 20,
+          reconcileTimeoutMs: 60_000,
+          // Out of reach: the orchestrator's own race must not be what produces
+          // the error, or this would not test the transport path at all.
+          relayfileOperationTimeoutMs: 60_000,
+        },
+      })
+      try {
+        mount.failListTree = true
+        await mount.hangStarted
+
+        await vi.waitFor(() => {
+          const readiness = factory.status().readinessReconcile
+          expect(readiness?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(1)
+          expect(readiness?.lastErrorClass).toBe('RelayfileOperationTimeoutError')
+          // The parenthesised phase is the part the transport could not supply.
+          expect(readiness?.lastError)
+            .toMatch(/relayfile listTree did not respond within \d+ms \(.+\)/u)
+        }, { timeout: 5_000 })
+      } finally {
+        mount.failListTree = false
+        await factory.stop()
+      }
+    }, 20_000)
+
+    // The control for the test above. Same fixture, same hang, only the
+    // per-call bound moved out past the test horizon: the cycle must then NOT
+    // abort. Without this, a test that passed because of something else in the
+    // loop would look like proof of the abort.
+    it('control: with the per-call bound out of reach the same hang freezes the loop', async () => {
+      const mount = new HangingListTreeMount()
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: {
+          transport: 'subscribe',
+          reconcileIntervalMs: 20,
+          reconcileTimeoutMs: 60_000,
+          // The pre-#351 behaviour: no reachable bound on the call.
+          relayfileOperationTimeoutMs: 60_000,
+        },
+      })
+      try {
+        mount.hangListTree = true
+        await mount.hangStarted
+        const sweepsWhileHung = factory.status().counters.readinessReconcileSweeps ?? 0
+
+        // ~12 reconcile intervals. Long enough that a working abort would have
+        // fired many times over.
+        await new Promise<void>((resolve) => { setTimeout(resolve, 250) })
+
+        const status = factory.status()
+        expect(status.counters.readinessReconcileSweeps ?? 0).toBe(sweepsWhileHung)
+        expect(status.readinessReconcile?.consecutiveFailures).toBe(0)
+        expect(status.readinessReconcile?.lastError).toBeUndefined()
+      } finally {
+        mount.release()
+        await factory.runOnce().catch(() => undefined)
+        await factory.stop()
+      }
+    })
+
     it('reports a pass still in flight past the stall threshold as stalled rather than healthy', async () => {
       const mount = new CountingEventsMount()
       mount.setSubRoot('/linear/issues', 'absent')
@@ -14044,7 +14502,7 @@ describe('FactoryLoop', () => {
       // placement is gone.
       await stateStore.claimDispatchLifecycle(
         'factory-test',
-        issueKey(decision.issue),
+        dispatchIssueIdentity(decision.issue),
         {
           runId: 'released-run-2291',
           issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
@@ -14076,7 +14534,7 @@ describe('FactoryLoop', () => {
       // agent name nor the id can tell the generations apart. The durable row
       // must still not carry the dead generation's release stamp forward:
       // every consumer that filters on it would treat the live worker as gone.
-      const persisted = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+      const persisted = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
       const respawned = persisted?.agents.find((agent) => agent.name === implementer.name)
       expect(respawned?.tracked.result?.name).toBe(implementer.name)
       expect(respawned?.releasedAtMs).toBeUndefined()
@@ -14104,7 +14562,7 @@ describe('FactoryLoop', () => {
       fleet.hydrateTracked([{ name: implementer.name, invocationId: plannedInvocationId, node: 'sf-mini' }])
       await stateStore.claimDispatchLifecycle(
         'factory-test',
-        issueKey(decision.issue),
+        dispatchIssueIdentity(decision.issue),
         {
           runId: 'planned-run-2292',
           issue: { uuid: decision.issue.uuid, key: decision.issue.key, path: decision.issue.path },
@@ -14126,7 +14584,7 @@ describe('FactoryLoop', () => {
       await factory.dispatch(decision)
 
       expect(fleet.spawns.filter((spawn) => spawn.name === implementer.name)).toEqual([])
-      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({
           agents: expect.arrayContaining([expect.objectContaining({
             name: implementer.name,
@@ -14293,7 +14751,7 @@ describe('FactoryLoop', () => {
 
       expect(stateStore.runningSaveAttempts).toBe(1)
       expect(notifications).toEqual([])
-      await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .resolves.toMatchObject({ phase: 'dispatching' })
 
       await vi.advanceTimersByTimeAsync(1_000)
@@ -14304,7 +14762,7 @@ describe('FactoryLoop', () => {
         agent: { name: 'ar-125-impl-pear' },
         sessionOwner: null,
       })
-      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
       expect(lifecycle).toMatchObject({
         phase: 'running',
         ticketDispatchNotification: { workUnitId: lifecycle?.runId },
@@ -14372,7 +14830,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
 
       expect(notifications).toHaveLength(1)
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       const running = await firstState.getDispatchLifecycle('factory-test', key)
       expect(running).toMatchObject({
         phase: 'running',
@@ -14490,7 +14948,7 @@ describe('FactoryLoop', () => {
       await first.dispatch(decision)
 
       expect(notifications).toHaveLength(1)
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
       const notified = await firstState.getDispatchLifecycle('factory-test', key)
       expect(notified).toMatchObject({
         phase: 'running',
@@ -15374,7 +15832,7 @@ describe('FactoryLoop', () => {
       'AgentWorkforce/hoopsheet',
       'AgentWorkforce/pear',
     ])
-    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))).resolves.toMatchObject({
+    await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).resolves.toMatchObject({
       pullRequest: { repo: 'AgentWorkforce/pear', number: 126 },
       pullRequests: expect.arrayContaining([
         expect.objectContaining({ repo: 'AgentWorkforce/pear', number: 126 }),
@@ -15889,7 +16347,7 @@ describe('FactoryLoop', () => {
     // resume forever.
     fleet.emitAgentExit('ar-803-impl-pear-resumed-1', 'crash')
     await vi.waitFor(async () => {
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
         .toMatchObject({ phase: 'abandoned' })
     })
 
@@ -15917,7 +16375,7 @@ describe('FactoryLoop', () => {
     ).toHaveLength(2))
     fleet.emitAgentExit('ar-806-impl-pear', 'crash')
     await vi.waitFor(async () => expect(
-      await stateStore.getDispatchLifecycle('factory-test', issueKey({
+      await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity({
         uuid: 'uuid-806', key: 'AR-806', path: issuePath(806),
       })),
     ).toMatchObject({ phase: 'abandoned' }))
@@ -15954,7 +16412,7 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(first)
     await factory.dispatch(second)
-    await expect(stateStore.getDispatchLifecycle('factory-test', issueKey(second.issue)))
+    await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(second.issue)))
       .resolves.toMatchObject({ phase: 'queued' })
 
     fleet.emitAgentExit('ar-804-impl-pear', 'crash')
@@ -15966,9 +16424,9 @@ describe('FactoryLoop', () => {
     // count exactly like a session resume so the next exit frees capacity.
     fleet.emitAgentExit('ar-804-impl-pear', 'crash')
     await vi.waitFor(async () => {
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(first.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(first.issue)))
         .toMatchObject({ phase: 'abandoned' })
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(second.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(second.issue)))
         .toMatchObject({ phase: 'running' })
     }, { timeout: 4_000 })
 
@@ -16003,9 +16461,9 @@ describe('FactoryLoop', () => {
     fleet.emitAgentExit('ar-807-impl-pear', 'crash')
 
     await vi.waitFor(async () => {
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(first.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(first.issue)))
         .toMatchObject({ phase: 'abandoned' })
-      expect(await stateStore.getDispatchLifecycle('factory-test', issueKey(second.issue)))
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(second.issue)))
         .toMatchObject({ phase: 'running' })
     }, { timeout: 4_000 })
     expect(stateStore.abandonedSaveFailures).toBe(1)
@@ -18792,7 +19250,7 @@ describe('FactoryLoop', () => {
     const report = await factory.runOnce()
 
     expect(report.dispatched).toEqual([])
-    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-20', key: 'AR-20', path: issuePath(20) }, reason: 'queued or escalated' })
+    expect(report.skipped).toContainEqual({ issue: { uuid: 'uuid-20', key: 'AR-20', path: issuePath(20) }, reason: 'queued or escalated', code: 'queued-or-escalated' })
     expect(fleet.spawns).toEqual([])
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
@@ -21367,7 +21825,7 @@ describe('FactoryLoop', () => {
       ])
       restartedFleet.emitAgentExit('ar-955-review', 'completed')
       await terminal
-      expect(await state().getDispatchLifecycle('factory-test', issueKey(decision.issue))).toMatchObject({ phase: 'complete' })
+      expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))).toMatchObject({ phase: 'complete' })
       await restarted.stop()
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -22501,7 +22959,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(495), issue))
       await factory.dispatch(decision)
-      branch = (await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue)))!
+      branch = (await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))!
         .decision.implementers[0]!.branch!
 
       const stalePrPath = '/github/repos/AgentWorkforce/pear/pulls/1495/metadata.json'
@@ -22517,7 +22975,7 @@ describe('FactoryLoop PR babysitter', () => {
       fleet.emitAgentExit('ar-495-impl-pear', 'reconciled-missing')
 
       await vi.waitFor(async () => {
-        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(decision.issue))
+        const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
         expect(lifecycle).toMatchObject({
           phase: 'running',
           pullRequest: { repo: 'AgentWorkforce/pear', number: 1595, headRef: branch },
@@ -22569,7 +23027,10 @@ describe('FactoryLoop PR babysitter', () => {
       await first.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       const decision = await first.triageIssue(parseLinearIssue(issuePath(496), issue))
       await first.dispatch(decision)
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
+      // Babysitter ownership stayed on the surface composite when lifecycles
+      // moved to the work-unit identity (#211).
+      const ownershipKey = issueKey(decision.issue)
       const branch = (await state().getDispatchLifecycle('factory-test', key))!
         .decision.implementers[0]!.branch!
 
@@ -22617,8 +23078,8 @@ describe('FactoryLoop PR babysitter', () => {
       if (exact.tracked.spec.invocationId) lifecycle.invocationIds.push(exact.tracked.spec.invocationId)
       await writeFile(watchStatePath, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8')
 
-      await state().clearBabysitterSession('factory-test', `${key}:agentworkforce/pear#1496`)
-      await state().setBabysitterSession('factory-test', `${key}:agentworkforce/pear#1596`, {
+      await state().clearBabysitterSession('factory-test', `${ownershipKey}:agentworkforce/pear#1496`)
+      await state().setBabysitterSession('factory-test', `${ownershipKey}:agentworkforce/pear#1596`, {
         issue: decision.issue,
         repo: 'AgentWorkforce/pear',
         prNumber: 1596,
@@ -22703,7 +23164,9 @@ describe('FactoryLoop PR babysitter', () => {
       mount.emit(changeEvent(prPath, 'remote-pr-493-open'))
       await vi.waitFor(() => expect(first.status().counters.babysitterSpawnFailures).toBe(1))
 
-      const key = issueKey(decision.issue)
+      const key = dispatchIssueIdentity(decision.issue)
+      // Babysitter ownership stayed on the surface composite (#211).
+      const ownershipKey = issueKey(decision.issue)
       await vi.waitFor(async () => {
         const lifecycle = await state().getDispatchLifecycle('factory-test', key)
         expect(lifecycle?.phase).toBe('dispatching')
@@ -22729,7 +23192,7 @@ describe('FactoryLoop PR babysitter', () => {
         ]),
       }), { timeout: 4_000 })
       await vi.waitFor(async () => expect(await state().listBabysitterSessions('factory-test')).toEqual([
-        [`${key}:agentworkforce/pear#493`, expect.objectContaining({ agentName: 'ar-493-babysit', repo: 'AgentWorkforce/pear', prNumber: 493 })],
+        [`${ownershipKey}:agentworkforce/pear#493`, expect.objectContaining({ agentName: 'ar-493-babysit', repo: 'AgentWorkforce/pear', prNumber: 493 })],
       ]))
 
       expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-493-babysit')).toHaveLength(1)
@@ -23644,10 +24107,7 @@ describe('FactoryLoop PR babysitter', () => {
       'has an active agent. Please continue on the linked issue or pull request.'
     const starting = factory.start({ mode: 'dispatch-owner' })
     try {
-      for (let tick = 0; tick < 200 && !mount.receiptWriteEntered; tick += 1) {
-        await vi.advanceTimersByTimeAsync(1)
-      }
-      expect(mount.receiptWriteEntered).toBe(true)
+      await vi.waitFor(() => expect(mount.receiptWriteEntered).toBe(true), { timeout: 4_000 })
 
       // Slack writeback budgets 90s for the confirm alone, so a write that runs
       // longer than the 60s lease is inside spec, not pathological. Push past
@@ -23722,10 +24182,7 @@ describe('FactoryLoop PR babysitter', () => {
     })
     const starting = factory.start({ mode: 'dispatch-owner' })
     try {
-      for (let tick = 0; tick < 200 && !mount.receiptWriteEntered; tick += 1) {
-        await vi.advanceTimersByTimeAsync(1)
-      }
-      expect(mount.receiptWriteEntered).toBe(true)
+      await vi.waitFor(() => expect(mount.receiptWriteEntered).toBe(true), { timeout: 4_000 })
 
       // Inside the renewal ceiling the claim still belongs to the write: a
       // writeback that runs past the 60s idle lease is inside spec, and this is
@@ -23808,10 +24265,7 @@ describe('FactoryLoop PR babysitter', () => {
     const starting = factory.start({ mode: 'dispatch-owner' })
     let stopping: Promise<void> | undefined
     try {
-      for (let tick = 0; tick < 200 && !mount.receiptWriteEntered; tick += 1) {
-        await vi.advanceTimersByTimeAsync(1)
-      }
-      expect(mount.receiptWriteEntered).toBe(true)
+      await vi.waitFor(() => expect(mount.receiptWriteEntered).toBe(true), { timeout: 4_000 })
 
       // A stopping daemon has no standing to keep holding a claim on work it is
       // walking away from; the successor must find the receipt free.
@@ -24665,7 +25119,7 @@ describe('FactoryLoop PR babysitter', () => {
     const stateStore = new InMemoryStateStore({ batchSize: 2 })
     await stateStore.claimDispatchLifecycle(
       'factory-test',
-      issueKey(decision.issue),
+      dispatchIssueIdentity(decision.issue),
       {
         runId: 'durable-waiting-run',
         issue: decision.issue,
@@ -25743,7 +26197,7 @@ describe('FactoryLoop PR babysitter', () => {
       expect(nextGenerationSpawns[3]?.continueFrom).toBe('session-ar-426-babysit')
       expect(nextGenerationSpawns[4]?.continueFrom).toBeUndefined()
       expect(harness.releases.filter((release) => release.name === 'ar-426-babysit')).toHaveLength(4)
-      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', issueKey(parsedIssue))
+      const lifecycle = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(parsedIssue))
       const invocationId = lifecycle?.agents
         .find((agent) => agent.name === 'ar-426-babysit')
         ?.tracked.spec.invocationId
@@ -26405,7 +26859,7 @@ describe('FactoryLoop PR babysitter', () => {
       await restarted.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       await vi.waitFor(async () => expect(await stateStore().getDispatchLifecycle(
         'factory-test',
-        issueKey(decision.issue),
+        dispatchIssueIdentity(decision.issue),
       )).toMatchObject({ phase: 'complete' }))
       await expect(stateStore().listBabysitterSessions('factory-test')).resolves.toEqual([])
       expect(states).toContainEqual({ key: 'AR-425', stateId: done })
@@ -27388,6 +27842,259 @@ const expectSlackConversationResume = async (
 
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+
+describe('work-unit identity at the triage boundary (#211)', () => {
+  // A `[factory]` Linear mirror of a GitHub issue: Linear's uuid, key and sense
+  // path, with the GitHub issue it mirrors declared in its provider payload.
+  const mirrorFile = {
+    provider: 'linear',
+    objectType: 'issue',
+    objectId: 'uuid-448',
+    payload: {
+      identifier: 'AR-448',
+      id: 'uuid-448',
+      url: 'https://linear.app/agent-relay/issue/AR-448/mirror-of-a-github-issue',
+      title: '[factory] mirror of a GitHub issue',
+      description: 'Mirror body. '.repeat(12),
+      state: { name: 'Ready for Agent', id: ready },
+      labels: [{ name: 'pear' }],
+      source: {
+        provider: 'github',
+        owner: 'AgentWorkforce',
+        repo: 'pear',
+        number: 448,
+        url: 'https://github.com/AgentWorkforce/pear/issues/448',
+      },
+    },
+  }
+  const mirrorPath = '/linear/issues/AR-448__uuid-448.json'
+
+  // Codex review, PR #329: once lifecycle authority is the work unit, a terminal
+  // row persisted from ONE surface must be cleared when the SAME work unit
+  // reopens on the OTHER. Comparing `lifecycle.issue.key` missed that — the
+  // GitHub-native row stores `448` while the reopening mirror is `AR-448` — and
+  // left the terminal row to refuse the reopened work permanently.
+  it('clears a terminal lifecycle persisted under another surface when the work unit reopens', async () => {
+    const githubRef = {
+      uuid: 'AgentWorkforce/pear#448',
+      key: '448',
+      path: githubIssuePath('AgentWorkforce', 'pear', 448),
+    }
+    const mirrorIssue = parseLinearIssue(mirrorPath, mirrorFile)
+    const mirrorRef = {
+      uuid: mirrorIssue.uuid,
+      key: mirrorIssue.key,
+      path: mirrorIssue.path,
+      origin: { provider: 'github' as const, owner: 'AgentWorkforce', repo: 'pear', number: 448 },
+    }
+
+    // One work unit, two surfaces, two different surface keys.
+    expect(dispatchIssueIdentity(mirrorRef)).toBe(dispatchIssueIdentity(githubRef))
+    expect(mirrorRef.key).not.toBe(githubRef.key)
+
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const decision = await new StaticTriage().triage(mirrorIssue)
+    // A completed run recorded from the GitHub-native surface, keyed on the unit.
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      dispatchIssueIdentity(githubRef),
+      {
+        runId: 'github-run',
+        issue: githubRef,
+        decision: { ...decision, issue: githubRef },
+        dryRun: false,
+        phase: 'complete',
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 1_000,
+      },
+      'previous-owner',
+      1_000,
+      1,
+    )
+    // The mirror itself was Done and is now back at Ready.
+    await stateStore.recordCanonicalState('factory-test', mirrorRef.key, done)
+
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [mirrorPath]: mirrorFile }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    const run = await factory.runOnce()
+
+    // The completed row from the other surface was cleared, so the reopened unit
+    // could claim afresh rather than being refused by it forever.
+    const current = await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(githubRef))
+    expect(current?.runId, 'the terminal row must not survive the reopen').not.toBe('github-run')
+    expect(current?.phase).not.toBe('complete')
+    // And the reopened unit actually gets worked, rather than being skipped as
+    // "dispatch lifecycle already terminal".
+    expect(run.skipped).toEqual([])
+    expect(run.dispatched.map((result) => result.issue.key)).toEqual(['AR-448'])
+  })
+
+  // Codex review, PR #329: a lifecycle persisted BEFORE this change has no
+  // `origin`, so a mirror row still resolves to linear:<uuid> and a later
+  // GitHub-native arrival for the same unit would claim alongside it — the
+  // rolling-upgrade form of the duplicate. Nothing on the row links it upstream,
+  // but the issue read during startup adoption does.
+  it('backfills the mirror origin onto a pre-upgrade lifecycle so a native claim finds it', async () => {
+    const githubRef = {
+      uuid: 'AgentWorkforce/pear#448',
+      key: '448',
+      path: githubIssuePath('AgentWorkforce', 'pear', 448),
+    }
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const mirrorIssue = parseLinearIssue(mirrorPath, mirrorFile)
+    // Exactly what a pre-#211 store holds: the surface ref, no origin.
+    const legacyRef = { uuid: mirrorIssue.uuid, key: mirrorIssue.key, path: mirrorIssue.path }
+    const decision = await new StaticTriage().triage(mirrorIssue)
+
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      dispatchIssueIdentity(legacyRef),
+      {
+        runId: 'pre-upgrade-run',
+        issue: legacyRef,
+        decision: { ...decision, issue: legacyRef },
+        dryRun: false,
+        phase: 'running',
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 1_000,
+      },
+      'previous-owner',
+      1_000,
+      1,
+    )
+    // The pre-upgrade row is unreachable from the native identity.
+    expect(dispatchIssueIdentity(legacyRef)).toBe(`linear:${mirrorIssue.uuid}`)
+    expect(dispatchIssueIdentity(legacyRef)).not.toBe(dispatchIssueIdentity(githubRef))
+
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [mirrorPath]: mirrorFile }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+    })
+    await factory.start({ mode: 'dispatch-owner' })
+    try {
+      // Startup adoption read the mirrored issue, so the row can now be
+      // recognised by the work unit it belongs to.
+      await vi.waitFor(async () => {
+        const rows = await stateStore.listDispatchLifecycles('factory-test')
+        const row = rows.find(([, lifecycle]) => lifecycle.runId === 'pre-upgrade-run')
+        expect(row?.[1].issue.origin).toEqual({
+          provider: 'github',
+          owner: 'AgentWorkforce',
+          repo: 'pear',
+          number: 448,
+        })
+        // And it is reachable from the GitHub-native identity, so a native
+        // arrival adopts it instead of opening a second claim.
+        expect(dispatchIssueIdentity(row![1].issue)).toBe(dispatchIssueIdentity(githubRef))
+      })
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  // CodeRabbit, PR #329: the fail-closed conflict is thrown from inside
+  // claimDispatchLifecycle, so an unreconcilable unit was aborting adoption of
+  // every row behind it — the #315 failure mode, reintroduced.
+  it('blocks only the unreconcilable work unit, not every row behind it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-migration-conflict-'))
+    const watchStatePath = join(root, 'state.json')
+    const conflicted = { uuid: 'uuid-700', key: 'AR-700', path: issuePath(700) }
+    const healthy = { uuid: 'uuid-701', key: 'AR-701', path: issuePath(701) }
+    const row = (issue: typeof conflicted, runId: string, decision: TriageDecision, leaseUntilMs: number) => ({
+      runId,
+      issue,
+      decision: { ...decision, issue },
+      dryRun: false,
+      phase: 'running',
+      agents: [],
+      invocationIds: [],
+      updatedAtMs: 1_000,
+      lease: { owner: `owner-${runId}`, epoch: 1, leaseUntilMs },
+    })
+    const conflictedDecision = await new StaticTriage().triage(parseLinearIssue(issuePath(700), issueFile(700)))
+    const healthyDecision = await new StaticTriage().triage(parseLinearIssue(issuePath(701), issueFile(701)))
+
+    // Seed through the store so the document shape stays valid, then add the
+    // second live-leased key by hand: two live leases for ONE work unit is a
+    // state the store's own claim path will not produce, which is the point.
+    const seeder = new FileStateStore({ batchSize: 4, watchStatePath })
+    await seeder.claimDispatchLifecycle(
+      'factory-test', dispatchIssueIdentity(conflicted),
+      row(conflicted, 'a', conflictedDecision, 9_000_000_000_000) as never,
+      'owner-a', 1_000, 9_000_000_000_000,
+    )
+    await seeder.claimDispatchLifecycle(
+      'factory-test', dispatchIssueIdentity(healthy),
+      row(healthy, 'healthy', healthyDecision, 1) as never,
+      'owner-healthy', 1_000, 1,
+    )
+    const document = JSON.parse(await readFile(watchStatePath, 'utf8')) as {
+      workspaces: Record<string, { dispatchLifecycles: Record<string, unknown> }>
+    }
+    const lifecycles = document.workspaces['factory-test']!.dispatchLifecycles
+    lifecycles[`${conflicted.key}:${conflicted.uuid}:${conflicted.path}`] =
+      row(conflicted, 'b', conflictedDecision, 9_000_000_000_000)
+    await writeFile(watchStatePath, JSON.stringify(document), 'utf8')
+
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [issuePath(700)]: issueFile(700), [issuePath(701)]: issueFile(701) }),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: new FileStateStore({ batchSize: 4, watchStatePath }),
+      triage: new StaticTriage(),
+    })
+    try {
+      await factory.start({ mode: 'dispatch-owner' })
+      // One unit is blocked for an operator; the row behind it is still adopted,
+      // and the conflicting rows are retained rather than resolved by guesswork.
+      // Both rows of the pair are visited, so each reports the conflict.
+      await vi.waitFor(() => expect(factory.status().counters.dispatchLifecycleMigrationConflicts).toBe(2))
+      const after = new FileStateStore({ batchSize: 4, watchStatePath })
+      const healthyRow = await after.getDispatchLifecycle('factory-test', dispatchIssueIdentity(healthy))
+      expect(healthyRow?.lease?.owner, 'the row behind the conflict is adopted').not.toBe('owner-healthy')
+      expect((await after.listDispatchLifecycles('factory-test')).map(([, l]) => l.runId).sort())
+        .toEqual(['a', 'b', 'healthy'])
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('re-attaches the mirror origin a triage engine dropped', async () => {
+    // StaticTriage returns only { uuid, key, path } — the same shape
+    // TriageDecisionSchema.parse leaves behind, so this covers LlmTriage and any
+    // custom TriageEngine as well as the heuristic path.
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [mirrorPath]: mirrorFile }),
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+      logger: {},
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(mirrorPath, mirrorFile))
+
+    expect(decision.issue.origin).toEqual({
+      provider: 'github',
+      owner: 'AgentWorkforce',
+      repo: 'pear',
+      number: 448,
+    })
+    // The mirror and its GitHub-native counterpart are one work unit.
+    expect(dispatchIssueIdentity(decision.issue)).toBe('github:agentworkforce/pear#448')
+    expect(dispatchIssueIdentity(decision.issue)).toBe(dispatchIssueIdentity({
+      uuid: 'AgentWorkforce/pear#448',
+      key: '448',
+      path: githubIssuePath('AgentWorkforce', 'pear', 448),
+    }))
+  })
+})
 
 describe('changeEventPath (resource-less event tolerance)', () => {
   it('returns the path for a well-formed event', () => {

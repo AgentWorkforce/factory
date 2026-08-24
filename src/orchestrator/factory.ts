@@ -3,6 +3,12 @@ import { readFile } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
 
 import { DEFAULT_READINESS_RECONCILE_TIMEOUT_MS, FactoryConfigSchema, type FactoryConfig } from '../config/schema'
+import {
+  DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS,
+  RelayfileOperationTimeoutError,
+  relayfileTimeoutWithPhase,
+  withRelayfileCallDeadline,
+} from '../mount/relayfile-operation-timeout'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
@@ -40,6 +46,8 @@ import type {
   BabysitterSessionState,
   DispatchLifecycleAgentUsage,
   DispatchLifecycle,
+  DispatchLifecycleClaim,
+  DispatchLifecycleLease,
   DispatchLifecyclePhase,
   DiscoveryCheckpoint,
   DiscoverySweepClaim,
@@ -65,7 +73,7 @@ import { branchImplementsIssue, containsExplicitIssueReference, containsIssueKey
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { dispatchRelayflowForChangeEvent } from '../dispatch/relayflow-registry'
-import { dispatchAgentIdentityKey } from '../dispatch/work-unit-identity'
+import { dispatchAgentIdentityKey, dispatchIssueIdentity, mirrorWorkUnitOrigin } from '../dispatch/work-unit-identity'
 import {
   deriveDescriptorsFromMount,
   prescriptiveInstructions,
@@ -106,7 +114,9 @@ import type {
   ProbePrResolver,
   TriageDecision,
   TriageEngine,
+  WorkUnitOrigin,
 } from '../types'
+import { DispatchLifecycleMigrationConflictError } from '../ports/state'
 import { AppGithubWriteback, FACTORY_GITHUB_STATUS_LABELS, GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
 import { parseSlackThreadReply, slackThreadReplyGlob, type SlackThreadReply } from '../subscriptions/slack-filter'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
@@ -140,6 +150,8 @@ import {
   publicHealthFromHeartbeat,
   readinessReconcileInFlightMs,
 } from './public-health'
+import { factorySweepSkipReasonCounts } from './sweep-skip-reason'
+import type { FactorySweepSkipReasonCode } from './sweep-skip-reason'
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
 import {
@@ -476,9 +488,28 @@ const DISPATCH_FAILURE_HANDOFF_UNRESOLVED_TTL_MS = 5 * 60_000
 const DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS = 15_000
 const REMOTE_OPERATION_PROGRESS_INTERVAL_MS = 15_000
 const REMOTE_OPERATION_SLOW_WARN_MS = 30_000
+/** How far the cycle-level relayfile backstop sits above the transport deadline. */
+const RELAYFILE_OPERATION_BACKSTOP_RATIO = 1.25
 const DISCOVERY_SWEEP_LEASE_MS = 5 * 60_000
 const DISCOVERY_SWEEP_RENEW_MS = 30_000
 const READINESS_RECONCILE_FAILURE_THRESHOLD = 3
+
+/**
+ * A relayfile fault a swallowing catch must not turn into "no result".
+ *
+ * A 429 already escaped every one of these (#297): it is a fact about the
+ * dependency, not about the one item being read, so folding it into an empty
+ * result reports a clean pass over work that was never served.
+ *
+ * A per-call timeout (#351) is the same fact in a worse costume. The read that
+ * hung will hang for the next item too, and `#githubIssuePaths` swallowing it
+ * turns a wedged dependency into a *successful* sweep that discovered zero
+ * issues — `consecutiveFailures: 0`, no `lastError`, nothing dispatched. That
+ * is the exact silence this bound exists to remove, so it escapes here too.
+ */
+const isPassWideRelayfileFault = (error: unknown): boolean =>
+  Boolean(relayfileOverload(error)) || error instanceof RelayfileOperationTimeoutError
+
 const DISCOVERY_CHANGE_EVENT_LIMIT = 1_000
 const DISCOVERY_OVERLOAD_BACKOFF_MAX_MS = 5 * 60_000
 /** First rung of the ladder when the 429 advertises no `Retry-After`. */
@@ -766,11 +797,22 @@ export class FactoryLoop implements Factory {
   #liveHeartbeatInFlight = false
   #liveHeartbeatRefresh?: Promise<void>
   #liveHeartbeatLastWriteMs = 0
+  #heartbeatStartedAtMs?: number
+  #progressSequence = 0
+  #lastProgressAtMs?: number
   #stoppingHeartbeatRefreshActive = false
   #readinessReconcileTimer?: ReturnType<typeof setTimeout>
   #readinessReconcileInFlight?: Promise<void>
   #readinessReconcileIntervalMs = 60_000
   #readinessReconcileTimeoutMs = DEFAULT_READINESS_RECONCILE_TIMEOUT_MS
+  /**
+   * Deadline for ONE relayfile call (#351).
+   *
+   * `#readinessReconcileTimeoutMs` bounds the sweep; this bounds the calls
+   * inside it. Only the second one can reach a dependency call that never
+   * returns: a deadline checked between awaits never regains control to check.
+   */
+  #relayfileOperationTimeoutMs = DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS
   // Set for exactly as long as a sweep is running. `state` is derived from
   // this, so an in-flight pass can no longer masquerade as the last settled one.
   #readinessReconcileInFlightSinceMs?: number
@@ -805,6 +847,46 @@ export class FactoryLoop implements Factory {
   #readinessReconcileLastFailureAtMs?: number
   #readinessReconcileLastError?: string
   #readinessReconcileLastErrorClass?: string
+  /**
+   * The last *enumerating* sweep's arithmetic (#355).
+   *
+   * Held as one record rather than three fields so it can only ever be replaced
+   * whole: publishing a `dispatched` from one pass beside a `candidates` from
+   * another would be worse than publishing neither, since the whole use of
+   * these numbers is comparing them to each other.
+   *
+   * `undefined` until a sweep enumerates, and never initialised to zeroes —
+   * "this daemon has not finished a sweep" and "a sweep finished and found
+   * nothing" are the two readings #355 has to tell apart.
+   */
+  #readinessReconcileLastSweep?: {
+    candidates: number
+    dispatched: number
+    skipped: number
+    skipReasons: Partial<Record<FactorySweepSkipReasonCode, number>>
+    /**
+     * When the pass these counts describe finished enumerating (#359 review).
+     *
+     * Retaining counts across a deferral without this left them with no time
+     * coordinate: `lastCompletedAtMs` moves on every deferred pass, so the
+     * payload paired arbitrarily old counts with a fresh completion stamp and
+     * a reader could not tell a measurement one interval old from one four
+     * days old. It belongs to this record, and is replaced with it.
+     */
+    enumeratedAtMs: number
+  }
+  /**
+   * Whether the MOST RECENT pass deferred, tracked apart from the counts above
+   * (#358 review, CodeRabbit — Major, and right).
+   *
+   * A deferred pass enumerates nothing and settles in milliseconds, so folding
+   * it into the snapshot overwrote the last real sweep's numbers with zeroes.
+   * On a container where another process holds the lease for any length of time
+   * — the #347/#349 condition — every pass would publish `candidates: 0` and the
+   * last actual enumeration would be unrecoverable, destroying the measurement
+   * this whole change exists to provide.
+   */
+  #readinessReconcileLastSweepDeferred?: 'sweep-in-flight'
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
@@ -927,9 +1009,14 @@ export class FactoryLoop implements Factory {
   #started = false
   #startMode?: FactoryStartOptions['mode']
   #stopping = false
+  readonly #readOnly: boolean
 
   constructor(config: FactoryConfig, ports: FactoryPorts) {
+    this.#readOnly = ports.readOnly ?? false
     this.#config = config
+    // Also read here, not only in `#startLiveSubscription`: a standalone
+    // `runOnce()` never starts the live subscription and must still be bounded.
+    this.#relayfileOperationTimeoutMs = config.liveSubscription.relayfileOperationTimeoutMs
     this.#mount = ports.mount
     // Resolved role<->state mapping. The CLI injects a name-resolved, per-team
     // resolution via ports; fall back to one built from explicit stateIds plus
@@ -1014,7 +1101,13 @@ export class FactoryLoop implements Factory {
         }
       },
     })
-    this.#wireFleetEvents()
+    // Read-only commands consume no fleet events, and subscribing is not free:
+    // the relay client mints this process's workspace identity to open the
+    // socket. Wiring it here unconditionally is what made `factory status`
+    // register an agent it then abandoned before presence (factory-cloud#55).
+    // The live paths wire in `#start()` instead, where the subscription is
+    // actually used and the identity is meant to persist.
+    if (!this.#readOnly) this.#wireFleetEvents()
   }
 
   async #resolveIntegrationInstructions(): Promise<string | undefined> {
@@ -1093,7 +1186,7 @@ export class FactoryLoop implements Factory {
    * row to wait on, or the wait ended because Factory is stopping.
    */
   async waitForDispatchTerminal(issue: IssueRef): Promise<TerminalDispatchLifecyclePhase | undefined> {
-    const key = issueKey(issue)
+    const key = dispatchLifecycleKey(issue)
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     // No durable row means this dispatch never claimed a lifecycle: a
     // dependency park, a triage escalation, and a label refusal all return
@@ -1173,6 +1266,13 @@ export class FactoryLoop implements Factory {
   }
 
   async start(opts: FactoryStartOptions = {}): Promise<void> {
+    // A read-only instance was built with no fleet event wiring and, in the
+    // CLI, with a fleet client that cannot register. Starting one would be a
+    // half-live daemon; refuse rather than let a future caller reintroduce the
+    // side effect this mode exists to remove.
+    if (this.#readOnly) {
+      throw new Error('Factory was constructed read-only and cannot be started')
+    }
     if (this.#started) {
       return
     }
@@ -1500,6 +1600,7 @@ export class FactoryLoop implements Factory {
     // `start()` overrides skip the schema's cross-field check, so re-apply its
     // floor here: a deadline under one interval would kill every pass.
     this.#readinessReconcileTimeoutMs = Math.max(options.reconcileTimeoutMs, options.reconcileIntervalMs)
+    this.#relayfileOperationTimeoutMs = options.relayfileOperationTimeoutMs
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     const highWatermark = await this.#currentEventHighWatermark()
@@ -1551,9 +1652,15 @@ export class FactoryLoop implements Factory {
       const backfillStartedAtMs = this.#clock.now()
       this.#readinessReconcileLastStartedAtMs = backfillStartedAtMs
       try {
-        await this.runOnce()
+        // The startup backfill is a discovery pass like any other, and on a
+        // cold container it is the first — and for the next interval, only —
+        // sweep whose counts exist. Leaving it unrecorded would make a daemon
+        // that has completed a full pass still read as "never ran" (#355).
+        const report = await this.runOnce()
         this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
-        this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
+        const completedAtMs = this.#clock.now()
+        this.#readinessReconcileLastCompletedAtMs = completedAtMs
+        this.#recordReadinessSweepOutcome(report, completedAtMs)
       } catch (error) {
         this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
         this.#readinessReconcileLastFailureAtMs = this.#clock.now()
@@ -1578,6 +1685,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #startLiveHeartbeat(): Promise<void> {
+    this.#beginHeartbeatLifetime()
     this.#liveHeartbeatActive = true
     await this.#writeLiveHeartbeat('running')
     this.#scheduleLiveHeartbeatRefresh()
@@ -1651,6 +1759,12 @@ export class FactoryLoop implements Factory {
     this.#liveHeartbeatLastWriteMs = this.#clock.now()
   }
 
+  #beginHeartbeatLifetime(): void {
+    this.#heartbeatStartedAtMs = this.#clock.now()
+    this.#progressSequence = 0
+    this.#lastProgressAtMs = undefined
+  }
+
   #liveOptions(overrides: Partial<FactoryLiveSubscriptionOptions>): FactoryLiveSubscriptionOptions {
     return {
       transport: overrides.transport ?? this.#config.liveSubscription.transport,
@@ -1659,6 +1773,8 @@ export class FactoryLoop implements Factory {
       replaySkewMarginMs: overrides.replaySkewMarginMs ?? this.#config.liveSubscription.replaySkewMarginMs,
       reconcileIntervalMs: overrides.reconcileIntervalMs ?? this.#config.liveSubscription.reconcileIntervalMs,
       reconcileTimeoutMs: overrides.reconcileTimeoutMs ?? this.#config.liveSubscription.reconcileTimeoutMs,
+      relayfileOperationTimeoutMs: overrides.relayfileOperationTimeoutMs
+        ?? this.#config.liveSubscription.relayfileOperationTimeoutMs,
     }
   }
 
@@ -1782,14 +1898,27 @@ export class FactoryLoop implements Factory {
       const report = await this.#runOnceWithReadinessDeadline()
       this.#readinessReconcileConsecutiveFailures = 0
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
-      this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
+      const completedAtMs = this.#clock.now()
+      this.#readinessReconcileLastCompletedAtMs = completedAtMs
       this.#readinessReconcileLastError = undefined
       this.#readinessReconcileLastErrorClass = undefined
+      // The three integers below have gone to stdout since this loop existed,
+      // and stdout does not reach the deployed container's operator (#355).
+      // Publishing them is what lets a reader tell a sweep that saw eligible
+      // work and rejected it from one that never pulled it at all.
+      this.#recordReadinessSweepOutcome(report, completedAtMs)
       this.#logger.info?.('[factory] periodic readiness reconciliation completed', {
         durationMs: this.#readinessReconcileLastDurationMs,
         candidates: report.pulled.length,
         dispatched: report.dispatched.length,
         skipped: report.skipped.length,
+        // THIS pass's breakdown, never the retained snapshot (#359 review,
+        // codex P2). Logging the retained one beside a deferred pass's zeroes
+        // produced a line that contradicted its own arithmetic —
+        // `skipped: 0` next to a non-empty breakdown — and this log is what a
+        // local operator reads.
+        skipReasons: factorySweepSkipReasonCounts(report.skipped),
+        discoveryDeferred: report.discoveryDeferred,
       })
     } catch (error) {
       // #297: all four relayfile overload reason codes share one message, and
@@ -1811,6 +1940,10 @@ export class FactoryLoop implements Factory {
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
       this.#readinessReconcileLastFailureAtMs = this.#clock.now()
       this.#readinessReconcileLastError = errorMessage
+      // This failure is now the latest settled pass. A deferral marker left by
+      // an older pass would falsely describe this one as lease contention when
+      // the timestamps/error below prove that it acquired the lease and failed.
+      this.#readinessReconcileLastSweepDeferred = undefined
       // The class, unlike the message, is publishable: #295 puts it on the
       // unauthenticated health surface through the same allowlist.
       this.#readinessReconcileLastErrorClass = telemetryErrorClass(error)
@@ -2159,7 +2292,7 @@ export class FactoryLoop implements Factory {
     try {
       const batch = await this.#batch()
       const records = batch.inFlight
-        .filter((record) => !record.dryRun && !this.#completionInFlight.has(issueKey(record.issue)))
+        .filter((record) => !record.dryRun && !this.#completionInFlight.has(dispatchLifecycleKey(record.issue)))
       if (records.length === 0) {
         return
       }
@@ -2315,7 +2448,7 @@ export class FactoryLoop implements Factory {
   async #orphanedPrMetaPaths(record: InFlightIssue): Promise<string[]> {
     const wanted: Array<{ repo: string; prNumber: number }> = []
     if (this.#usesDurableDispatchLifecycle()) {
-      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       const receipts = lifecycle?.pullRequests ?? (lifecycle?.pullRequest ? [lifecycle.pullRequest] : [])
       for (const receipt of receipts) wanted.push({ repo: receipt.repo, prNumber: receipt.number })
     }
@@ -2630,6 +2763,10 @@ export class FactoryLoop implements Factory {
       const completed = await this.#commitDiscoverySweep(claim.lease.epoch, checkpoint, residual)
       leaseReleased = completed
       if (!completed) throw new Error('discovery sweep lease was lost before completion')
+      // This is the progress boundary consumed by deployment health. A timer
+      // firing, a sweep starting, or a failed/deferred sweep must not move it.
+      this.#progressSequence += 1
+      this.#lastProgressAtMs = this.#clock.now()
       this.#logger.info?.('[factory] discovery sweep checkpoint committed', {
         owner: claim.lease.owner,
         epoch: claim.lease.epoch,
@@ -2829,7 +2966,13 @@ export class FactoryLoop implements Factory {
       }
       const paths = await this.#readyIssuePaths()
       const orphanRecovery = issueSource === 'github'
-        ? await this.#githubOrphanRecoveryContext()
+        ? await this.#githubOrphanRecoveryContext(dryRun)
+        : undefined
+      // Preserved-not-reconciled is a fact the caller needs either way, but the
+      // two causes are not the same event: a dry run skips the context by
+      // design, a live sweep that has none failed to build one.
+      const orphanRecoveryDegraded = issueSource === 'github' && orphanRecovery === undefined
+        ? (dryRun ? 'dry-run' as const : 'context-unavailable' as const)
         : undefined
       const pulled: IssueRef[] = []
       const triaged: TriageDecision[] = []
@@ -2841,6 +2984,7 @@ export class FactoryLoop implements Factory {
           issue: entry.issue.key,
           path: entry.issue.path,
           reason: entry.reason,
+          code: entry.code,
         })
       }
       // Backstop for the skip-by-default catch below: see #292. Reset only by
@@ -2878,7 +3022,11 @@ export class FactoryLoop implements Factory {
             retryAfterSeconds: overload.retryAfterSeconds,
             sweepOverloads: this.#discoverySweepOverloads,
           })
-          recordSkip({ issue: issueRefFromPath(path), reason: perItemDispatchSkipReason(error) })
+          recordSkip({
+            issue: issueRefFromPath(path),
+            reason: perItemDispatchSkipReason(error),
+            code: 'read-failed',
+          })
         }
         readyIssueReads += 1
         // Relayfile served this work unit's read: the dependency is shedding
@@ -2944,7 +3092,7 @@ export class FactoryLoop implements Factory {
         if (!mayRecoverGithubOrphan) {
           const dispatchBlock = await this.#dispatchBlockReason(issue)
           if (dispatchBlock) {
-            recordSkip({ issue: issueRef(issue), reason: dispatchBlock })
+            recordSkip({ issue: issueRef(issue), ...dispatchBlock })
             continue
           }
         }
@@ -2955,20 +3103,25 @@ export class FactoryLoop implements Factory {
         const recoveredOrphan = orphanResult.recovered
         const batch = await this.#batch()
         if (batch.isInFlight(issue) || batch.isQueued(issue)) {
-          recordSkip({ issue: issueRef(issue), reason: orphanResult.reason ?? 'already tracked' })
+          recordSkip({
+            issue: issueRef(issue),
+            reason: orphanResult.reason ?? 'already tracked',
+            code: 'already-tracked',
+          })
           continue
         }
         if (!wasReady && !recoveredOrphan) {
           if (mayRecoverGithubOrphan) {
             const dispatchBlock = await this.#dispatchBlockReason(issue)
             if (dispatchBlock) {
-              recordSkip({ issue: issueRef(issue), reason: dispatchBlock })
+              recordSkip({ issue: issueRef(issue), ...dispatchBlock })
               continue
             }
           }
           recordSkip({
             issue: issueRef(issue),
             reason: orphanResult.reason ?? 'live state is not ready-for-agent',
+            code: 'not-ready',
           })
           continue
         }
@@ -2977,18 +3130,22 @@ export class FactoryLoop implements Factory {
           if (recoveredOrphan) {
             const dispatchBlock = await this.#dispatchBlockReason(issue)
             if (dispatchBlock) {
-              recordSkip({ issue: issueRef(issue), reason: dispatchBlock })
+              recordSkip({ issue: issueRef(issue), ...dispatchBlock })
               continue
             }
           }
 
           if (!isInFactoryScope(issue, this.#config.safety)) {
-            recordSkip({ issue: issueRef(issue), reason: 'not factory-e2e scope' })
+            recordSkip({ issue: issueRef(issue), reason: 'not factory-e2e scope', code: 'out-of-scope' })
             continue
           }
 
           if (!isDispatchableIssue(issue)) {
-            recordSkip({ issue: issueRef(issue), reason: 'not reconciled real Linear issue' })
+            recordSkip({
+              issue: issueRef(issue),
+              reason: 'not reconciled real Linear issue',
+              code: 'not-dispatchable',
+            })
             continue
           }
 
@@ -3002,12 +3159,17 @@ export class FactoryLoop implements Factory {
           // decays the durable overload ratchet (#297).
           this.#discoverySweepProgress = true
           if (result.agents.length === 0 && !dryRun) {
+            const code: FactorySweepSkipReasonCode = result.hold?.kind === 'dependency-cycle'
+              ? 'dependency-cycle'
+              : result.hold?.kind === 'dependency'
+                ? 'parked-dependency'
+                : 'queued-or-escalated'
             const reason = result.hold?.kind === 'dependency-cycle'
               ? `dependency cycle detected: ${result.hold.cycle?.join(' -> ') ?? 'unknown cycle'}`
               : result.hold?.kind === 'dependency'
                 ? `parked on dependencies: ${result.hold.blockers?.join(', ') ?? 'unresolved dependency'}`
                 : 'queued or escalated'
-            recordSkip({ issue: decision.issue, reason })
+            recordSkip({ issue: decision.issue, reason, code })
           } else {
             dispatched.push(result)
           }
@@ -3084,14 +3246,26 @@ export class FactoryLoop implements Factory {
               error: describeError(error).errorMessage,
             })
           }
-          recordSkip({ issue: issueRef(issue), reason: perItemDispatchSkipReason(error) })
+          recordSkip({
+            issue: issueRef(issue),
+            reason: perItemDispatchSkipReason(error),
+            code: 'dispatch-failed',
+          })
           continue
         } finally {
           if (recoveredIdentity) this.#reconciledGithubInProgress.delete(recoveredIdentity)
         }
       }
 
-      report = { pulled, triaged, dispatched, skipped, dryRun, slackDegraded: this.#slackDegraded }
+      report = {
+        pulled,
+        triaged,
+        dispatched,
+        skipped,
+        dryRun,
+        slackDegraded: this.#slackDegraded,
+        ...(orphanRecoveryDegraded ? { orphanRecoveryDegraded } : {}),
+      }
       return report
     } catch (error) {
       this.#logger.warn?.('[factory] run-once failed', {
@@ -3110,6 +3284,7 @@ export class FactoryLoop implements Factory {
           dispatched: report.dispatched.length,
           skipped: report.skipped.length,
           slackDegraded: report.slackDegraded ?? false,
+          orphanRecoveryDegraded: report.orphanRecoveryDegraded,
           relayfileWaitWarnings: (this.#counters.relayfileOperationWaitWarnings ?? 0) - relayfileWaitWarningsAtStart,
           relayfileSlowOperations: (this.#counters.relayfileSlowOperations ?? 0) - relayfileSlowOperationsAtStart,
           relayfileOperationFailures: (this.#counters.relayfileOperationFailures ?? 0) - relayfileOperationFailuresAtStart,
@@ -3398,7 +3573,7 @@ export class FactoryLoop implements Factory {
         ? { available: false }
         : { available: true, highWatermark }
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       this.#increment('discoveryHighWatermarkFailures')
       this.#logger.warn?.('[factory] discovery high-watermark unavailable; using a full sweep without caching', {
         error: describeError(error).errorMessage,
@@ -3421,7 +3596,7 @@ export class FactoryLoop implements Factory {
       })
       events = [...page.events].sort(compareDiscoveryEvents)
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       this.#logger.warn?.('[factory] discovery change feed unavailable; refreshing tree prefixes once', {
         error: describeError(error).errorMessage,
       })
@@ -3483,7 +3658,34 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #githubOrphanRecoveryContext(): Promise<GithubOrphanRecoveryContext | undefined> {
+  /**
+   * The safety context orphan recovery needs before it may release a leaked
+   * `factory:in-progress` claim: who is online, which issues are actively
+   * owned, and which durable lifecycle rows look abandoned.
+   *
+   * A dry run never builds it. `#reconcileOrphanedGithubInProgress` refuses to
+   * release a claim under `dryRun` before it so much as looks at the context,
+   * and `mayRecoverGithubOrphan` in `#performRunOnce` is itself `!dryRun` —
+   * so the context was already provably unused on that path. Gathering it
+   * anyway was not free: `fleet.roster()` mints this process's workspace
+   * identity on demand, which is exactly what a read-only client refuses
+   * (#343) and exactly what a dry run must not need. Deciding what a sweep
+   * WOULD do must not require an identity to do it with.
+   *
+   * Returning `undefined` is therefore the honest answer for a dry run, not a
+   * failure: the caller reports the sweep as `orphanRecoveryDegraded:
+   * 'dry-run'` and preserves in-progress issues, which is what a dry run does
+   * regardless. The failure counter and the warn below stay for the live path,
+   * where an absent context IS a degradation.
+   */
+  async #githubOrphanRecoveryContext(dryRun: boolean): Promise<GithubOrphanRecoveryContext | undefined> {
+    if (dryRun) {
+      this.#increment('githubOrphanRecoveryContextSkippedDryRun')
+      this.#logger.info?.('[factory] dry run skipped the orphan-recovery safety context; in-progress issues are preserved', {
+        reason: 'a dry run never releases an in-progress claim, so it needs no workspace identity to build one',
+      })
+      return undefined
+    }
     try {
       const [registry, roster, lifecycles, waitingClarifications] = await Promise.all([
         readFactoryInFlightRegistry(this.#config.loop.registryPath),
@@ -3719,7 +3921,7 @@ export class FactoryLoop implements Factory {
     identity: string,
     candidate: { key: string; lifecycle: DispatchLifecycle },
   ): Promise<boolean> {
-    let key = candidate.key
+    const key = candidate.key
     let lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     if (!lifecycle) return true
     if (
@@ -3777,7 +3979,6 @@ export class FactoryLoop implements Factory {
           })
           return false
         }
-        key = claim.key ?? key
         lifecycle = claim.lifecycle
         epoch = claim.lease.epoch
         this.#dispatchLifecycleEpochs.set(key, epoch)
@@ -3947,7 +4148,7 @@ export class FactoryLoop implements Factory {
     const record = batch.start(decision, false)
     if (!record) {
       if (durableAdoption) {
-        const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(decision.issue))
+        const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(decision.issue))
         if (durable) {
           this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(durable))
           this.#increment('githubOrphanedPullRequestsAdopted')
@@ -4126,7 +4327,22 @@ export class FactoryLoop implements Factory {
     }
 
     try {
-      const result = await fn()
+      // The bound the 2026-08-23 wedge needed (#351). `#readinessReconcileTimeoutMs`
+      // is 90 minutes and rejects only the WAIT — the sweep keeps its discovery
+      // lease and the next cycle coalesces onto it — so a call that never
+      // returns stopped dispatch for as long as the process lived. Bounding the
+      // call instead makes the pass unwind, which releases the lease and lets
+      // the next cycle actually start.
+      //
+      // Slightly above the transport's own deadline so the mount's cancellation
+      // wins the race and reports the more precise error; this is the backstop
+      // for mounts that cannot honour a signal.
+      const result = await withRelayfileCallDeadline(
+        operation,
+        details.phase,
+        this.#relayfileOperationBackstopMs(),
+        fn,
+      )
       const elapsedMs = this.#elapsedSince(startedAtMs)
       const count = opts.count?.(result)
       if (opts.logComplete) {
@@ -4185,12 +4401,29 @@ export class FactoryLoop implements Factory {
           error: describeError(error).errorMessage,
         })
       }
-      throw error
+      // The transport deadline is meant to win the race above, and the mount
+      // does not know which phase it was serving. Without this, `lastError`
+      // would name the call but not the context — one of many list/read sites
+      // (codex on #354).
+      throw relayfileTimeoutWithPhase(error, details.phase)
     } finally {
       if (progressTimer) {
         clearInterval(progressTimer)
       }
     }
+  }
+
+  /**
+   * The cycle-level backstop budget: the transport deadline plus a margin.
+   *
+   * Proportional rather than a flat grace so it holds at both ends of the
+   * range — a five-minute production budget and a millisecond test budget both
+   * leave the transport room to fire first.
+   */
+  #relayfileOperationBackstopMs(): number | undefined {
+    const timeoutMs = this.#relayfileOperationTimeoutMs
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return undefined
+    return Math.ceil(timeoutMs * RELAYFILE_OPERATION_BACKSTOP_RATIO)
   }
 
   #elapsedSince(startedAtMs: number): number {
@@ -4221,6 +4454,7 @@ export class FactoryLoop implements Factory {
     )))
     const heartbeatPath = opts.heartbeatPath ?? this.#config.loop.heartbeatPath
     const registryPath = opts.registryPath ?? this.#config.loop.registryPath
+    this.#beginHeartbeatLifetime()
     this.#loopReapPaths = { heartbeatPath, registryPath }
     const reports: IterationReport[] = []
     let consecutiveFailures = 0
@@ -4287,16 +4521,31 @@ export class FactoryLoop implements Factory {
   }
 
   async triageIssue(issue: LinearIssue): Promise<TriageDecision> {
-    return this.#triage.triage(issue, {
+    return await this.#triageWithOrigin(issue)
+  }
+
+  /**
+   * The mirror origin is a property of the issue Factory fed in, not of the
+   * engine's answer, so it is re-attached here rather than trusted from the
+   * engine. `TriageDecisionSchema` drops unknown keys, so `LlmTriage` returns a
+   * decision that has lost it, and a custom `TriageEngine` never set it at all
+   * — either way a Linear mirror would fall back to `linear:<uuid>` and
+   * duplicate its own GitHub-native arrival, which is the defect #211 fixes.
+   */
+  async #triageWithOrigin(issue: LinearIssue): Promise<TriageDecision> {
+    const decision = await this.#triage.triage(issue, {
       config: this.#config,
       repoMap: repoMapFromConfig(this.#config),
     })
+    return decisionWithMirrorOrigin(decision, issue)
   }
 
   async dispatch(decision: TriageDecision, opts: { dryRun?: boolean; labelsValidated?: boolean } = {}): Promise<DispatchResult> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const phase = triageEscalationReason(decision) ? 'escalation' : 'dispatch'
-    const key = `${issueStateKey(decision.issue)}:${dryRun ? 'dry-run' : 'live'}:${phase}`
+    // The dispatch concurrency gate is per work unit: a mirror of an issue
+    // already being dispatched must join that call, not start a second one.
+    const key = `${dispatchLifecycleKey(decision.issue)}:${dryRun ? 'dry-run' : 'live'}:${phase}`
     const inFlight = this.#dispatchInFlight.get(key)
     if (inFlight) {
       this.#increment('dispatchDuplicateSuppressed')
@@ -4324,9 +4573,9 @@ export class FactoryLoop implements Factory {
       return existingRecord.result
     }
     if (!dryRun && this.#usesDurableDispatchLifecycle()) {
-      const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(decision.issue))
+      const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(decision.issue))
       if (durable && !isTerminalDispatchLifecycle(durable)) {
-        if (durable.result && this.#dispatchLifecycleEpochs.has(issueKey(decision.issue))) {
+        if (durable.result && this.#dispatchLifecycleEpochs.has(dispatchLifecycleKey(decision.issue))) {
           return durable.result
         }
         if (this.#startMode === 'dispatch-owner') {
@@ -4339,7 +4588,7 @@ export class FactoryLoop implements Factory {
 
     const blockReason = await this.#dispatchBlockReason(decision.issue)
     if (blockReason) {
-      const error = new Error(`Refusing to dispatch ${decision.issue.key}: ${blockReason}`)
+      const error = new Error(`Refusing to dispatch ${decision.issue.key}: ${blockReason.reason}`)
       this.#error(error, decision.issue)
       throw error
     }
@@ -4586,7 +4835,7 @@ export class FactoryLoop implements Factory {
           state: 'pending',
           updatedAtMs: this.#clock.now(),
         }
-        this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+        this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
       }
       await this.#writeInFlightRegistry()
 
@@ -4761,7 +5010,7 @@ export class FactoryLoop implements Factory {
           ...(tracked.result?.node ? { node: tracked.result.node } : {}),
         })),
         claim: {
-          ...(record.dispatchClaim ?? this.#dispatchClaimStatuses.get(issueKey(record.issue)) ?? {
+          ...(record.dispatchClaim ?? this.#dispatchClaimStatuses.get(dispatchLifecycleKey(record.issue)) ?? {
             state: 'pending' as const,
             updatedAtMs: nowMs,
           }),
@@ -4779,6 +5028,9 @@ export class FactoryLoop implements Factory {
       })) ?? [],
       counters: { ...this.#counters },
       fleetControlPlane: this.#fleetControlPlane.status(),
+      // Optional on the port: a backend with no socket omits it, and an absent
+      // value stays absent rather than being invented as healthy.
+      ...(this.#fleet.fleetConnectStatus ? { fleetConnect: this.#fleet.fleetConnectStatus() } : {}),
       slackDegraded: this.#slackDegraded,
       slackDegradedReason: this.#slackDegradedReason,
       eventListener: this.#eventListenerStatus(),
@@ -4810,6 +5062,40 @@ export class FactoryLoop implements Factory {
       return { state: 'polling' }
     }
     return { state: 'starting' }
+  }
+
+  /**
+   * Snapshot a settled sweep's counts onto the readiness surface (#355).
+   *
+   * Only successful passes reach here: a pass that threw has no report, and
+   * inventing zeroes for it would publish "found nothing" for a sweep that
+   * never got to look. The previous enumerating pass's numbers stay put
+   * instead, dated by `lastEnumeratedAtMs`, which is the honest reading.
+   *
+   * A deferred pass gets the same treatment for the same reason. It settles
+   * successfully, and `lastCompletedAtMs` moves — deliberately, because the
+   * #295/#296 stall derivation reads that timestamp against `lastStartedAtMs`,
+   * and freezing it would report a functioning daemon as a hung one after ten
+   * intervals of deferring correctly to another owner. But it enumerated
+   * nothing, so its zeroes are not a measurement of anything and must not
+   * replace one. Only the marker is recorded.
+   */
+  #recordReadinessSweepOutcome(report: IterationReport, completedAtMs: number): void {
+    if (report.discoveryDeferred) {
+      this.#readinessReconcileLastSweepDeferred = report.discoveryDeferred
+      return
+    }
+    this.#readinessReconcileLastSweepDeferred = undefined
+    this.#readinessReconcileLastSweep = {
+      candidates: report.pulled.length,
+      dispatched: report.dispatched.length,
+      skipped: report.skipped.length,
+      skipReasons: factorySweepSkipReasonCounts(report.skipped),
+      // The caller's completion stamp, not a fresh clock read: on a pass that
+      // enumerated, `lastEnumeratedAtMs` and `lastCompletedAtMs` describe the
+      // same instant and must not drift apart by a tick.
+      enumeratedAtMs: completedAtMs,
+    }
   }
 
   #readinessReconcileStatus(): FactoryReadinessReconcileStatus {
@@ -4887,6 +5173,25 @@ export class FactoryLoop implements Factory {
         : {}),
       ...(this.#readinessReconcileLastFailureAtMs !== undefined
         ? { lastFailureAtMs: this.#readinessReconcileLastFailureAtMs }
+        : {}),
+      // Spread whole or not at all: see `#readinessReconcileLastSweep`. Zeroes
+      // are published, which is the entire point — an absent `candidates` and
+      // a zero `candidates` are different diagnoses (#355).
+      ...(this.#readinessReconcileLastSweep
+        ? {
+            candidates: this.#readinessReconcileLastSweep.candidates,
+            dispatched: this.#readinessReconcileLastSweep.dispatched,
+            skipped: this.#readinessReconcileLastSweep.skipped,
+            ...(Object.keys(this.#readinessReconcileLastSweep.skipReasons).length > 0
+              ? { skipReasons: { ...this.#readinessReconcileLastSweep.skipReasons } }
+              : {}),
+            lastEnumeratedAtMs: this.#readinessReconcileLastSweep.enumeratedAtMs,
+          }
+        : {}),
+      // Independent of the trio: a daemon whose FIRST pass deferred has no
+      // counts to publish and still needs to say why.
+      ...(this.#readinessReconcileLastSweepDeferred
+        ? { discoveryDeferred: this.#readinessReconcileLastSweepDeferred }
         : {}),
       ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
       ...(this.#readinessReconcileLastErrorClass
@@ -5002,14 +5307,30 @@ export class FactoryLoop implements Factory {
         ])
         if (previews.length > 0) this.#previewReferences.set(issueKey(lifecycle.issue), previews)
         hasNonterminalDurableLifecycle = true
-        const claim = await this.#state.claimDispatchLifecycle(
-          this.#workspaceId,
-          key,
-          lifecycle,
-          this.#dispatchLifecycleOwner,
-          this.#clock.now(),
-          DISPATCH_LIFECYCLE_LEASE_MS,
-        )
+        // A work unit whose keys cannot be reconciled must not strand the rows
+        // behind it — #315 is the same lesson from the shed-read path. Retain
+        // the conflicting rows, leave that one unit blocked for an operator,
+        // and carry on adopting the rest.
+        let claim: DispatchLifecycleClaim
+        try {
+          claim = await this.#state.claimDispatchLifecycle(
+            this.#workspaceId,
+            key,
+            lifecycle,
+            this.#dispatchLifecycleOwner,
+            this.#clock.now(),
+            DISPATCH_LIFECYCLE_LEASE_MS,
+          )
+        } catch (error) {
+          if (!(error instanceof DispatchLifecycleMigrationConflictError)) throw error
+          this.#increment('dispatchLifecycleMigrationConflicts')
+          this.#logger.error?.('[factory] dispatch is blocked for one work unit until its keys are reconciled', {
+            issue: lifecycle.issue.key,
+            canonicalKey: error.canonicalKey,
+            conflictingKeys: error.conflictingKeys,
+          })
+          continue
+        }
         if (!claim.acquired || !claim.lease) {
           // The other process may have crashed while its nominal lease is
           // still live. Keep this process attached so it reclaims the row
@@ -5017,7 +5338,7 @@ export class FactoryLoop implements Factory {
           this.#scheduleDispatchLifecycleRetry(inFlightRecordFromLifecycle(claim.lifecycle))
           continue
         }
-        this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
+        this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
         this.#hydrateCostLedger(claim.lifecycle)
         if (claim.lifecycle.phase === 'waiting-for-human') continue
         const durableRecord = inFlightRecordFromLifecycle(claim.lifecycle)
@@ -5047,6 +5368,14 @@ export class FactoryLoop implements Factory {
               reason: relayfileOverloadReasonLabel(overload.reason),
             })
           }
+          // A row persisted before #211 has no `origin`, so a Linear mirror
+          // still resolves to `linear:<uuid>` and a GitHub-native arrival for
+          // the same work unit would claim alongside it — the rolling-upgrade
+          // form of the duplicate this change removes. Nothing on the row links
+          // it to its upstream, but the issue we just read does, so backfill it
+          // here under the lease this process already holds. The next claim or
+          // load then recognises the row by identity and re-keys it.
+          if (liveIssue) await this.#backfillMirrorOrigin(key, claim, liveIssue)
           // A babysat Linear issue already at Done may have merged while this
           // process was down. Let authoritative PR restoration drive the
           // normal `complete` path so merged work is not mislabeled abandoned.
@@ -5079,7 +5408,7 @@ export class FactoryLoop implements Factory {
           this.#ticketDispatchNotificationIsPending(claim.lifecycle)
         ) {
           if (!liveIssue) {
-            this.#dispatchLifecycleEpochs.delete(claim.key ?? key)
+            this.#dispatchLifecycleEpochs.delete(key)
             this.#scheduleDispatchLifecycleRetry(restored)
             throw new Error(`Unable to recover ticket-dispatch notification ${restored.issue.key}: issue is not currently readable`)
           }
@@ -5439,7 +5768,7 @@ export class FactoryLoop implements Factory {
       // never-placed — which also excludes its agents from the release below,
       // leaking live workers (#303 review, CodeRabbit).
       let effective = deadline
-      const key = issueKey(record.issue)
+      const key = dispatchLifecycleKey(record.issue)
       if (this.#abandonedDispatchReasons.has(key)) continue
       if (this.#usesDurableDispatchLifecycle()) {
         const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
@@ -5495,6 +5824,45 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  /**
+   * Records the upstream origin on an adopted lifecycle that predates it.
+   * Best-effort: a failed write leaves the row exactly as it was, and the next
+   * startup tries again.
+   */
+  async #backfillMirrorOrigin(
+    key: string,
+    claim: { lifecycle: DispatchLifecycle; lease?: DispatchLifecycleLease },
+    liveIssue: LinearIssue,
+  ): Promise<void> {
+    const epoch = claim.lease?.epoch
+    if (epoch === undefined || claim.lifecycle.issue.origin) return
+    const origin = mirrorWorkUnitOrigin(liveIssue)
+    if (!origin) return
+    const issue = { ...claim.lifecycle.issue, origin }
+    const enriched: DispatchLifecycle = {
+      ...claim.lifecycle,
+      issue,
+      decision: { ...claim.lifecycle.decision, issue },
+    }
+    const saved = await this.#state.saveDispatchLifecycle(
+      this.#workspaceId,
+      key,
+      this.#dispatchLifecycleOwner,
+      epoch,
+      this.#clock.now(),
+      enriched,
+    ).catch((error: unknown) => {
+      this.#logger.warn?.('[factory] could not backfill mirror origin on an adopted lifecycle', {
+        issue: claim.lifecycle.issue.key,
+        error: describeError(error).errorMessage,
+      })
+      return false
+    })
+    if (!saved) return
+    claim.lifecycle = enriched
+    this.#increment('dispatchLifecycleMirrorOriginsBackfilled')
+  }
+
   async #renewDispatchLifecycles(): Promise<void> {
     for (const [key, epoch] of [...this.#dispatchLifecycleEpochs]) {
       const renewed = await this.#state.renewDispatchLifecycle(
@@ -5535,7 +5903,7 @@ export class FactoryLoop implements Factory {
       pullRequest?: GithubPublishPullRequestResult
     } = {},
   ): Promise<{ created: boolean; lifecycle: DispatchLifecycle }> {
-    const key = issueKey(decision.issue)
+    const key = dispatchLifecycleKey(decision.issue)
     const seed: DispatchLifecycle = {
       runId: preparedRunId ?? randomUUID(),
       issue: { ...decision.issue },
@@ -5567,7 +5935,7 @@ export class FactoryLoop implements Factory {
         `Refusing to dispatch ${decision.issue.key}: ${reason}`,
       )
     }
-    this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
+    this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
     this.#hydrateCostLedger(claim.lifecycle)
     this.#scheduleDispatchLifecycleRenewal()
     if (claim.created) {
@@ -5641,7 +6009,7 @@ export class FactoryLoop implements Factory {
     options: { releaseReason?: string } = {},
   ): Promise<void> {
     const lifecycle = await this.#state
-      .getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      .getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       .catch(() => undefined)
     if (!lifecycle) return
     await this.#report({
@@ -5669,7 +6037,7 @@ export class FactoryLoop implements Factory {
 
   async #handleAgentUsage(usage: AgentUsage, key: string): Promise<void> {
     const record = (await this.#batch()).getIssueByAgent(usage.name)
-    const activeRecord = record && issueKey(record.issue) === key ? record : undefined
+    const activeRecord = record && dispatchLifecycleKey(record.issue) === key ? record : undefined
     let tracked = activeRecord?.agents.get(usage.name)
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     // Completion removes the in-memory batch record immediately after the
@@ -5784,7 +6152,7 @@ export class FactoryLoop implements Factory {
 
   async #dispatchLifecycleKeyForAgent(name: string): Promise<string | undefined> {
     const record = (await this.#batch()).getIssueByAgent(name)
-    if (record?.agents.has(name)) return issueKey(record.issue)
+    if (record?.agents.has(name)) return dispatchLifecycleKey(record.issue)
     return (await this.#findDispatchLifecycleAgent(name))?.key
   }
 
@@ -5937,7 +6305,7 @@ export class FactoryLoop implements Factory {
     else record.slotHeldSinceAtMs = undefined
     if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
     if (isTerminalDispatchPhase(phase)) await this.#drainAgentUsage()
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     return this.#serializeDispatchLifecyclePersistence(key, async () => {
       const epoch = this.#dispatchLifecycleEpochs.get(key)
       if (epoch === undefined) {
@@ -6040,7 +6408,7 @@ export class FactoryLoop implements Factory {
   // after release could see it cleared, or see the next dispatch for the same
   // issue, and classify the wrong run.
   #resolveDispatchTerminalWaiters(issue: IssueRef, phase: TerminalDispatchLifecyclePhase): void {
-    const key = issueKey(issue)
+    const key = dispatchLifecycleKey(issue)
     for (const resolve of this.#dispatchTerminalWaiters.get(key) ?? []) resolve(phase)
     this.#dispatchTerminalWaiters.delete(key)
   }
@@ -6175,7 +6543,7 @@ export class FactoryLoop implements Factory {
   }
 
   #scheduleDispatchLifecycleRetry(record: InFlightIssue, delayMs = DISPATCH_LIFECYCLE_RETRY_MS): void {
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
@@ -6223,7 +6591,7 @@ export class FactoryLoop implements Factory {
       this.#scheduleDispatchLifecycleRetry(record)
       return
     }
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
@@ -6265,7 +6633,7 @@ export class FactoryLoop implements Factory {
       if (!claim.acquired || !claim.lease) {
         throw new DispatchLifecycleOwnedElsewhereError(claim.lifecycle.lease?.leaseUntilMs)
       }
-      this.#dispatchLifecycleEpochs.set(claim.key ?? key, claim.lease.epoch)
+      this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
       this.#hydrateCostLedger(claim.lifecycle)
       this.#scheduleDispatchLifecycleRenewal()
       lifecycle = claim.lifecycle
@@ -6527,7 +6895,7 @@ export class FactoryLoop implements Factory {
         state: 'pending',
         updatedAtMs: this.#clock.now(),
       }
-      this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+      this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
     }
     await this.#writeInFlightRegistry()
     if (!record.dryRun) {
@@ -6668,7 +7036,7 @@ export class FactoryLoop implements Factory {
   async #finishDurableRelease(record: InFlightIssue, releaseReason?: string): Promise<boolean> {
     const batch = await this.#batch()
     const reason = releaseReason ?? (this.#config.terminalState === 'human-review' ? 'issue-human-review' : 'issue-done')
-    const releaseKey = issueKey(record.issue)
+    const releaseKey = dispatchLifecycleKey(record.issue)
     // Terminal writeback has already been acknowledged before this method is
     // entered. Remove externally reachable routes first so a stuck agent
     // release cannot leave a preview live after Human Review or Done.
@@ -6739,7 +7107,7 @@ export class FactoryLoop implements Factory {
 
   async #assertIssueDispatchLifecycleOwner(issue: IssueRef): Promise<boolean> {
     if (!this.#usesDurableDispatchLifecycle()) return true
-    const key = issueKey(issue)
+    const key = dispatchLifecycleKey(issue)
     const epoch = this.#dispatchLifecycleEpochs.get(key)
     if (epoch === undefined) return false
     const renewed = await this.#state.renewDispatchLifecycle(
@@ -6907,7 +7275,7 @@ export class FactoryLoop implements Factory {
       state: 'verified',
       updatedAtMs: this.#clock.now(),
     }
-    this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+    this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
     await this.#writeDispatchClaimRegistry(record.issue)
     return implementingStateId
   }
@@ -6941,7 +7309,7 @@ export class FactoryLoop implements Factory {
           ...(deadLettered ? { deadLettered: true } : {}),
           updatedAtMs: this.#clock.now(),
         }
-        this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+        this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
         await this.#writeDispatchClaimRegistry(record.issue)
 
         if (deadLettered) {
@@ -7146,7 +7514,7 @@ export class FactoryLoop implements Factory {
       this.#githubIssuePathIndexReady = true
       return [...issuePaths.values()].sort()
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       this.#githubIssuePathIndexReady = false
       this.#increment('githubIssueListFailures')
       this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
@@ -7161,7 +7529,7 @@ export class FactoryLoop implements Factory {
       const { content } = await this.#readRelayfileFile(indexPath, 'GitHub issue index discovery')
       parsed = parseJsonContent(content)
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       return undefined
     }
     if (!Array.isArray(parsed)) return undefined
@@ -7271,7 +7639,7 @@ export class FactoryLoop implements Factory {
       }
       this.#increment('githubIssueMirrorsCreated')
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       this.#logger.error?.('[factory] failed to ingest GitHub issue', error)
     }
   }
@@ -7742,20 +8110,32 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #dispatchBlockReason(issue: IssueRef): Promise<string | undefined> {
+  /**
+   * Why durable dispatch state refuses this issue, or `undefined` to proceed.
+   *
+   * Returns the operator text *and* its #355 code together rather than letting
+   * the sweep re-derive one from the other: these four conditions are the ones
+   * most likely to explain a sweep that saw eligible issues and dispatched
+   * nothing, and two of them (`terminal`, `retry-limit`) never clear on their
+   * own. Deriving the code by matching the message would put that distinction
+   * one rename away from collapsing into `other`.
+   */
+  async #dispatchBlockReason(
+    issue: IssueRef,
+  ): Promise<{ reason: string; code: FactorySweepSkipReasonCode } | undefined> {
     const key = issueStateKey(issue)
     const state = await this.#state.getDispatchAttempts(this.#workspaceId, key)
     if (!state) return undefined
-    if (state.terminal) return 'dispatch already terminal'
-    if (state.inFlight) return 'dispatch already in-flight'
+    if (state.terminal) return { reason: 'dispatch already terminal', code: 'dispatch-terminal' }
+    if (state.inFlight) return { reason: 'dispatch already in-flight', code: 'dispatch-in-flight' }
     const now = this.#clock.now()
     if (state.backoffUntilMs > now) {
-      return 'dispatch backoff active'
+      return { reason: 'dispatch backoff active', code: 'dispatch-backoff' }
     }
     if (state.attempts >= this.#config.dispatch.maxAttempts) {
       state.terminal = true
       await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
-      return 'dispatch retry limit reached'
+      return { reason: 'dispatch retry limit reached', code: 'dispatch-retry-limit' }
     }
     return undefined
   }
@@ -7809,7 +8189,9 @@ export class FactoryLoop implements Factory {
     await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
   }
 
-  async #recordCanonicalIssueState(issue: Pick<LinearIssue, 'uuid' | 'key' | 'path' | 'stateId'>): Promise<void> {
+  async #recordCanonicalIssueState(
+    issue: Pick<LinearIssue, 'uuid' | 'key' | 'path' | 'stateId'> & { raw?: unknown; origin?: WorkUnitOrigin },
+  ): Promise<void> {
     const key = issueStateKey(issue)
     const previousStateId = await this.#state.getCanonicalState(this.#workspaceId, key)
     const previousRole = this.#states.roleOf(previousStateId)
@@ -7824,10 +8206,18 @@ export class FactoryLoop implements Factory {
         await this.#state.recordDispatchAttempt(this.#workspaceId, key, dispatchState)
         this.#increment('dispatchTerminalReopened')
       }
-      for (const [key, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
-        if (lifecycle.issue.key !== issue.key || !isTerminalDispatchLifecycle(lifecycle)) continue
-        await this.#state.clearDispatchLifecycle(this.#workspaceId, key)
-        this.#dispatchLifecycleEpochs.delete(key)
+      // Match on the work unit, not the surface key: a completed Linear mirror
+      // persists `AR-448` while the GitHub-native arrival of the same issue is
+      // `448`, and comparing surface keys would leave that terminal row in
+      // place to refuse the reopened work forever.
+      const reopenedIdentity = safeDispatchLifecycleKey(issueRefForState(issue))
+      for (const [lifecycleKey, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
+        if (!isTerminalDispatchLifecycle(lifecycle)) continue
+        const matches = reopenedIdentity !== undefined &&
+          safeDispatchLifecycleKey(lifecycle.issue) === reopenedIdentity
+        if (!matches && lifecycle.issue.key !== issue.key) continue
+        await this.#state.clearDispatchLifecycle(this.#workspaceId, lifecycleKey)
+        this.#dispatchLifecycleEpochs.delete(lifecycleKey)
       }
     }
     await this.#state.recordCanonicalState(this.#workspaceId, key, issue.stateId)
@@ -7841,18 +8231,36 @@ export class FactoryLoop implements Factory {
     maxIterations: number,
   ): Promise<void> {
     const updatedAtMs = this.#clock.now()
+    this.#heartbeatStartedAtMs ??= updatedAtMs
     const heartbeat: FactoryLoopHeartbeat = {
       pid: process.pid,
       status,
+      source: maxIterations === 0 ? 'live-timer' : 'bounded-loop',
       iteration,
       maxIterations,
+      startedAt: new Date(this.#heartbeatStartedAtMs).toISOString(),
+      startedAtMs: this.#heartbeatStartedAtMs,
+      progressContract: 'discovery-sweep-v1',
       updatedAt: new Date(updatedAtMs).toISOString(),
       updatedAtMs,
+      ...(this.#lastProgressAtMs !== undefined
+        ? {
+            progress: {
+              sequence: this.#progressSequence,
+              operation: 'discovery-sweep' as const,
+              updatedAt: new Date(this.#lastProgressAtMs).toISOString(),
+              updatedAtMs: this.#lastProgressAtMs,
+            },
+          }
+        : {}),
       registryPath,
       eventListener: this.#eventListenerStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
       dispatchCapacity: this.#dispatchCapacityStatus(),
       fleetControlPlane: this.#fleetControlPlane.status(),
+      // Optional on the port: a backend with no socket omits it, and an absent
+      // value stays absent rather than being invented as healthy.
+      ...(this.#fleet.fleetConnectStatus ? { fleetConnect: this.#fleet.fleetConnectStatus() } : {}),
     }
     // The deployed container serves `/healthz` straight out of this file and
     // has no redaction logic of its own, so publish the already-safe view here
@@ -8080,7 +8488,7 @@ export class FactoryLoop implements Factory {
       this.#indexDependencyIssue(resolvedIssue)
       return resolvedIssue
     } catch (error) {
-      if (relayfileOverload(error)) throw error
+      if (isPassWideRelayfileFault(error)) throw error
       if (isMissingIssueFileError(error) && isIssuePathUnderRoot(path)) {
         this.#increment('phantomSkipped')
         this.#logger.debug?.('[factory] skipped missing issue file discovered from issue tree', { path })
@@ -8174,7 +8582,7 @@ export class FactoryLoop implements Factory {
         this.#logger.warn?.(`[factory] failed to release ${agentName} during ${context}`, error)
         if (record) {
           const lifecycle = await this.#state
-            .getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+            .getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
             .catch(() => undefined)
           if (lifecycle) {
             await this.#reportLifecycle(lifecycle, 'factory.failure', {
@@ -8375,7 +8783,7 @@ export class FactoryLoop implements Factory {
         }
       }
       const fleetTracked = this.#fleet.trackedAgents?.().get(agentName)
-      const dispatchClaim = this.#dispatchClaimStatuses.get(issueKey(issue))
+      const dispatchClaim = this.#dispatchClaimStatuses.get(dispatchLifecycleKey(issue))
       agents.push({
         name: agentName,
         role: tracked.spec.role,
@@ -8399,7 +8807,7 @@ export class FactoryLoop implements Factory {
       for (const record of (await this.#batch()).inFlight) {
         if (record.dryRun) continue
         if (record.dispatchClaim) {
-          this.#dispatchClaimStatuses.set(issueKey(record.issue), record.dispatchClaim)
+          this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
         }
         for (const [agentName, tracked] of record.agents) {
           await appendAgent(record.issue, agentName, tracked, record)
@@ -8537,7 +8945,7 @@ export class FactoryLoop implements Factory {
    * durable row, which is authoritative when another owner terminalized it.
    */
   async #dispatchLifecycleStillOwned(record: InFlightIssue): Promise<boolean> {
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     if (this.#abandonedDispatchReasons.has(key)) return false
     if (!this.#usesDurableDispatchLifecycle()) return true
     const epoch = this.#dispatchLifecycleEpochs.get(key)
@@ -8656,7 +9064,7 @@ export class FactoryLoop implements Factory {
     if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit telemetry completed', { issue: record.issue.key, name })
 
     if (this.#usesDurableDispatchLifecycle()) {
-      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       if (lifecycle?.phase === 'parking') {
         this.#increment('clarificationParkingExitsSuppressed')
         return
@@ -8842,7 +9250,7 @@ export class FactoryLoop implements Factory {
       // subsequent no-PR implementer exit is terminal and frees the slot.
       const recoveryLifecycle = await this.#state.getDispatchLifecycle(
         this.#workspaceId,
-        issueKey(record.issue),
+        dispatchLifecycleKey(record.issue),
       )
       const recoveryRunIdentity = recoveryLifecycle?.runId
         ?? tracked.spec.branch
@@ -9055,7 +9463,7 @@ export class FactoryLoop implements Factory {
         `Refusing to publish ${record.issue.key}: branch ${expectedHeadRef} belongs to a different issue`,
       )
     }
-    const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
     const cached = this.#publishedPullRequests.get(key)
     if (cached) {
       if (cached.headRef !== expectedHeadRef) {
@@ -9237,7 +9645,7 @@ export class FactoryLoop implements Factory {
       try {
         paths = await this.#listRelayfileTree(root, 'exact-head PR confirmation')
       } catch (error) {
-        if (relayfileOverload(error)) throw error
+        if (isPassWideRelayfileFault(error)) throw error
         continue
       }
       for (const path of paths) {
@@ -9508,7 +9916,7 @@ export class FactoryLoop implements Factory {
         try {
           return await this.#listRelayfileTree(root, 'published PR confirmation')
         } catch (error) {
-          if (relayfileOverload(error)) throw error
+          if (isPassWideRelayfileFault(error)) throw error
           return []
         }
       }))).flat()
@@ -9759,7 +10167,7 @@ export class FactoryLoop implements Factory {
   }
 
   #scheduleAbandonedDispatchRetry(record: InFlightIssue, reason: string): void {
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
@@ -9797,7 +10205,7 @@ export class FactoryLoop implements Factory {
           ? githubIssuePathParts(record.issue.path)?.owner
           : undefined
         const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org ?? sourceOwner)
-        const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+        const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
         if (publishedPullRequests(lifecycle).some((receipt) =>
           receipt.repo.toLowerCase() === repo.toLowerCase()
         )) return true
@@ -11308,7 +11716,7 @@ export class FactoryLoop implements Factory {
           }
         }
       } catch (error) {
-        if (relayfileOverload(error)) throw error
+        if (isPassWideRelayfileFault(error)) throw error
         this.#logger.warn?.('[factory] unable to list GitHub issue comments for replay', { prefix, error })
       }
     }
@@ -11577,10 +11985,7 @@ export class FactoryLoop implements Factory {
     }
 
     const clarifiedIssue = issueWithGithubClarification(issue, text)
-    const decision = await this.#triage.triage(clarifiedIssue, {
-      config: this.#config,
-      repoMap: repoMapFromConfig(this.#config),
-    })
+    const decision = await this.#triageWithOrigin(clarifiedIssue)
     const escalationReason = triageEscalationReason(decision)
     if (escalationReason) {
       if (hasDispatchableRoute(decision)) {
@@ -12064,7 +12469,7 @@ export class FactoryLoop implements Factory {
     const records = onlyRecord ? [onlyRecord] : (await this.#batch()).inFlight
     for (const record of records) {
       if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) continue
-      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       // Babysitter sessions are independently durable and restore only after
       // their mounted PR metadata passes the open/draft/issue-identity guard.
       // Fold those validated receipts back into the lifecycle on takeover.
@@ -12745,7 +13150,7 @@ export class FactoryLoop implements Factory {
   }
 
   async #suspendBabysitterWakeForHuman(state: BabysitterWakeState): Promise<boolean> {
-    const key = issueKey(state.issue)
+    const key = dispatchLifecycleKey(state.issue)
     const [lifecycle, clarification] = await Promise.all([
       this.#usesDurableDispatchLifecycle()
         ? this.#state.getDispatchLifecycle(this.#workspaceId, key)
@@ -13532,7 +13937,7 @@ export class FactoryLoop implements Factory {
   // after opening its PR (an event, not a poll).
   async #ensureBabysitterForIssue(record: InFlightIssue): Promise<void> {
     if (this.#usesDurableDispatchLifecycle()) {
-      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       const receipts = lifecycle?.pullRequests ?? (lifecycle?.pullRequest ? [lifecycle.pullRequest] : [])
       if (receipts.length > 0) {
         for (const receipt of receipts) {
@@ -13776,7 +14181,7 @@ export class FactoryLoop implements Factory {
     prRef: Pick<BabysitterPrRef, 'repo' | 'prNumber'>,
   ): Promise<boolean> {
     const wanted = githubPrIdentity(prRef.repo, prRef.prNumber)
-    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
     const trackedAgents = new Map([
       ...(lifecycle?.agents ?? [])
         .filter((agent) => agent.releasedAtMs === undefined)
@@ -13823,7 +14228,7 @@ export class FactoryLoop implements Factory {
       })
     }
     if (superseded.length > 0) {
-      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       if (latest && !await this.#saveDispatchLifecycle(record, latest.phase)) {
         throw new Error(`Failed to persist superseded babysitter cleanup for ${record.issue.key}`)
       }
@@ -13833,7 +14238,7 @@ export class FactoryLoop implements Factory {
 
   async #retireBabysittersOutsideCurrentRoutes(record: InFlightIssue): Promise<void> {
     const wantedRepos = new Set(record.decision.implementers.map((implementer) => implementer.repo.toLowerCase()))
-    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
     const trackedAgents = new Map([
       ...(lifecycle?.agents ?? [])
         .filter((agent) => agent.releasedAtMs === undefined)
@@ -13879,7 +14284,7 @@ export class FactoryLoop implements Factory {
       })
     }
     if (unrouted.length > 0) {
-      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      const latest = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       if (latest && !await this.#saveDispatchLifecycle(record, latest.phase)) {
         throw new Error(`Failed to persist unrouted babysitter cleanup for ${record.issue.key}`)
       }
@@ -13893,7 +14298,7 @@ export class FactoryLoop implements Factory {
   // guards on the PR's OWN webhook-fed meta (still open, not a draft, not already
   // merged) before flipping the issue to Human Review. No `gh` call.
   async #maybeAdvanceToHumanReview(record: InFlightIssue, agentName: string): Promise<void> {
-    if (this.#completionInFlight.has(issueKey(record.issue))) {
+    if (this.#completionInFlight.has(dispatchLifecycleKey(record.issue))) {
       return
     }
 
@@ -13999,7 +14404,7 @@ export class FactoryLoop implements Factory {
         const tree = await this.#listRelayfileTree(root, 'PR meta path discovery')
         found.push(...tree.filter((path) => path.endsWith('.json') && numberSegment.test(path)))
       } catch (error) {
-        if (relayfileOverload(error)) throw error
+        if (isPassWideRelayfileFault(error)) throw error
         // try the next root
       }
     }
@@ -14040,7 +14445,7 @@ export class FactoryLoop implements Factory {
       mergedPullRequest?: SlackPullRequestRef
     } = {},
   ): Promise<void> {
-    const completionKey = issueKey(record.issue)
+    const completionKey = dispatchLifecycleKey(record.issue)
     if (this.#completionInFlight.has(completionKey)) {
       return
     }
@@ -14186,7 +14591,7 @@ export class FactoryLoop implements Factory {
       // Cancellation must see the subscription identity so it can issue the
       // idempotent Relayfile DELETE before clearing the local owner maps.
       await this.#cancelBabysittersForIssue(record.issue)
-      const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(record.issue)).catch(() => undefined)
+      const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue)).catch(() => undefined)
       if (!this.#usesDurableDispatchLifecycle() || (durable && isTerminalDispatchLifecycle(durable))) {
         for (const publishedKey of this.#publishedPullRequests.keys()) {
           if (publishedKey.startsWith(`${completionKey}:`)) this.#publishedPullRequests.delete(publishedKey)
@@ -14287,7 +14692,7 @@ export class FactoryLoop implements Factory {
 
   async #claimTicketDispatchNotification(record: InFlightIssue): Promise<boolean> {
     if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return true
-    const key = issueKey(record.issue)
+    const key = dispatchLifecycleKey(record.issue)
     return this.#serializeDispatchLifecyclePersistence(key, async () => {
       const epoch = this.#dispatchLifecycleEpochs.get(key)
       if (epoch === undefined) {
@@ -14361,7 +14766,7 @@ export class FactoryLoop implements Factory {
     void (async () => {
       try {
         const lifecycle = issue
-          ? await this.#state.getDispatchLifecycle(this.#workspaceId, issueKey(issue)).catch(() => undefined)
+          ? await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(issue)).catch(() => undefined)
           : undefined
         if (lifecycle) {
           await this.#reportLifecycle(lifecycle, 'factory.failure', {
@@ -14656,7 +15061,7 @@ export class FactoryLoop implements Factory {
     additional: SlackPullRequestRef[] = [],
   ): Promise<SlackPullRequestRef[]> {
     const lifecycle = await this.#state
-      .getDispatchLifecycle(this.#workspaceId, issueKey(record.issue))
+      .getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue))
       .catch(() => undefined)
     const lifecycleRefs = publishedPullRequests(lifecycle).map((receipt) => ({
       repo: receipt.repo,
@@ -15057,7 +15462,7 @@ export class FactoryLoop implements Factory {
 
   async #ownsActiveSlackConversationIssue(issue: IssueRef): Promise<boolean> {
     if (!(await this.#batch()).getIssue(issue)) return false
-    const key = issueKey(issue)
+    const key = dispatchLifecycleKey(issue)
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     if (!lifecycle) return true
     if (lifecycle.phase === 'releasing' || isTerminalDispatchLifecycle(lifecycle)) return false
@@ -15320,7 +15725,7 @@ export class FactoryLoop implements Factory {
       try {
         return await this.#listRelayfileTree(prefix, 'Slack identity lookup')
       } catch (error) {
-        if (relayfileOverload(error)) throw error
+        if (isPassWideRelayfileFault(error)) throw error
         return []
       }
     }
@@ -16604,7 +17009,7 @@ export class FactoryLoop implements Factory {
       if (!waiting.dryRun && this.#usesDurableDispatchLifecycle()) {
         try {
           const claim = await this.#claimDispatchLifecycle(waiting.decision, false)
-          const lifecycleKey = issueKey(waiting.issue)
+          const lifecycleKey = dispatchLifecycleKey(waiting.issue)
           const epoch = this.#dispatchLifecycleEpochs.get(lifecycleKey)
           if (
             claim.lifecycle.phase === 'waiting-for-human' &&
@@ -16904,10 +17309,7 @@ export class FactoryLoop implements Factory {
     }
 
     const clarifiedIssue = issueWithSlackClarification(issue, text)
-    const decision = await this.#triage.triage(clarifiedIssue, {
-      config: this.#config,
-      repoMap: repoMapFromConfig(this.#config),
-    })
+    const decision = await this.#triageWithOrigin(clarifiedIssue)
     const escalationReason = triageEscalationReason(decision)
     if (escalationReason) {
       if (hasDispatchableRoute(decision)) {
@@ -17528,7 +17930,58 @@ const issueRefFromPath = (path: string): IssueRef => {
   return { uuid: uuidFromPath(path) ?? key, key, path }
 }
 
-const issueRef = (issue: LinearIssue): IssueRef => ({ uuid: issue.uuid, key: issue.key, path: issue.path })
+const issueRef = (issue: LinearIssue): IssueRef => {
+  const origin = mirrorWorkUnitOrigin(issue)
+  return { uuid: issue.uuid, key: issue.key, path: issue.path, ...(origin ? { origin } : {}) }
+}
+
+/**
+ * An `IssueRef` for a canonical-state record, carrying the mirror origin from
+ * whichever shape the caller had — a full `LinearIssue`, or an `IssueRef` that
+ * already resolved one.
+ */
+const issueRefForState = (
+  issue: Pick<LinearIssue, 'uuid' | 'key' | 'path'> & { raw?: unknown; origin?: WorkUnitOrigin },
+): IssueRef => {
+  const origin = issue.origin ??
+    (issue.raw === undefined ? undefined : mirrorWorkUnitOrigin({ path: issue.path, raw: issue.raw }))
+  return { uuid: issue.uuid, key: issue.key, path: issue.path, ...(origin ? { origin } : {}) }
+}
+
+/** Work-unit key, or undefined for a row with no derivable provider identity. */
+const safeDispatchLifecycleKey = (issue: IssueRef): string | undefined => {
+  try {
+    return dispatchLifecycleKey(issue)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Re-attaches the provider origin a triage engine did not carry through.
+ * Only fills a gap — an engine that already resolved an origin keeps it.
+ */
+const decisionWithMirrorOrigin = (decision: TriageDecision, issue: LinearIssue): TriageDecision => {
+  if (decision.issue.origin) return decision
+  const origin = mirrorWorkUnitOrigin(issue)
+  return origin ? { ...decision, issue: { ...decision.issue, origin } } : decision
+}
+
+/**
+ * The claim/dedup/lifecycle authority key: the work unit, not the surface it
+ * arrived through.
+ *
+ * `issueKey()` composes the Relayfile sense path, so the same issue reaching
+ * Factory GitHub-native and through its own Linear mirror hashed to two keys
+ * and the lease never saw a conflict — both dispatched (#211, AR-448). Every
+ * durable lifecycle read and write goes through this instead.
+ *
+ * `issueKey()` deliberately stays as-is for the surface-scoped correlation
+ * maps — waiting clarifications, babysitter sessions, Slack threads, preview
+ * ownership — which are keyed by surface on disk and would be orphaned by a
+ * global redefinition.
+ */
+const dispatchLifecycleKey = (issue: IssueRef): string => dispatchIssueIdentity(issue)
 
 // Preserve the historical Linear state namespace while keeping GitHub-native
 // issue numbers independent across repositories in the same workspace.
@@ -18624,7 +19077,7 @@ const resolveIssuePrFromMount = async (
       try {
         for (const path of await listTree(root)) paths.add(path)
       } catch (error) {
-        if (relayfileOverload(error)) throw error
+        if (isPassWideRelayfileFault(error)) throw error
         listErrors.push(error)
       }
     }

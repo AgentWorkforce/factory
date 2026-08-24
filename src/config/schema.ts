@@ -7,6 +7,7 @@ import {
   DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS,
   DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
 } from '../fleet/control-plane-circuit'
+import { DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS } from '../mount/relayfile-operation-timeout'
 
 import { KubernetesEnvironmentConfigSchema } from '../environments/connection-registry.js'
 
@@ -70,6 +71,19 @@ const liveSubscriptionSchema = z.object({
   /** Bounds one sweep so a hung dependency call cannot stop the loop forever. */
   reconcileTimeoutMs: z.number().int().min(50).max(6 * 60 * 60_000)
     .default(DEFAULT_READINESS_RECONCILE_TIMEOUT_MS),
+  /**
+   * Bounds ONE relayfile call (#351).
+   *
+   * Distinct from `reconcileTimeoutMs`, and deliberately far tighter. The
+   * cold-mirror cost that forces the sweep deadline up to 90 minutes is spread
+   * across thousands of calls; no single call has ever needed minutes. So a
+   * per-call bound catches a wedge in five minutes instead of ninety without
+   * re-creating the crash-loop risk described above — and unlike the sweep
+   * deadline it actually unwinds the pass, releasing the discovery lease so the
+   * next cycle starts clean rather than coalescing onto the hung one.
+   */
+  relayfileOperationTimeoutMs: z.number().int().min(50).max(60 * 60_000)
+    .default(DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS),
 }).superRefine((value, ctx) => {
   // A deadline below the interval kills every pass that takes longer than one
   // tick, which is most of them on a cold mirror.

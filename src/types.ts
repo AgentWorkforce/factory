@@ -8,11 +8,13 @@ import type { AgentWorktreeManager } from './ports/worktree'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
 import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
+import type { FactorySweepSkipReasonCode } from './orchestrator/sweep-skip-reason'
 import type { DispatchRelayflowOptions, RelayflowPolicyRegistry } from './dispatch/relayflow-registry'
 import type { VerificationGate } from './environments/verification-pipeline'
 import type { CostLedger } from './cost/ledger'
 import type { TicketDispatchDelivery } from './delivery/ticket-dispatch'
 import type { FleetControlPlaneStatus } from './fleet/control-plane-circuit'
+import type { FleetConnectStatus } from './ports/fleet'
 
 export interface FactoryPorts {
   mount: MountClient
@@ -62,6 +64,17 @@ export interface FactoryPorts {
   relayflows?: FactoryRelayflowDispatchPort
   /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
   worktrees?: AgentWorktreeManager
+  /**
+   * This instance serves a read-only command (`status`, a `--dry-run` sweep) and
+   * must be free of workspace side effects.
+   *
+   * Construction alone used to subscribe to fleet events, and subscribing mints
+   * this process's relay identity — so `factory status` created an agent row it
+   * then abandoned before presence, which is what wedged cloud dispatch for a
+   * week (factory-cloud#55). A read-only instance skips that wiring and refuses
+   * `start()`; pair it with a read-only `fleet` client for the hard guarantee.
+   */
+  readOnly?: boolean
 }
 
 export interface FactoryRelayflowDispatchPort extends Omit<DispatchRelayflowOptions, 'cwd'> {
@@ -114,6 +127,12 @@ export interface FactoryLiveSubscriptionOptions {
    * sized above realistic worst-case mirror hydration, not to the interval.
    */
   reconcileTimeoutMs: number
+  /**
+   * Deadline for one relayfile call inside a sweep (#351). Bounds what
+   * `reconcileTimeoutMs` cannot: a single dependency call that never returns,
+   * which no deadline checked *between* awaits can reach.
+   */
+  relayfileOperationTimeoutMs: number
 }
 
 /**
@@ -139,10 +158,27 @@ export type FactoryLoopHeartbeatStatus = 'running' | 'idle' | 'stopping'
 export interface FactoryLoopHeartbeat {
   pid: number
   status: FactoryLoopHeartbeatStatus
+  /** Writer path for this record; `live-timer` proves process liveness only. */
+  source?: 'live-timer' | 'bounded-loop'
   iteration: number
   maxIterations: number
+  /** Stable for this loop lifetime; lets readers apply a cold-start grace. */
+  startedAt?: string
+  startedAtMs?: number
+  /** Explicit capability marker for consumers of the progress receipt below. */
+  progressContract?: 'discovery-sweep-v1'
   updatedAt: string
   updatedAtMs: number
+  /**
+   * Advances only after a discovery sweep commits successfully. Timer-only
+   * heartbeat refreshes copy this receipt unchanged.
+   */
+  progress?: {
+    sequence: number
+    operation: 'discovery-sweep'
+    updatedAt: string
+    updatedAtMs: number
+  }
   registryPath?: string
   eventListener?: FactoryEventListenerStatus
   readinessReconcile?: FactoryReadinessReconcileStatus
@@ -150,6 +186,17 @@ export interface FactoryLoopHeartbeat {
   dispatchCapacity?: FactoryDispatchCapacityStatus
   /** Daemon-owned dispatch admission state; status readers must prefer this over a fresh local Factory instance. */
   fleetControlPlane?: FleetControlPlaneStatus
+  /**
+   * State of the fleet EVENT SOCKET dial that makes this Factory agent
+   * `online`. Absent when the backend has no socket. `dialed` is unconfirmed:
+   * the SDK accepted `connect()`, but no stream event has proved the socket
+   * opened, so a healthy silent workspace may remain in that state.
+   *
+   * Distinct from `eventListener`, which is the orchestrator's ISSUE
+   * subscription. Conflating the two is how a fleet client that registered an
+   * agent and never connected read as healthy on every surface.
+   */
+  fleetConnect?: FleetConnectStatus
   /**
    * Redacted projection of this record, safe to serve unauthenticated (#295).
    *
@@ -195,6 +242,57 @@ export interface FactoryReadinessReconcileStatus {
   lastFailureAtMs?: number
   /** Age of a pass that started and has neither completed nor failed. */
   inFlightMs?: number
+  /**
+   * Work units the last *enumerating* sweep pulled and evaluated (#355).
+   *
+   * Written when a pass settles successfully AND enumerated; left alone by a
+   * pass that failed, one still running, and one that deferred to another
+   * process's lease. `lastEnumeratedAtMs` — not `lastCompletedAtMs` — is what
+   * dates them, because the latter advances on deferred passes too.
+   *
+   * Optional, and never defaulted to zero. A sweep that ran and found nothing
+   * publishes `0`; a daemon that has not enumerated a sweep publishes nothing
+   * at all, and the whole point of the field is that those two are different
+   * facts — `candidates: 0` blames discovery, an absent `candidates` blames
+   * nobody yet.
+   */
+  candidates?: number
+  /** Work units the last enumerating sweep actually dispatched. */
+  dispatched?: number
+  /** Work units the last enumerating sweep saw and declined. */
+  skipped?: number
+  /**
+   * `skipped` split by cause. Zero-count codes are omitted; the codes
+   * themselves are a fixed published vocabulary, so an absent key is a zero.
+   */
+  skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
+  /**
+   * When the pass the counts above describe finished enumerating (#359 review).
+   *
+   * NOT `lastCompletedAtMs`, and the difference is the point. That timestamp
+   * advances on every settled pass including a deferred one, which enumerates
+   * nothing; this one advances only when a pass actually enumerated. Equal on
+   * a daemon that is sweeping normally; where they differ, the gap is how
+   * stale the counts are — the freshness a reader otherwise could not
+   * recover, since retained counts sat beside an ever-fresh completion stamp.
+   */
+  lastEnumeratedAtMs?: number
+  /**
+   * The MOST RECENT pass never enumerated anything: another process held the
+   * discovery lease, so it returned an empty report immediately.
+   *
+   * Without this, that pass is indistinguishable from a sweep that queried the
+   * provider and legitimately found no ready work — both would publish
+   * `candidates: 0` — and those are opposite diagnoses (#355).
+   *
+   * Independent of the counts above, which describe the last sweep that
+   * actually enumerated. A deferred pass records only this marker: its zeroes
+   * measure nothing and must not overwrite a real sweep's numbers, which on a
+   * persistently-held lease would erase them entirely (#358 review). So the two
+   * together mean "the counts are from an earlier pass"; this one alone means
+   * nothing has enumerated yet.
+   */
+  discoveryDeferred?: 'sweep-in-flight'
   /** Free text; authenticated surfaces only. */
   lastError?: string
   /** Allowlisted class name of `lastError`; publishable. */
@@ -216,6 +314,38 @@ export interface FactoryPublicReadinessReconcileHealth {
   inFlightMs?: number
   /** `inFlightMs` expressed in sweeps that should have run and did not. */
   missedPasses?: number
+  /**
+   * The last enumerating sweep's arithmetic, published (#355).
+   *
+   * Counts only — no issue keys, no paths, no titles — and absent rather than
+   * zero until a sweep has completed enumeration, so "never enumerated" and
+   * "enumerated and found nothing" are two different readings of this surface
+   * rather than one. A completed deferral still leaves these absent.
+   */
+  candidates?: number
+  dispatched?: number
+  skipped?: number
+  /** `skipped` split by a closed vocabulary of causes; zero counts omitted. */
+  skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
+  /**
+   * When the pass the counts describe finished enumerating. Dates them —
+   * `lastCompletedAtMs` does not, since it advances on deferred passes too.
+   */
+  lastEnumeratedAtMs?: number
+  /**
+   * A producer supplied some enumeration counts, but the trio was incomplete
+   * or invalid and was rejected during normalization. This is not equivalent
+   * to a genuine first-pass deferral with no enumeration evidence.
+   */
+  enumerationCountsInvalid?: true
+  /**
+   * The most recent pass deferred to another process's discovery lease. Present
+   * alongside the counts it means they are from an earlier pass. Present alone
+   * means nothing has enumerated yet only when `enumerationCountsInvalid` is
+   * absent; otherwise a supplied snapshot was unusable and prior enumeration
+   * is unknown.
+   */
+  discoveryDeferred?: 'sweep-in-flight'
   lastErrorClass?: string
 }
 
@@ -336,6 +466,22 @@ export interface FactoryPublicEventListenerHealth {
  * probe failure names sockets and paths — so only the state, the counters and
  * the retry instant cross.
  */
+/**
+ * Unauthenticated view of the fleet socket. State and counters only.
+ *
+ * `lastError` is deliberately absent for the same reason it is absent from the
+ * control-plane block: it stays behind the authenticated `/evidence`.
+ */
+export interface FactoryPublicFleetConnectHealth {
+  state: FleetConnectStatus['state'] | 'unknown'
+  attempts?: number
+  lastAttemptAtMs?: number
+  lastDialedAtMs?: number
+  firstEventAtMs?: number
+  lastConnectedAtMs?: number
+  lastFailureAtMs?: number
+}
+
 export interface FactoryPublicFleetControlPlaneHealth {
   state: FleetControlPlaneStatus['state'] | 'unknown'
   consecutiveFailures: number
@@ -376,6 +522,8 @@ export interface FactoryPublicHealth {
   readinessReconcile?: FactoryPublicReadinessReconcileHealth
   eventListener?: FactoryPublicEventListenerHealth
   fleetControlPlane?: FactoryPublicFleetControlPlaneHealth
+  /** Fleet event socket. NOT dispatch-gating: see DISPATCH_GATING_SUBSYSTEMS. */
+  fleetConnect?: FactoryPublicFleetConnectHealth
   dispatchCapacity?: FactoryPublicDispatchCapacityHealth
 }
 
@@ -471,19 +619,54 @@ export interface LinearIssue {
   raw: Record<string, unknown>
 }
 
+/**
+ * Where the work unit actually lives, when the surface that offered it is a
+ * mirror rather than the origin.
+ *
+ * A `[factory]` Linear mirror of a GitHub issue has Linear's uuid, key and
+ * sense path but is the same unit of work as the GitHub issue it mirrors.
+ * Without the origin recorded structurally, the mirror and the GitHub-native
+ * row derive different work-unit identities and both dispatch — the AR-448
+ * shape. The surface fields stay authoritative for writeback; this is only
+ * for identity.
+ */
+export interface WorkUnitOrigin {
+  provider: 'github'
+  owner: string
+  repo: string
+  number: number
+}
+
 export interface IssueRef {
   uuid: string
   key: string
   path: string
+  /** Provider-native origin when this ref came from a mirror. Absent for a native surface. */
+  origin?: WorkUnitOrigin
 }
 
 export interface IterationReport {
   pulled: IssueRef[]
   triaged: TriageDecision[]
   dispatched: DispatchResult[]
-  skipped: Array<{ issue: IssueRef; reason: string }>
+  /**
+   * `reason` is free text for an operator; `code` is the closed vocabulary
+   * that may cross onto the unauthenticated health surface (#355).
+   */
+  skipped: Array<{ issue: IssueRef; reason: string; code?: FactorySweepSkipReasonCode }>
   dryRun: boolean
   slackDegraded?: boolean
+  /**
+   * Orphan recovery did not run for this sweep, so `factory:in-progress`
+   * claims were preserved rather than reconciled.
+   *
+   * `dry-run` is expected and benign: a dry run never releases a claim, so it
+   * deliberately skips building the safety context — which on a read-only
+   * fleet client would mean minting a workspace identity just to decide what
+   * the sweep WOULD do. `context-unavailable` is the real degradation: a live
+   * sweep tried to build the context and could not.
+   */
+  orphanRecoveryDegraded?: 'dry-run' | 'context-unavailable'
   /** A cross-process owner was already enumerating this workspace. */
   discoveryDeferred?: 'sweep-in-flight'
   error?: { message: string; stack?: string }
@@ -518,6 +701,8 @@ export interface FactoryStatus {
   counters: Record<string, number>
   /** Broker/fleet mutation gate. An open circuit blocks new workers until a successful half-open roster probe. */
   fleetControlPlane: FleetControlPlaneStatus
+  /** Fleet event socket status. Absent when the backend has no socket. */
+  fleetConnect?: FleetConnectStatus
   slackDegraded?: boolean
   slackDegradedReason?: string
   /** Primary Relayfile subscription/poll registration, not event activity. */

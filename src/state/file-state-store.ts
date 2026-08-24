@@ -21,8 +21,15 @@ import type {
   SlackThreadWatchState,
   WaitingClarification,
 } from '../ports/state'
+import { DispatchLifecycleMigrationConflictError } from '../ports/state'
 import { InMemoryStateStore, type InMemoryStateStoreOptions } from './in-memory-state-store'
-import { matchingGithubLifecycleEntry } from './github-lifecycle-identity'
+import {
+  asMigrationAlias,
+  isMigrationAlias,
+  migrateDispatchLifecycleKeys,
+  planLifecycleMigration,
+  prunableMigrationAliases,
+} from './work-unit-lifecycle-migration'
 import { dispatchLifecycleOccupiesSlot, stampDispatchLifecycleSlot } from './dispatch-lifecycle-slot'
 import type {
   PersistedWorkspaceState,
@@ -238,11 +245,10 @@ export class DocumentStateStore extends InMemoryStateStore {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+      // Adopt any row written under a pre-#211 key before deciding no claim
+      // exists, so a deploy does not create a second claim for live work.
+      const migrated = applyLifecycleMigration(workspace.dispatchLifecycles, key, seed, nowMs)
       let lifecycle = workspace.dispatchLifecycles[key]
-      if (!lifecycle) {
-        const matching = matchingGithubLifecycleEntry(Object.entries(workspace.dispatchLifecycles), seed)
-        if (matching) [key, lifecycle] = matching
-      }
       const created = !lifecycle
       if (!lifecycle) {
         lifecycle = cloneLifecycle(seed)
@@ -252,7 +258,8 @@ export class DocumentStateStore extends InMemoryStateStore {
       const terminal = lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
       const activeOtherOwner = lifecycle.lease && lifecycle.lease.owner !== owner && lifecycle.lease.leaseUntilMs > nowMs
       if (terminal || activeOtherOwner) {
-        return { key, acquired: false, lifecycle: cloneLifecycle(lifecycle), created }
+        if (migrated) await this.#persist(document)
+        return { acquired: false, lifecycle: cloneLifecycle(lifecycle), created }
       }
       const epoch = lifecycle.lease?.owner === owner
         ? lifecycle.lease.epoch
@@ -265,7 +272,6 @@ export class DocumentStateStore extends InMemoryStateStore {
       stampDispatchLifecycleSlot(lifecycle, lifecycle, nowMs)
       await this.#persist(document)
       return {
-        key,
         acquired: true,
         lifecycle: cloneLifecycle(lifecycle),
         lease: { ...lifecycle.lease },
@@ -370,7 +376,10 @@ export class DocumentStateStore extends InMemoryStateStore {
   override async listDispatchLifecycles(workspaceId: string): Promise<Array<[string, DispatchLifecycle]>> {
     return await this.#exclusive(async () => {
       const lifecycles = (await this.#loadFromDisk()).workspaces[workspaceId]?.dispatchLifecycles ?? {}
-      return Object.entries(lifecycles).map(([key, lifecycle]) => [key, cloneLifecycle(lifecycle)])
+      // Migration aliases are audit evidence, never adoptable work.
+      return Object.entries(lifecycles)
+        .filter(([, lifecycle]) => !isMigrationAlias(lifecycle))
+        .map(([key, lifecycle]) => [key, cloneLifecycle(lifecycle)])
     })
   }
 
@@ -1235,7 +1244,13 @@ export class DocumentStateStore extends InMemoryStateStore {
   }
 
   async #loadFromDisk(): Promise<WatchStateDocument> {
-    return await this.#documentStore.read()
+    const document = await this.#documentStore.read()
+    // Rows persisted under a pre-#211 key are rekeyed as the document loads, so
+    // startup adoption walks canonical keys and every later read finds them.
+    for (const workspace of Object.values(document.workspaces)) {
+      migrateWorkspaceLifecycleKeys(workspace.dispatchLifecycles)
+    }
+    return document
   }
 
   async #persist(document: WatchStateDocument): Promise<void> {
@@ -1399,7 +1414,55 @@ const dispatchLifecycleLeaseMatches = (
   : expected !== undefined && current.owner === expected.owner && current.epoch === expected.epoch
 
 const activeDispatchLifecycleCount = (lifecycles: Record<string, DispatchLifecycle>, exceptKey?: string): number =>
-  Object.entries(lifecycles).filter(([key, lifecycle]) => key !== exceptKey && dispatchLifecycleOccupiesSlot(lifecycle)).length
+  Object.entries(lifecycles).filter(([key, lifecycle]) =>
+    key !== exceptKey && !isMigrationAlias(lifecycle) && dispatchLifecycleOccupiesSlot(lifecycle)).length
+
+/**
+ * Moves a row persisted under a pre-#211 key onto the canonical work-unit key,
+ * demotes any other matching rows to audit-only aliases, and prunes aliases
+ * that have outlived the retention policy. Returns whether anything changed.
+ *
+ * Throws rather than choosing when two keys both hold a live lease.
+ */
+const migrateWorkspaceLifecycleKeys = (
+  lifecycles: Record<string, DispatchLifecycle>,
+): boolean => migrateDispatchLifecycleKeys(
+  () => Object.entries(lifecycles),
+  (from, to) => {
+    lifecycles[to] = lifecycles[from]!
+    delete lifecycles[from]
+  },
+  (key, canonicalKey) => {
+    lifecycles[key] = asMigrationAlias(lifecycles[key]!, canonicalKey)
+  },
+)
+
+const applyLifecycleMigration = (
+  lifecycles: Record<string, DispatchLifecycle>,
+  canonicalKey: string,
+  seed: Pick<DispatchLifecycle, 'issue'>,
+  nowMs: number,
+): boolean => {
+  const plan = planLifecycleMigration(Object.entries(lifecycles), canonicalKey, seed, nowMs)
+  if (plan.outcome === 'conflict') {
+    throw new DispatchLifecycleMigrationConflictError(canonicalKey, plan.keys)
+  }
+  let changed = false
+  if (plan.outcome === 'adopt') {
+    lifecycles[canonicalKey] = lifecycles[plan.from]!
+    delete lifecycles[plan.from]
+    changed = true
+  }
+  for (const aliasKey of plan.aliases) {
+    lifecycles[aliasKey] = asMigrationAlias(lifecycles[aliasKey]!, canonicalKey, nowMs)
+    changed = true
+  }
+  for (const pruned of prunableMigrationAliases(Object.entries(lifecycles), nowMs)) {
+    delete lifecycles[pruned]
+    changed = true
+  }
+  return changed
+}
 
 const emptyWorkspaceState = (): PersistedWorkspaceState => ({
   githubIssueCommentWatches: {},

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
+import { describeControlPlaneError } from './control-plane-circuit'
+import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, ReadOnlyFleetIdentityError, RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
 import { runFleetCli } from '../cli/fleet'
 
 import type {
@@ -37,6 +38,7 @@ class FakeMessaging {
   agentPresenceRows: Array<{ agentId: string; agentName: string; status: 'online' | 'offline' }> | undefined
   nodeRows: Array<Partial<RelayNode> & { name: string }> = []
   directError: Error | undefined
+  connectEvent: unknown | undefined
   connected = 0
   disconnected = 0
   nextInvocationId = 0
@@ -135,6 +137,7 @@ class FakeMessaging {
   readonly events = {
     connect: () => {
       this.connected += 1
+      if (this.connectEvent !== undefined) this.emit('any', this.connectEvent)
     },
     disconnect: async () => {
       this.disconnected += 1
@@ -1152,6 +1155,65 @@ describe('RelayFleetClient', () => {
     ])
   })
 
+  // The must-not-fire half of the test above, at the site that does the write.
+  //
+  // Registration is the only workspace mutation in this client's bootstrap, so
+  // a read-only client that reaches it has already caused the outage: the row
+  // exists, the process exits before presence, and the live daemon that boots
+  // next under the same name can never reclaim it (factory-cloud#55). Asserting
+  // on the register call rather than on `roster()`'s rejection is deliberate —
+  // the requirement is "no agent row", not "the call failed".
+  it('refuses to register an identity when the client is read-only', async () => {
+    const messaging = new FakeMessaging()
+    const registered: Array<{ name: string }> = []
+    const bootstrap: RelayClientLike = {
+      messaging: {
+        agents: {
+          register: async (input: { name: string }) => {
+            registered.push(input)
+            return { id: 'agent-1', name: input.name, token: 'at_live_rotated', status: 'online' }
+          },
+        },
+      } as unknown as RelayMessaging,
+    }
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      readOnly: true,
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+    })
+
+    const outcome = await fleet.roster().then(() => 'resolved' as const, (error: unknown) => error)
+
+    // Asserted first, and on the recorded call rather than on the rejection, so
+    // a regression reports the thing that matters: an agent row was created.
+    expect(registered).toEqual([])
+    expect(outcome).toBeInstanceOf(ReadOnlyFleetIdentityError)
+  })
+
+  // A read-only client is not an offline one. Handed an identity it did not
+  // have to create, it reads the fleet normally — which is what keeps the mode
+  // safe to apply to every read-only command rather than only to `status`.
+  it('reads the fleet read-only when an agent token is already supplied', async () => {
+    const messaging = new FakeMessaging()
+    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    const registered: Array<{ name: string }> = []
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      agentToken: 'at_live_supplied',
+      readOnly: true,
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: () => ({ messaging: messaging.asMessaging() }),
+    })
+
+    await expect(fleet.roster()).resolves.toBeDefined()
+    expect(registered).toEqual([])
+  })
+
   // A stub with @relaycast/sdk 8.2.0's REAL semantics: `registerOrRotate` and
   // `registerOrGet` are deprecated aliases that just call `register`, and the
   // engine answers a name it already holds with 409 agent_already_exists.
@@ -1399,14 +1461,23 @@ describe('RelayFleetClient', () => {
     },
   )
 
-  // A stale `offline` record plus an unreadable presence must never authorise a
+  // A stale `offline` record plus an UNREADABLE presence must never authorise a
   // seizure: the cost of being wrong is stranding a LIVE factory's credential,
   // and the token taken is the one it would have needed to recover.
+  //
+  // "Unreadable" means exactly that — the request failed, or the body was not a
+  // list. A presence list that WAS read and simply omits this agent is the
+  // opposite case and is covered by the must-fire tests below; conflating the
+  // two is the defect this pair exists to pin.
   it.each([
     ['presence request throws', () => { throw new Error('presence unavailable') }],
     ['presence returns a non-list', () => ({ not: 'a list' })],
-    ['presence omits this agent', () => [{ agentName: 'someone-else', status: 'offline' }]],
     ['presence entry carries no status', () => [{ agentName: 'factory' }]],
+    // Omission only means absence if a row FOR this agent would have been
+    // recognised. A row we cannot name breaks that: if the SDK renamed the
+    // naming field, a LIVE agent's row stops matching and reads as absent.
+    ['a presence row carries no agent name', () => [{}]],
+    ['presence rows use an unrecognised naming field', () => [{ agent: 'factory', status: 'online' }]],
   ])('fails closed and does not take over when %s', async (_label, impl) => {
     const messaging = new FakeMessaging()
     const { agents, presenceImpl } = deprecatedAliasAgents()
@@ -1432,9 +1503,97 @@ describe('RelayFleetClient', () => {
 
     const error = await fleet.roster().then(() => undefined, (err: unknown) => err)
     expect((error as Error).name).toBe('FactoryAgentRegistrationError')
-    expect((error as Error).message).toMatch(/cannot be confirmed offline|could not read presence/)
+    expect((error as Error).message).toMatch(/cannot be confirmed offline/)
+    // The refusal must not claim absence from presence — that is the other,
+    // now-permitted case, and an operator has to be able to tell them apart.
+    expect((error as Error).message).not.toMatch(/does not list this agent/)
     // The seizure must never have been attempted.
     expect(takeovers).toBe(0)
+  })
+
+  // The must-fire half of the pair. Absence from a presence list we actually
+  // READ is the strongest evidence the engine can give that the agent is
+  // offline; refusing to conclude it is what left an orphaned row permanently
+  // unreclaimable and gated dispatch (factory-cloud#55). The empty-list arm is
+  // the shape a single-agent cloud factory sees, where the dead row is the only
+  // agent there is.
+  it.each([
+    ['presence lists only other agents', () => [{ agentName: 'someone-else', status: 'online' }]],
+    ['presence is readable and empty', () => []],
+  ])('reclaims the identity when %s', async (_label, impl) => {
+    const messaging = new FakeMessaging()
+    const { agents, presenceImpl } = deprecatedAliasAgents()
+    await (agents.register as (i: { name: string }) => Promise<unknown>)({ name: 'factory' })
+    presenceImpl.value = impl as () => unknown
+    const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = []
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      nodeId: 'node_test_1',
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      fetch: (async (url: string, init: { body: string }) => {
+        calls.push({ url, body: JSON.parse(init.body) as Record<string, unknown> })
+        return new Response(
+          JSON.stringify({ ok: true, data: { agent_id: 'agent-1', name: 'factory', token: 'at_live_seized' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }) as unknown as typeof globalThis.fetch,
+      createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+    })
+
+    await expect(fleet.roster()).resolves.toBeDefined()
+
+    // Resolving is not enough on its own: the takeover must actually have been
+    // issued, for this record, rather than the conflict being routed elsewhere.
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.url).toBe('https://cast.agentrelay.com/v1/agents/factory/takeover')
+    expect(calls[0]?.body.expected_agent_id).toBe('agent-1')
+  })
+
+  // Control arm. Both presence shapes run through ONE harness that differs in
+  // nothing but the presence stub, so no setup difference can absorb a swap of
+  // the two branches. The `not.toBe` assertion additionally kills the inert
+  // fixture — the failure mode where both arms take the same path for a reason
+  // unrelated to presence, which is exactly what would let a swapped
+  // implementation pass a pair of separately-written tests.
+  it('separates readable-and-absent from unreadable presence, and would notice a swap', async () => {
+    const run = async (impl: () => unknown): Promise<{ seized: boolean; message: string }> => {
+      const messaging = new FakeMessaging()
+      const { agents, presenceImpl } = deprecatedAliasAgents()
+      await (agents.register as (i: { name: string }) => Promise<unknown>)({ name: 'factory' })
+      presenceImpl.value = impl
+      const bootstrap: RelayClientLike = { messaging: { agents } as unknown as RelayMessaging }
+      let takeovers = 0
+      const fleet = new RelayFleetClient({
+        workspaceKey: 'rk_live_test',
+        env: {},
+        sleep: immediateSleep,
+        pollIntervalMs: 0,
+        fetch: (async () => {
+          takeovers += 1
+          return new Response(
+            JSON.stringify({ ok: true, data: { agent_id: 'agent-1', name: 'factory', token: 'at_live_seized' } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }) as unknown as typeof globalThis.fetch,
+        createRelay: (options) => (options.agentToken ? { messaging: messaging.asMessaging() } : bootstrap),
+      })
+      const error = await fleet.roster().then(() => undefined, (err: unknown) => err)
+      return { seized: takeovers > 0, message: error instanceof Error ? error.message : '' }
+    }
+
+    const absent = await run(() => [{ agentName: 'someone-else', status: 'online' }])
+    const unreadable = await run(() => { throw new Error('presence unavailable') })
+
+    expect(absent.seized).toBe(true)
+    expect(unreadable.seized).toBe(false)
+    // Fails if the harness cannot tell the two apart at all.
+    expect(absent.seized).not.toBe(unreadable.seized)
+    // And the refusal has to say WHICH of the two it was.
+    expect(unreadable.message).toMatch(/presence is unreadable/)
+    expect(absent.message).toBe('')
   })
 
   it('re-reads the agent id and retries once when the identity moved mid-takeover', async () => {
@@ -1832,5 +1991,186 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
 
     await expect(fleet.spawn(spawnInput())).resolves.toMatchObject({ sessionRef: 'session-1' })
     expect(reads).toBe(0)
+  })
+})
+
+/**
+ * The fleet socket had no status anywhere. `#ensureEventSubscription` starts the
+ * subscription with `void ... .catch()` and reported a rejection by calling
+ * `#log` only, so a client that registered an agent and then failed to connect
+ * was indistinguishable from a healthy one on every surface. These pin the
+ * outcome into a field a health surface can publish.
+ */
+describe('RelayFleetClient fleet connect status', () => {
+  it('starts as never-attempted, so an unstarted socket is not reported as healthy', () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    const status = fleet.fleetConnectStatus()
+    expect(status.state).toBe('never-attempted')
+    expect(status.attempts).toBe(0)
+    expect(status.lastError).toBeUndefined()
+  })
+
+  it('reports only dialed until the socket produces a confirming event', async () => {
+    const messaging = new FakeMessaging()
+    let now = 1_000
+    const fleet = createClient(messaging, { now: () => ++now })
+    fleet.onAgentExit(() => {})
+    await flush()
+
+    expect(fleet.fleetConnectStatus()).toMatchObject({
+      state: 'dialed',
+      attempts: 1,
+      lastDialedAtMs: 1_002,
+    })
+    expect(fleet.fleetConnectStatus().firstEventAtMs).toBeUndefined()
+    expect(messaging.connected).toBe(1)
+
+    messaging.emit('any', { type: 'connected' })
+    expect(fleet.fleetConnectStatus()).toMatchObject({
+      state: 'connected',
+      firstEventAtMs: 1_003,
+      lastConnectedAtMs: 1_003,
+    })
+  })
+
+  it('records an established socket dropping and its later recovery', async () => {
+    const messaging = new FakeMessaging()
+    let now = 2_000
+    const fleet = createClient(messaging, { now: () => ++now })
+    fleet.onAgentExit(() => {})
+    await flush()
+
+    messaging.emit('any', { type: 'connected' })
+    const firstEventAtMs = fleet.fleetConnectStatus().firstEventAtMs
+    messaging.emit('any', { type: 'disconnected' })
+    expect(fleet.fleetConnectStatus()).toMatchObject({
+      state: 'failed',
+      lastError: 'RelayEventStreamDisconnected',
+    })
+
+    messaging.emit('any', { type: 'reconnecting', attempt: 1 })
+    expect(fleet.fleetConnectStatus().state).toBe('connecting')
+    messaging.emit('any', { type: 'connected' })
+    expect(fleet.fleetConnectStatus().state).toBe('connected')
+    expect(fleet.fleetConnectStatus().firstEventAtMs).toBe(firstEventAtMs)
+    expect(fleet.fleetConnectStatus().lastError).toBeUndefined()
+  })
+
+  it('does not overwrite a synchronous connection event with dialed', async () => {
+    const messaging = new FakeMessaging()
+    messaging.connectEvent = { type: 'connected' }
+    const fleet = createClient(messaging)
+    fleet.onAgentExit(() => {})
+    await flush()
+
+    expect(fleet.fleetConnectStatus().state).toBe('connected')
+    expect(fleet.fleetConnectStatus().lastDialedAtMs).toBeTypeOf('number')
+    expect(fleet.fleetConnectStatus().firstEventAtMs).toBeTypeOf('number')
+  })
+
+  /**
+   * THE REGRESSION THIS EXISTS FOR. Before, this produced a `#log` line and
+   * nothing else: every status surface still read healthy.
+   */
+  it('records a failed subscription instead of only logging it', async () => {
+    const messaging = new FakeMessaging()
+    messaging.commands.available = () => false
+    const fleet = createClient(messaging)
+    fleet.onAgentExit(() => {})
+    await flush()
+    const status = fleet.fleetConnectStatus()
+    expect(status.state).toBe('failed')
+    expect(status.attempts).toBe(1)
+    expect(status.lastFailureAtMs).toBeTypeOf('number')
+    expect(status.lastError).toBeDefined()
+    expect(messaging.connected).toBe(0)
+  })
+
+  /**
+   * CONTROL. The failure arm above only means something if the SAME harness can
+   * produce the other outcome -- otherwise it would pass against a client that
+   * reports 'failed' unconditionally.
+   */
+  it('the same harness yields connected when the gate does not throw', async () => {
+    const failing = new FakeMessaging()
+    failing.commands.available = () => false
+    const failingFleet = createClient(failing)
+    failingFleet.onAgentExit(() => {})
+    await flush()
+
+    const healthy = new FakeMessaging()
+    const healthyFleet = createClient(healthy)
+    healthyFleet.onAgentExit(() => {})
+    await flush()
+    healthy.emit('any', { type: 'connected' })
+
+    expect(failingFleet.fleetConnectStatus().state).toBe('failed')
+    expect(healthyFleet.fleetConnectStatus().state).toBe('connected')
+  })
+
+  it('reduces the cause to a name and code, never a transport message', async () => {
+    const messaging = new FakeMessaging()
+    messaging.commands.available = () => {
+      const error = new Error('connect failed to wss://relay.example/socket?token=at_live_abcdef0123456789')
+      error.name = 'FleetSocketError'
+      ;(error as Error & { code?: string }).code = 'ECONNREFUSED'
+      throw error
+    }
+    const fleet = createClient(messaging)
+    fleet.onAgentExit(() => {})
+    await flush()
+    const lastError = fleet.fleetConnectStatus().lastError ?? ''
+    expect(lastError).toBe('FleetSocketError (ECONNREFUSED)')
+    expect(lastError).not.toContain('at_live_')
+    expect(lastError).not.toContain('wss://')
+  })
+})
+
+/**
+ * Production reported `fleetControlPlane.lastError: "FactoryAgentRegistrationError"`
+ * and that string was the whole answer: ten different throw sites reduce to it,
+ * and the sentence naming which one fired is discarded by redaction. These pin
+ * the code through the SAME reducer every published surface uses.
+ */
+describe('registration failures survive redaction with their cause', () => {
+  it('renders the discriminating code after the error name', () => {
+    const error = new FactoryAgentRegistrationError(
+      'factory-cloud-7d6e3ca1',
+      'PRESENCE_STATUS_MISSING',
+      'presence reported no status for this agent, so it cannot be confirmed offline',
+    )
+    expect(describeControlPlaneError(error)).toBe('FactoryAgentRegistrationError (PRESENCE_STATUS_MISSING)')
+  })
+
+  /**
+   * CONTROL. Distinct sites must reduce to DISTINCT strings, or the code adds a
+   * suffix without adding an answer — which is the bug being fixed, one level up.
+   */
+  it('distinguishes the throw sites from one another', () => {
+    const rendered = (
+      [
+        'STATUS_NOT_OFFLINE',
+        'PRESENCE_STATUS_MISSING',
+        'PRESENCE_UNREADABLE',
+        'TAKEOVER_FAILED',
+        'MAX_ATTEMPTS',
+      ] as const
+    ).map((code) => describeControlPlaneError(new FactoryAgentRegistrationError('a', code, 'detail')))
+    expect(new Set(rendered).size).toBe(rendered.length)
+  })
+
+  /** The detail sentence may embed a transport message, so it must NOT survive. */
+  it('still withholds the message the code replaces', () => {
+    const rendered = describeControlPlaneError(
+      new FactoryAgentRegistrationError(
+        'a',
+        'TAKEOVER_FAILED',
+        'could not reclaim the existing identity: POST https://relay.example/v1/agents?token=at_live_abcdef0123456789 failed',
+      ),
+    )
+    expect(rendered).toBe('FactoryAgentRegistrationError (TAKEOVER_FAILED)')
+    expect(rendered).not.toContain('at_live_')
+    expect(rendered).not.toContain('https://')
   })
 })

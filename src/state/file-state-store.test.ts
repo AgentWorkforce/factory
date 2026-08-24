@@ -5,6 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { describe, expect, it } from 'vitest'
 
 import type { BabysitterSessionState, ConversationSessionState, DispatchLifecycle, GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
+import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
 import { FileStateStore } from './file-state-store'
 import { InMemoryStateStore } from './in-memory-state-store'
 
@@ -188,8 +189,8 @@ describe('FileStateStore', () => {
       const watchStatePath = join(root, 'state.json')
       const first = new FileStateStore({ batchSize: 2, watchStatePath })
       const second = new FileStateStore({ batchSize: 2, watchStatePath })
-      const key = 'AR-85:uuid-85:/linear/issues/AR-85.json'
       const seed = dispatchLifecycle(85)
+      const key = dispatchIssueIdentity(seed.issue)
 
       const initial = await first.claimDispatchLifecycle('workspace-1', key, seed, 'owner-a', 1_000, 5_000)
       expect(initial).toMatchObject({ acquired: true, created: true, lease: { owner: 'owner-a', epoch: 1 } })
@@ -240,28 +241,31 @@ describe('FileStateStore', () => {
           146,
           '/github/repos/AgentWorkforce/factory/issues/146__stand-up-test-infra/meta.json',
         )
-        const byIdKey = `146:${byId.issue.uuid}:${byId.issue.path}`
-        const sluggedKey = `146:${slugged.issue.uuid}:${slugged.issue.path}`
+        // Both Relayfile aliases derive the one work-unit identity, so the
+        // second arrival addresses the row the first created rather than
+        // needing the store to hand a different key back.
+        const canonicalKey = dispatchIssueIdentity(byId.issue)
+        expect(dispatchIssueIdentity(slugged.issue)).toBe(canonicalKey)
 
         const initial = await store.claimDispatchLifecycle(
-          workspace, byIdKey, byId, 'owner-a', 1_000, 5_000,
+          workspace, canonicalKey, byId, 'owner-a', 1_000, 5_000,
         )
         const alias = await store.claimDispatchLifecycle(
-          workspace, sluggedKey, slugged, 'owner-a', 1_001, 5_000,
+          workspace, canonicalKey, slugged, 'owner-a', 1_001, 5_000,
         )
 
-        expect(initial).toMatchObject({ key: byIdKey, acquired: true, created: true })
-        expect(alias).toMatchObject({ key: byIdKey, acquired: true, created: false })
+        expect(initial).toMatchObject({ acquired: true, created: true })
+        expect(alias).toMatchObject({ acquired: true, created: false })
         expect(alias.lifecycle.issue.path).toBe(byId.issue.path)
         expect(await store.listDispatchLifecycles(workspace)).toHaveLength(1)
 
-        expect(await store.saveDispatchLifecycle(workspace, byIdKey, 'owner-a', 1, 1_002, {
+        expect(await store.saveDispatchLifecycle(workspace, canonicalKey, 'owner-a', 1, 1_002, {
           ...alias.lifecycle,
           phase: 'complete',
         })).toBe(true)
         await expect(store.claimDispatchLifecycle(
-          workspace, sluggedKey, slugged, 'owner-b', 1_003, 5_000,
-        )).resolves.toMatchObject({ key: byIdKey, acquired: false, created: false, lifecycle: { phase: 'complete' } })
+          workspace, canonicalKey, slugged, 'owner-b', 1_003, 5_000,
+        )).resolves.toMatchObject({ acquired: false, created: false, lifecycle: { phase: 'complete' } })
       }
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -856,7 +860,11 @@ describe('FileStateStore', () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-combined-'))
     try {
       const watchStatePath = join(root, 'factory-state.json')
+      // Babysitter sessions stay keyed by surface; lifecycles moved to the
+      // work-unit identity (#211). The two keys are no longer the same string.
       const issueKey = 'AR-9387:uuid-9387:/linear/issues/AR-9387__uuid-9387.json'
+      const seed = dispatchLifecycle(93)
+      const lifecycleKey = dispatchIssueIdentity(seed.issue)
       const session: BabysitterSessionState = {
         issue: { uuid: 'uuid-9387', key: 'AR-9387', path: '/linear/issues/AR-9387__uuid-9387.json' },
         repo: 'AgentWorkforce/factory',
@@ -868,26 +876,26 @@ describe('FileStateStore', () => {
       }
       const first = new FileStateStore({ batchSize: 2, watchStatePath })
       const claim = await first.claimDispatchLifecycle(
-        'workspace-1', issueKey, dispatchLifecycle(93), 'owner-a', 1_000, 5_000,
+        'workspace-1', lifecycleKey, seed, 'owner-a', 1_000, 5_000,
       )
       expect(claim.acquired).toBe(true)
       await first.setBabysitterSession('workspace-1', issueKey, session)
 
       const restarted = new FileStateStore({ batchSize: 2, watchStatePath })
       expect(await restarted.listBabysitterSessions('workspace-1')).toEqual([[issueKey, session]])
-      expect(await restarted.getDispatchLifecycle('workspace-1', issueKey)).toMatchObject({
+      expect(await restarted.getDispatchLifecycle('workspace-1', lifecycleKey)).toMatchObject({
         phase: 'dispatching',
         lease: { owner: 'owner-a', epoch: 1 },
       })
 
-      expect(await restarted.saveDispatchLifecycle('workspace-1', issueKey, 'owner-a', 1, 1_001, {
+      expect(await restarted.saveDispatchLifecycle('workspace-1', lifecycleKey, 'owner-a', 1, 1_001, {
         ...claim.lifecycle,
         phase: 'published',
       })).toBe(true)
       expect(await restarted.listBabysitterSessions('workspace-1')).toEqual([[issueKey, session]])
 
       await restarted.clearBabysitterSession('workspace-1', issueKey)
-      expect(await new FileStateStore({ batchSize: 2, watchStatePath }).getDispatchLifecycle('workspace-1', issueKey))
+      expect(await new FileStateStore({ batchSize: 2, watchStatePath }).getDispatchLifecycle('workspace-1', lifecycleKey))
         .toMatchObject({ phase: 'published' })
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -900,13 +908,15 @@ describe('FileStateStore', () => {
       const watchStatePath = join(root, 'state.json')
       const first = new FileStateStore({ batchSize: 1, watchStatePath })
       const second = new FileStateStore({ batchSize: 1, watchStatePath })
-      const firstKey = 'AR-851:uuid-851:/linear/issues/AR-851.json'
-      const secondKey = 'AR-852:uuid-852:/linear/issues/AR-852.json'
+      const firstSeed = dispatchLifecycle(851)
+      const secondSeed = dispatchLifecycle(852)
+      const firstKey = dispatchIssueIdentity(firstSeed.issue)
+      const secondKey = dispatchIssueIdentity(secondSeed.issue)
       const firstClaim = await first.claimDispatchLifecycle(
-        'workspace-1', firstKey, dispatchLifecycle(851), 'owner-a', 1_000, 5_000,
+        'workspace-1', firstKey, firstSeed, 'owner-a', 1_000, 5_000,
       )
       const secondClaim = await second.claimDispatchLifecycle(
-        'workspace-1', secondKey, dispatchLifecycle(852), 'owner-b', 1_001, 5_000,
+        'workspace-1', secondKey, secondSeed, 'owner-b', 1_001, 5_000,
       )
 
       expect(firstClaim.lifecycle.phase).toBe('dispatching')
@@ -933,8 +943,8 @@ describe('FileStateStore', () => {
       ]
       for (const [index, store] of stores.entries()) {
         const workspace = `workspace-${index}`
-        const promotedKey = `promoted-${index}`
         const queuedSeed = { ...dispatchLifecycle(880 + index), phase: 'queued' as const }
+        const promotedKey = dispatchIssueIdentity(queuedSeed.issue)
         const snapshot = await store.claimDispatchLifecycle(
           workspace, promotedKey, queuedSeed, `owner-${index}`, 1_000, 5_000,
         )
@@ -946,9 +956,10 @@ describe('FileStateStore', () => {
         expect(await store.clearQueuedDispatchLifecycle(workspace, promotedKey, snapshot.lease)).toBe(false)
         expect(await store.getDispatchLifecycle(workspace, promotedKey)).toMatchObject({ phase: 'dispatching' })
 
-        const queuedKey = `queued-${index}`
+        const laterSeed = { ...dispatchLifecycle(890 + index), phase: 'queued' as const }
+        const queuedKey = dispatchIssueIdentity(laterSeed.issue)
         const queued = await store.claimDispatchLifecycle(
-          workspace, queuedKey, { ...dispatchLifecycle(890 + index), phase: 'queued' }, `owner-q-${index}`, 1_002, 5_000,
+          workspace, queuedKey, laterSeed, `owner-q-${index}`, 1_002, 5_000,
         )
         expect(await store.clearQueuedDispatchLifecycle(workspace, queuedKey, queued.lease)).toBe(true)
         expect(await store.getDispatchLifecycle(workspace, queuedKey)).toBeUndefined()

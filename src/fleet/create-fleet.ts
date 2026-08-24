@@ -1,5 +1,9 @@
 import { InternalFleetClient, type HarnessDriverClientLike } from './internal-fleet-client'
-import { RelayFleetClient } from './relay-fleet-client'
+import {
+  RelayFleetClient,
+  type RelayClientFactoryOptions,
+  type RelayClientLike,
+} from './relay-fleet-client'
 import type { Logger } from '../ports/system'
 import type { PreviewConfig } from '../config/schema'
 
@@ -17,6 +21,11 @@ export interface CreateFleetOptions {
    * leaves `RelayFleetClient`'s own default in place.
    */
   relayAgentName?: string
+  /**
+   * Serve a read-only command: the relay backend must not register a workspace
+   * agent. Relay-only; the internal backend registers through its broker.
+   */
+  readOnly?: boolean
 }
 
 export interface CreateFleetDeps {
@@ -31,6 +40,8 @@ export interface CreateFleetDeps {
   logger?: Logger
   /** Hermetic credential environment for the relay backend (tests). */
   env?: NodeJS.ProcessEnv
+  /** Hermetic relay engine transport for the relay backend (tests). */
+  createRelay?: (options: RelayClientFactoryOptions) => RelayClientLike
 }
 
 export function parseOwnedBrokerAgentExitTimeoutMs(value: unknown): number | undefined {
@@ -62,7 +73,9 @@ export function createFleet(options: CreateFleetOptions = {}, deps: CreateFleetD
     return new RelayFleetClient({
       workspaceKey: deps.workspaceKey,
       agentName: options.relayAgentName,
+      readOnly: options.readOnly ?? false,
       env: deps.env,
+      createRelay: deps.createRelay,
       log: deps.logger ? (message) => deps.logger?.info?.(message) : undefined,
     })
   }

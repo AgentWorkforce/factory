@@ -68,7 +68,15 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
     "inFlightSinceMs": 1787224595805,   // when the oldest sweep still running began
     "inFlightMs": 4560000,          // this pass has run 76 minutes
     "missedPasses": 76,
-    "lastErrorClass": "TimeoutError"
+    "lastErrorClass": "TimeoutError",
+    // The last ENUMERATING sweep's arithmetic (#355). Absent until one enumerates.
+    "candidates": 7,                // work units it pulled and evaluated
+    "dispatched": 0,                // work units it dispatched
+    "skipped": 7,                   // work units it saw and declined
+    "skipReasons": { "dispatch-terminal": 7 },
+    // When THOSE counts were measured. Not lastCompletedAtMs, which also
+    // advances on a deferred pass that enumerated nothing.
+    "lastEnumeratedAtMs": 1787224535802
   },
   "eventListener": { "state": "subscribed" },
   "fleetControlPlane": { "state": "closed", "consecutiveFailures": 0, "failureThreshold": 3 }
@@ -86,19 +94,96 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   #296 — fall back to `lastStarted > lastCompleted`, which infers the same thing from timestamp order.
   Prefer the published field: once a sweep has passed its deadline (below) the wait records a failure
   while the sweep underneath it keeps running, and order alone then reports nothing in flight.
+- **`candidates` / `dispatched` / `skipped`** — the *green-but-idle* case, and the fastest question to
+  ask when nothing is being dispatched and every state above reads healthy. On 2026-08-23 a sub-second
+  sweep with `state: healthy`, `consecutiveFailures: 0` and a free dispatch slot declined seven
+  eligible issues, and no surface anyone could reach said which half of the pipeline was at fault.
+
+  - `candidates > 0` — the sweep **saw** those issues and **rejected** them. The bug is in eligibility
+    evaluation, and `skipReasons` names which gate.
+  - `candidates == 0` — the sweep **never pulled** them. The bug is upstream, in discovery/ingestion.
+  - **the three fields absent entirely** — this daemon has not completed a sweep that **enumerated**
+    (or predates #355). That is not a zero, and must not be read as one: it says nothing about either
+    half. Check `discoveryDeferred` first, then `lastCompletedAtMs`, `lastFailureAtMs`, and `inFlightMs`
+    to distinguish a completed deferral, a failure, work still running, and a pre-counter daemon.
+
+  They describe the last sweep that settled successfully **and enumerated**. A pass that failed —
+  or that deferred — leaves them untouched rather than zeroing them.
+
+- **`lastEnumeratedAtMs`** — when those counts were measured, and the field to check before acting on
+  them. It is **not** `lastCompletedAtMs`: that one advances on every settled pass including a
+  deferred one, so on a daemon contending for the discovery lease the counts would otherwise sit
+  beside an ever-fresh completion stamp with no way to tell a measurement one interval old from one
+  four days old. Equal to `lastCompletedAtMs` on a daemon sweeping normally; where they differ, the
+  gap is exactly how stale the counts are.
+
+- **`discoveryDeferred: "sweep-in-flight"`** — the **most recent** pass returned immediately because
+  another process held the discovery lease, so it enumerated nothing. It is tracked apart from the
+  three counts, which describe the last sweep that actually enumerated:
+
+  - **with the counts** — those numbers are from an *earlier* pass, not the one `lastCompletedAtMs`
+    dates. A deferred pass records only this marker; its zeroes measure nothing and must not
+    overwrite a real sweep's numbers, which under a persistently-held lease would erase them.
+  - **alone, with no counts** — nothing has enumerated successfully yet on this daemon. The most
+    recent pass deferred because another process held the lease; an earlier startup attempt may
+    instead have failed before it could publish an outcome.
+
+  `lastCompletedAtMs` *does* move for a deferred pass. That is deliberate: the stall derivation above
+  reads it against `lastStartedAtMs`, so freezing it would report a daemon that is correctly
+  deferring to another owner as hung after ten intervals.
+
+- **`skipReasons`** — `skipped` split by a closed vocabulary
+  (`FACTORY_SWEEP_SKIP_REASON_CODES`); zero-count codes are omitted, so an absent key is a zero, and
+  the counts always sum to `skipped`. The full vocabulary, grouped by what to do about it:
+
+  | code | |
+  |---|---|
+  | `dispatch-terminal`, `dispatch-retry-limit` | **needs a human** — permanently declined, never clears on its own |
+  | `dispatch-backoff`, `dispatch-in-flight`, `already-tracked`, `queued-or-escalated` | transient; resolves by itself |
+  | `out-of-scope`, `not-ready`, `not-dispatchable` | the gate is working as configured and the issue does not match it — check the deployed `safety` config against the issue, not the daemon |
+  | `parked-dependency`, `dependency-cycle` | parked on other work; a cycle needs a human to break it |
+  | `read-failed`, `dispatch-failed` | per-item failures the sweep **absorbed and continued past** (#292/#297) — see below |
+  | `other` | a code this reader's vocabulary does not know, from a producer on another version |
+
+  `read-failed` and `dispatch-failed` count work units an otherwise-**successful** pass gave up on
+  individually. Do **not** reach for `lastErrorClass` to explain them: that field describes a pass
+  that *failed as a whole*, and the success path clears it, so it is absent in exactly this scenario.
+  The per-item messages go to the container log (`[factory] relayfile shed a ready-issue read…`,
+  `[factory] skipped a work unit whose dispatch failed…`); the count here is what tells you to go
+  looking. A rising `read-failed` alongside `state: healthy` is the #297 shedding signature.
+
+  Counts only, by construction: issue keys, paths and titles carry customer project and repository
+  names and never cross onto this surface. The keys are rebuilt from the reader's own copy of the
+  vocabulary — anything unrecognised is counted under `other` rather than dropped, so the parts keep
+  summing to `skipped` — which is also why a record from another version cannot publish an arbitrary
+  string as a key.
+
 - **`fleetControlPlane`** — an `open` circuit fails every spawn and resume fast, so it gates dispatch
   as hard as a failing sweep. `closed` is the healthy value.
 - **`state: "stalled"`** — derived, not written: an in-flight pass older than ten sweep intervals.
   A cold container legitimately spends minutes in its first pass (#36 measured 61 minutes while the
   Relayfile mirror hydrated), so check `lastCompletedAtMs`: absent means "first pass since boot,
   still hydrating"; present and hours old means "was fine, then wedged".
-- **How long a stall can last** — a sweep is bounded at `liveSubscription.reconcileTimeoutMs`,
-  90 minutes by default (#296). On expiry the *wait* fails, so `consecutiveFailures` starts rising
-  and the loop schedules the next pass; the sweep itself is not cancelled, because it holds a durable
-  discovery lease, so `inFlightSinceMs` keeps ageing until it really finishes. A `stalled` state that
-  never turns into a rising `consecutiveFailures` therefore means the process is not running the loop
-  at all, which is a restart, not a wait. The deadline sits above #36's 61-minute measurement on
+- **How long a stall can last** — two deadlines, at different scales.
+
+  `liveSubscription.relayfileOperationTimeoutMs` bounds ONE relayfile call, five minutes by default
+  (#351). This is the one that catches a wedge. Expiry cancels the request, fails the pass with
+  `lastErrorClass: "RelayfileOperationTimeoutError"` and a `lastError` naming the call
+  (`relayfile listTree did not respond within 300000ms (GitHub issue ingestion)`), and unwinds the
+  sweep — which releases the discovery lease, so the next cycle starts clean.
+
+  `liveSubscription.reconcileTimeoutMs` bounds the whole sweep, 90 minutes by default (#296). It is
+  the outer backstop only. On expiry the *wait* fails, so `consecutiveFailures` starts rising and the
+  loop schedules the next pass; the sweep itself is not cancelled, because it holds a durable
+  discovery lease, so `inFlightSinceMs` keeps ageing until it really finishes — and the next pass
+  coalesces onto that same running `runOnce()`. The deadline sits above #36's 61-minute measurement on
   purpose: setting it below realistic cold-mirror hydration would turn a slow boot into a crash loop.
+  Per-call bounds can be far tighter precisely because that cold-mirror cost is spread across
+  thousands of calls rather than concentrated in one.
+
+  A `stalled` state that never turns into a rising `consecutiveFailures` means either the process is
+  not running the loop at all, or it predates #351 — on a current build a hung call fails within
+  `relayfileOperationTimeoutMs`.
 
 ### Why `ok` stays `true` while `status` goes amber
 

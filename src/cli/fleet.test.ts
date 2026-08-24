@@ -27,6 +27,7 @@ import { DocumentStateStore, FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
+import type { RelayMessaging } from '@agent-relay/sdk'
 import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, resolveFactoryBrokerConnectionPath, runFleetCli } from './fleet'
@@ -3237,6 +3238,13 @@ describe('fleet CLI runtime', () => {
           retryAtMs: now + 59_500,
           lastError: 'TimeoutError (FACTORY_FLEET_CONTROL_TIMEOUT)',
         },
+        fleetConnect: {
+          state: 'failed',
+          attempts: 2,
+          lastAttemptAtMs: now - 2_000,
+          lastFailureAtMs: now - 400,
+          lastError: 'RelayEventStreamDisconnected',
+        },
       }))
       const output = buffer()
       const factory = {
@@ -3255,6 +3263,11 @@ describe('fleet CLI runtime', () => {
             timeoutMs: 5_000,
             failureThreshold: 2,
             resetTimeoutMs: 60_000,
+          },
+          fleetConnect: {
+            state: 'connected' as const,
+            attempts: 1,
+            firstEventAtMs: now - 5_000,
           },
         })),
       } as unknown as Factory
@@ -3279,6 +3292,11 @@ describe('fleet CLI runtime', () => {
           state: 'open',
           consecutiveFailures: 2,
           lastError: 'TimeoutError (FACTORY_FLEET_CONTROL_TIMEOUT)',
+        },
+        fleetConnect: {
+          state: 'failed',
+          attempts: 2,
+          lastError: 'RelayEventStreamDisconnected',
         },
       })
     } finally {
@@ -3314,6 +3332,10 @@ describe('fleet CLI runtime', () => {
             failureThreshold: 2,
             resetTimeoutMs: 60_000,
           },
+          fleetConnect: {
+            state: 'connected' as const,
+            attempts: 1,
+          },
         })),
       } as unknown as Factory
 
@@ -3326,7 +3348,9 @@ describe('fleet CLI runtime', () => {
       })
 
       expect(code).toBe(0)
-      expect(JSON.parse(output.text())).not.toHaveProperty('fleetControlPlane')
+      const status = JSON.parse(output.text())
+      expect(status).not.toHaveProperty('fleetControlPlane')
+      expect(status).not.toHaveProperty('fleetConnect')
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -5453,3 +5477,165 @@ const writeConfig = async (root: string, overrides: Record<string, unknown> = {}
 const flush = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
+
+// The discriminating test for factory-cloud#55.
+//
+// Every other test in this file injects `fleet` or `createFleet` and therefore
+// never exercises the client that actually registers. These run the real
+// `RelayFleetClient` through the real `buildFleet`, stubbing only the relay
+// engine, and assert on the one thing the outage turned on: whether an agent
+// row was created.
+describe('read-only CLI commands leave no workspace identity', () => {
+  const relayEnv = { RELAY_WORKSPACE_KEY: 'rk_live_test' }
+
+  const recordingRelay = () => {
+    const registered: Array<{ name: string }> = []
+    const messaging = {
+      agents: {
+        register: async (input: { name: string }) => {
+          registered.push(input)
+          return { id: 'agent-1', name: input.name, token: 'at_live_minted', status: 'online' }
+        },
+        list: async () => [],
+        presence: async () => [],
+        me: async () => ({ name: 'factory' }),
+      },
+      nodes: { list: async () => [] },
+      events: { connect: () => {}, disconnect: async () => {}, on: () => () => {} },
+      commands: { available: () => false },
+    } as unknown as RelayMessaging
+    return { registered, createRelay: () => ({ messaging }) }
+  }
+
+  // The control arm. `fleet roster` needs an identity to read the roster and is
+  // an explicit operator command, not a pre-daemon gate, so it stays live — and
+  // that makes it the proof this harness can reach registration at all. Without
+  // it the assertions below could pass because the fake never gets that far.
+  it('still registers for a command that is not read-only', async () => {
+    const relay = recordingRelay()
+
+    const code = await runFleetCli(['fleet', 'roster', '--backend', 'relay'], {
+      env: relayEnv,
+      createRelay: relay.createRelay,
+      stdout: buffer(),
+      stderr: buffer(),
+    })
+
+    expect(code).toBe(0)
+    expect(relay.registered).toEqual([{ name: 'factory' }])
+  })
+
+  it('creates no agent row for the status preflight the cloud container runs on every boot', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-readonly-status-'))
+    try {
+      const configPath = await writeConfig(root)
+      const relay = recordingRelay()
+      const output = buffer()
+
+      const code = await runFleetCli([
+        'status', '--backend', 'relay', '--config', configPath,
+      ], {
+        env: relayEnv,
+        createRelay: relay.createRelay,
+        mount: new FakeMountClient(),
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(relay.registered).toEqual([])
+      expect(code).toBe(0)
+      expect(JSON.parse(output.text())).toMatchObject({ inFlight: [], queued: [] })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('creates no agent row for the run-once dry run that runs ahead of a start-disabled boot', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-readonly-dryrun-'))
+    try {
+      // GitHub-backed, matching the cloud config template. It is not cosmetic:
+      // that is the branch whose sweep reads the roster for orphan recovery, so
+      // this is the path where skipping the constructor's event wiring is NOT
+      // enough on its own and the client's own refusal to register is what
+      // holds the line.
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      const relay = recordingRelay()
+      const mount = mountWithIntegrationConnections(
+        {},
+        fakeIntegrationConnections(async () => ({ ready: true, state: 'ready' })),
+      )
+
+      await runFleetCli([
+        'run-once', '--dry-run', '--backend', 'relay', '--config', configPath,
+      ], {
+        env: relayEnv,
+        createRelay: relay.createRelay,
+        mount,
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+
+      // Asserted without gating on the exit code: a sweep that fails for an
+      // unrelated reason must not let a registration through unnoticed.
+      expect(relay.registered).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+// The enumeration, enforced. `status` was the command we found; it was never
+// the only one that constructs a Factory before the daemon exists. Asserted
+// through the real CLI so a new command that reaches the same construction site
+// has to state which side of the line it is on.
+describe('read-only classification of every Factory-constructing command', () => {
+  const classify = async (argv: string[]): Promise<boolean | undefined> => {
+    const root = await mkdtemp(join(tmpdir(), 'fleet-cli-readonly-classify-'))
+    try {
+      let readOnly: boolean | undefined
+      const configPath = await writeConfig(root, { issueSource: 'github' })
+      await runFleetCli([...argv, '--config', configPath], {
+        createFleet: ((options) => {
+          readOnly = options?.readOnly
+          // Fail the command straight after classification: this test is about
+          // which client gets built, not about running the command to the end.
+          throw new Error('classified')
+        }) as unknown as typeof createFleet,
+        mount: mountWithIntegrationConnections(
+          {},
+          fakeIntegrationConnections(async () => ({ ready: true, state: 'ready' })),
+        ),
+        stdout: buffer(),
+        stderr: buffer(),
+      })
+      return readOnly
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  }
+
+  it.each([
+    // The two the cloud container runs before the live daemon exists.
+    ['status', ['status', '--backend', 'relay']],
+    ['run-once --dry-run', ['run-once', '--dry-run', '--backend', 'relay']],
+    ['loop --dry-run', ['loop', '--dry-run', '--backend', 'relay']],
+    ['loop-status', ['loop-status', '--backend', 'relay']],
+    ['kill-loop', ['kill-loop', '--backend', 'relay']],
+    ['canary', ['canary', '48', '--backend', 'relay']],
+    ['triage', ['triage', '48', '--backend', 'relay']],
+    ['dispatch --dry-run', ['dispatch', '48', '--dry-run', '--backend', 'relay']],
+  ])('builds a read-only fleet client for %s', async (_label, argv) => {
+    await expect(classify(argv)).resolves.toBe(true)
+  })
+
+  it.each([
+    ['start', ['start', '--backend', 'relay']],
+    ['run-once', ['run-once', '--backend', 'relay']],
+    ['loop', ['loop', '--backend', 'relay']],
+    ['dispatch', ['dispatch', '48', '--backend', 'relay']],
+    // Skips the relay dispatch-owner branch but still spawns a real team.
+    ['dispatch --backend internal', ['dispatch', '48', '--backend', 'internal']],
+  ])('keeps a registering fleet client for %s', async (_label, argv) => {
+    await expect(classify(argv)).resolves.toBe(false)
+  })
+})

@@ -2,9 +2,10 @@ import { createHash } from 'node:crypto'
 
 import { AgentRelay } from '@agent-relay/sdk'
 
+import { describeControlPlaneError } from './control-plane-circuit'
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
 
-import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult, TeammateAgent, TeammateQuery } from '../ports/fleet'
+import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, FleetConnectStatus, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult, TeammateAgent, TeammateQuery } from '../ports/fleet'
 import { RelaycastTeammateDirectory, type TeammateDirectory } from './teammates'
 import type {
   RelayActionInvocation,
@@ -87,6 +88,23 @@ export interface RelayFleetClientOptions {
   now?: () => number
   sleep?: (ms: number) => Promise<void>
   log?: (message: string) => void
+  /**
+   * Refuse to mint a workspace identity for this client.
+   *
+   * A read-only CLI invocation (`factory status`, any `--dry-run` sweep) must
+   * leave no trace in the workspace. Registration is the one fleet operation
+   * that writes: it creates a `factory-cloud-<id>` agent row the caller then
+   * abandons at process exit, without ever entering presence. The live daemon
+   * boots seconds later under the same name, cannot reclaim the orphan, and
+   * latches after MAX_REGISTRATION_ATTEMPTS — which is how a status probe took
+   * dispatch down for a week (factory-cloud#55).
+   *
+   * With this set, an explicitly supplied `agentToken`/`messaging` still works,
+   * so a read-only command that already owns an identity keeps full fleet
+   * reads. What it cannot do is create a new one: that fails closed with
+   * `ReadOnlyFleetIdentityError` rather than silently planting a row.
+   */
+  readOnly?: boolean
 }
 
 const knownCapabilities = new Set<NodeCapability>(['spawn:claude', 'spawn:codex', 'workflow:run', 'preview:tailscale-serve'])
@@ -127,6 +145,26 @@ const LATE_PLACEMENT_RELEASE_REASON = 'late-placement-timeout'
 const CALL_TIMED_OUT = Symbol('relay.placement.callTimedOut')
 
 type CallOutcome<T> = { ok: true; value: T } | { ok: false; error: unknown }
+
+/**
+ * A read-only fleet client was asked to mint a workspace identity.
+ *
+ * Thrown instead of registering so the failure is loud and attributable. The
+ * callers that can hit it (roster reads inside a dry-run sweep) already treat a
+ * control-plane read failure as a degraded-but-continue condition, which is the
+ * correct outcome here: a probe that cannot enumerate the fleet without
+ * creating an agent should report less, not write more.
+ */
+export class ReadOnlyFleetIdentityError extends Error {
+  constructor(agentName: string) {
+    super(
+      `Refusing to register relay agent "${agentName}": this fleet client is read-only. ` +
+      'A status or dry-run command must not create a workspace agent; ' +
+      'supply RELAY_AGENT_TOKEN to give it an existing identity instead.',
+    )
+    this.name = 'ReadOnlyFleetIdentityError'
+  }
+}
 
 /**
  * A placement call that outlived the operation's remaining budget (#306).
@@ -177,6 +215,7 @@ export class RelayFleetClient implements FleetClient {
   readonly #now: () => number
   readonly #sleep: (ms: number) => Promise<void>
   readonly #log: (message: string) => void
+  readonly #readOnly: boolean
   readonly #agentExitListeners = new Set<AgentExitListener>()
   readonly #deliveryFailedListeners = new Set<DeliveryFailedListener>()
   readonly #agentMessageListeners = new Set<AgentMessageListener>()
@@ -197,6 +236,15 @@ export class RelayFleetClient implements FleetClient {
   #eventsStarted = false
   #eventSubscriptionReady?: Promise<void>
   #disposed = false
+  /**
+   * The fleet socket's own status.
+   *
+   * Kept here rather than inferred by callers because the dial is
+   * fire-and-forget: `#ensureEventSubscription` cannot return its outcome, so
+   * without this the ONLY trace of a failed connect was a `#log` line that no
+   * health surface reads.
+   */
+  #fleetConnect: FleetConnectStatus = { state: 'never-attempted', attempts: 0 }
   #watchTimer: ReturnType<typeof setInterval> | undefined
   #reconciling: Promise<void> | undefined
   #pendingReleaseRetry: Promise<void> | undefined
@@ -226,6 +274,7 @@ export class RelayFleetClient implements FleetClient {
     this.#now = options.now ?? Date.now
     this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
     this.#log = options.log ?? (() => {})
+    this.#readOnly = options.readOnly ?? false
     this.#messaging = options.messaging
     this.#teammateDirectory = options.teammateDirectory
   }
@@ -772,6 +821,11 @@ export class RelayFleetClient implements FleetClient {
     // failure from colliding with our own record (factory#316).
     agentToken ??= this.#registeredAgentToken
     if (!agentToken) {
+      // The single write in this client's bootstrap, and the one a read-only
+      // caller must never reach. Guarded here rather than at each call site so
+      // the property holds for every fleet operation, present and future: no
+      // path through a read-only client can plant an agent row.
+      if (this.#readOnly) throw new ReadOnlyFleetIdentityError(this.#agentName)
       agentToken = await this.#registerFactoryAgent(workspaceKey as string)
       this.#registeredAgentToken = agentToken
     }
@@ -799,6 +853,7 @@ export class RelayFleetClient implements FleetClient {
     if (this.#registrationAttempts > MAX_REGISTRATION_ATTEMPTS) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'MAX_ATTEMPTS',
         `gave up after ${MAX_REGISTRATION_ATTEMPTS} registration attempts`,
       )
     }
@@ -950,6 +1005,7 @@ export class RelayFleetClient implements FleetClient {
       if (!agentId) {
         throw new FactoryAgentRegistrationError(
           this.#agentName,
+          'RECORD_UNREADABLE',
           `name is taken but the record could not be read back: ${errorMessage(lastError)}`,
           { cause: lastError },
         )
@@ -963,6 +1019,7 @@ export class RelayFleetClient implements FleetClient {
         if (error instanceof FactoryAgentRegistrationError) throw error
         throw new FactoryAgentRegistrationError(
           this.#agentName,
+          'TAKEOVER_FAILED',
           `could not reclaim the existing identity: ${errorMessage(error)}`,
           { cause: error },
         )
@@ -970,6 +1027,7 @@ export class RelayFleetClient implements FleetClient {
     }
     throw new FactoryAgentRegistrationError(
       this.#agentName,
+      'TAKEOVER_EXHAUSTED',
       `could not reclaim the existing identity: ${errorMessage(lastError)}`,
       { cause: lastError },
     )
@@ -990,57 +1048,104 @@ export class RelayFleetClient implements FleetClient {
     if (status !== 'offline') {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'STATUS_NOT_OFFLINE',
         `refusing to take over agent in status "${status ?? 'unknown'}"; another factory may still hold this identity`,
       )
     }
 
     // Presence is the canonical liveness signal, and the agent record can be
-    // stale. Everything below fails CLOSED: only a presence row we actually
-    // read, for this agent, carrying a status we recognise as not-live, may
-    // authorise a seizure. A request that failed, a body we cannot parse, or a
-    // missing row is absence of evidence — not evidence of death.
+    // stale. Two outcomes are routed apart here, and collapsing them swaps one
+    // wrong conclusion for another:
     //
-    // This asymmetry is deliberate. Refusing to boot costs us a recoverable
-    // outage of our own; seizing a live agent's credential strands another
-    // running process and takes the very token it would need to recover.
-    let presence: unknown
-    try {
-      presence = await agents.presence()
-    } catch (error) {
-      throw new FactoryAgentRegistrationError(
-        this.#agentName,
-        `could not read presence to confirm the agent is not live: ${errorMessage(error)}`,
-        { cause: error },
-      )
-    }
-    if (!Array.isArray(presence)) {
-      throw new FactoryAgentRegistrationError(
-        this.#agentName,
-        'presence did not return a list, so the agent cannot be confirmed offline',
-      )
-    }
+    //   presence UNREADABLE (threw, timed out, or came back as something other
+    //   than a list) — evidence of nothing. Fails CLOSED, because seizing a
+    //   live agent's credential strands another running process and takes the
+    //   very token it would need to recover.
+    //
+    //   presence READABLE and omitting this agent — the strongest evidence the
+    //   engine can give that the agent is offline. Proceeds. Treating this as
+    //   inconclusive is what made an orphaned row permanently unreclaimable
+    //   (factory-cloud#55): every registration attempt burned the bounded
+    //   budget, which only a success resets, and dispatch stayed gated.
+    //
+    // A row that IS listed still has to clear the status check below: presence
+    // listing us is the case where the engine may still be holding the
+    // identity, so an unrecognised or missing status stays fail-closed.
+    const presence = await this.#readPresenceRows(agents)
     const entry = presence
       .map((row) => asRecord(row))
       .find((row) => readString(row, 'agentName', 'agent_name', 'name') === this.#agentName)
     if (!entry) {
-      throw new FactoryAgentRegistrationError(
-        this.#agentName,
-        'presence does not list this agent, so it cannot be confirmed offline',
-      )
+      // Confirmed absence. Note this is also the correct reading of an empty
+      // list: a single-agent cloud factory whose only row is the dead one sees
+      // exactly that, and refusing it would re-latch the outage in its most
+      // common shape.
+      this.#log(`Presence is readable and does not list ${this.#agentName}; treating the existing record as offline`)
+      return
     }
     const seenStatus = readString(entry, 'status')
     if (seenStatus === undefined) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_STATUS_MISSING',
         'presence reported no status for this agent, so it cannot be confirmed offline',
       )
     }
     if (LIVE_AGENT_STATUSES.has(seenStatus)) {
       throw new FactoryAgentRegistrationError(
         this.#agentName,
+        'PRESENCE_REPORTS_LIVE',
         `presence reports this agent as "${seenStatus}"; another factory may still hold this identity`,
       )
     }
+  }
+
+  /**
+   * Read the presence list, or fail closed.
+   *
+   * Every failure here means presence could not be read at all — a transport
+   * error, a timeout, or a body that is not a list. None of them say anything
+   * about whether the agent is alive, so none of them may authorise a seizure.
+   * The messages all name presence as UNREADABLE so an operator can tell this
+   * apart from a presence list that was read and simply did not list us.
+   */
+  async #readPresenceRows(agents: RelayMessaging['agents']): Promise<unknown[]> {
+    let presence: unknown
+    try {
+      presence = await agents.presence()
+    } catch (error) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        'PRESENCE_UNREADABLE',
+        `presence is unreadable, so the agent cannot be confirmed offline: ${errorMessage(error)}`,
+        { cause: error },
+      )
+    }
+    if (!Array.isArray(presence)) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        'PRESENCE_NOT_A_LIST',
+        'presence is unreadable (it did not return a list), so the agent cannot be confirmed offline',
+      )
+    }
+    // A list whose rows we cannot name is not readable either, however
+    // well-formed the array around them is. Omission only means absence if a
+    // row FOR this agent would have been recognised — so if the SDK renames the
+    // naming field, or a row arrives without one, every row silently stops
+    // matching and a live agent reads as absent. That is the one way the
+    // permitted branch below could strand a running factory, so it is checked
+    // here, on the read, rather than inferred from the lookup missing.
+    const unnamed = presence.findIndex(
+      (row) => readString(asRecord(row), 'agentName', 'agent_name', 'name') === undefined,
+    )
+    if (unnamed !== -1) {
+      throw new FactoryAgentRegistrationError(
+        this.#agentName,
+        'PRESENCE_ROW_UNNAMED',
+        `presence is unreadable (row ${unnamed} carries no agent name), so the agent cannot be confirmed offline`,
+      )
+    }
+    return presence
   }
 
   async #takeOverAgent(workspaceKey: string, expectedAgentId: string): Promise<string> {
@@ -1230,9 +1335,24 @@ export class RelayFleetClient implements FleetClient {
   #ensureEventSubscription(): void {
     if (this.#eventsStarted) return
     this.#eventsStarted = true
+    this.#fleetConnect = {
+      ...this.#fleetConnect,
+      state: 'connecting',
+      attempts: this.#fleetConnect.attempts + 1,
+      lastAttemptAtMs: this.#now(),
+    }
     this.#eventSubscriptionReady = this.#subscribeEvents().catch((error) => {
       this.#eventsStarted = false
       this.#eventSubscriptionReady = undefined
+      // The rejection now lands in a field a health surface can publish. It kept
+      // going only to `#log` before, which is why a fleet client that never
+      // connected was indistinguishable from a healthy one everywhere.
+      this.#fleetConnect = {
+        ...this.#fleetConnect,
+        state: 'failed',
+        lastFailureAtMs: this.#now(),
+        lastError: describeControlPlaneError(error),
+      }
       this.#log(`relay fleet event subscription failed: ${errorMessage(error)}`)
       throw error
     })
@@ -1253,17 +1373,37 @@ export class RelayFleetClient implements FleetClient {
     await this.#eventSubscriptionReady
   }
 
+  fleetConnectStatus(): FleetConnectStatus {
+    return { ...this.#fleetConnect }
+  }
+
   async #subscribeEvents(): Promise<void> {
     const messaging = await this.#ensureMessaging()
     if (this.#options.registerLifecycleAction !== false) {
       await this.#ensureLifecycleAction(messaging)
     }
     if (this.#disposed) return
-    messaging.events.connect()
-    this.#eventUnsubscribers.push(messaging.events.on('any', (event) => this.#handleEvent(event)))
+    // Listen before dialing so a synchronous lifecycle event cannot race past
+    // the observer. `connect()` is void: returning only proves the SDK accepted
+    // the dial, not that the WebSocket handshake completed.
+    const unsubscribe = messaging.events.on('any', (event) => this.#handleEvent(event))
+    const statusBeforeDial = this.#fleetConnect
+    try {
+      messaging.events.connect()
+    } catch (error) {
+      unsubscribe()
+      throw error
+    }
+    this.#eventUnsubscribers.push(unsubscribe)
+    this.#fleetConnect = {
+      ...this.#fleetConnect,
+      ...(this.#fleetConnect === statusBeforeDial ? { state: 'dialed' as const } : {}),
+      lastDialedAtMs: this.#now(),
+    }
   }
 
   #handleEvent(event: RelayMessagingEvent): void {
+    this.#observeFleetConnectionEvent(event)
     switch (event.type) {
       case 'dmReceived':
       case 'groupDmReceived':
@@ -1283,6 +1423,43 @@ export class RelayFleetClient implements FleetClient {
         break
       default:
         break
+    }
+  }
+
+  /** Translate the SDK's real stream lifecycle into the published status. */
+  #observeFleetConnectionEvent(event: RelayMessagingEvent): void {
+    const now = this.#now()
+    switch (event.type) {
+      case 'disconnected':
+      case 'permanentlyDisconnected':
+        this.#fleetConnect = {
+          ...this.#fleetConnect,
+          state: 'failed',
+          lastFailureAtMs: now,
+          lastError: 'RelayEventStreamDisconnected',
+        }
+        return
+      case 'error':
+        this.#fleetConnect = {
+          ...this.#fleetConnect,
+          state: 'failed',
+          lastFailureAtMs: now,
+          lastError: 'RelayEventStreamError',
+        }
+        return
+      case 'reconnecting':
+        this.#fleetConnect = { ...this.#fleetConnect, state: 'connecting' }
+        return
+      default:
+        // `connected` and every data event are confirmations that the event
+        // stream opened. A void `connect()` call alone never reaches this arm.
+        this.#fleetConnect = {
+          ...this.#fleetConnect,
+          state: 'connected',
+          firstEventAtMs: this.#fleetConnect.firstEventAtMs ?? now,
+          ...(this.#fleetConnect.state !== 'connected' ? { lastConnectedAtMs: now } : {}),
+          lastError: undefined,
+        }
     }
   }
 
@@ -1610,13 +1787,48 @@ function previewReference(value: unknown, placementNode?: string): PreviewRefere
  * Registration could not converge on a usable agent identity. Named so a
  * six-day silent 409 loop surfaces as one actionable failure instead.
  */
+/**
+ * Which of the ten registration failures happened.
+ *
+ * These exist to survive redaction. `describeControlPlaneError` reduces a cause
+ * to `${name}${code}` and appends the code ONLY when it matches
+ * /^[A-Z0-9_]{1,80}$/ -- so a bare `FactoryAgentRegistrationError` is what every
+ * published surface showed, with the sentence naming the actual throw site
+ * discarded. Production reported exactly that string and it could not be told
+ * whether the name was taken, presence was unreadable, the record was not
+ * offline, or the takeover itself failed.
+ *
+ * A constrained token carries none of the message's risk: no transport text, no
+ * URL, no credential. The reducer already validates the shape, so this widens
+ * the answer without widening the exposure.
+ */
+export type FactoryAgentRegistrationErrorCode =
+  | 'MAX_ATTEMPTS'
+  | 'RECORD_UNREADABLE'
+  | 'STATUS_NOT_OFFLINE'
+  | 'PRESENCE_UNREADABLE'
+  | 'PRESENCE_NOT_A_LIST'
+  | 'PRESENCE_ROW_UNNAMED'
+  | 'PRESENCE_STATUS_MISSING'
+  | 'PRESENCE_REPORTS_LIVE'
+  | 'TAKEOVER_FAILED'
+  | 'TAKEOVER_EXHAUSTED'
+
 export class FactoryAgentRegistrationError extends Error {
   readonly agentName: string
+  /** Uppercase token so `describeControlPlaneError` renders it after the name. */
+  readonly code: FactoryAgentRegistrationErrorCode
 
-  constructor(agentName: string, detail: string, options?: { cause?: unknown }) {
+  constructor(
+    agentName: string,
+    code: FactoryAgentRegistrationErrorCode,
+    detail: string,
+    options?: { cause?: unknown },
+  ) {
     super(`Factory agent "${agentName}" could not register with the relay workspace: ${detail}`)
     this.name = 'FactoryAgentRegistrationError'
     this.agentName = agentName
+    this.code = code
     if (options && 'cause' in options) {
       ;(this as Error & { cause?: unknown }).cause = options.cause
     }

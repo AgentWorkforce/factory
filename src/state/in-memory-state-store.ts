@@ -22,7 +22,14 @@ import type {
   WaitingClarification,
   ClarificationReply,
 } from '../ports/state'
-import { matchingGithubLifecycleEntry } from './github-lifecycle-identity'
+import { DispatchLifecycleMigrationConflictError } from '../ports/state'
+import {
+  asMigrationAlias,
+  isMigrationAlias,
+  migrateDispatchLifecycleKeys,
+  planLifecycleMigration,
+  prunableMigrationAliases,
+} from './work-unit-lifecycle-migration'
 import { dispatchLifecycleOccupiesSlot, stampDispatchLifecycleSlot } from './dispatch-lifecycle-slot'
 
 type WorkspaceState = {
@@ -204,11 +211,10 @@ export class InMemoryStateStore implements StateStore {
     leaseMs: number,
   ): Promise<DispatchLifecycleClaim> {
     const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
+    // Adopt any row written under a pre-#211 key before deciding no claim
+    // exists, so a deploy does not create a second claim for live work.
+    applyLifecycleMigration(lifecycles, key, seed, nowMs)
     let lifecycle = lifecycles.get(key)
-    if (!lifecycle) {
-      const matching = matchingGithubLifecycleEntry(lifecycles, seed)
-      if (matching) [key, lifecycle] = matching
-    }
     const created = !lifecycle
     if (!lifecycle) {
       lifecycle = cloneDispatchLifecycle(seed)
@@ -218,7 +224,7 @@ export class InMemoryStateStore implements StateStore {
     const terminal = lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
     const activeOtherOwner = lifecycle.lease && lifecycle.lease.owner !== owner && lifecycle.lease.leaseUntilMs > nowMs
     if (terminal || activeOtherOwner) {
-      return { key, acquired: false, lifecycle: cloneDispatchLifecycle(lifecycle), created }
+      return { acquired: false, lifecycle: cloneDispatchLifecycle(lifecycle), created }
     }
     const epoch = lifecycle.lease?.owner === owner
       ? lifecycle.lease.epoch
@@ -229,7 +235,6 @@ export class InMemoryStateStore implements StateStore {
     // never-placed clock for rows that predate the field.
     stampDispatchLifecycleSlot(lifecycle, lifecycle, nowMs)
     return {
-      key,
       acquired: true,
       lifecycle: cloneDispatchLifecycle(lifecycle),
       lease: { ...lifecycle.lease },
@@ -307,7 +312,12 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async listDispatchLifecycles(workspaceId: string): Promise<Array<[string, DispatchLifecycle]>> {
+    // No load step here, so this is where a directly-seeded legacy row gets
+    // rekeyed before startup adoption can pick up its old key.
+    migrateWorkspaceLifecycleKeys(this.#workspace(workspaceId).dispatchLifecycles)
+    // Migration aliases are audit evidence, never adoptable work.
     return [...this.#workspace(workspaceId).dispatchLifecycles]
+      .filter(([, lifecycle]) => !isMigrationAlias(lifecycle))
       .map(([key, lifecycle]) => [key, cloneDispatchLifecycle(lifecycle)])
   }
 
@@ -1033,7 +1043,48 @@ const compareConversationMessages = (left: ConversationMessage, right: Conversat
   (left.providerSequence ?? left.id).localeCompare(right.providerSequence ?? right.id, undefined, { numeric: true })
 
 const activeDispatchLifecycleCount = (lifecycles: Map<string, DispatchLifecycle>, exceptKey?: string): number =>
-  [...lifecycles].filter(([key, lifecycle]) => key !== exceptKey && dispatchLifecycleOccupiesSlot(lifecycle)).length
+  [...lifecycles].filter(([key, lifecycle]) =>
+    key !== exceptKey && !isMigrationAlias(lifecycle) && dispatchLifecycleOccupiesSlot(lifecycle)).length
+
+/**
+ * Moves a row persisted under a pre-#211 key onto the canonical work-unit key,
+ * demotes any other matching rows to audit-only aliases, and prunes aliases
+ * that have outlived the retention policy.
+ *
+ * Throws rather than choosing when two keys both hold a live lease.
+ */
+const migrateWorkspaceLifecycleKeys = (
+  lifecycles: Map<string, DispatchLifecycle>,
+): boolean => migrateDispatchLifecycleKeys(
+  () => [...lifecycles],
+  (from, to) => {
+    lifecycles.set(to, lifecycles.get(from)!)
+    lifecycles.delete(from)
+  },
+  (key, canonicalKey) => {
+    lifecycles.set(key, asMigrationAlias(lifecycles.get(key)!, canonicalKey))
+  },
+)
+
+const applyLifecycleMigration = (
+  lifecycles: Map<string, DispatchLifecycle>,
+  canonicalKey: string,
+  seed: Pick<DispatchLifecycle, 'issue'>,
+  nowMs: number,
+): void => {
+  const plan = planLifecycleMigration(lifecycles, canonicalKey, seed, nowMs)
+  if (plan.outcome === 'conflict') {
+    throw new DispatchLifecycleMigrationConflictError(canonicalKey, plan.keys)
+  }
+  if (plan.outcome === 'adopt') {
+    lifecycles.set(canonicalKey, lifecycles.get(plan.from)!)
+    lifecycles.delete(plan.from)
+  }
+  for (const aliasKey of plan.aliases) {
+    lifecycles.set(aliasKey, asMigrationAlias(lifecycles.get(aliasKey)!, canonicalKey, nowMs))
+  }
+  for (const pruned of prunableMigrationAliases(lifecycles, nowMs)) lifecycles.delete(pruned)
+}
 
 const cloneWaitingClarification = (record: WaitingClarification): WaitingClarification =>
   structuredClone(record)
