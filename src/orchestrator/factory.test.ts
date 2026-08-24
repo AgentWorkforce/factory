@@ -13601,8 +13601,85 @@ describe('FactoryLoop', () => {
           mode: 'live',
           liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 20 },
         })
-        return { factory, cleanup: async () => { await rm(root, { recursive: true, force: true }) } }
+        return {
+          factory,
+          heartbeatPath: join(root, 'heartbeat.json'),
+          cleanup: async () => { await rm(root, { recursive: true, force: true }) },
+        }
       }
+
+      // MUST-FIRE for the scoping (#363 review, codex P2). The counters used to
+      // increment on EVERY served `listTree` in the process, and in live mode
+      // event drains and completion timers issue those concurrently with
+      // `runOnce()`. A populated lookup landing in the denominator makes
+      // `emptyTreeReads < treeReads` on a sweep whose every discovery read was
+      // empty, which erases exactly the signal the pair exists to raise; an
+      // unrelated empty lookup distorts it the other way.
+      //
+      // One-shot rather than live on purpose: the concurrency is what makes the
+      // bug real, but a fixed sweep is what makes the arithmetic assertable.
+      // This run serves seven tree reads, and only the two the discovery pass
+      // itself issued may appear in the pair.
+      it('counts only the discovery pass\'s own reads, not every list in the process', async () => {
+        class MixedReadMount extends CountingEventsMount {
+          readonly listed: Array<{ prefix: string; count: number }> = []
+
+          constructor() {
+            super()
+            this.setSubRoot('/linear/issues', 'absent')
+            // Enumeration: one path form exists, the other does not. That empty
+            // read is the ordinary one the pair is designed to tolerate.
+            this.files.set('/github/repos/AgentWorkforce/pear/issues/by-id/1.json', {
+              content: githubIssueFile(1, { labels: ['factory'] }),
+            })
+            // Reached only by the dispatch path's own lookups, never by
+            // discovery — the reads that must stay outside the ratio.
+            this.files.set('/github/repos/AgentWorkforce/pear/pulls/7/metadata.json', {
+              content: prFile(7, { title: 'GitHub factory issue 1', head_ref: 'gh-1', state: 'OPEN' }),
+            })
+          }
+
+          override async listTree(prefix: string): Promise<string[]> {
+            const paths = await super.listTree(prefix)
+            this.listed.push({ prefix, count: paths.length })
+            return paths
+          }
+        }
+
+        const mount = new MixedReadMount()
+        const factory = createFactory(config({ issueSource: 'github' }), {
+          mount,
+          stateStore: new InMemoryStateStore({ batchSize: 2 }),
+          fleet: new FakeFleetClient(),
+          triage: new StaticTriage(),
+          githubWriteback: new RecordingGithubWriteback(),
+          logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        })
+        const report = await factory.runOnce()
+        expect(report.dispatched).toHaveLength(1)
+
+        const isEnumerationRoot = (prefix: string) =>
+          prefix === '/github/repos/AgentWorkforce/pear/issues' ||
+          prefix === '/github/repos/AgentWorkforce__pear/issues'
+        const outsideDiscovery = mount.listed.filter(({ prefix }) => !isEnumerationRoot(prefix))
+
+        // The fixture earns the assertion below: the mount really did serve
+        // reads that were not the discovery pass, and at least one came back
+        // empty — the exact shape that used to inflate `emptyTreeReads`.
+        expect(outsideDiscovery.length).toBeGreaterThanOrEqual(1)
+        expect(outsideDiscovery.some(({ count }) => count === 0)).toBe(true)
+
+        // The discovery pass listed two path forms, one of which exists. That
+        // is the whole ratio; unconditional counting reported 7 and 4 here.
+        expect(report.treeReads).toBe(2)
+        expect(mount.listed.length).toBeGreaterThan(report.treeReads ?? 0)
+        // MUST-NOT-FIRE, the opposite direction: scoping the counters must not
+        // silently stop counting. The enumeration's own empty read is still in
+        // the numerator, so the ordinary case stays visible and a later
+        // all-empty sweep is still distinguishable from this one.
+        expect(report.emptyTreeReads).toBe(1)
+        expect(factory.status().counters.relayfileEmptyTreeReads).toBe(1)
+      }, 20_000)
 
       it('counts a served-but-empty read so a silent mount is distinguishable', async () => {
         // Every tree read is served, promptly, with nothing in it.
@@ -13618,7 +13695,7 @@ describe('FactoryLoop', () => {
         }
 
         const mount = new EmptyTreeMount()
-        const { factory, cleanup } = await startEmptyReadFactory(mount)
+        const { factory, heartbeatPath, cleanup } = await startEmptyReadFactory(mount)
         try {
           await vi.waitFor(() => {
             const readiness = factory.status().readinessReconcile
@@ -13635,6 +13712,19 @@ describe('FactoryLoop', () => {
 
           expect(factory.status().counters.relayfileEmptyTreeReads ?? 0)
             .toBeGreaterThanOrEqual(1)
+
+          // ...and it reaches the ONLY surface a deployed operator can read.
+          // `factory diagnose --deployed` goes to the unauthenticated /healthz
+          // route, which serves this projection of this file — so a pair that
+          // stops at the in-process `status()` object above does not exist
+          // where the fault is met (#363 review, codex P1).
+          await vi.waitFor(async () => {
+            const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+            const published = publicHealthFromHeartbeat(heartbeat!, { nowMs: Date.now() })
+              .readinessReconcile
+            expect(published?.treeReads ?? 0).toBeGreaterThanOrEqual(1)
+            expect(published?.emptyTreeReads).toBe(published?.treeReads)
+          }, { timeout: 5_000 })
         } finally {
           await factory.stop()
           await cleanup()

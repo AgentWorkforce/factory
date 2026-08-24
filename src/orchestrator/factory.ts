@@ -4278,7 +4278,15 @@ export class FactoryLoop implements Factory {
   // that expects a specific PR to appear, or an escalation/comment-replay
   // scan that must not miss a marker or reply that landed after the cache
   // was populated. Those callers must omit `cache` and pay for a fresh list.
-  async #listRelayfileTree(prefix: string, phase: string, opts: { cache?: boolean } = {}): Promise<string[]> {
+  //
+  // `enumeration` marks the call sites that ARE the readiness sweep's
+  // discovery pass — a full-root walk looking for candidate work. Only those
+  // feed the tree-read pair below, and only while a sweep holds the lease.
+  async #listRelayfileTree(
+    prefix: string,
+    phase: string,
+    opts: { cache?: boolean; enumeration?: boolean } = {},
+  ): Promise<string[]> {
     if (this.#discoverySweepLeaseLost) {
       throw new Error('discovery sweep lease was lost; refusing another tree request')
     }
@@ -4295,6 +4303,38 @@ export class FactoryLoop implements Factory {
       logStart: true,
       logComplete: true,
     })
+    // #351 follow-up: tree reads the backend SERVED, and how many of them it
+    // answered with nothing.
+    //
+    // The per-call deadline made a hung dependency loud. This is its
+    // companion: a mount that starts returning empty trees instead of hanging
+    // raises no timeout, no failure and no `lastError`, and produces a sweep
+    // that completes `healthy` having dispatched nothing.
+    //
+    // BOTH numbers, because one is not a signal. A healthy sweep lists two
+    // path forms per repo and only one of them exists, so an empty read is
+    // ordinary and a bare count of them fires constantly. What separates the
+    // fault is the RATIO: `emptyTreeReads === treeReads` means the mount
+    // served nothing at all, which `candidates: 0` cannot distinguish from a
+    // workspace that simply has no ready work.
+    //
+    // SCOPED TWICE, and both guards are load-bearing (#363 review, codex P2).
+    // The ratio is only readable if every read in it came from the same
+    // question. In live mode a Slack identity lookup, a PR-confirmation poll
+    // or a comment-replay scan can run concurrently with `runOnce()` — each is
+    // a `listTree`, none is discovery, and one populated result among them
+    // makes `emptyTreeReads < treeReads` on an all-empty sweep, silently
+    // erasing exactly the signal this pair exists to raise. `enumeration`
+    // keeps the numerator and denominator to the discovery pass; the epoch
+    // check keeps a discovery walk issued outside any sweep — startup
+    // backfill, most obviously — out of a sweep's totals.
+    if (opts.enumeration && this.#discoverySweepEpoch !== undefined) {
+      this.#discoverySweepTreeReads += 1
+      if (paths.length === 0) {
+        this.#increment('relayfileEmptyTreeReads')
+        this.#discoverySweepEmptyTreeReads += 1
+      }
+    }
     if (opts.cache) await this.#rememberDiscoveryTree(prefix, paths)
     return paths
   }
@@ -4388,27 +4428,6 @@ export class FactoryLoop implements Factory {
       )
       const elapsedMs = this.#elapsedSince(startedAtMs)
       const count = opts.count?.(result)
-      // #351 follow-up: tree reads the backend SERVED, and how many of them it
-      // answered with nothing.
-      //
-      // The per-call deadline made a hung dependency loud. This is its
-      // companion: a mount that starts returning empty trees instead of hanging
-      // raises no timeout, no failure and no `lastError`, and produces a sweep
-      // that completes `healthy` having dispatched nothing.
-      //
-      // BOTH numbers, because one is not a signal. A healthy sweep lists two
-      // path forms per repo and only one of them exists, so an empty read is
-      // ordinary and a bare count of them fires constantly. What separates the
-      // fault is the RATIO: `emptyTreeReads === treeReads` means the mount
-      // served nothing at all, which `candidates: 0` cannot distinguish from a
-      // workspace that simply has no ready work.
-      if (count !== undefined) {
-        this.#discoverySweepTreeReads += 1
-        if (count === 0) {
-          this.#increment('relayfileEmptyTreeReads')
-          this.#discoverySweepEmptyTreeReads += 1
-        }
-      }
       if (opts.logComplete) {
         this.#logger.info?.(`[factory] relayfile ${operation} completed`, {
           ...metadata,
@@ -7504,7 +7523,7 @@ export class FactoryLoop implements Factory {
     const candidates: LinearIssue[] = []
     let scanned = 0
     let lastProgressAtMs = startedAtMs
-    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'GitHub mirror candidate loading', { cache: true })) {
+    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'GitHub mirror candidate loading', { cache: true, enumeration: true })) {
       await this.#refreshLiveHeartbeatIfDue()
       if (!isLinearIssueMirrorCandidatePath(path)) {
         continue
@@ -7558,7 +7577,7 @@ export class FactoryLoop implements Factory {
         } else {
           pathBatches = []
           for (const root of roots) {
-            pathBatches.push(await this.#listRelayfileTree(root, 'GitHub issue ingestion', { cache: true }))
+            pathBatches.push(await this.#listRelayfileTree(root, 'GitHub issue ingestion', { cache: true, enumeration: true }))
           }
           this.#increment('githubIssueIndexFallbacks')
         }
@@ -8059,6 +8078,10 @@ export class FactoryLoop implements Factory {
         // The pass-scoped flag also lets every later blocked issue reuse the
         // resulting dependency index instead of rescanning the full tree.
         this.#dependencyLinearTreeLoaded = true
+        // Cached like the enumeration walks, but deliberately NOT `enumeration`:
+        // this is a lookup for named blocker identities, not the sweep asking
+        // what work exists, and mixing a lookup's result into the ratio is the
+        // masking the pair's scoping exists to prevent (#363 review).
         for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'dependency blocker discovery', { cache: true })) {
           if (isIssueFilePath(path)) await this.#readIssue(path)
         }
@@ -8523,7 +8546,7 @@ export class FactoryLoop implements Factory {
     }
     const pathsByKey = new Map<string, string>()
     const canonicalPathsByKey = new Map<string, string>()
-    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'Linear ready issue canonical discovery', { cache: true })) {
+    for (const path of await this.#listRelayfileTree(ISSUE_ROOT, 'Linear ready issue canonical discovery', { cache: true, enumeration: true })) {
       if (isIssueFilePath(path)) {
         const key = keyFromPath(path)
         canonicalPathsByKey.set(key, path)
@@ -8533,7 +8556,7 @@ export class FactoryLoop implements Factory {
     for (const path of await this.#listRelayfileTree(
       linearByStatePath('ready-for-agent'),
       'Linear ready issue alias discovery',
-      { cache: true },
+      { cache: true, enumeration: true },
     )) {
       if (isIssueAliasFilePath(path)) {
         const canonicalPath = canonicalPathsByKey.get(keyFromPath(path))

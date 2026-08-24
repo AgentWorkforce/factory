@@ -247,6 +247,32 @@ const dispatchFailureReasonCounts = (
 }
 
 /**
+ * The last sweep's tree reads and how many were empty, as an all-or-nothing
+ * pair (#351 follow-up; #363 review, codex P1).
+ *
+ * Validated as a pair because it is only readable as one. `emptyTreeReads`
+ * alone fires on a healthy sweep — discovery lists two path forms per repo and
+ * only one exists — and `treeReads` alone says nothing about what came back.
+ * So half a pair is dropped rather than published: a lone number here invites
+ * exactly the wrong reading ("some reads were empty, so the mount is sick").
+ *
+ * `emptyTreeReads > treeReads` is arithmetically impossible and means the
+ * producer is not one we understand; both numbers go rather than publishing a
+ * ratio a reader would take at face value. Deliberately independent of the
+ * `candidates` trio, for the same reason `dispatchFailures` is: a producer
+ * that publishes the trio and has never heard of these must keep its trio.
+ */
+const treeReadOutcome = (
+  status: { treeReads?: unknown; emptyTreeReads?: unknown },
+): Partial<Pick<FactoryPublicReadinessReconcileHealth, 'treeReads' | 'emptyTreeReads'>> => {
+  const treeReads = optionalCount('treeReads', status.treeReads)
+  const emptyTreeReads = optionalCount('emptyTreeReads', status.emptyTreeReads)
+  if (treeReads.treeReads === undefined || emptyTreeReads.emptyTreeReads === undefined) return {}
+  if (emptyTreeReads.emptyTreeReads > treeReads.treeReads) return {}
+  return { ...treeReads, ...emptyTreeReads }
+}
+
+/**
  * The last enumerating sweep's arithmetic, published (#355).
  *
  * Deliberately NOT `counter()`: that coerces an absent field to `0`, which
@@ -268,6 +294,8 @@ const sweepOutcome = (
     skipReasons?: unknown
     dispatchFailures?: unknown
     dispatchFailureReasons?: unknown
+    treeReads?: unknown
+    emptyTreeReads?: unknown
     discoveryDeferred?: unknown
     lastEnumeratedAtMs?: unknown
     enumerationCountsInvalid?: unknown
@@ -280,6 +308,8 @@ const sweepOutcome = (
   | 'skipReasons'
   | 'dispatchFailures'
   | 'dispatchFailureReasons'
+  | 'treeReads'
+  | 'emptyTreeReads'
   | 'discoveryDeferred'
   | 'lastEnumeratedAtMs'
   | 'enumerationCountsInvalid'
@@ -332,6 +362,12 @@ const sweepOutcome = (
     ...(dispatchFailures.dispatchFailures !== undefined && dispatchFailureReasons
       ? { dispatchFailureReasons }
       : {}),
+    // The half of the outage a timeout cannot catch, carried the rest of the
+    // way to the unauthenticated surface (#363 review, codex P1). Independently
+    // optional, like `dispatchFailures`: a 0.1.73 daemon publishes the trio and
+    // knows nothing about this pair, and requiring it would drop that
+    // producer's whole sweep block.
+    ...treeReadOutcome(status),
     // Part of the same atomic snapshot as the counts: it is what dates them,
     // and without it retained counts have no freshness a reader can recover
     // (#359 review).

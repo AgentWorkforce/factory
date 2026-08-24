@@ -123,6 +123,74 @@ describe('formatSweepOutcome (#359)', () => {
     )
     expect(outcome).not.toContain('nothing has enumerated successfully yet')
   })
+
+  // MUST-FIRE (#363 review, codex P1). The numbers reaching `/healthz` is only
+  // half of getting the signal to the operator: `candidates: 0` with every
+  // tree read empty and `candidates: 0` with content served are opposite
+  // diagnoses, and this sentence is where a deployed operator meets them. It
+  // is also the sentence the verdict line embeds, so the reading travels with
+  // the "dispatching" claim it qualifies.
+  it('names a silent mount rather than leaving a zero candidate count to speak for itself', () => {
+    const outcome = formatSweepOutcome({
+      state: 'healthy',
+      consecutiveFailures: 0,
+      failureThreshold: 3,
+      candidates: 0,
+      dispatched: 0,
+      skipped: 0,
+      treeReads: 3,
+      emptyTreeReads: 3,
+    })
+
+    expect(outcome).toContain('0 candidate(s)')
+    expect(outcome).toContain('every one of 3 tree read(s) came back empty')
+    expect(outcome).toContain('the mount served nothing at all')
+  })
+
+  // MUST-NOT-FIRE, and it is the reason this is a pair rather than a count: a
+  // healthy sweep lists two path forms per repo and only one exists, so an
+  // empty read is ORDINARY. A renderer that shouted on any empty read would
+  // shout on every healthy instance, and an operator would learn to ignore it.
+  it('stays quiet when the mount served content, and when no read was made', () => {
+    const emptyWorkspace = formatSweepOutcome({
+      state: 'healthy',
+      consecutiveFailures: 0,
+      failureThreshold: 3,
+      candidates: 0,
+      dispatched: 0,
+      skipped: 0,
+      treeReads: 3,
+      emptyTreeReads: 1,
+    })
+    expect(emptyWorkspace).not.toContain('served nothing at all')
+    expect(emptyWorkspace).toContain('1/3 tree read(s) empty')
+
+    // An incremental sweep that answered every root from the discovery cache
+    // issued no read at all. A ratio over zero reads is not a fact about the
+    // mount, so it claims neither direction.
+    const noReads = formatSweepOutcome({
+      state: 'healthy',
+      consecutiveFailures: 0,
+      failureThreshold: 3,
+      candidates: 0,
+      dispatched: 0,
+      skipped: 0,
+      treeReads: 0,
+      emptyTreeReads: 0,
+    })
+    expect(noReads).toBe('0 candidate(s), 0 dispatched, 0 skipped')
+
+    // A producer that predates the pair says nothing about it either.
+    const olderProducer = formatSweepOutcome({
+      state: 'healthy',
+      consecutiveFailures: 0,
+      failureThreshold: 3,
+      candidates: 0,
+      dispatched: 0,
+      skipped: 0,
+    })
+    expect(olderProducer).toBe('0 candidate(s), 0 dispatched, 0 skipped')
+  })
 })
 
 describe('factory diagnose --deployed (#295)', () => {

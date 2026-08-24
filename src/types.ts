@@ -374,6 +374,25 @@ export interface FactoryPublicReadinessReconcileHealth {
   dispatchFailures?: number
   dispatchFailureReasons?: Partial<Record<FactoryDispatchFailureReasonCode, number>>
   /**
+   * Tree reads the last enumerating sweep made, and how many came back empty
+   * (#351 follow-up; #363 review, codex P1).
+   *
+   * The counterpart of `FactoryReadinessReconcileStatus.treeReads` on the
+   * UNAUTHENTICATED surface, which is where `factory diagnose --deployed`
+   * reads it — the fault this pair exists to name is one an operator only ever
+   * meets on a deployed instance, so a signal that stops at the internal
+   * `status()` object does not exist where it is needed.
+   *
+   * Counts only, and a pair: published together or not at all, because
+   * `emptyTreeReads` alone is not a signal (a healthy sweep lists two path
+   * forms per repo and only one exists) and `treeReads` alone says nothing.
+   * The fault is `emptyTreeReads === treeReads` with `treeReads > 0` beside a
+   * zero `candidates`: the mount served nothing at all, rather than the
+   * workspace having no ready work.
+   */
+  treeReads?: number
+  emptyTreeReads?: number
+  /**
    * When the pass the counts describe finished enumerating. Dates them —
    * `lastCompletedAtMs` does not, since it advances on deferred passes too.
    */

@@ -196,6 +196,16 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   `candidates: 0, treeReads: 3, emptyTreeReads: 1` is an empty workspace, and
   `candidates: 0, treeReads: 3, emptyTreeReads: 3` is a silent mount.
 
+  `factory diagnose --deployed` makes that reading for you: it renders a `tree reads` line and
+  folds the verdict into the "Last enumerating sweep" sentence, so an all-empty pass says
+  `the mount served nothing at all` rather than leaving a zero `candidates` to speak for itself.
+
+  Both numbers count only the reads the readiness sweep's own discovery pass issued. In live mode
+  event drains and completion timers list trees too, and a populated lookup landing in the
+  denominator would make `emptyTreeReads < treeReads` on a sweep whose every discovery read was
+  empty — masking the fault. So a sweep whose roots all came from the discovery cache reports
+  `treeReads: 0`, which claims nothing in either direction.
+
 ### Why `ok` stays `true` while `status` goes amber
 
 `/healthz` is the Cloudflare **Container ping endpoint** (`pingEndpoint = 'localhost/healthz'` in the
