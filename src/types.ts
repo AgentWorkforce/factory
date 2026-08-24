@@ -306,8 +306,9 @@ export interface FactoryPublicReadinessReconcileHealth {
    * The last completed sweep's arithmetic, published (#355).
    *
    * Counts only — no issue keys, no paths, no titles — and absent rather than
-   * zero until a sweep has completed, so "never ran" and "ran and found
-   * nothing" are two different readings of this surface rather than one.
+   * zero until a sweep has completed enumeration, so "never enumerated" and
+   * "enumerated and found nothing" are two different readings of this surface
+   * rather than one. A completed deferral still leaves these absent.
    */
   candidates?: number
   dispatched?: number

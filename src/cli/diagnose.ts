@@ -358,7 +358,9 @@ export function formatSweepOutcome(
       // counts sit beside an ever-fresh `lastCompletedAtMs`, so without this
       // an operator cannot tell a measurement one interval old from one days
       // old, and the staleness is the whole reason to say anything at all.
-      ? ` measured ${formatInstant(readiness.lastEnumeratedAtMs)} — the most recent pass deferred ` +
+      ? `${readiness.lastEnumeratedAtMs === undefined
+          ? ''
+          : ` measured ${formatInstant(readiness.lastEnumeratedAtMs)}`} — the most recent pass deferred ` +
         'to another process holding the discovery lease and enumerated nothing'
       : '')
 }

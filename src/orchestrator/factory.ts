@@ -1940,6 +1940,10 @@ export class FactoryLoop implements Factory {
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
       this.#readinessReconcileLastFailureAtMs = this.#clock.now()
       this.#readinessReconcileLastError = errorMessage
+      // This failure is now the latest settled pass. A deferral marker left by
+      // an older pass would falsely describe this one as lease contention when
+      // the timestamps/error below prove that it acquired the lease and failed.
+      this.#readinessReconcileLastSweepDeferred = undefined
       // The class, unlike the message, is publishable: #295 puts it on the
       // unauthenticated health surface through the same allowlist.
       this.#readinessReconcileLastErrorClass = telemetryErrorClass(error)

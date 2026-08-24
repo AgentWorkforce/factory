@@ -102,9 +102,10 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   - `candidates > 0` — the sweep **saw** those issues and **rejected** them. The bug is in eligibility
     evaluation, and `skipReasons` names which gate.
   - `candidates == 0` — the sweep **never pulled** them. The bug is upstream, in discovery/ingestion.
-  - **the three fields absent entirely** — this daemon has not *completed* a sweep (or predates #355).
-    That is not a zero, and must not be read as one: it says nothing about either half. Check
-    `lastCompletedAtMs` and `inFlightMs`.
+  - **the three fields absent entirely** — this daemon has not completed a sweep that **enumerated**
+    (or predates #355). That is not a zero, and must not be read as one: it says nothing about either
+    half. Check `discoveryDeferred` first, then `lastCompletedAtMs`, `lastFailureAtMs`, and `inFlightMs`
+    to distinguish a completed deferral, a failure, work still running, and a pre-counter daemon.
 
   They describe the last sweep that settled successfully **and enumerated**. A pass that failed —
   or that deferred — leaves them untouched rather than zeroing them.

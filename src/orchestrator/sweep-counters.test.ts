@@ -401,18 +401,23 @@ describe('readiness sweep counters (#355)', () => {
         dispatched: 1,
         skipped: 0,
       }), { timeout: 5_000 })
-      const completedAtMs = factory.status().readinessReconcile?.lastCompletedAtMs
 
       stateStore.deferClaims = true
 
       // Then deferred passes, for long enough that several land.
       await vi.waitFor(() => {
-        expect(factory.status().readinessReconcile?.discoveryDeferred).toBe('sweep-in-flight')
-        expect(factory.status().readinessReconcile?.lastCompletedAtMs)
-          .toBeGreaterThan(completedAtMs ?? 0)
+        const deferred = factory.status().readinessReconcile
+        expect(deferred?.discoveryDeferred).toBe('sweep-in-flight')
+        expect(deferred?.lastEnumeratedAtMs).toBeDefined()
+        expect(deferred?.lastCompletedAtMs).toBeGreaterThan(deferred?.lastEnumeratedAtMs ?? 0)
       }, { timeout: 5_000 })
 
       const status = factory.status().readinessReconcile
+      // Capture the enumerating baseline only after deferral is observable. A
+      // 50ms pass can land between the first wait and flipping `deferClaims`,
+      // so a pre-toggle completion timestamp is inherently racy.
+      const completedAtMs = status?.lastEnumeratedAtMs
+      expect(completedAtMs).toBeDefined()
       // The measurement survives, and the marker says it is from an earlier pass.
       expect(status).toMatchObject({
         state: 'healthy',
@@ -542,6 +547,70 @@ describe('readiness sweep counters (#355)', () => {
     }
     // Two sequential waits on a live 50ms loop; vitest's 5s default is not a
     // budget this fits in, and this repo configures no `testTimeout`.
+  }, 30_000)
+
+  it('clears an older deferral marker when the next pass fails', async () => {
+    class ControllableStateStore extends InMemoryStateStore {
+      mode: 'enumerate' | 'defer' | 'fail' = 'enumerate'
+
+      override async claimDiscoverySweep(
+        workspaceId: string,
+        owner: string,
+        nowMs: number,
+        leaseMs: number,
+      ): Promise<DiscoverySweepClaim> {
+        if (this.mode === 'fail') throw new Error('discovery failed after deferral')
+        const claim = await super.claimDiscoverySweep(
+          workspaceId,
+          this.mode === 'defer' ? 'another-process' : owner,
+          nowMs,
+          leaseMs,
+        )
+        return this.mode === 'defer' ? { ...claim, acquired: false, lease: undefined } : claim
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-counters-'))
+    const stateStore = new ControllableStateStore({ batchSize: 4 })
+    const factory = createFactory(
+      config({ loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') } }),
+      {
+        mount: new FakeMountClient({ [issuePath(981)]: issueFile(981) }),
+        fleet: new FakeFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        logger: {},
+      },
+    )
+    try {
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+      })
+      await vi.waitFor(() => {
+        expect(factory.status().readinessReconcile?.lastEnumeratedAtMs).toBeDefined()
+      }, { timeout: 5_000 })
+
+      stateStore.mode = 'defer'
+      await vi.waitFor(() => {
+        expect(factory.status().readinessReconcile?.discoveryDeferred).toBe('sweep-in-flight')
+      }, { timeout: 5_000 })
+
+      stateStore.mode = 'fail'
+      await vi.waitFor(() => {
+        const failed = factory.status().readinessReconcile
+        expect(failed?.lastErrorClass).toBe('Error')
+        expect(failed?.lastFailureAtMs).toBeDefined()
+        expect(failed && Object.hasOwn(failed, 'discoveryDeferred')).toBe(false)
+      }, { timeout: 5_000 })
+
+      // The last real measurement remains useful; only the stale attribution
+      // to lease contention is removed by the newer failed pass.
+      expect(factory.status().readinessReconcile).toMatchObject({ candidates: 1 })
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
   }, 30_000)
 
   it('publishes counts only: no issue key, path or title reaches the unauthenticated record', async () => {
