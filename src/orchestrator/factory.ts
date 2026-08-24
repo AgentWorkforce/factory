@@ -864,6 +864,16 @@ export class FactoryLoop implements Factory {
     dispatched: number
     skipped: number
     skipReasons: Partial<Record<FactorySweepSkipReasonCode, number>>
+    /**
+     * When the pass these counts describe finished enumerating (#359 review).
+     *
+     * Retaining counts across a deferral without this left them with no time
+     * coordinate: `lastCompletedAtMs` moves on every deferred pass, so the
+     * payload paired arbitrarily old counts with a fresh completion stamp and
+     * a reader could not tell a measurement one interval old from one four
+     * days old. It belongs to this record, and is replaced with it.
+     */
+    enumeratedAtMs: number
   }
   /**
    * Whether the MOST RECENT pass deferred, tracked apart from the counts above
@@ -1646,9 +1656,11 @@ export class FactoryLoop implements Factory {
         // cold container it is the first — and for the next interval, only —
         // sweep whose counts exist. Leaving it unrecorded would make a daemon
         // that has completed a full pass still read as "never ran" (#355).
-        this.#recordReadinessSweepOutcome(await this.runOnce())
+        const report = await this.runOnce()
         this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
-        this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
+        const completedAtMs = this.#clock.now()
+        this.#readinessReconcileLastCompletedAtMs = completedAtMs
+        this.#recordReadinessSweepOutcome(report, completedAtMs)
       } catch (error) {
         this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
         this.#readinessReconcileLastFailureAtMs = this.#clock.now()
@@ -1886,20 +1898,26 @@ export class FactoryLoop implements Factory {
       const report = await this.#runOnceWithReadinessDeadline()
       this.#readinessReconcileConsecutiveFailures = 0
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
-      this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
+      const completedAtMs = this.#clock.now()
+      this.#readinessReconcileLastCompletedAtMs = completedAtMs
       this.#readinessReconcileLastError = undefined
       this.#readinessReconcileLastErrorClass = undefined
       // The three integers below have gone to stdout since this loop existed,
       // and stdout does not reach the deployed container's operator (#355).
       // Publishing them is what lets a reader tell a sweep that saw eligible
       // work and rejected it from one that never pulled it at all.
-      this.#recordReadinessSweepOutcome(report)
+      this.#recordReadinessSweepOutcome(report, completedAtMs)
       this.#logger.info?.('[factory] periodic readiness reconciliation completed', {
         durationMs: this.#readinessReconcileLastDurationMs,
         candidates: report.pulled.length,
         dispatched: report.dispatched.length,
         skipped: report.skipped.length,
-        skipReasons: this.#readinessReconcileLastSweep?.skipReasons,
+        // THIS pass's breakdown, never the retained snapshot (#359 review,
+        // codex P2). Logging the retained one beside a deferred pass's zeroes
+        // produced a line that contradicted its own arithmetic —
+        // `skipped: 0` next to a non-empty breakdown — and this log is what a
+        // local operator reads.
+        skipReasons: factorySweepSkipReasonCounts(report.skipped),
         discoveryDeferred: report.discoveryDeferred,
       })
     } catch (error) {
@@ -5055,7 +5073,7 @@ export class FactoryLoop implements Factory {
    * nothing, so its zeroes are not a measurement of anything and must not
    * replace one. Only the marker is recorded.
    */
-  #recordReadinessSweepOutcome(report: IterationReport): void {
+  #recordReadinessSweepOutcome(report: IterationReport, completedAtMs: number): void {
     if (report.discoveryDeferred) {
       this.#readinessReconcileLastSweepDeferred = report.discoveryDeferred
       return
@@ -5066,6 +5084,10 @@ export class FactoryLoop implements Factory {
       dispatched: report.dispatched.length,
       skipped: report.skipped.length,
       skipReasons: factorySweepSkipReasonCounts(report.skipped),
+      // The caller's completion stamp, not a fresh clock read: on a pass that
+      // enumerated, `lastEnumeratedAtMs` and `lastCompletedAtMs` describe the
+      // same instant and must not drift apart by a tick.
+      enumeratedAtMs: completedAtMs,
     }
   }
 
@@ -5156,6 +5178,7 @@ export class FactoryLoop implements Factory {
             ...(Object.keys(this.#readinessReconcileLastSweep.skipReasons).length > 0
               ? { skipReasons: { ...this.#readinessReconcileLastSweep.skipReasons } }
               : {}),
+            lastEnumeratedAtMs: this.#readinessReconcileLastSweep.enumeratedAtMs,
           }
         : {}),
       // Independent of the trio: a daemon whose FIRST pass deferred has no

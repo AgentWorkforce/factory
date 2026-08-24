@@ -223,10 +223,11 @@ const sweepOutcome = (
     skipped?: unknown
     skipReasons?: unknown
     discoveryDeferred?: unknown
+    lastEnumeratedAtMs?: unknown
   },
 ): Partial<Pick<
   FactoryPublicReadinessReconcileHealth,
-  'candidates' | 'dispatched' | 'skipped' | 'skipReasons' | 'discoveryDeferred'
+  'candidates' | 'dispatched' | 'skipped' | 'skipReasons' | 'discoveryDeferred' | 'lastEnumeratedAtMs'
 >> => {
   // Independent of the trio (#358 review, CodeRabbit): the counts describe the
   // last sweep that ENUMERATED, and this describes the most recent pass. A
@@ -253,6 +254,10 @@ const sweepOutcome = (
     ...dispatched,
     ...skipped,
     ...(skipReasons ? { skipReasons } : {}),
+    // Part of the same atomic snapshot as the counts: it is what dates them,
+    // and without it retained counts have no freshness a reader can recover
+    // (#359 review).
+    ...optionalTimestamp('lastEnumeratedAtMs', status.lastEnumeratedAtMs),
     ...deferred,
   }
 }

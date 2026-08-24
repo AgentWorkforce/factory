@@ -352,7 +352,12 @@ export function formatSweepOutcome(
   return `${readiness.candidates} candidate(s), ${readiness.dispatched ?? 0} dispatched, ` +
     `${readiness.skipped ?? 0} skipped` +
     (readiness.discoveryDeferred
-      ? ' (from an earlier pass — the most recent one deferred to another process holding the discovery lease)'
+      // Name the instant, not just "an earlier pass" (#359 review): retained
+      // counts sit beside an ever-fresh `lastCompletedAtMs`, so without this
+      // an operator cannot tell a measurement one interval old from one days
+      // old, and the staleness is the whole reason to say anything at all.
+      ? ` measured ${formatInstant(readiness.lastEnumeratedAtMs)} — the most recent pass deferred ` +
+        'to another process holding the discovery lease and enumerated nothing'
       : '')
 }
 
@@ -507,6 +512,7 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
       // #355. `candidates === 0` and an absent `candidates` are opposite
       // diagnoses, so the renderer must not collapse them into one dash.
       lines.push(`    last sweep         : ${formatSweepOutcome(readiness)}`)
+      lines.push(`    lastEnumeratedAt   : ${formatInstant(readiness.lastEnumeratedAtMs)}`)
       if (readiness.skipReasons) {
         lines.push(`    skip reasons       : ${formatSkipReasons(readiness.skipReasons)}`)
       }

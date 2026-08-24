@@ -73,7 +73,10 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
     "candidates": 7,                // work units it pulled and evaluated
     "dispatched": 0,                // work units it dispatched
     "skipped": 7,                   // work units it saw and declined
-    "skipReasons": { "dispatch-terminal": 7 }
+    "skipReasons": { "dispatch-terminal": 7 },
+    // When THOSE counts were measured. Not lastCompletedAtMs, which also
+    // advances on a deferred pass that enumerated nothing.
+    "lastEnumeratedAtMs": 1787224535802
   },
   "eventListener": { "state": "subscribed" },
   "fleetControlPlane": { "state": "closed", "consecutiveFailures": 0, "failureThreshold": 3 }
@@ -103,8 +106,15 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
     That is not a zero, and must not be read as one: it says nothing about either half. Check
     `lastCompletedAtMs` and `inFlightMs`.
 
-  They describe the last sweep that settled **successfully**, the same tense as `lastDurationMs`;
-  `lastCompletedAtMs` dates them. A pass that failed leaves them untouched rather than zeroing them.
+  They describe the last sweep that settled successfully **and enumerated**. A pass that failed —
+  or that deferred — leaves them untouched rather than zeroing them.
+
+- **`lastEnumeratedAtMs`** — when those counts were measured, and the field to check before acting on
+  them. It is **not** `lastCompletedAtMs`: that one advances on every settled pass including a
+  deferred one, so on a daemon contending for the discovery lease the counts would otherwise sit
+  beside an ever-fresh completion stamp with no way to tell a measurement one interval old from one
+  four days old. Equal to `lastCompletedAtMs` on a daemon sweeping normally; where they differ, the
+  gap is exactly how stale the counts are.
 
 - **`discoveryDeferred: "sweep-in-flight"`** — the **most recent** pass returned immediately because
   another process held the discovery lease, so it enumerated nothing. It is tracked apart from the
@@ -129,8 +139,15 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   | `dispatch-backoff`, `dispatch-in-flight`, `already-tracked`, `queued-or-escalated` | transient; resolves by itself |
   | `out-of-scope`, `not-ready`, `not-dispatchable` | the gate is working as configured and the issue does not match it — check the deployed `safety` config against the issue, not the daemon |
   | `parked-dependency`, `dependency-cycle` | parked on other work; a cycle needs a human to break it |
-  | `read-failed`, `dispatch-failed` | the dependency or the dispatch threw — pair with `lastErrorClass` |
+  | `read-failed`, `dispatch-failed` | per-item failures the sweep **absorbed and continued past** (#292/#297) — see below |
   | `other` | a code this reader's vocabulary does not know, from a producer on another version |
+
+  `read-failed` and `dispatch-failed` count work units an otherwise-**successful** pass gave up on
+  individually. Do **not** reach for `lastErrorClass` to explain them: that field describes a pass
+  that *failed as a whole*, and the success path clears it, so it is absent in exactly this scenario.
+  The per-item messages go to the container log (`[factory] relayfile shed a ready-issue read…`,
+  `[factory] skipped a work unit whose dispatch failed…`); the count here is what tells you to go
+  looking. A rising `read-failed` alongside `state: healthy` is the #297 shedding signature.
 
   Counts only, by construction: issue keys, paths and titles carry customer project and repository
   names and never cross onto this surface. The keys are rebuilt from the reader's own copy of the

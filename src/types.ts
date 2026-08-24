@@ -233,9 +233,10 @@ export interface FactoryReadinessReconcileStatus {
   /**
    * Work units the last *completed* sweep pulled and evaluated (#355).
    *
-   * Same tense as `lastDurationMs`: written when a pass settles successfully,
-   * left alone by a pass that failed or is still running, so
-   * `lastCompletedAtMs` says which pass these describe.
+   * Written when a pass settles successfully AND enumerated; left alone by a
+   * pass that failed, one still running, and one that deferred to another
+   * process's lease. `lastEnumeratedAtMs` — not `lastCompletedAtMs` — is what
+   * dates them, because the latter advances on deferred passes too.
    *
    * Optional, and never defaulted to zero. A sweep that ran and found nothing
    * publishes `0`; a daemon that has not completed a sweep publishes nothing
@@ -253,6 +254,17 @@ export interface FactoryReadinessReconcileStatus {
    * themselves are a fixed published vocabulary, so an absent key is a zero.
    */
   skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
+  /**
+   * When the pass the counts above describe finished enumerating (#359 review).
+   *
+   * NOT `lastCompletedAtMs`, and the difference is the point. That timestamp
+   * advances on every settled pass including a deferred one, which enumerates
+   * nothing; this one advances only when a pass actually enumerated. Equal on
+   * a daemon that is sweeping normally; where they differ, the gap is how
+   * stale the counts are — the freshness a reader otherwise could not
+   * recover, since retained counts sat beside an ever-fresh completion stamp.
+   */
+  lastEnumeratedAtMs?: number
   /**
    * The MOST RECENT pass never enumerated anything: another process held the
    * discovery lease, so it returned an empty report immediately.
@@ -302,6 +314,11 @@ export interface FactoryPublicReadinessReconcileHealth {
   skipped?: number
   /** `skipped` split by a closed vocabulary of causes; zero counts omitted. */
   skipReasons?: Partial<Record<FactorySweepSkipReasonCode, number>>
+  /**
+   * When the pass the counts describe finished enumerating. Dates them —
+   * `lastCompletedAtMs` does not, since it advances on deferred passes too.
+   */
+  lastEnumeratedAtMs?: number
   /**
    * The most recent pass deferred to another process's discovery lease. Present
    * alongside the counts it means they are from an earlier pass; present alone
