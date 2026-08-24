@@ -3,6 +3,11 @@ import { telemetryErrorClassName } from '../observability/error-class.js'
 import type { FleetControlPlaneStatus } from '../fleet/control-plane-circuit'
 import type { FleetConnectStatus } from '../ports/fleet'
 import { DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS, DEFAULT_CAPACITY_WAIT_WARN_MS } from '../config/schema'
+import {
+  FACTORY_SWEEP_SKIP_REASON_CODES,
+  factorySweepSkipReasonCode,
+} from './sweep-skip-reason'
+import type { FactorySweepSkipReasonCode } from './sweep-skip-reason'
 import type {
   FactoryDispatchCapacityStatus,
   FactoryEventListenerStatus,
@@ -174,6 +179,88 @@ const boundedText = (value: string): string =>
   // C1 range as escape introducers.
   value.replace(/[\u0000-\u001F\u007F-\u009F]+/gu, ' ').trim().slice(0, 300)
 
+/**
+ * The last sweep's skip breakdown, rebuilt key by key (#355).
+ *
+ * Numbers only, and the keys come from this module's own copy of the
+ * vocabulary rather than from the record: a producer on another version — or a
+ * corrupted one — could otherwise put an arbitrary string on an
+ * unauthenticated surface simply by using it as an object key, which is the
+ * one thing every other field here is careful not to allow. An unknown key's
+ * count is folded into `other` rather than dropped, so the parts still sum to
+ * `skipped`.
+ */
+const skipReasonCounts = (
+  value: unknown,
+): Partial<Record<FactorySweepSkipReasonCode, number>> | undefined => {
+  const record = plainRecord(value)
+  if (!record) return undefined
+  const counts: Partial<Record<FactorySweepSkipReasonCode, number>> = {}
+  for (const [key, raw] of Object.entries(record)) {
+    const parsed = finiteNumber(raw)
+    if (parsed === undefined || parsed < 0) continue
+    const floored = Math.floor(parsed)
+    if (floored === 0) continue
+    const code = factorySweepSkipReasonCode(key)
+    counts[code] = (counts[code] ?? 0) + floored
+  }
+  // Emitted in vocabulary order so two samples of the same surface diff
+  // cleanly, and dropped entirely when empty: `skipped` already carries the
+  // total, so an empty breakdown states nothing the reader did not have.
+  const ordered = FACTORY_SWEEP_SKIP_REASON_CODES.filter((code) => counts[code] !== undefined)
+  if (ordered.length === 0) return undefined
+  return Object.fromEntries(ordered.map((code) => [code, counts[code] as number]))
+}
+
+/**
+ * The last completed sweep's arithmetic, published (#355).
+ *
+ * Deliberately NOT `counter()`: that coerces an absent field to `0`, which
+ * would make a daemon that has never completed a sweep indistinguishable from
+ * one that completed a sweep and found nothing. Those are the two halves of
+ * the split this block exists to make, so the three fields travel together —
+ * all present, or none — and a zero is published as a zero.
+ */
+const sweepOutcome = (
+  // Deliberately `unknown` per field rather than the status type: the same
+  // code serves the writer, which holds a real status, and the reader, which
+  // holds parsed JSON from a process it does not control. Casting the latter
+  // into the former to share the function would be the one unchecked
+  // assumption on a path whose whole job is not making any.
+  status: {
+    candidates?: unknown
+    dispatched?: unknown
+    skipped?: unknown
+    skipReasons?: unknown
+    discoveryDeferred?: unknown
+  },
+): Partial<Pick<
+  FactoryPublicReadinessReconcileHealth,
+  'candidates' | 'dispatched' | 'skipped' | 'skipReasons' | 'discoveryDeferred'
+>> => {
+  const candidates = optionalCount('candidates', status.candidates)
+  const dispatched = optionalCount('dispatched', status.dispatched)
+  const skipped = optionalCount('skipped', status.skipped)
+  // A record carrying only some of the three is a producer we do not
+  // understand; publishing the fragment would invite exactly the arithmetic
+  // ("candidates minus dispatched") that the missing field makes wrong.
+  if (candidates.candidates === undefined ||
+      dispatched.dispatched === undefined ||
+      skipped.skipped === undefined) {
+    return {}
+  }
+  const skipReasons = skipReasonCounts(status.skipReasons)
+  return {
+    ...candidates,
+    ...dispatched,
+    ...skipped,
+    ...(skipReasons ? { skipReasons } : {}),
+    ...(status.discoveryDeferred === 'sweep-in-flight'
+      ? { discoveryDeferred: 'sweep-in-flight' as const }
+      : {}),
+  }
+}
+
 const DISPATCH_CAPACITY_STATES: readonly FactoryPublicDispatchCapacityHealth['state'][] = [
   'healthy',
   'waiting',
@@ -309,6 +396,7 @@ function readinessReconcileHealth(
     ...(inFlightMs !== undefined
       ? { inFlightMs, missedPasses: Math.floor(inFlightMs / cadenceMs) }
       : {}),
+    ...sweepOutcome(status),
     // `lastError` itself never crosses. Its class does, through the same
     // allowlist that guards IterationReport.skipped[].reason — and a record
     // that carries an error but no admissible class still says so.
@@ -677,6 +765,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             ...optionalTimestamp('lastFailureAtMs', readiness.lastFailureAtMs),
             ...optionalDuration('inFlightMs', readiness.inFlightMs),
             ...optionalCount('missedPasses', readiness.missedPasses),
+            ...sweepOutcome(readiness),
             ...(readiness.lastErrorClass !== undefined
               ? { lastErrorClass: telemetryErrorClassName(readiness.lastErrorClass) }
               : {}),

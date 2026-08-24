@@ -1,6 +1,6 @@
 import { telemetryErrorClass } from '../observability/error-class.js'
 import { normalizePublicHealth } from '../orchestrator/public-health.js'
-import type { FactoryPublicHealth } from '../types'
+import type { FactoryPublicHealth, FactoryPublicReadinessReconcileHealth } from '../types'
 
 /**
  * `factory diagnose --deployed <url>` (#295).
@@ -315,13 +315,47 @@ function verdictFor(diagnosis: Omit<DeployedFactoryDiagnosis, 'verdict' | 'dispa
         'not dispatching: the readiness loop is not running — this instance is not a live daemon.',
     }
   }
+  // #355. Everything above is a subsystem verdict, and every one of them read
+  // green through a total dispatch outage: a healthy sub-second sweep declined
+  // seven eligible issues and this line still said "dispatching". The last
+  // sweep's own arithmetic is the only thing on this surface that can
+  // contradict that, so it goes in the sentence rather than three lines below
+  // it.
   return {
     dispatching: true,
     verdict:
       'dispatching: readinessReconcile is healthy' +
       (readiness?.intervalMs ? ` on a ${formatDuration(readiness.intervalMs)} cadence` : '') +
-      `, and the event listener is ${health.eventListener?.state ?? 'unknown'}.`,
+      `, and the event listener is ${health.eventListener?.state ?? 'unknown'}.` +
+      ` Last completed sweep: ${formatSweepOutcome(readiness)}.`,
   }
+}
+
+/**
+ * The last completed sweep, as a phrase that keeps zero and absent apart (#355).
+ *
+ * `candidates: 0` says discovery pulled nothing and the bug is upstream of
+ * eligibility; no `candidates` at all says this instance has not finished a
+ * sweep — or predates the counters — and says nothing about either. Rendering
+ * both as `0` would recreate the ambiguity the field exists to remove.
+ */
+export function formatSweepOutcome(
+  readiness: FactoryPublicReadinessReconcileHealth | undefined,
+): string {
+  if (!readiness || readiness.candidates === undefined) {
+    return 'not reported (no sweep has completed, or this instance predates the counters)'
+  }
+  return `${readiness.candidates} candidate(s), ${readiness.dispatched ?? 0} dispatched, ` +
+    `${readiness.skipped ?? 0} skipped` +
+    (readiness.discoveryDeferred
+      ? ' — it deferred to another process holding the discovery lease and enumerated nothing'
+      : '')
+}
+
+/** The skip breakdown, ordered as the record carries it. */
+export function formatSkipReasons(counts: Record<string, number>): string {
+  const entries = Object.entries(counts).filter(([, count]) => count > 0)
+  return entries.length === 0 ? '—' : entries.map(([code, count]) => `${code}=${count}`).join(', ')
 }
 
 export function formatDuration(ms: number | undefined): string {
@@ -466,6 +500,12 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
       lines.push(`    lastStartedAt      : ${formatInstant(readiness.lastStartedAtMs)}`)
       lines.push(`    lastCompletedAt    : ${formatInstant(readiness.lastCompletedAtMs)}`)
       lines.push(`    lastFailureAt      : ${formatInstant(readiness.lastFailureAtMs)}`)
+      // #355. `candidates === 0` and an absent `candidates` are opposite
+      // diagnoses, so the renderer must not collapse them into one dash.
+      lines.push(`    last sweep         : ${formatSweepOutcome(readiness)}`)
+      if (readiness.skipReasons) {
+        lines.push(`    skip reasons       : ${formatSkipReasons(readiness.skipReasons)}`)
+      }
     }
     const capacity = health.dispatchCapacity
     if (capacity) {

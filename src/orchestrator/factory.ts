@@ -150,6 +150,8 @@ import {
   publicHealthFromHeartbeat,
   readinessReconcileInFlightMs,
 } from './public-health'
+import { factorySweepSkipReasonCounts } from './sweep-skip-reason'
+import type { FactorySweepSkipReasonCode } from './sweep-skip-reason'
 import { boundedRunCostTotal, CostLedger, type RunCostTotal, type UnpricedModelCostRecord } from '../cost/ledger'
 import { createTicketDispatchDelivery, type TicketDispatchDelivery } from '../delivery/ticket-dispatch'
 import {
@@ -845,6 +847,25 @@ export class FactoryLoop implements Factory {
   #readinessReconcileLastFailureAtMs?: number
   #readinessReconcileLastError?: string
   #readinessReconcileLastErrorClass?: string
+  /**
+   * The last *completed* sweep's arithmetic (#355).
+   *
+   * Held as one record rather than four fields so it can only ever be replaced
+   * whole: publishing a `dispatched` from one pass beside a `candidates` from
+   * another would be worse than publishing neither, since the whole use of
+   * these numbers is comparing them to each other.
+   *
+   * `undefined` until a sweep completes, and never initialised to zeroes —
+   * "this daemon has not finished a sweep" and "a sweep finished and found
+   * nothing" are the two readings #355 has to tell apart.
+   */
+  #readinessReconcileLastSweep?: {
+    candidates: number
+    dispatched: number
+    skipped: number
+    skipReasons: Partial<Record<FactorySweepSkipReasonCode, number>>
+    discoveryDeferred?: 'sweep-in-flight'
+  }
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
@@ -1610,7 +1631,11 @@ export class FactoryLoop implements Factory {
       const backfillStartedAtMs = this.#clock.now()
       this.#readinessReconcileLastStartedAtMs = backfillStartedAtMs
       try {
-        await this.runOnce()
+        // The startup backfill is a discovery pass like any other, and on a
+        // cold container it is the first — and for the next interval, only —
+        // sweep whose counts exist. Leaving it unrecorded would make a daemon
+        // that has completed a full pass still read as "never ran" (#355).
+        this.#recordReadinessSweepOutcome(await this.runOnce())
         this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
         this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
       } catch (error) {
@@ -1853,11 +1878,18 @@ export class FactoryLoop implements Factory {
       this.#readinessReconcileLastCompletedAtMs = this.#clock.now()
       this.#readinessReconcileLastError = undefined
       this.#readinessReconcileLastErrorClass = undefined
+      // The three integers below have gone to stdout since this loop existed,
+      // and stdout does not reach the deployed container's operator (#355).
+      // Publishing them is what lets a reader tell a sweep that saw eligible
+      // work and rejected it from one that never pulled it at all.
+      this.#recordReadinessSweepOutcome(report)
       this.#logger.info?.('[factory] periodic readiness reconciliation completed', {
         durationMs: this.#readinessReconcileLastDurationMs,
         candidates: report.pulled.length,
         dispatched: report.dispatched.length,
         skipped: report.skipped.length,
+        skipReasons: this.#readinessReconcileLastSweep?.skipReasons,
+        discoveryDeferred: report.discoveryDeferred,
       })
     } catch (error) {
       // #297: all four relayfile overload reason codes share one message, and
@@ -2919,6 +2951,7 @@ export class FactoryLoop implements Factory {
           issue: entry.issue.key,
           path: entry.issue.path,
           reason: entry.reason,
+          code: entry.code,
         })
       }
       // Backstop for the skip-by-default catch below: see #292. Reset only by
@@ -2956,7 +2989,11 @@ export class FactoryLoop implements Factory {
             retryAfterSeconds: overload.retryAfterSeconds,
             sweepOverloads: this.#discoverySweepOverloads,
           })
-          recordSkip({ issue: issueRefFromPath(path), reason: perItemDispatchSkipReason(error) })
+          recordSkip({
+            issue: issueRefFromPath(path),
+            reason: perItemDispatchSkipReason(error),
+            code: 'read-failed',
+          })
         }
         readyIssueReads += 1
         // Relayfile served this work unit's read: the dependency is shedding
@@ -3022,7 +3059,7 @@ export class FactoryLoop implements Factory {
         if (!mayRecoverGithubOrphan) {
           const dispatchBlock = await this.#dispatchBlockReason(issue)
           if (dispatchBlock) {
-            recordSkip({ issue: issueRef(issue), reason: dispatchBlock })
+            recordSkip({ issue: issueRef(issue), ...dispatchBlock })
             continue
           }
         }
@@ -3033,20 +3070,25 @@ export class FactoryLoop implements Factory {
         const recoveredOrphan = orphanResult.recovered
         const batch = await this.#batch()
         if (batch.isInFlight(issue) || batch.isQueued(issue)) {
-          recordSkip({ issue: issueRef(issue), reason: orphanResult.reason ?? 'already tracked' })
+          recordSkip({
+            issue: issueRef(issue),
+            reason: orphanResult.reason ?? 'already tracked',
+            code: 'already-tracked',
+          })
           continue
         }
         if (!wasReady && !recoveredOrphan) {
           if (mayRecoverGithubOrphan) {
             const dispatchBlock = await this.#dispatchBlockReason(issue)
             if (dispatchBlock) {
-              recordSkip({ issue: issueRef(issue), reason: dispatchBlock })
+              recordSkip({ issue: issueRef(issue), ...dispatchBlock })
               continue
             }
           }
           recordSkip({
             issue: issueRef(issue),
             reason: orphanResult.reason ?? 'live state is not ready-for-agent',
+            code: 'not-ready',
           })
           continue
         }
@@ -3055,18 +3097,22 @@ export class FactoryLoop implements Factory {
           if (recoveredOrphan) {
             const dispatchBlock = await this.#dispatchBlockReason(issue)
             if (dispatchBlock) {
-              recordSkip({ issue: issueRef(issue), reason: dispatchBlock })
+              recordSkip({ issue: issueRef(issue), ...dispatchBlock })
               continue
             }
           }
 
           if (!isInFactoryScope(issue, this.#config.safety)) {
-            recordSkip({ issue: issueRef(issue), reason: 'not factory-e2e scope' })
+            recordSkip({ issue: issueRef(issue), reason: 'not factory-e2e scope', code: 'out-of-scope' })
             continue
           }
 
           if (!isDispatchableIssue(issue)) {
-            recordSkip({ issue: issueRef(issue), reason: 'not reconciled real Linear issue' })
+            recordSkip({
+              issue: issueRef(issue),
+              reason: 'not reconciled real Linear issue',
+              code: 'not-dispatchable',
+            })
             continue
           }
 
@@ -3080,12 +3126,17 @@ export class FactoryLoop implements Factory {
           // decays the durable overload ratchet (#297).
           this.#discoverySweepProgress = true
           if (result.agents.length === 0 && !dryRun) {
+            const code: FactorySweepSkipReasonCode = result.hold?.kind === 'dependency-cycle'
+              ? 'dependency-cycle'
+              : result.hold?.kind === 'dependency'
+                ? 'parked-dependency'
+                : 'queued-or-escalated'
             const reason = result.hold?.kind === 'dependency-cycle'
               ? `dependency cycle detected: ${result.hold.cycle?.join(' -> ') ?? 'unknown cycle'}`
               : result.hold?.kind === 'dependency'
                 ? `parked on dependencies: ${result.hold.blockers?.join(', ') ?? 'unresolved dependency'}`
                 : 'queued or escalated'
-            recordSkip({ issue: decision.issue, reason })
+            recordSkip({ issue: decision.issue, reason, code })
           } else {
             dispatched.push(result)
           }
@@ -3162,7 +3213,11 @@ export class FactoryLoop implements Factory {
               error: describeError(error).errorMessage,
             })
           }
-          recordSkip({ issue: issueRef(issue), reason: perItemDispatchSkipReason(error) })
+          recordSkip({
+            issue: issueRef(issue),
+            reason: perItemDispatchSkipReason(error),
+            code: 'dispatch-failed',
+          })
           continue
         } finally {
           if (recoveredIdentity) this.#reconciledGithubInProgress.delete(recoveredIdentity)
@@ -4500,7 +4555,7 @@ export class FactoryLoop implements Factory {
 
     const blockReason = await this.#dispatchBlockReason(decision.issue)
     if (blockReason) {
-      const error = new Error(`Refusing to dispatch ${decision.issue.key}: ${blockReason}`)
+      const error = new Error(`Refusing to dispatch ${decision.issue.key}: ${blockReason.reason}`)
       this.#error(error, decision.issue)
       throw error
     }
@@ -4976,6 +5031,24 @@ export class FactoryLoop implements Factory {
     return { state: 'starting' }
   }
 
+  /**
+   * Snapshot a settled sweep's counts onto the readiness surface (#355).
+   *
+   * Only successful passes reach here: a pass that threw has no report, and
+   * inventing zeroes for it would publish "found nothing" for a sweep that
+   * never got to look. The previous pass's numbers stay put instead, dated by
+   * `lastCompletedAtMs`, which is the honest reading.
+   */
+  #recordReadinessSweepOutcome(report: IterationReport): void {
+    this.#readinessReconcileLastSweep = {
+      candidates: report.pulled.length,
+      dispatched: report.dispatched.length,
+      skipped: report.skipped.length,
+      skipReasons: factorySweepSkipReasonCounts(report.skipped),
+      ...(report.discoveryDeferred ? { discoveryDeferred: report.discoveryDeferred } : {}),
+    }
+  }
+
   #readinessReconcileStatus(): FactoryReadinessReconcileStatus {
     const consecutiveFailures = this.#readinessReconcileConsecutiveFailures
     // #296 owns the numerator here, #295/#300 own the derivation. The earliest
@@ -5051,6 +5124,22 @@ export class FactoryLoop implements Factory {
         : {}),
       ...(this.#readinessReconcileLastFailureAtMs !== undefined
         ? { lastFailureAtMs: this.#readinessReconcileLastFailureAtMs }
+        : {}),
+      // Spread whole or not at all: see `#readinessReconcileLastSweep`. Zeroes
+      // are published, which is the entire point — an absent `candidates` and
+      // a zero `candidates` are different diagnoses (#355).
+      ...(this.#readinessReconcileLastSweep
+        ? {
+            candidates: this.#readinessReconcileLastSweep.candidates,
+            dispatched: this.#readinessReconcileLastSweep.dispatched,
+            skipped: this.#readinessReconcileLastSweep.skipped,
+            ...(Object.keys(this.#readinessReconcileLastSweep.skipReasons).length > 0
+              ? { skipReasons: { ...this.#readinessReconcileLastSweep.skipReasons } }
+              : {}),
+            ...(this.#readinessReconcileLastSweep.discoveryDeferred
+              ? { discoveryDeferred: this.#readinessReconcileLastSweep.discoveryDeferred }
+              : {}),
+          }
         : {}),
       ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
       ...(this.#readinessReconcileLastErrorClass
@@ -7969,20 +8058,32 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #dispatchBlockReason(issue: IssueRef): Promise<string | undefined> {
+  /**
+   * Why durable dispatch state refuses this issue, or `undefined` to proceed.
+   *
+   * Returns the operator text *and* its #355 code together rather than letting
+   * the sweep re-derive one from the other: these four conditions are the ones
+   * most likely to explain a sweep that saw eligible issues and dispatched
+   * nothing, and two of them (`terminal`, `retry-limit`) never clear on their
+   * own. Deriving the code by matching the message would put that distinction
+   * one rename away from collapsing into `other`.
+   */
+  async #dispatchBlockReason(
+    issue: IssueRef,
+  ): Promise<{ reason: string; code: FactorySweepSkipReasonCode } | undefined> {
     const key = issueStateKey(issue)
     const state = await this.#state.getDispatchAttempts(this.#workspaceId, key)
     if (!state) return undefined
-    if (state.terminal) return 'dispatch already terminal'
-    if (state.inFlight) return 'dispatch already in-flight'
+    if (state.terminal) return { reason: 'dispatch already terminal', code: 'dispatch-terminal' }
+    if (state.inFlight) return { reason: 'dispatch already in-flight', code: 'dispatch-in-flight' }
     const now = this.#clock.now()
     if (state.backoffUntilMs > now) {
-      return 'dispatch backoff active'
+      return { reason: 'dispatch backoff active', code: 'dispatch-backoff' }
     }
     if (state.attempts >= this.#config.dispatch.maxAttempts) {
       state.terminal = true
       await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
-      return 'dispatch retry limit reached'
+      return { reason: 'dispatch retry limit reached', code: 'dispatch-retry-limit' }
     }
     return undefined
   }
