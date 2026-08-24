@@ -1511,6 +1511,25 @@ describe('RelayfileCloudMountClient', () => {
       }
     }
 
+    class HangingReadFileClient extends FakeRelayFileClient {
+      seenSignal?: AbortSignal
+
+      override async readFile(
+        workspaceId: string,
+        path: string,
+        _correlationId?: string,
+        signal?: AbortSignal,
+      ): Promise<never> {
+        this.readFileCalls.push({ workspaceId, path })
+        this.seenSignal = signal
+        return await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            reject((signal as AbortSignal & { reason?: unknown }).reason)
+          })
+        })
+      }
+    }
+
     it('cancels a read that stops answering and names the operation', async () => {
       const client = new HangingListTreeClient()
       const mount = new RelayfileCloudMountClient({
@@ -1544,6 +1563,38 @@ describe('RelayfileCloudMountClient', () => {
         name: 'RelayfileOperationTimeoutError',
         operation: 'ensureSubRoot',
       })
+    })
+
+    it('cancels the revision read before an unguarded write', async () => {
+      const client = new HangingReadFileClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 25,
+      })
+
+      await expect(mount.writeFile('/tmp/draft.json', { draft: true })).rejects.toMatchObject({
+        name: 'RelayfileOperationTimeoutError',
+        operation: 'writeFile.readRevision',
+      })
+      expect(client.seenSignal?.aborted).toBe(true)
+      expect(client.writeFileCalls).toEqual([])
+    })
+
+    it('cancels the current-revision read before a delete', async () => {
+      const client = new HangingReadFileClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 25,
+      })
+
+      await expect(mount.deleteFile('/tmp/draft.json')).rejects.toMatchObject({
+        name: 'RelayfileOperationTimeoutError',
+        operation: 'deleteFile.readCurrent',
+      })
+      expect(client.seenSignal?.aborted).toBe(true)
+      expect(client.deleteFileCalls).toEqual([])
     })
 
     it('caps an explicit ensureSubRoot timeout at the tighter client-wide budget', async () => {

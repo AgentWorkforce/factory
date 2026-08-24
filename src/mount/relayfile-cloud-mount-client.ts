@@ -706,7 +706,8 @@ export class RelayfileCloudMountClient implements MountClient {
         })
       }
       try {
-        baseRevision = (await this.#client.readFile(this.workspaceId, path)).revision
+        baseRevision = (await this.#bounded('writeFile.readRevision', this.#operationTimeoutMs, (signal) =>
+          this.#client.readFile(this.workspaceId, path, undefined, signal))).revision
       } catch (error) {
         if (!isHttpStatus(error, 404)) throw error
       }
@@ -734,7 +735,8 @@ export class RelayfileCloudMountClient implements MountClient {
   async deleteFile(path: string): Promise<void> {
     this.#confirmedExternalIdByPath.delete(path)
     this.#confirmedFailureReasonByPath.delete(path)
-    const current = await this.#client.readFile(this.workspaceId, path)
+    const current = await this.#bounded('deleteFile.readCurrent', this.#operationTimeoutMs, (signal) =>
+      this.#client.readFile(this.workspaceId, path, undefined, signal))
     const currentContent = parseRemoteContent(current)
     if (isProviderPath(path)) {
       await this.#assertProviderDeleteAllowed(path, currentContent)

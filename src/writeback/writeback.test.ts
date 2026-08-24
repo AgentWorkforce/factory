@@ -126,6 +126,32 @@ describe('MountLinearWriteback', () => {
       .toBe('human-review-state')
   })
 
+  it('recognizes a statusCode-shaped Linear revision conflict', async () => {
+    class StatusCodeConflictMountClient extends FakeMountClient {
+      override async writeFile(
+        path: string,
+        content: unknown,
+        opts?: { guarded?: boolean; baseRevision?: string },
+      ): Promise<void> {
+        if (opts?.baseRevision !== undefined) {
+          this.files.set(path, {
+            content: wrappedIssueRecord({ stateId: 'human-review-state' }),
+            revision: String(Number(opts.baseRevision) + 1),
+          })
+          throw Object.assign(new Error(`Revision conflict for ${path}`), { statusCode: 409 })
+        }
+        await super.writeFile(path, content, opts)
+      }
+    }
+    const mount = new StatusCodeConflictMountClient()
+    mount.files.set(issuePath, { content: wrappedIssueRecord({ stateId: 'implementing-state' }), revision: '7' })
+    const linear = MountLinearWriteback(mount)
+
+    await expect(linear.compareAndSetState?.(issue, 'implementing-state', '7', 'ready-state'))
+      .resolves.toBe('superseded')
+    expect(mount.writes).toEqual([])
+  })
+
   it('preserves current Linear fields when conditionally restoring the state', async () => {
     const mount = new FakeMountClient()
     mount.files.set(issuePath, {

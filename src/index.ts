@@ -357,6 +357,7 @@ export type {
   GithubIssueStatus,
   GithubStatusWriteResult,
   GithubStatusClaimReceipt,
+  GithubStatusRollbackResult,
   GithubWriteback,
   LinearWriteback,
   Logger,

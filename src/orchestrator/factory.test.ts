@@ -1081,7 +1081,7 @@ class BlockingDispatchClaimGithubWriteback extends RecordingGithubWriteback {
     return 'applied'
   }
 
-  override async claimStatus(
+  async claimStatus(
     issue: LinearIssue,
     status: GithubIssueStatus,
   ): Promise<GithubStatusClaimReceipt> {
@@ -1091,7 +1091,7 @@ class BlockingDispatchClaimGithubWriteback extends RecordingGithubWriteback {
     return { result, claimToken }
   }
 
-  override async rollbackStatusClaim(
+  async rollbackStatusClaim(
     issue: LinearIssue,
     status: GithubIssueStatus,
     claimToken: string,
@@ -12078,6 +12078,9 @@ describe('FactoryLoop', () => {
       githubWriteback.commentWriteGate.resolve()
       const runResult = await withDeadline(run, 8_000, 'comment failure did not compensate the claim')
       expect(runResult).toMatchObject({ name: 'PostSpawnDispatchWaitRejectedError' })
+      if (!(runResult instanceof Error) || !('compensationError' in runResult)) {
+        throw new Error('expected a rejected post-spawn dispatch with compensation detail')
+      }
       expect(runResult.compensationError).toBeUndefined()
       expect(factory.status().counters.postSpawnDispatchClaimCompensationFailures).toBeUndefined()
       await withDeadline(stateStore.releaseStarted.promise, 2_000, 'stop did not drain before lifecycle release')
@@ -12148,6 +12151,9 @@ describe('FactoryLoop', () => {
       const runResult = await withDeadline(run, 8_000, 'failed rollback did not preserve cancellation')
       expect(runResult).toMatchObject({ name: 'PostSpawnDispatchWaitRejectedError' })
       expect(runResult).toHaveProperty('compensationError')
+      if (!(runResult instanceof Error) || !('compensationError' in runResult)) {
+        throw new Error('expected a rejected post-spawn dispatch with compensation detail')
+      }
       expect(runResult.compensationError).toBeInstanceOf(AggregateError)
       expect((runResult.compensationError as AggregateError).errors).toEqual([
         expect.objectContaining({ message: 'provider rejected the in-flight dispatch comment' }),
@@ -12369,6 +12375,63 @@ describe('FactoryLoop', () => {
       await withDeadline(run, 8_000, 'timed-out dispatch did not unwind after its provider recovered')
       expect(factory.status().inFlight).toEqual([])
       if (!stopped) await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('keeps draining a rejected claim for a non-durable fleet until compensation settles', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-claim-stop-nondurable-'))
+    const number = 1265
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new BlockingDispatchClaimGithubWriteback()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 60_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let stop: Promise<void> | undefined
+    let stopSettled = false
+    try {
+      await withDeadline(githubWriteback.claimWriteStarted.promise, 4_000, 'dispatch claim did not start')
+
+      stop = factory.stop().then(() => { stopSettled = true })
+      await new Promise<void>((resolve) => { setTimeout(resolve, 2_700) })
+
+      expect(stopSettled).toBe(false)
+      expect(factory.status().counters.postSpawnDispatchClaimDrainTimeouts).toBeUndefined()
+      expect(fleet.releases).toEqual([])
+
+      githubWriteback.claimWriteGate.resolve()
+      await withDeadline(run, 8_000, 'non-durable dispatch did not compensate after its provider recovered')
+      await withDeadline(stop, 4_000, 'stop did not finish after non-durable compensation settled')
+
+      expect(githubWriteback.statuses).toEqual([
+        { key: String(number), status: 'in-progress' },
+        { key: String(number), status: 'ready' },
+      ])
+      expect(fleet.releases).toEqual([
+        { name: `ar-${number}-impl-pear`, reason: 'factory-stopped' },
+        { name: `ar-${number}-review-pear`, reason: 'factory-stopped' },
+      ])
+      expect(factory.status().inFlight).toEqual([])
+    } finally {
+      githubWriteback.claimWriteGate.resolve()
+      await (stop ?? factory.stop())
       await rm(root, { recursive: true, force: true })
     }
   }, 30_000)

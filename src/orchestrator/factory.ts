@@ -1607,6 +1607,16 @@ export class FactoryLoop implements Factory {
 
     let timer: ReturnType<typeof setTimeout> | undefined
     const drained = Promise.allSettled([...dispatches]).then(() => true)
+    // A durable fleet can recover ownership after this process exits. Local
+    // and other non-durable fleets cannot: releasing their placements before
+    // the provider claim has compensated would leave no successor able to
+    // finish the lifecycle, and a late write could strand the issue in its
+    // claimed state. Keep draining those fleets without the shutdown escape
+    // hatch.
+    if (this.#fleet.durableOwnership !== true) {
+      await drained
+      return
+    }
     const timedOut = new Promise<false>((resolve) => {
       timer = setTimeout(() => resolve(false), STOP_REJECTED_DISPATCH_DRAIN_TIMEOUT_MS)
       timer.unref?.()

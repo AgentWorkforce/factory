@@ -46,6 +46,7 @@ export type {
   GithubIssueStatus,
   GithubStatusWriteResult,
   GithubStatusClaimReceipt,
+  GithubStatusRollbackResult,
   GithubWriteback,
   LinearWriteback,
   SlackWriteback,

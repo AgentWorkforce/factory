@@ -372,7 +372,10 @@ export const MountLinearWriteback = (
 }
 
 const isRevisionConflict = (error: unknown): boolean =>
-  Boolean(error && typeof error === 'object' && 'status' in error && error.status === 409)
+  Boolean(error && typeof error === 'object' && (
+    ('status' in error && error.status === 409)
+    || ('statusCode' in error && error.statusCode === 409)
+  ))
 
 const isStateOnlyDraft = (payload: Record<string, unknown>): boolean => {
   const keys = Object.keys(payload)
