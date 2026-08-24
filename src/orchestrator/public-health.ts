@@ -203,11 +203,11 @@ const skipReasonCounts = (
 }
 
 /**
- * The last completed sweep's arithmetic, published (#355).
+ * The last enumerating sweep's arithmetic, published (#355).
  *
  * Deliberately NOT `counter()`: that coerces an absent field to `0`, which
- * would make a daemon that has never completed a sweep indistinguishable from
- * one that completed a sweep and found nothing. Those are the two halves of
+ * would make a daemon that has never enumerated a sweep indistinguishable from
+ * one that enumerated a sweep and found nothing. Those are the two halves of
  * the split this block exists to make, so the three fields travel together —
  * all present, or none — and a zero is published as a zero.
  */

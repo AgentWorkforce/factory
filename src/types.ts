@@ -231,7 +231,7 @@ export interface FactoryReadinessReconcileStatus {
   /** Age of a pass that started and has neither completed nor failed. */
   inFlightMs?: number
   /**
-   * Work units the last *completed* sweep pulled and evaluated (#355).
+   * Work units the last *enumerating* sweep pulled and evaluated (#355).
    *
    * Written when a pass settles successfully AND enumerated; left alone by a
    * pass that failed, one still running, and one that deferred to another
@@ -239,15 +239,15 @@ export interface FactoryReadinessReconcileStatus {
    * dates them, because the latter advances on deferred passes too.
    *
    * Optional, and never defaulted to zero. A sweep that ran and found nothing
-   * publishes `0`; a daemon that has not completed a sweep publishes nothing
+   * publishes `0`; a daemon that has not enumerated a sweep publishes nothing
    * at all, and the whole point of the field is that those two are different
    * facts — `candidates: 0` blames discovery, an absent `candidates` blames
    * nobody yet.
    */
   candidates?: number
-  /** Work units the last completed sweep actually dispatched. */
+  /** Work units the last enumerating sweep actually dispatched. */
   dispatched?: number
-  /** Work units the last completed sweep saw and declined. */
+  /** Work units the last enumerating sweep saw and declined. */
   skipped?: number
   /**
    * `skipped` split by cause. Zero-count codes are omitted; the codes
@@ -303,7 +303,7 @@ export interface FactoryPublicReadinessReconcileHealth {
   /** `inFlightMs` expressed in sweeps that should have run and did not. */
   missedPasses?: number
   /**
-   * The last completed sweep's arithmetic, published (#355).
+   * The last enumerating sweep's arithmetic, published (#355).
    *
    * Counts only — no issue keys, no paths, no titles — and absent rather than
    * zero until a sweep has completed enumeration, so "never enumerated" and

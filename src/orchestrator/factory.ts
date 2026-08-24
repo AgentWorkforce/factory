@@ -5066,8 +5066,8 @@ export class FactoryLoop implements Factory {
    *
    * Only successful passes reach here: a pass that threw has no report, and
    * inventing zeroes for it would publish "found nothing" for a sweep that
-   * never got to look. The previous pass's numbers stay put instead, dated by
-   * `lastCompletedAtMs`, which is the honest reading.
+   * never got to look. The previous enumerating pass's numbers stay put
+   * instead, dated by `lastEnumeratedAtMs`, which is the honest reading.
    *
    * A deferred pass gets the same treatment for the same reason. It settles
    * successfully, and `lastCompletedAtMs` moves — deliberately, because the
