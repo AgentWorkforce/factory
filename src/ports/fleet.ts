@@ -132,7 +132,12 @@ export type AgentUsage = {
 }
 export type FleetTrackedAgent = { invocationId?: string; node?: string }
 
-/** Lifecycle of the fleet event socket: the dial that makes this agent `online`. */
+/**
+ * Lifecycle of the fleet event socket: the dial that makes this agent `online`.
+ * `dialed` means the SDK accepted `connect()` but Factory has not observed a
+ * stream event yet. It is unconfirmed, not necessarily failed: a live socket in
+ * a silent workspace can remain `dialed` until its first event arrives.
+ */
 export type FleetConnectState = 'never-attempted' | 'connecting' | 'dialed' | 'connected' | 'failed'
 
 /**
