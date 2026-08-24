@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { formatSweepOutcome } from './diagnose'
 import { runFleetCli } from './fleet'
 
 const BASE = 'https://factory.example.com'
@@ -64,6 +65,23 @@ const healthy = {
     eventListener: { state: 'subscribed' },
   },
 }
+
+describe('formatSweepOutcome (#359)', () => {
+  it('attributes a count-free deferral only to the latest pass', () => {
+    const outcome = formatSweepOutcome({
+      state: 'healthy',
+      consecutiveFailures: 0,
+      failureThreshold: 3,
+      discoveryDeferred: 'sweep-in-flight',
+    })
+
+    expect(outcome).toBe(
+      'nothing has enumerated successfully yet — the most recent pass deferred ' +
+      'to another process holding the discovery lease',
+    )
+    expect(outcome).not.toContain('every pass')
+  })
+})
 
 describe('factory diagnose --deployed (#295)', () => {
   it('reports a healthy deployed instance and exits zero without any credential', async () => {
@@ -765,4 +783,3 @@ describe('factory diagnose --deployed (#295)', () => {
     }
   })
 })
-
