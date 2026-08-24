@@ -933,6 +933,7 @@ describe('RelayFleetClient', () => {
 
   it('lets a worker-side teammate client observe replies without claiming the Factory lifecycle action', async () => {
     const messaging = new FakeMessaging()
+    messaging.connectEvent = { type: 'connected' }
     const fleet = createClient(messaging, { registerLifecycleAction: false })
     const messages: Array<{ from: string; target: string; body: string }> = []
     fleet.onAgentMessage((message) => messages.push(message))
@@ -954,6 +955,24 @@ describe('RelayFleetClient', () => {
       target: 'factory-worker',
       body: 'answer',
     })])
+  })
+
+  it('does not report teammate replies observable until the socket handshake is confirmed', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging, { registerLifecycleAction: false })
+    const ready = fleet.whenMessagesObservable()
+    let settled = false
+    void ready.then(() => { settled = true })
+
+    await flush()
+    expect(messaging.connected).toBe(1)
+    expect(fleet.fleetConnectStatus().state).toBe('dialed')
+    expect(settled).toBe(false)
+
+    messaging.emit('any', { type: 'connected' })
+    await ready
+    expect(settled).toBe(true)
+    expect(fleet.fleetConnectStatus().state).toBe('connected')
   })
 
   it('routes durable lifecycle actions through the authenticated identity when factory and broker are absent', async () => {

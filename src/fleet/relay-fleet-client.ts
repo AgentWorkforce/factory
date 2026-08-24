@@ -235,6 +235,9 @@ export class RelayFleetClient implements FleetClient {
   #authenticatedAgentName: string
   #eventsStarted = false
   #eventSubscriptionReady?: Promise<void>
+  #messageObservabilityReady?: Promise<void>
+  #resolveMessageObservability?: () => void
+  #rejectMessageObservability?: (error: Error) => void
   #disposed = false
   /**
    * The fleet socket's own status.
@@ -728,6 +731,7 @@ export class RelayFleetClient implements FleetClient {
     }
 
     this.#disposed = true
+    this.#settleMessageObservability(new Error('Relay fleet client disposed before its event stream connected'))
     if (this.#watchTimer) {
       clearInterval(this.#watchTimer)
       this.#watchTimer = undefined
@@ -1371,6 +1375,34 @@ export class RelayFleetClient implements FleetClient {
   async whenMessagesObservable(): Promise<void> {
     this.#ensureEventSubscription()
     await this.#eventSubscriptionReady
+    if (this.#fleetConnect.state === 'connected') return
+    await this.#messageObservabilityPromise()
+  }
+
+  #messageObservabilityPromise(): Promise<void> {
+    if (this.#fleetConnect.state === 'connected') return Promise.resolve()
+    if (!this.#messageObservabilityReady) {
+      const pending = new Promise<void>((resolve, reject) => {
+        this.#resolveMessageObservability = resolve
+        this.#rejectMessageObservability = reject
+      })
+      this.#messageObservabilityReady = pending
+      // The ask-level deadline may stop awaiting this shared handshake first.
+      // Retain the waiter for another caller, but never surface its later
+      // transport rejection as an unhandled promise.
+      void pending.catch(() => {})
+    }
+    return this.#messageObservabilityReady
+  }
+
+  #settleMessageObservability(error?: Error): void {
+    const resolve = this.#resolveMessageObservability
+    const reject = this.#rejectMessageObservability
+    this.#messageObservabilityReady = undefined
+    this.#resolveMessageObservability = undefined
+    this.#rejectMessageObservability = undefined
+    if (error) reject?.(error)
+    else resolve?.()
   }
 
   fleetConnectStatus(): FleetConnectStatus {
@@ -1438,6 +1470,7 @@ export class RelayFleetClient implements FleetClient {
           lastFailureAtMs: now,
           lastError: 'RelayEventStreamDisconnected',
         }
+        this.#settleMessageObservability(new Error('Relay event stream disconnected before becoming observable'))
         return
       case 'error':
         this.#fleetConnect = {
@@ -1446,6 +1479,7 @@ export class RelayFleetClient implements FleetClient {
           lastFailureAtMs: now,
           lastError: 'RelayEventStreamError',
         }
+        this.#settleMessageObservability(new Error('Relay event stream failed before becoming observable'))
         return
       case 'reconnecting':
         this.#fleetConnect = { ...this.#fleetConnect, state: 'connecting' }
@@ -1460,6 +1494,7 @@ export class RelayFleetClient implements FleetClient {
           ...(this.#fleetConnect.state !== 'connected' ? { lastConnectedAtMs: now } : {}),
           lastError: undefined,
         }
+        this.#settleMessageObservability()
     }
   }
 
