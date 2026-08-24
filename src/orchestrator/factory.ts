@@ -654,7 +654,9 @@ interface PostSpawnDispatchClaimFence {
   claimStarted: boolean
   accepted?: boolean
   settled: Promise<boolean>
+  rejectionSettled: Promise<boolean>
   settle(accepted: boolean): void
+  settleRejection(compensated: boolean): void
 }
 
 interface AppliedDispatchClaim {
@@ -908,6 +910,10 @@ export class FactoryLoop implements Factory {
   // release sweep removes it after the copy is safe.
   readonly #shutdownReleaseCapturedDispatches = new Set<string>()
   readonly #postSpawnDispatchesRejectedDuringStop = new Set<string>()
+  // A rejected provider claim is unsafe to release until its conditional
+  // rollback succeeds or a newer provider status supersedes it. This runtime
+  // set closes the race before the durable dispatchClaim flag is persisted.
+  readonly #uncompensatedDispatchClaims = new Set<string>()
   readonly #agentExitsInFlight = new Map<string, Promise<void>>()
   #reconciledAgentExitsActive = 0
   readonly #reconciledAgentExitWaiters: Array<() => void> = []
@@ -1305,6 +1311,7 @@ export class FactoryLoop implements Factory {
     // dispatch for one already captured by the previous shutdown.
     this.#shutdownReleaseCapturedDispatches.clear()
     this.#postSpawnDispatchesRejectedDuringStop.clear()
+    this.#uncompensatedDispatchClaims.clear()
     this.#stopping = false
     this.#startMode = opts.mode ?? 'live'
     const issueSource = await this.#issueSource()
@@ -1630,6 +1637,86 @@ export class FactoryLoop implements Factory {
       dispatches: dispatches.size,
       timeoutMs: STOP_REJECTED_DISPATCH_DRAIN_TIMEOUT_MS,
     })
+  }
+
+  async #awaitRejectedClaimCompensation(settled: Promise<boolean>): Promise<boolean> {
+    if (this.#fleet.durableOwnership !== true) return await settled
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timedOut = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), STOP_REJECTED_DISPATCH_DRAIN_TIMEOUT_MS)
+      timer.unref?.()
+    })
+    const compensated = await Promise.race([settled, timedOut])
+    if (timer) clearTimeout(timer)
+    return compensated
+  }
+
+  async #retainUncompensatedDispatchClaim(
+    record: InFlightIssue,
+    error: unknown,
+    opts: { preferExistingError?: boolean } = {},
+  ): Promise<void> {
+    const key = dispatchLifecycleKey(record.issue)
+    const alreadyBlocked = record.dispatchClaim?.cancellationBlocked === true
+    const errorMessage = describeError(error).errorMessage
+    this.#uncompensatedDispatchClaims.add(key)
+    record.dispatchClaim = {
+      ...record.dispatchClaim,
+      state: 'degraded',
+      cancellationBlocked: true,
+      write: 'rejected dispatch claim rollback',
+      error: opts.preferExistingError ? record.dispatchClaim?.error ?? errorMessage : errorMessage,
+      deadLettered: true,
+      updatedAtMs: this.#clock.now(),
+    }
+    this.#dispatchClaimStatuses.set(key, record.dispatchClaim)
+    if (!alreadyBlocked) {
+      this.#increment('postSpawnDispatchClaimRecoveryRetentions')
+      this.#logger.warn?.('[factory] retaining dispatch lifecycle because rejected claim compensation is unproven', {
+        issue: record.issue.key,
+      })
+    }
+    if (this.#usesDurableDispatchLifecycle()) {
+      await this.#saveDispatchLifecycle(record, 'running')
+    } else {
+      await this.#writeDispatchClaimRegistry(record.issue)
+    }
+  }
+
+  async #clearDispatchCancellationBlock(record: InFlightIssue): Promise<void> {
+    const key = dispatchLifecycleKey(record.issue)
+    this.#uncompensatedDispatchClaims.delete(key)
+    if (record.dispatchClaim?.cancellationBlocked !== true) return
+    const { cancellationBlocked: _blocked, ...claim } = record.dispatchClaim
+    record.dispatchClaim = claim
+    this.#dispatchClaimStatuses.set(key, claim)
+    if (this.#usesDurableDispatchLifecycle()) {
+      await this.#saveDispatchLifecycle(record, 'running')
+    } else {
+      await this.#writeDispatchClaimRegistry(record.issue)
+    }
+  }
+
+  async #dispatchClaimBlocksAbandonment(record: InFlightIssue): Promise<boolean> {
+    const key = dispatchLifecycleKey(record.issue)
+    if (!this.#uncompensatedDispatchClaims.has(key) && record.dispatchClaim?.cancellationBlocked !== true) {
+      return false
+    }
+    if (!this.#githubWriteback.getIssueStatus) return true
+    try {
+      const issue = await this.#readIssue(record.issue.path)
+      if (!issue || !isGithubIssue(issue)) return true
+      if (await this.#githubWriteback.getIssueStatus(issue) === 'in-progress') return true
+      await this.#clearDispatchCancellationBlock(record)
+      return false
+    } catch (error) {
+      this.#logger.warn?.('[factory] unable to verify whether a blocked dispatch claim was superseded', {
+        issue: record.issue.key,
+        error: describeError(error).errorMessage,
+      })
+      return true
+    }
   }
 
   async #boundedStopTeardown(label: string, teardown: () => Promise<void> | void | undefined): Promise<void> {
@@ -4860,11 +4947,17 @@ export class FactoryLoop implements Factory {
     const postSpawnDispatchClaim = new Promise<boolean>((resolve) => {
       resolvePostSpawnDispatchClaim = resolve
     })
+    let resolveRejectedClaimCompensation!: (compensated: boolean) => void
+    let rejectedClaimCompensationSettled = false
+    const rejectedClaimCompensation = new Promise<boolean>((resolve) => {
+      resolveRejectedClaimCompensation = resolve
+    })
     let postSpawnDispatchClaimFence!: PostSpawnDispatchClaimFence
     postSpawnDispatchClaimFence = {
       completionAtWriteBoundary: false,
       claimStarted: false,
       settled: postSpawnDispatchClaim,
+      rejectionSettled: rejectedClaimCompensation,
       settle: (accepted: boolean): void => {
         if (postSpawnDispatchClaimSettled) return
         postSpawnDispatchClaimSettled = true
@@ -4873,6 +4966,11 @@ export class FactoryLoop implements Factory {
         if (this.#postSpawnDispatchClaimFences.get(postSpawnKey) === postSpawnDispatchClaimFence) {
           this.#postSpawnDispatchClaimFences.delete(postSpawnKey)
         }
+      },
+      settleRejection: (compensated: boolean): void => {
+        if (rejectedClaimCompensationSettled) return
+        rejectedClaimCompensationSettled = true
+        resolveRejectedClaimCompensation(compensated)
       },
     }
     this.#postSpawnDispatchClaimFences.set(postSpawnKey, postSpawnDispatchClaimFence)
@@ -5043,6 +5141,14 @@ export class FactoryLoop implements Factory {
       settlePostSpawnDispatchClaim(false)
       if (error instanceof PostSpawnDispatchWaitRejectedError) {
         settlePostSpawnIssueObservation(false)
+        const compensated = error.compensationError === undefined
+        if (compensated) {
+          this.#uncompensatedDispatchClaims.delete(postSpawnKey)
+          await this.#clearDispatchCancellationBlock(record)
+        } else {
+          await this.#retainUncompensatedDispatchClaim(record, error.compensationError)
+        }
+        postSpawnDispatchClaimFence.settleRejection(compensated)
         if (error.compensationError !== undefined) {
           this.#increment('postSpawnDispatchClaimCompensationFailures')
           this.#logger.error?.('[factory] rejected dispatch claim could not be safely compensated', {
@@ -5055,7 +5161,11 @@ export class FactoryLoop implements Factory {
         // dispatch-failure path would race or duplicate that cleanup. During
         // stop, however, retain local placements until the shutdown release
         // sweep has captured them. If it already has, removal is safe now.
-        if (this.#stopping) {
+        if (!compensated) {
+          // The provider still exposes a claim this lifecycle authored. Keep
+          // the process-local slot and durable row recoverable; releasing its
+          // agents would leave the claimed issue with no successor lifecycle.
+        } else if (this.#stopping) {
           this.#postSpawnDispatchesRejectedDuringStop.add(postSpawnKey)
           if (this.#shutdownReleaseCapturedDispatches.has(postSpawnKey)) {
             batch.abandon(decision.issue)
@@ -8757,13 +8867,20 @@ export class FactoryLoop implements Factory {
 
   async #releaseInFlightAgents(reason: string, opts: { preserveDurable?: boolean } = {}): Promise<void> {
     const agents = new Map<string, TrackedAgent>()
+    const blockedDispatches = new Set<string>()
     const batch = await this.#batch()
     const records = [...batch.inFlight]
     for (const record of records) {
-      this.#shutdownReleaseCapturedDispatches.add(dispatchLifecycleKey(record.issue))
+      const key = dispatchLifecycleKey(record.issue)
       if (record.dryRun) {
+        this.#shutdownReleaseCapturedDispatches.add(key)
         continue
       }
+      if (this.#uncompensatedDispatchClaims.has(key) || record.dispatchClaim?.cancellationBlocked === true) {
+        blockedDispatches.add(key)
+        continue
+      }
+      this.#shutdownReleaseCapturedDispatches.add(key)
       if (opts.preserveDurable && [...record.agents.values()].some((tracked) => tracked.result?.locality === 'remote')) {
         continue
       }
@@ -8775,10 +8892,11 @@ export class FactoryLoop implements Factory {
     await this.#releaseAndTerminateAgents([...agents], reason, 'stop')
     for (const record of records) {
       const key = dispatchLifecycleKey(record.issue)
+      if (blockedDispatches.has(key)) continue
       if (!this.#postSpawnDispatchesRejectedDuringStop.delete(key)) continue
       batch.abandon(record.issue)
     }
-    await this.#writeInFlightRegistry(undefined, undefined, true)
+    await this.#writeInFlightRegistry(undefined, undefined, true, blockedDispatches)
   }
 
   async #releaseAndTerminateAgents(
@@ -9023,6 +9141,7 @@ export class FactoryLoop implements Factory {
     path = this.#config.loop.registryPath,
     heartbeatPath = this.#config.loop.heartbeatPath,
     empty = false,
+    retainIssueKeys?: ReadonlySet<string>,
   ): Promise<void> {
     const updatedAtMs = this.#clock.now()
     const agents: FactoryInFlightRegistryAgent[] = []
@@ -9067,9 +9186,10 @@ export class FactoryLoop implements Factory {
       })
     }
 
-    if (!empty) {
+    if (!empty || retainIssueKeys?.size) {
       for (const record of (await this.#batch()).inFlight) {
         if (record.dryRun) continue
+        if (empty && !retainIssueKeys?.has(dispatchLifecycleKey(record.issue))) continue
         if (record.dispatchClaim) {
           this.#dispatchClaimStatuses.set(dispatchLifecycleKey(record.issue), record.dispatchClaim)
         }
@@ -10324,11 +10444,31 @@ export class FactoryLoop implements Factory {
   // record leaves the batch.
   async #abandonStuckDispatch(record: InFlightIssue, reason: string): Promise<void> {
     const key = dispatchLifecycleKey(record.issue)
+    const claimFence = this.#postSpawnDispatchClaimFences.get(key)
+    const rejectedClaimCompensation = claimFence?.claimStarted
+      ? claimFence.rejectionSettled
+      : undefined
     // A dispatch can be stuck inside a later spawn after an earlier agent has
     // already started completion. Release both post-spawn waits before the
     // first abandonment await so terminal processing cannot remain an
     // absorbing promise after this lifecycle is reaped.
     this.#settlePostSpawnDispatchWaits(key, false, 'abandonment')
+    if (rejectedClaimCompensation) {
+      const compensated = await this.#awaitRejectedClaimCompensation(rejectedClaimCompensation)
+      if (!compensated) {
+        await this.#retainUncompensatedDispatchClaim(
+          record,
+          new Error('Rejected dispatch claim compensation did not complete before abandonment'),
+          { preferExistingError: true },
+        )
+        this.#scheduleAbandonedDispatchRetry(record, reason)
+        return
+      }
+    }
+    if (await this.#dispatchClaimBlocksAbandonment(record)) {
+      this.#scheduleAbandonedDispatchRetry(record, reason)
+      return
+    }
     const heldPastDeadline = reason === HELD_PAST_DEADLINE_RELEASE_REASON
     const agentReleaseReason = heldPastDeadline ? HELD_PAST_DEADLINE_RELEASE_REASON : 'issue-abandoned'
     this.#abandonedDispatchReasons.set(key, reason)
@@ -14962,6 +15102,12 @@ export class FactoryLoop implements Factory {
     const claimFence = this.#postSpawnDispatchClaimFences.get(key)
     if (!observation && !claimFence) return false
     // Capture both before either settlement deletes its own map entry.
+    if (!accepted && claimFence?.claimStarted) {
+      // The rejection handler clears this provisional block only after a
+      // conditional provider rollback succeeds. Until then, shutdown and held
+      // abandonment must not release the lifecycle's agents.
+      this.#uncompensatedDispatchClaims.add(key)
+    }
     observation?.settle(accepted)
     claimFence?.settle(accepted)
     if (source === 'abandonment') this.#increment('postSpawnWaitsSettledByAbandonment')

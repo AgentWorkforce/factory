@@ -1155,12 +1155,12 @@ class RejectingBlockingDispatchClaimGithubWriteback extends BlockingDispatchClai
   }
 }
 
-class FailingRollbackDispatchClaimGithubWriteback extends RejectingBlockingDispatchCommentGithubWriteback {
+class UnprovenRollbackDispatchClaimGithubWriteback extends RejectingBlockingDispatchCommentGithubWriteback {
   rollbackAttempts = 0
 
-  override async rollbackStatusClaim(): Promise<'reverted'> {
+  override async rollbackStatusClaim(): Promise<'unproven'> {
     this.rollbackAttempts += 1
-    throw new Error('conditional dispatch claim rollback failed')
+    return 'unproven'
   }
 }
 
@@ -11742,6 +11742,80 @@ describe('FactoryLoop', () => {
     }
   }, 30_000)
 
+  it('does not abandon held agents when a rejected GitHub claim rollback is unproven', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-unproven-rollback-deadline-'))
+    const number = 1266
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const fleet = new RemoteLifecycleFleetClient()
+    const githubWriteback = new UnprovenRollbackDispatchClaimGithubWriteback()
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      mergePolicy: 'never',
+      terminalState: 'human-review',
+      dispatch: { agentHoldTimeoutMs: 1_000, agentlessHoldTimeoutMs: 60_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), {
+      mount: new FakeMountClient({
+        [path]: githubIssueFile(number, { labels: ['factory', 'pear'] }),
+      }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+      logger: { error: () => {}, warn: () => {} },
+    })
+    const run = factory.runOnce().catch((error: unknown) => error)
+    let stopped = false
+    try {
+      await withDeadline(githubWriteback.claimWriteStarted.promise, 4_000, 'dispatch claim did not start')
+      githubWriteback.claimWriteGate.resolve()
+      await withDeadline(githubWriteback.commentWriteStarted.promise, 4_000, 'dispatch comment did not start')
+      fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+      await vi.waitFor(() => expect(factory.status().counters.postSpawnWaitsSettledByAbandonment)
+        .toBe(1), { timeout: 8_000 })
+      githubWriteback.commentWriteGate.resolve()
+      await withDeadline(run, 8_000, 'unproven claim rollback did not unwind dispatch')
+
+      expect(githubWriteback.rollbackAttempts).toBe(3)
+      expect(githubWriteback.statuses).toEqual([
+        { key: String(number), status: 'in-progress' },
+      ])
+      expect(githubWriteback.comments).toEqual([])
+      expect(factory.status().counters.postSpawnDispatchClaimCompensationFailures).toBe(1)
+      expect(factory.status().counters.postSpawnDispatchClaimRecoveryRetentions).toBe(1)
+      expect(factory.status().inFlight).toHaveLength(1)
+      expect(fleet.releases).toEqual([])
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity({
+        uuid: `AgentWorkforce/pear#${number}`,
+        key: String(number),
+        path,
+      }))).resolves.toMatchObject({
+        phase: 'running',
+        dispatchClaim: {
+          state: 'degraded',
+          cancellationBlocked: true,
+          write: 'rejected dispatch claim rollback',
+          deadLettered: true,
+        },
+      })
+
+      await withDeadline(factory.stop(), 4_000, 'stop did not retain the uncompensated held dispatch')
+      stopped = true
+      expect(factory.status().inFlight).toHaveLength(1)
+      expect(fleet.releases).toEqual([])
+    } finally {
+      githubWriteback.claimWriteGate.resolve()
+      githubWriteback.commentWriteGate.resolve()
+      if (!stopped) await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it('keeps a claim cancellable while the running lifecycle publication is pending', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-running-save-deadline-'))
     const number = 1260
@@ -12108,12 +12182,13 @@ describe('FactoryLoop', () => {
     }
   }, 30_000)
 
-  it('retains local placements for stop even when conditional claim rollback fails', async () => {
+  it('retains the lifecycle and local placements when conditional claim rollback is unproven', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-rollback-failure-stop-'))
     const number = 1259
     const path = githubIssuePath('AgentWorkforce', 'pear', number)
     const fleet = new LocalLifecycleFleetClient()
-    const githubWriteback = new FailingRollbackDispatchClaimGithubWriteback()
+    const githubWriteback = new UnprovenRollbackDispatchClaimGithubWriteback()
+    const registryPath = join(root, 'registry.json')
     const stateStore = new BlockingDispatchLifecycleReleaseStateStore({
       batchSize: 2,
       watchStatePath: join(root, 'state.json'),
@@ -12125,7 +12200,7 @@ describe('FactoryLoop', () => {
       dispatch: { agentHoldTimeoutMs: 60_000, agentlessHoldTimeoutMs: 60_000 },
       loop: {
         heartbeatPath: join(root, 'heartbeat.json'),
-        registryPath: join(root, 'registry.json'),
+        registryPath,
       },
     }), {
       mount: new FakeMountClient({
@@ -12157,20 +12232,41 @@ describe('FactoryLoop', () => {
       expect(runResult.compensationError).toBeInstanceOf(AggregateError)
       expect((runResult.compensationError as AggregateError).errors).toEqual([
         expect.objectContaining({ message: 'provider rejected the in-flight dispatch comment' }),
-        expect.objectContaining({ message: 'conditional dispatch claim rollback failed' }),
+        expect.objectContaining({ message: 'GitHub rejected dispatch claim rollback could not prove ownership' }),
       ])
       expect(githubWriteback.rollbackAttempts).toBe(3)
       expect(factory.status().counters.postSpawnDispatchClaimCompensationFailures).toBe(1)
+      expect(factory.status().counters.postSpawnDispatchClaimRecoveryRetentions).toBe(1)
       await withDeadline(stateStore.releaseStarted.promise, 2_000, 'stop did not drain before lifecycle release')
       expect(factory.status().inFlight).toHaveLength(1)
 
       stateStore.releaseGate.resolve()
-      await withDeadline(stop, 2_000, 'stop did not release agents after rollback failure')
+      await withDeadline(stop, 2_000, 'stop did not retain agents after unproven rollback')
       stopped = true
-      expect(factory.status().inFlight).toEqual([])
-      expect(fleet.releases).toEqual([
-        { name: `ar-${number}-impl-pear`, reason: 'factory-stopped' },
-        { name: `ar-${number}-review-pear`, reason: 'factory-stopped' },
+      expect(factory.status().inFlight).toHaveLength(1)
+      expect(fleet.releases).toEqual([])
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity({
+        uuid: `AgentWorkforce/pear#${number}`,
+        key: String(number),
+        path,
+      }))).resolves.toMatchObject({
+        phase: 'running',
+        dispatchClaim: {
+          state: 'degraded',
+          cancellationBlocked: true,
+          write: 'rejected dispatch claim rollback',
+          deadLettered: true,
+        },
+      })
+      expect((await readFactoryInFlightRegistry(registryPath))?.agents).toEqual([
+        expect.objectContaining({
+          name: `ar-${number}-impl-pear`,
+          dispatchClaim: expect.objectContaining({ cancellationBlocked: true }),
+        }),
+        expect.objectContaining({
+          name: `ar-${number}-review-pear`,
+          dispatchClaim: expect.objectContaining({ cancellationBlocked: true }),
+        }),
       ])
       expect(githubWriteback.statuses).toEqual([
         { key: String(number), status: 'in-progress' },
@@ -12230,13 +12326,22 @@ describe('FactoryLoop', () => {
       expect(factory.status().inFlight).toHaveLength(1)
 
       stateStore.releaseGate.resolve()
-      await withDeadline(stop, 2_000, 'stop did not release agents after the provider failure')
+      await withDeadline(stop, 2_000, 'stop did not retain agents after the ambiguous provider failure')
       stopped = true
-      expect(factory.status().inFlight).toEqual([])
-      expect(fleet.releases).toEqual([
-        { name: `ar-${number}-impl-pear`, reason: 'factory-stopped' },
-        { name: `ar-${number}-review-pear`, reason: 'factory-stopped' },
-      ])
+      expect(factory.status().inFlight).toHaveLength(1)
+      expect(fleet.releases).toEqual([])
+      await expect(stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity({
+        uuid: `AgentWorkforce/pear#${number}`,
+        key: String(number),
+        path,
+      }))).resolves.toMatchObject({
+        phase: 'running',
+        dispatchClaim: {
+          state: 'degraded',
+          cancellationBlocked: true,
+          deadLettered: true,
+        },
+      })
       expect(githubWriteback.statuses).toEqual(Array.from(
         { length: 3 },
         () => ({ key: String(number), status: 'in-progress' as const }),
@@ -12366,14 +12471,15 @@ describe('FactoryLoop', () => {
       expect(factory.status().inFlight).toEqual([
         expect.objectContaining({ uuid: `AgentWorkforce/pear#${number}` }),
       ])
-      expect(fleet.releases).toEqual([
-        { name: `ar-${number}-impl-pear`, reason: 'factory-stopped' },
-        { name: `ar-${number}-review-pear`, reason: 'factory-stopped' },
-      ])
+      expect(fleet.releases).toEqual([])
     } finally {
       githubWriteback.claimWriteGate.resolve()
       await withDeadline(run, 8_000, 'timed-out dispatch did not unwind after its provider recovered')
-      expect(factory.status().inFlight).toEqual([])
+      // Shutdown's release snapshot deliberately skipped this ambiguous
+      // claim. Even if compensation proves safe after stop has returned, keep
+      // the lifecycle and placements for successor adoption rather than
+      // silently abandoning agents that were never released.
+      expect(factory.status().inFlight).toHaveLength(1)
       if (!stopped) await factory.stop()
       await rm(root, { recursive: true, force: true })
     }

@@ -433,6 +433,8 @@ export interface FactoryInFlightRegistryAgent {
 
 export interface FactoryDispatchClaimStatus {
   state: 'pending' | 'verified' | 'degraded'
+  /** Cancellation could not safely undo the provider claim; keep its lifecycle and placements recoverable. */
+  cancellationBlocked?: boolean
   write?: string
   attempts?: number
   maxAttempts?: number
