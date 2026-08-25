@@ -634,6 +634,14 @@ export interface StateStore {
     generationId: string,
   ): Promise<boolean>
 
-  recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void>
+  /**
+   * The lifecycle role a work unit was last seen in, keyed on the work unit
+   * (`dispatchIssueIdentity`) rather than on the surface it arrived through.
+   *
+   * The value is a provider-neutral `FactoryStateRole`, not a Linear state id:
+   * a GitHub issue has no workflow-state UUID, and the only consumer compares
+   * roles (#334). Empty string means "seen, but in no role Factory names".
+   */
+  recordCanonicalState(workspaceId: string, key: string, role: string): Promise<void>
   getCanonicalState(workspaceId: string, key: string): Promise<string | undefined>
 }

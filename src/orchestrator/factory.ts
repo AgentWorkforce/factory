@@ -9,6 +9,7 @@ import {
   FactoryConfigSchema,
   resolvedSweepBudgetMs,
   type FactoryConfig,
+  type FactoryStateRole,
 } from '../config/schema'
 import {
   DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS,
@@ -83,7 +84,7 @@ import {
   dispatchLifecycleOccupiesSlot,
   dispatchPhaseOccupiesSlot,
 } from '../state/dispatch-lifecycle-slot'
-import { branchImplementsIssue, containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue, prBodyDisclaimsClosing, prClosureAuthority } from '../issue-key-match'
+import { ISSUE_KEY_PARTS, branchImplementsIssue, containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue, prBodyDisclaimsClosing, prClosureAuthority } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
 import { dispatchRelayflowForChangeEvent } from '../dispatch/relayflow-registry'
@@ -3666,8 +3667,11 @@ export class FactoryLoop implements Factory {
           { read: readyIssueReads, total: paths.length, path },
         )
         if (!shed) {
-          if (issue && issueSource === 'linear') {
-            await this.#recordCanonicalIssueState(issue)
+          // Both surfaces. Gating this on Linear is what left GitHub ingestion
+          // with no canonical state at all, so nothing could ever clear the
+          // terminal row a completed run left behind (#334).
+          if (issue) {
+            await this.#recordCanonicalIssueState(issue, this.#issueLifecycleRole(issue))
           }
           issueEntries.push({ path, issue })
         }
@@ -8118,8 +8122,8 @@ export class FactoryLoop implements Factory {
 
     try {
       const issue = await this.#readIssue(path)
-      if (issue && !isGithubIssue(issue)) {
-        await this.#recordCanonicalIssueState(issue)
+      if (issue) {
+        await this.#recordCanonicalIssueState(issue, this.#issueLifecycleRole(issue))
       }
       if (issue && this.#dependencyIssueIsTerminal(issue)) {
         await this.#markDependencyTerminalAndReconcile(issue)
@@ -9339,38 +9343,90 @@ export class FactoryLoop implements Factory {
     await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
   }
 
+  /**
+   * The lifecycle role a work unit is in, from whichever surface described it.
+   *
+   * A GitHub issue carries no Linear workflow state — `githubIssueAsFactoryIssue`
+   * sets `stateId: ''` — so its role lives in the `factory:*` labels and the
+   * open/closed flag instead, exactly as `#isIssueReady` and
+   * `#isIssueExternallyTerminal` already read it. Canonical state is recorded as
+   * this role rather than as a raw state id so one provider-neutral value means
+   * the same thing on both surfaces (#334).
+   */
+  #issueLifecycleRole(issue: LinearIssue): FactoryStateRole | undefined {
+    if (!isGithubIssue(issue)) return this.#states.roleOf(issue.stateId)
+    if (githubFactoryIssueIsClosed(issue)) return 'done'
+    const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
+    if (labels.has('factory:human-review')) return 'humanReview'
+    if (this.#isIssueReady(issue)) return 'readyForAgent'
+    if (labels.has('factory:in-progress')) return 'agentImplementing'
+    return undefined
+  }
+
+  /**
+   * Remember the role this work unit was last seen in, and clear the durable
+   * refusals a completed run left behind when it comes back ready.
+   *
+   * Called for BOTH surfaces. It used to be gated to Linear, so on a
+   * GitHub-sourced Factory the reopen cleanup below was never reached at all
+   * and a terminal row refused the reopened work forever — seven work units
+   * across five repositories on 2026-08-25 (#334).
+   */
   async #recordCanonicalIssueState(
-    issue: Pick<LinearIssue, 'uuid' | 'key' | 'path' | 'stateId'> & { raw?: unknown; origin?: WorkUnitOrigin },
+    issue: Pick<LinearIssue, 'uuid' | 'key' | 'path'> & { raw?: unknown; origin?: WorkUnitOrigin },
+    role: FactoryStateRole | undefined,
   ): Promise<void> {
-    const key = issueStateKey(issue)
-    const previousStateId = await this.#state.getCanonicalState(this.#workspaceId, key)
-    const previousRole = this.#states.roleOf(previousStateId)
+    const ref = issueRefForState(issue)
+    const canonicalKey = canonicalStateKey(ref)
+    const previousRole = await this.#state.getCanonicalState(this.#workspaceId, canonicalKey)
     const reopenedFromTerminal = previousRole === 'done' || previousRole === 'humanReview'
-    if (reopenedFromTerminal && this.#states.isRole(issue.stateId, 'readyForAgent')) {
-      const dispatchState = await this.#state.getDispatchAttempts(this.#workspaceId, key)
+    if (reopenedFromTerminal && role === 'readyForAgent') {
+      // Dispatch attempts stay on the surface key: that is the key every other
+      // reader and writer of the attempt counters uses, and rekeying only this
+      // one site is the writer/reader mismatch #367 was filed for.
+      const attemptKey = issueStateKey(ref)
+      // One increment per reopened work unit, not per cleared row: the attempt
+      // counters and the durable lifecycle are two records of the same refusal
+      // and a unit that clears both reopened once. Counted here rather than at
+      // the attempt clear alone so a reopen that only had a durable row — the
+      // shape a restart leaves, and the one #334 saw in production — is still
+      // visible to an operator.
+      let reopened = false
+      const dispatchState = await this.#state.getDispatchAttempts(this.#workspaceId, attemptKey)
       if (dispatchState?.terminal) {
         dispatchState.attempts = 0
         dispatchState.inFlight = false
         dispatchState.terminal = false
         dispatchState.backoffUntilMs = 0
-        await this.#state.recordDispatchAttempt(this.#workspaceId, key, dispatchState)
-        this.#increment('dispatchTerminalReopened')
+        await this.#state.recordDispatchAttempt(this.#workspaceId, attemptKey, dispatchState)
+        reopened = true
       }
       // Match on the work unit, not the surface key: a completed Linear mirror
       // persists `AR-448` while the GitHub-native arrival of the same issue is
       // `448`, and comparing surface keys would leave that terminal row in
       // place to refuse the reopened work forever.
-      const reopenedIdentity = safeDispatchLifecycleKey(issueRefForState(issue))
+      const reopenedIdentity = safeDispatchLifecycleKey(ref)
       for (const [lifecycleKey, lifecycle] of await this.#state.listDispatchLifecycles(this.#workspaceId)) {
         if (!isTerminalDispatchLifecycle(lifecycle)) continue
-        const matches = reopenedIdentity !== undefined &&
-          safeDispatchLifecycleKey(lifecycle.issue) === reopenedIdentity
-        if (!matches && lifecycle.issue.key !== issue.key) continue
+        const lifecycleIdentity = safeDispatchLifecycleKey(lifecycle.issue)
+        const matches = reopenedIdentity !== undefined && lifecycleIdentity === reopenedIdentity
+        // The surface-key fallback covers only a row so old it cannot produce a
+        // work-unit identity at all, and only for a Linear-shaped key. A GitHub
+        // issue key is a bare number that repeats in every repository, so
+        // `key === key` there would let a reopened `factory#364` clear
+        // `cloud#364`'s completed row — the #334 evidence spans five
+        // repositories with overlapping numbering.
+        const legacySurfaceMatch = lifecycleIdentity === undefined &&
+          ISSUE_KEY_PARTS.test(issue.key) &&
+          lifecycle.issue.key === issue.key
+        if (!matches && !legacySurfaceMatch) continue
         await this.#state.clearDispatchLifecycle(this.#workspaceId, lifecycleKey)
         this.#dispatchLifecycleEpochs.delete(lifecycleKey)
+        reopened = true
       }
+      if (reopened) this.#increment('dispatchTerminalReopened')
     }
-    await this.#state.recordCanonicalState(this.#workspaceId, key, issue.stateId)
+    await this.#state.recordCanonicalState(this.#workspaceId, canonicalKey, role ?? '')
   }
 
   async #writeLoopHeartbeat(
@@ -15000,16 +15056,26 @@ export class FactoryLoop implements Factory {
 
     try {
       const githubIssue = isGithubIssue(issue)
+      let terminalWriteProven = true
       if (githubIssue) {
-        await this.#githubWriteback.closeIssue(
+        terminalWriteProven = await this.#githubWriteback.closeIssue(
           issue,
           `Factory observed pull request #${snapshot.number} merge and completed this issue.\n\nClosing authority: ${authority.evidence}.`,
-        )
+        ) === 'applied'
       } else {
         const doneStateId = this.#states.idFor(issue.team, 'done')
         await this.#linear.setState(issue, doneStateId)
-        await this.#recordCanonicalIssueState({ ...issueRef(issue), stateId: doneStateId })
       }
+      // Recorded from the write, not left to the next sweep's read: a reopen
+      // landing in that gap would otherwise be read as the FIRST terminal
+      // observation of this unit and the reopen would never be seen (#334).
+      //
+      // Only a provider-proven close records it. An acknowledgement or a legacy
+      // void adapter is not evidence the issue actually closed, and recording a
+      // terminal role the provider never applied would make the very next read
+      // — which still says ready — look like a reopen and re-dispatch finished
+      // work. Unproven, the next sweep records whatever the provider does say.
+      if (terminalWriteProven) await this.#recordCanonicalIssueState(issueRef(issue), 'done')
       this.#emit('writeback-verified', { issue: issueRef(issue), path: issue.path })
       await this.#markDependencyTerminalAndReconcile(issue)
       this.#increment('mergedPrAdvancedDone')
@@ -15825,9 +15891,14 @@ export class FactoryLoop implements Factory {
             : this.#states.idFor(issueTeam, 'done')
           await this.#linear.setState(issue, targetState)
           record.issueWritebackConfirmedAtMs ??= this.#clock.now()
-          await this.#recordCanonicalIssueState({ ...record.issue, stateId: targetState })
         }
         if (record.issueWritebackConfirmedAtMs !== undefined) {
+          // Both surfaces now, and recorded from the write rather than left to
+          // the next sweep so a reopen cannot slip into the gap (#334). Behind
+          // the same provider-proven receipt the emit below uses: a terminal
+          // role recorded from an unproven write would make the next read —
+          // which still says ready — look like a reopen.
+          await this.#recordCanonicalIssueState(record.issue, humanReview ? 'humanReview' : 'done')
           this.#emit('writeback-verified', { issue: record.issue, path: issue.path })
         }
         // Unblock a concurrent post-spawn read as soon as the issue writeback
@@ -19343,6 +19414,23 @@ const dispatchLifecycleKey = (issue: IssueRef): string => dispatchIssueIdentity(
 // issue numbers independent across repositories in the same workspace.
 const issueStateKey = (issue: IssueRef): string =>
   githubIssuePathParts(issue.path) ? issueKey(issue) : issue.key
+
+/**
+ * The canonical-state key: the work unit, the same identity the dispatch
+ * lifecycle it gates is keyed under (#211, #329, #367).
+ *
+ * Canonical state exists for exactly one decision — did this work unit reach a
+ * terminal role and then come back ready — and that decision clears a durable
+ * row keyed on the work unit. Keying the question per surface and the answer
+ * per work unit is what made #334 reachable: a GitHub-native ref could not see
+ * the terminal role its own Linear mirror had recorded.
+ *
+ * Falls back to the surface key for a ref with no derivable provider identity,
+ * so a malformed row degrades to today's behaviour instead of throwing out of
+ * ingestion.
+ */
+const canonicalStateKey = (issue: IssueRef): string =>
+  safeDispatchLifecycleKey(issue) ?? issueStateKey(issue)
 
 const pidsFromSpawnResult = (result: { pid?: number; pids?: number[] } | undefined): number[] => {
   const pids = new Set<number>()
