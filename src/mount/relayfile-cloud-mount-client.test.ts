@@ -1461,7 +1461,12 @@ describe('RelayfileCloudMountClient', () => {
       options: { path: '/linear/issues', cursor: undefined, signal: expect.any(AbortSignal) },
     })
     expect(fake.listTreeCalls[0]?.options?.signal?.aborted).toBe(false)
-    expect(fake.getEventsCalls[0]).toEqual({ workspaceId: 'rw_test', opts: { cursor: 'evt-0', limit: 10 } })
+    // The change feed now carries the same deadline signal the tree read does.
+    expect(fake.getEventsCalls[0]).toEqual({
+      workspaceId: 'rw_test',
+      opts: { cursor: 'evt-0', limit: 10, signal: expect.any(AbortSignal) },
+    })
+    expect(fake.getEventsCalls[0]?.opts?.signal?.aborted).toBe(false)
   })
 
   it('paginates listTree to exhaustion', async () => {
@@ -1615,6 +1620,124 @@ describe('RelayfileCloudMountClient', () => {
         timeoutMs: 25,
       })
       expect(client.seenSignal?.aborted).toBe(true)
+    })
+
+    // The hole #354 left, and the one the deployed sweep hung in: the change
+    // feed. `#prepareDiscoverySession` calls `getEventHighWatermark()` as the
+    // FIRST network read after it claims the discovery lease, and both feed
+    // methods went straight to the SDK with no deadline and no signal.
+    class HangingChangeFeedClient extends FakeRelayFileClient {
+      seenSignal?: AbortSignal
+
+      override async listLastNChanges(
+        limit: number,
+        context?: { workspaceId: string },
+      ): Promise<never> {
+        this.listLastNChangesCalls.push({ limit, context })
+        return await new Promise<never>(() => undefined)
+      }
+
+      override async getEvents(
+        workspaceId: string,
+        opts?: { cursor?: string; limit?: number; provider?: string; last?: number; signal?: AbortSignal },
+      ): Promise<never> {
+        this.getEventsCalls.push({ workspaceId, opts })
+        this.seenSignal = opts?.signal
+        return await new Promise<never>((_resolve, reject) => {
+          opts?.signal?.addEventListener('abort', () => {
+            reject((opts.signal as AbortSignal & { reason?: unknown }).reason)
+          })
+        })
+      }
+    }
+
+    it('bounds the discovery high-watermark read that wedged the sweep', async () => {
+      const client = new HangingChangeFeedClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 25,
+      })
+
+      await expect(mount.getEventHighWatermark()).rejects.toMatchObject({
+        name: 'RelayfileOperationTimeoutError',
+        operation: 'listLastNChanges',
+        timeoutMs: 25,
+      })
+    })
+
+    it('bounds the change-log tail read behind a provider-filtered getEvents', async () => {
+      const client = new HangingChangeFeedClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 25,
+      })
+
+      await expect(mount.getEvents({ last: 100, limit: 100 })).rejects.toMatchObject({
+        name: 'RelayfileOperationTimeoutError',
+        operation: 'listLastNChanges',
+      })
+    })
+
+    it('cancels a cursor-paged getEvents at the transport', async () => {
+      const client = new HangingChangeFeedClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 25,
+      })
+
+      // `GetEventsOptions` carries a `signal`, unlike `listLastNChanges`'s
+      // context — so this half gets real cancellation, not just an abandoned
+      // wait.
+      await expect(mount.getEvents({ limit: 10 })).rejects.toMatchObject({
+        name: 'RelayfileOperationTimeoutError',
+        operation: 'getEvents',
+      })
+      expect(client.seenSignal?.aborted).toBe(true)
+    })
+
+    // MUST-NOT-FIRE. A deadline that rejected a healthy read would replace one
+    // wedge with an outage, and a deadline that fired with no budget
+    // configured would mean the rejections above prove nothing about the
+    // budget.
+    it('leaves a served change-feed read alone under a generous budget', async () => {
+      const client = new FakeRelayFileClient()
+      client.events = [{
+        eventId: '11',
+        type: 'file.updated' as const,
+        path: '/github/repos/AgentWorkforce__factory/issues/by-id/1.json',
+        provider: 'github',
+        revision: '2',
+        timestamp: '2026-01-01T00:00:00.000Z',
+        contentType: 'application/json',
+      }]
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 60_000,
+      })
+
+      await expect(mount.getEventHighWatermark()).resolves.toBe('11')
+      expect(client.listLastNChangesCalls).toEqual([{ limit: 10, context: { workspaceId: 'rw_test' } }])
+    })
+
+    it('leaves the change-feed read unbounded when no budget is configured', async () => {
+      const client = new HangingChangeFeedClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 0,
+      })
+
+      const pending = mount.getEventHighWatermark()
+      const settled = await Promise.race([
+        pending.then(() => 'settled' as const, () => 'settled' as const),
+        new Promise<'pending'>((resolve) => { setTimeout(() => resolve('pending'), 50) }),
+      ])
+      expect(settled).toBe('pending')
+      void pending.catch(() => undefined)
     })
 
     it('leaves the call unbounded when no budget is configured', async () => {
