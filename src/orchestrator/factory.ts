@@ -1583,24 +1583,33 @@ export class FactoryLoop implements Factory {
     if (this.#heldAgentDeadlineTimer) clearTimeout(this.#heldAgentDeadlineTimer)
     this.#heldAgentDeadlineTimer = undefined
     this.#heldAgentDeadlineDueAtMs = undefined
-    await this.#heldAgentDeadlineSweepInFlight
-    for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
-    this.#dispatchLifecycleRetryTimers.clear()
-    this.#abandonedDispatchReasons.clear()
-    this.#dispatchLifecycleCapacityWaits.clear()
-    this.#dispatchLifecycleOwnershipWaitLogged.clear()
-    if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
-    this.#completionSweepTimer = undefined
-    if (this.#readinessReconcileTimer) clearTimeout(this.#readinessReconcileTimer)
-    this.#readinessReconcileTimer = undefined
-    if (this.#previewSweepTimer) clearTimeout(this.#previewSweepTimer)
-    this.#previewSweepTimer = undefined
     // #372: the drain below is unbounded in the one case that matters — a
     // wedged sweep — so shutdown inherits the sweep budget, 90 minutes at the
     // default. Spending it after one teardown window bounds shutdown without
     // discarding a sweep that was about to finish.
+    //
+    // Armed BEFORE the first shutdown await, not just before the sweep drain
+    // (cubic-dev-ai, #374 review). The grace is a timer, so arming it costs
+    // nothing and starts the clock at the moment shutdown starts; arming it
+    // after `#heldAgentDeadlineSweepInFlight` made the lever's start depend on
+    // an UNRELATED in-flight sweep finishing first, so a slow held-agent pass
+    // simply added its own latency to the wedged discovery sweep's reprieve —
+    // in the limit the lever never arms at all, which is the bound this whole
+    // change exists to provide.
     const releaseSweepBudgetGrace = this.#cutSweepBudgetsShortForStop()
     try {
+      await this.#heldAgentDeadlineSweepInFlight
+      for (const timer of this.#dispatchLifecycleRetryTimers.values()) clearTimeout(timer)
+      this.#dispatchLifecycleRetryTimers.clear()
+      this.#abandonedDispatchReasons.clear()
+      this.#dispatchLifecycleCapacityWaits.clear()
+      this.#dispatchLifecycleOwnershipWaitLogged.clear()
+      if (this.#completionSweepTimer) clearTimeout(this.#completionSweepTimer)
+      this.#completionSweepTimer = undefined
+      if (this.#readinessReconcileTimer) clearTimeout(this.#readinessReconcileTimer)
+      this.#readinessReconcileTimer = undefined
+      if (this.#previewSweepTimer) clearTimeout(this.#previewSweepTimer)
+      this.#previewSweepTimer = undefined
       await this.#readinessReconcileInFlight
       // #301 review: the deadline ends the *wait*, so `#readinessReconcileInFlight`
       // can settle with its `runOnce()` still live. Shutdown releases dispatch

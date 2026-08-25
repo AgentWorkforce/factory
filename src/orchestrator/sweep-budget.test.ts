@@ -161,9 +161,19 @@ describe('sweep budget primitive', () => {
     const timers = () => process.getActiveResourcesInfo().filter((resource) => resource === 'Timeout').length
     const before = timers()
     const budget = startDiscoverySweepBudget(90 * 60_000)
-    expect(timers()).toBe(before + 1)
-    expect(await budget.run('run-once', async () => 'served')).toBe('served')
-    budget.dispose()
+    // `dispose()` has to run on the failing path too, not just the passing one.
+    // This is the ONE test in the file that deliberately arms the real 90-minute
+    // timer, so an assertion that throws before an unguarded `dispose()` would
+    // leave a *referenced* Timeout in the worker — the exact resource the next
+    // line proves keeps the event loop alive. The failure would then present as
+    // a hung suite instead of a named assertion, which is the worst way to
+    // report it (cubic-dev-ai, #374 review).
+    try {
+      expect(timers()).toBe(before + 1)
+      expect(await budget.run('run-once', async () => 'served')).toBe('served')
+    } finally {
+      budget.dispose()
+    }
     // ...and the other half: a settled sweep leaves nothing behind, which is
     // what makes keeping it referenced affordable at a 90-minute budget.
     expect(timers()).toBe(before)
@@ -261,7 +271,11 @@ const implementing = '22222222-2222-4222-8222-222222222222'
 const done = '33333333-3333-4333-8333-333333333333'
 const planning = '44444444-4444-4444-8444-444444444444'
 
-const config = (sweepBudgetMs: number, registryRoot: string): FactoryConfig => FactoryConfigSchema.parse({
+const config = (
+  sweepBudgetMs: number,
+  registryRoot: string,
+  dispatch?: { agentHoldTimeoutMs?: number; agentlessHoldTimeoutMs?: number },
+): FactoryConfig => FactoryConfigSchema.parse({
   workspaceId: 'factory-sweep-budget',
   repos: {
     byLabel: { pear: 'AgentWorkforce/pear' },
@@ -277,6 +291,7 @@ const config = (sweepBudgetMs: number, registryRoot: string): FactoryConfig => F
     heartbeatPath: join(registryRoot, 'heartbeat.json'),
   },
   liveSubscription: { sweepBudgetMs },
+  ...(dispatch ? { dispatch } : {}),
 })
 
 const issuePath = (n: number) => `/linear/issues/AR-${n}__uuid-${n}.json`
@@ -381,6 +396,42 @@ class SlowRosterFleet extends FakeFleetClient {
       await new Promise((resolve) => setTimeout(resolve, this.rosterDelayMs))
     }
     return await super.roster()
+  }
+}
+
+/**
+ * A fleet that parks the held-agent deadline sweep partway through, so a sweep
+ * UNRELATED to discovery is genuinely in flight when `stop()` is called.
+ *
+ * `#sweepHeldAgentDeadlines` releases the agents it reaps through
+ * `fleet.release(name, reason)`, so blocking that one reason is enough to hold
+ * `#heldAgentDeadlineSweepInFlight` open for as long as the test wants,
+ * without a timer or a sleep deciding the outcome.
+ */
+class HeldSweepParkingFleet extends FakeFleetClient {
+  static readonly HELD_PAST_DEADLINE = 'held-past-deadline'
+
+  #open?: () => void
+  // Once unparked, STAY unparked: a held dispatch releases every one of its
+  // agents, so a one-shot gate would park the second release forever and the
+  // test would fail on shutdown rather than on the assertion it exists for.
+  #opened = false
+  #entered!: () => void
+  /** Resolves once the held-agent sweep is parked inside its release. */
+  readonly parked: Promise<void> = new Promise((resolve) => { this.#entered = resolve })
+
+  override async release(name: string, reason?: string): Promise<void> {
+    if (reason === HeldSweepParkingFleet.HELD_PAST_DEADLINE && !this.#opened) {
+      this.#entered()
+      await new Promise<void>((resolve) => { this.#open = resolve })
+    }
+    await super.release(name, reason)
+  }
+
+  /** Lets the parked held-agent sweep finish, and keeps it free thereafter. */
+  unpark(): void {
+    this.#opened = true
+    this.#open?.()
   }
 }
 
@@ -531,6 +582,71 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it(
+    'must-fire: the shutdown lever arms even while an unrelated held-agent sweep is still in flight',
+    { timeout: 30_000 },
+    async () => {
+      // The pair for the test above. That one proves the lever exists; this one
+      // proves WHEN it is armed, which is the half a passing shutdown cannot
+      // distinguish (cubic-dev-ai, #374 review).
+      //
+      // `stop()` arms the grace timer and then drains. Arming it after
+      // `#heldAgentDeadlineSweepInFlight` made the wedged discovery sweep's
+      // reprieve equal to `held-agent sweep duration + grace` instead of just
+      // `grace` — an unrelated subsystem silently extending the one bound this
+      // change exists to provide, without limit if that sweep never returns.
+      //
+      // The grace itself is `STOP_TEARDOWN_TIMEOUT_MS` (factory.ts), 2.5 s. The
+      // observation below sits at 3.2 s: past the grace, and far short of the
+      // 60 s budget, so a run that reads the counter as set cannot be a budget
+      // that simply expired on its own.
+      const root = await mkdtemp(join(tmpdir(), 'factory-sweep-budget-held-'))
+      const mount = new HangingWatermarkMount({ [issuePath(901)]: issueFile(901) })
+      // As above: serve the pre-backfill read and the backfill's own, so the
+      // daemon comes up healthy and a LATER periodic sweep is the one that wedges.
+      mount.serveFirst = 2
+      const fleet = new HeldSweepParkingFleet()
+      // 50 ms puts the dispatched agents past their hold deadline almost
+      // immediately, so the held-agent sweep is running well before shutdown.
+      const factory = createFactory(config(60_000, root, { agentHoldTimeoutMs: 50 }), {
+        mount,
+        fleet,
+        stateStore: new LeaseWatchingStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(),
+        logger: {},
+      })
+      try {
+        await withDeadline(factory.start({
+          mode: 'live',
+          liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50, reconcileTimeoutMs: 60_000 },
+        }), 8_000, 'start never returned')
+        // Both preconditions are OBSERVED, not slept for: a discovery sweep is
+        // wedged, and a held-agent sweep is parked mid-release.
+        await withDeadline(
+          (async () => {
+            while (mount.hungCalls === 0) await new Promise((resolve) => setTimeout(resolve, 25))
+          })(),
+          8_000,
+          'no periodic sweep ever wedged',
+        )
+        await withDeadline(fleet.parked, 8_000, 'the held-agent deadline sweep never started')
+
+        const stopping = factory.stop()
+        await new Promise((resolve) => setTimeout(resolve, 3_200))
+        // Before the fix this is `undefined`: `stop()` is still parked on the
+        // held-agent sweep and has not armed the timer that spends the budget.
+        expect(factory.status().counters.discoverySweepBudgetsCutShortForStop).toBe(1)
+
+        fleet.unpark()
+        await withDeadline(stopping, 8_000, 'stop never completed')
+      } finally {
+        fleet.unpark()
+        await factory.stop().catch(() => undefined)
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
 
   it('must-fire: a sweep aborted before the claim phase never opens a lease', async () => {
     // A lease taken after the budget expired makes every later sweep defer —
