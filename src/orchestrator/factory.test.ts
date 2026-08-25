@@ -14473,14 +14473,23 @@ describe('FactoryLoop', () => {
       }
     }, 40_000)
 
-    // MUST FIRE, and the control for the arm above. Identical fixture and an
-    // identical orphan-shaped row — the dispatch simply is not in flight any
-    // more. Without this arm the assertion above would pass for a fixture that
-    // never reaches the orphan-recovery call site at all.
-    it('CONTROL: still releases the same claim once no dispatch is in flight', async () => {
+    // MUST FIRE, and the control for BOTH must-not-fire arms — one per key
+    // phase. Identical fixture and an identical orphan-shaped row; the dispatch
+    // simply is not in flight any more.
+    //
+    // The escalation arm needs its own control rather than borrowing the
+    // dispatch one (#369 review, cubic). The two use different triages and so
+    // produce different key phases, and an orphan sweep that silently skipped
+    // escalation-keyed lifecycles altogether would green the escalation
+    // must-not-fire while releasing nothing. Only a positive control on the
+    // same triage rules that out.
+    it.each([
+      { label: 'dispatch-keyed', number: 370, triage: () => new StaticTriage() },
+      { label: 'escalation-keyed', number: 372, triage: () => new RoutelessLowConfidenceTriage() },
+    ])('CONTROL: still releases the same $label claim once no dispatch is in flight', async ({ number, triage }) => {
       const {
         root, fleet, factory, spawnGate, spawnStarted, markInProgress, startDispatch,
-      } = await inFlightFixture(370)
+      } = await inFlightFixture(number, triage())
       try {
         const dispatched = startDispatch().catch(() => undefined)
         await withDeadline(spawnStarted.promise, 12_000, 'the spawn was never entered')
@@ -14511,8 +14520,9 @@ describe('FactoryLoop', () => {
     // `:live:escalation` does reach lifecycle creation, and a guard that
     // matched only `:live:dispatch` would reopen #367 for it.
     //
-    // The CONTROL above is shared: it is the same fixture with no call in
-    // flight, and it still releases.
+    // Paired with the `escalation-keyed` CONTROL above, which uses this same
+    // triage and does release once the call is no longer in flight — so a
+    // sweep that simply ignored escalation-keyed rows cannot green this.
     it('preserves the claim of a dispatch keyed for escalation before routing upgraded it', async () => {
       const {
         root, fleet, factory, spawnGate, spawnStarted, markInProgress, startDispatch,
