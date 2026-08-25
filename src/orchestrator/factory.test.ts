@@ -1079,6 +1079,20 @@ class ReleaseHookFleetClient extends RemoteLifecycleFleetClient {
   }
 }
 
+/** The same hook on a local-placement fleet, where no durable lifecycle row exists. */
+class LocalReleaseHookFleetClient extends FakeFleetClient {
+  onCompletionRelease?: () => Promise<void>
+
+  override async release(name: string, reason?: string): Promise<void> {
+    if (reason === 'issue-done' || reason === 'issue-human-review') {
+      const hook = this.onCompletionRelease
+      this.onCompletionRelease = undefined
+      await hook?.()
+    }
+    await super.release(name, reason)
+  }
+}
+
 class LaterSpawnHangingFleetClient extends RemoteLifecycleFleetClient {
   readonly laterSpawnGate = Promise.withResolvers<void>()
   terminalExitEmitted = false
@@ -8038,6 +8052,37 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.dispatchTerminalReopenedDuringCompletion).toBeUndefined()
     const lifecycles = [...await stateStore.listDispatchLifecycles('factory-test')]
     expect(lifecycles.filter(([, lifecycle]) => lifecycle.phase === 'complete')).toHaveLength(1)
+    await factory.stop()
+  })
+
+  // #375 review (cubic-dev-ai P3). A reopen that lands after the terminal rows
+  // exist is cleared by the observation path itself and leaves behind the same
+  // `readyForAgent` row the recheck reads. Counting the read rather than the
+  // repair would file that reopen — which completion never raced — under the
+  // completion window. Here the observation path cleared everything, so the
+  // recheck finds nothing to repair and must count nothing.
+  it('counts no completion-window reopen when the observation path already cleared the refusal', async () => {
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const mount = new FakeMountClient({ [issuePath(381)]: issueFile(381) })
+    const fleet = new LocalReleaseHookFleetClient()
+    const factory = createFactory(config(), { mount, fleet, stateStore, triage: new StaticTriage() })
+
+    await factory.runOnce()
+    const identity = dispatchIssueIdentity({ uuid: 'uuid-381', key: 'AR-381', path: issuePath(381) })
+    fleet.onCompletionRelease = async () => {
+      await stateStore.recordDispatchAttempt('factory-test', 'AR-381', {
+        attempts: 0,
+        inFlight: false,
+        terminal: false,
+        backoffUntilMs: 0,
+      })
+      await stateStore.recordCanonicalState('factory-test', identity, 'readyForAgent')
+    }
+
+    fleet.emitAgentExit('ar-381-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+
+    expect(factory.status().counters.dispatchTerminalReopenedDuringCompletion).toBeUndefined()
     await factory.stop()
   })
 

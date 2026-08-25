@@ -9480,8 +9480,15 @@ export class FactoryLoop implements Factory {
     const ref = issueRefForState(record.issue)
     const role = await this.#state.getCanonicalState(this.#workspaceId, canonicalStateKey(ref))
     if (role !== 'readyForAgent') return
-    this.#increment('dispatchTerminalReopenedDuringCompletion')
-    await this.#clearTerminalRefusals(ref)
+    // Counted from the repair, not from the observation. A reopen that landed
+    // after the terminal rows existed was already cleared by the observation
+    // path itself and leaves the same `readyForAgent` row behind, so counting
+    // the read would put a reopen completion never raced into the
+    // completion-window bucket (cubic-dev-ai P3, #375 review). Only a clear
+    // that actually found a refusal to remove is one this recheck repaired.
+    if (await this.#clearTerminalRefusals(ref)) {
+      this.#increment('dispatchTerminalReopenedDuringCompletion')
+    }
   }
 
   async #writeLoopHeartbeat(
