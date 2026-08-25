@@ -6251,8 +6251,23 @@ export class FactoryLoop implements Factory {
       consecutiveFailures,
       failureThreshold: READINESS_RECONCILE_FAILURE_THRESHOLD,
       intervalMs: this.#readinessReconcileIntervalMs,
+      // The two bounds that can actually preempt this pass, published beside
+      // the cadence that cannot. Omitting them made the stanza unreadable in
+      // the one situation it exists for: `intervalMs` next to a climbing
+      // `inFlightMs` looks exactly like an unbounded hang, and has twice been
+      // reported as one. `timeoutMs` ends the wait, `sweepBudgetMs` unwinds
+      // the sweep and hands the lease back — so the second is the one that
+      // answers "when does this recover".
+      timeoutMs: this.#readinessReconcileTimeoutMs,
+      sweepBudgetMs: this.#discoverySweepBudgetMs,
       ...(Number.isFinite(inFlightSinceMs) ? { inFlightSinceMs } : {}),
       ...(inFlightMs !== undefined ? { inFlightMs } : {}),
+      // Derived here rather than left to each reader. The public projection
+      // already computed it (#295/#300); the heartbeat stanza did not, so the
+      // surface an operator actually opens first was the one missing it.
+      ...(inFlightMs !== undefined && this.#readinessReconcileIntervalMs > 0
+        ? { missedPasses: Math.floor(inFlightMs / this.#readinessReconcileIntervalMs) }
+        : {}),
       ...(this.#readinessReconcileLastDurationMs !== undefined
         ? { lastDurationMs: this.#readinessReconcileLastDurationMs }
         : {}),

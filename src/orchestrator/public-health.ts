@@ -507,6 +507,11 @@ function readinessReconcileHealth(
     consecutiveFailures: counter(status.consecutiveFailures),
     failureThreshold: counter(status.failureThreshold),
     ...(intervalMs !== undefined ? { intervalMs } : {}),
+    // Republished only when positive, for the same reason `intervalMs` is: a
+    // recorded `0` means "no bound configured", and echoing it as though it
+    // were a real deadline would read as an instant one.
+    ...optionalPositive('timeoutMs', status.timeoutMs),
+    ...optionalPositive('sweepBudgetMs', status.sweepBudgetMs),
     ...(finiteNumber(status.lastDurationMs) !== undefined
       ? { lastDurationMs: finiteNumber(status.lastDurationMs) }
       : {}),
@@ -879,6 +884,8 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             consecutiveFailures: counter(readiness.consecutiveFailures),
             failureThreshold: counter(readiness.failureThreshold),
             ...optionalPositive('intervalMs', readiness.intervalMs),
+            ...optionalPositive('timeoutMs', readiness.timeoutMs),
+            ...optionalPositive('sweepBudgetMs', readiness.sweepBudgetMs),
             ...optionalDuration('lastDurationMs', readiness.lastDurationMs),
             ...optionalTimestamp('lastStartedAtMs', readiness.lastStartedAtMs),
             ...optionalTimestamp('lastCompletedAtMs', readiness.lastCompletedAtMs),
