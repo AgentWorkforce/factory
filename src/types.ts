@@ -134,6 +134,13 @@ export interface FactoryLiveSubscriptionOptions {
    * which no deadline checked *between* awaits can reach.
    */
   relayfileOperationTimeoutMs: number
+  /**
+   * Aggregate budget for one whole sweep (#372). Bounds what neither neighbour
+   * can: a bounded call wrapped in an unbounded retry, or a hang on a transport
+   * nobody has bounded yet. Expiry aborts the sweep from inside its own fence,
+   * so the discovery lease is released and the next cycle starts clean.
+   */
+  sweepBudgetMs: number
 }
 
 /**
