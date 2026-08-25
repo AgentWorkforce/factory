@@ -31632,9 +31632,40 @@ class CompletionReleaseFailingFleetClient extends FakeFleetClient {
   }
 }
 
+/**
+ * The same failure on the DURABLE lifecycle, which is what production runs.
+ *
+ * `#usesDurableDispatchLifecycle()` is `durableOwnership ?? placementLocality
+ * === 'remote'`, so a local-placement fake exercises `#scheduleReleaseRetry`'s
+ * own timer and never touches `#driveDispatchLifecycle`. The deployed Factory
+ * places remotely. The first version of this suite tested only the local path
+ * and therefore proved nothing about the loop in the report (#379 review, P1).
+ */
+class DurableCompletionReleaseFailingFleetClient extends RemoteLifecycleFleetClient {
+  readonly releaseAttempts: Array<{ name: string; reason?: string }> = []
+  failReleases = true
+  remainingFailures?: number
+
+  override async release(name: string, reason?: string): Promise<void> {
+    this.releaseAttempts.push({ name, reason })
+    if (reason === 'issue-done') {
+      if (this.remainingFailures !== undefined) {
+        if (this.remainingFailures > 0) {
+          this.remainingFailures -= 1
+          throw new Error(`control plane unavailable for ${name}`)
+        }
+      } else if (this.failReleases) {
+        throw new Error(`control plane unavailable for ${name}`)
+      }
+    }
+    await super.release(name, reason)
+  }
+}
+
 describe('completion release retry budget (#379)', () => {
-  const completionReleases = (fleet: CompletionReleaseFailingFleetClient) =>
-    fleet.releaseAttempts.filter((attempt) => attempt.reason === 'issue-done')
+  const completionReleases = (
+    fleet: CompletionReleaseFailingFleetClient | DurableCompletionReleaseFailingFleetClient,
+  ) => fleet.releaseAttempts.filter((attempt) => attempt.reason === 'issue-done')
 
   // The production floor is 1 s, so exhausting the budget honestly would cost
   // ten real seconds per case. The cadence is a test-only port override for the
@@ -31734,4 +31765,114 @@ describe('completion release retry budget (#379)', () => {
     // ...and the budget never tripped.
     expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBeUndefined()
   }, 20_000)
+
+  /**
+   * THE PRODUCTION SHAPE, and the case the first version of this suite missed.
+   *
+   * On the durable lifecycle the retry does not go through
+   * `#scheduleReleaseRetry`'s own timer. It goes:
+   *
+   *   #finishDurableRelease -> release fails -> returns FALSE (never throws)
+   *     -> #scheduleReleaseRetry -> #scheduleDispatchLifecycleRetry
+   *       -> timer -> #driveDispatchLifecycle -> phase 'releasing'
+   *         -> #finishDurableRelease -> fails -> re-arms -> RESOLVES NORMALLY
+   *
+   * `#driveDispatchLifecycle` discards `#finishDurableRelease`'s boolean
+   * (factory.ts, the `phase === 'releasing'` branch), so the drive resolves on
+   * a failed release and the scheduler's success handler runs. Any budget
+   * cleared there is cleared on every pass, and the counter can never climb.
+   *
+   * This test therefore asserts on the counter surviving ACROSS re-arms, not
+   * merely on a dead-letter being reachable by some path.
+   */
+  it('exhausts the budget on the durable lifecycle, where the failed release resolves instead of throwing', async () => {
+    const mount = new FakeMountClient({ [issuePath(73)]: issueFile(73) })
+    const fleet = new DurableCompletionReleaseFailingFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const errors: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      logger: { warn: () => undefined, error: (...args: unknown[]) => errors.push(args) },
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-73-impl-pear', 'issue-done')
+
+    await vi.waitFor(
+      () => expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
+      { timeout: 10_000, interval: 5 },
+    )
+    expect(errors.map(([message]) => message)).toContain(
+      '[factory] release retries exhausted; abandoning cleanup for this work unit',
+    )
+
+    // The re-arm loop is genuinely stopped, not merely counted once.
+    const bounded = completionReleases(fleet).length
+    await new Promise((resolve) => setTimeout(resolve, RETRY_MS * 100))
+    expect(completionReleases(fleet).length).toBe(bounded)
+  }, 20_000)
+
+  /**
+   * A dead-letter must not silently eat capacity. Trading a visible 1 Hz spin
+   * for an in-flight record nobody will ever complete is not a win: the slot is
+   * gone until someone restarts the process (#379 review, P1).
+   */
+  it('releases the slot when the budget is exhausted rather than leaking the work unit', async () => {
+    const mount = new FakeMountClient({ [issuePath(74)]: issueFile(74) })
+    const fleet = new CompletionReleaseFailingFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      logger: {},
+    })
+
+    await factory.runOnce()
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-74'])
+    fleet.emitAgentExit('ar-74-impl-pear', 'issue-done')
+
+    await vi.waitFor(
+      () => expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
+      { timeout: 10_000, interval: 5 },
+    )
+
+    // The slot is what capacity is computed from. Abandoning cleanup must not
+    // also abandon the accounting.
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 10_000, interval: 5 })
+  }, 20_000)
+
+  /**
+   * The narrowing that answers #379 review P1 (wrong budget charged) is
+   * STRUCTURAL, and this test states the structure rather than pretending to
+   * exercise it.
+   *
+   * The generic arm of `#driveDispatchLifecycle`'s `.catch()` re-arms for
+   * dispatch, publishing and recovery failures as well as releases, so it must
+   * not charge. Charging is now confined to `#scheduleReleaseRetry`. I could
+   * not reach that generic arm from a realistic fixture — forcing durable state
+   * reads to throw makes the agent-exit handler fail before any lifecycle retry
+   * is scheduled, so a test built that way passes whether or not the narrowing
+   * is present, which is worth nothing. Rather than ship that, the guarantee is
+   * pinned by auditing the call sites, which is what actually makes it true.
+   */
+  it('charges the release budget from the release scheduler only', () => {
+    const source = readFileSync(new URL('./factory.ts', import.meta.url), 'utf8')
+
+    // Two call sites, both inside `#scheduleReleaseRetry` — its durable branch
+    // and its local branch. Every caller of that method is a failed release:
+    // the three inside `#finishDurableRelease`, and `#completeIssue`'s catch
+    // once `releaseReasonForRetry` is set.
+    const callSites = [...source.matchAll(/!this\.#chargeReleaseAttempt\(/gu)]
+    expect(callSites).toHaveLength(2)
+
+    // The generic lifecycle re-arm — dispatch, publishing, recovery — passes no
+    // release charge, so it cannot dead-letter a unit that never released.
+    expect(source).toContain('this.#scheduleDispatchLifecycleRetry(record, nextDelayMs)\n')
+    expect(source).not.toContain('releaseAttempt = true')
+  })
 })

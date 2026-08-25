@@ -7716,6 +7716,7 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleReleaseAbandoned.add(key)
     this.#dispatchLifecycleReleaseAttempts.delete(key)
     this.#increment('dispatchLifecycleReleaseAbandoned')
+    const durableLifecycleRetained = this.#usesDurableDispatchLifecycle()
     // `error`, not `warn`. Every previous layer of this failure was invisible
     // until somebody read stderr by hand; a work unit whose cleanup this
     // process has permanently given up on is exactly the event that must not
@@ -7728,9 +7729,43 @@ export class FactoryLoop implements Factory {
       // The durable lifecycle is retained on purpose: a takeover or a restart
       // re-drives it from the persisted phase. This bounds THIS process's
       // spin, it does not declare the work unit clean.
-      durableLifecycleRetained: this.#usesDurableDispatchLifecycle(),
+      durableLifecycleRetained,
     })
+    const drive = this.#releaseDeadLetteredSlot(record, key)
+      .catch((error) => {
+        this.#logger.warn?.('[factory] dead-lettered release could not free its batch slot', {
+          issue: record.issue.key,
+          error: describeError(error).errorMessage,
+        })
+      })
+      .finally(() => this.#dispatchLifecycleDrives.delete(drive))
+    this.#dispatchLifecycleDrives.add(drive)
     return false
+  }
+
+  /**
+   * Hand back the batch slot of a work unit whose release was dead-lettered.
+   *
+   * Without this the bound trades an unbounded 1 Hz spin for a permanently
+   * leaked slot, which is not obviously the better failure (#379 review, P1):
+   * a spin is loud and self-describing, whereas an in-flight record nobody will
+   * ever complete silently reduces dispatch capacity until the process is
+   * restarted. The slot is process-local accounting and is always freed here.
+   *
+   * What is NOT declared clean is the work itself. On a durable lifecycle the
+   * persisted `releasing` phase is deliberately left in place, so a successor
+   * or a restart re-drives the same cleanup with a fresh budget; freeing the
+   * local slot does not write a terminal phase. On a local lifecycle there is
+   * no durable record to retain, so the batch record is all there is and
+   * completing it is what keeps capacity honest.
+   */
+  async #releaseDeadLetteredSlot(record: InFlightIssue, key: string): Promise<void> {
+    const batch = await this.#batch()
+    const next = batch.complete(record.issue)
+    this.#uncompensatedDispatchClaims.delete(key)
+    await this.#writeInFlightRegistry()
+    // A freed slot that nothing is admitted into is only half the repair.
+    if (next && !this.#stopping) await this.dispatch(next.decision, { dryRun: next.dryRun })
   }
 
   /** Clears a work unit's release budget once cleanup actually succeeds. */
@@ -7757,13 +7792,22 @@ export class FactoryLoop implements Factory {
         .then(() => {
           this.#dispatchLifecycleCapacityWaits.delete(key)
           this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
-          // Progress resets the budget: the ten attempts are consecutive
-          // failures, not a lifetime quota on a work unit that keeps recovering.
-          this.#clearReleaseAttempts(key)
+          // DELIBERATELY NOT `#clearReleaseAttempts` (#379 review, P1).
+          //
+          // A FAILED release reaches here. `#finishDurableRelease` returns
+          // `false` rather than throwing, and `#driveDispatchLifecycle`
+          // discards that boolean in its `phase === 'releasing'` branch, so
+          // the drive RESOLVES on a failed release and this handler runs on
+          // every re-arm. Clearing the budget here zeroed it once per pass and
+          // the counter could never reach the cap — the same never-fires this
+          // bound exists to avoid, moved from the `.catch()` to the `.then()`.
+          //
+          // The budget is refunded where success is actually known:
+          // `#finishDurableRelease` clears it on real per-agent progress and
+          // again when the work unit completes.
         })
         .catch((error) => {
           let nextDelayMs = this.#dispatchLifecycleRetryMs
-          let releaseAttempt = false
           if (error instanceof DispatchLifecycleCapacityError) {
             this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
             nextDelayMs = this.#recordDispatchCapacityWait(record, key)
@@ -7783,15 +7827,26 @@ export class FactoryLoop implements Factory {
           } else {
             this.#dispatchLifecycleCapacityWaits.delete(key)
             this.#dispatchLifecycleOwnershipWaitLogged.delete(key)
-            // A genuine failure, as opposed to a wait. This is the branch that
-            // spun at 1 Hz forever.
-            releaseAttempt = true
             this.#logger.warn?.('[factory] durable dispatch lifecycle retry failed', {
               issue: record.issue.key,
               error: describeError(error).errorMessage,
             })
           }
-          this.#scheduleDispatchLifecycleRetry(record, nextDelayMs, { releaseAttempt })
+          // Deliberately UNCHARGED (#379 review, P1). This arm re-arms for
+          // dispatch, publishing and recovery failures as well as releases, and
+          // charging all of them would dead-letter a work unit that was never
+          // stuck in a release loop. Charging is confined to
+          // `#scheduleReleaseRetry`, whose every caller is a release failure:
+          // the three inside `#finishDurableRelease` and `#completeIssue`'s
+          // catch once `releaseReasonForRetry` is set.
+          //
+          // The gap this leaves, stated plainly: a release failure that THREW
+          // out of `#finishDurableRelease` instead of returning `false` would
+          // reach here and re-arm unbounded. Every failure path in that method
+          // returns `false` and schedules its own retry, so this is not a
+          // reachable shape today — and if one appears it degrades to the
+          // pre-existing unbounded behaviour rather than to a wrong dead-letter.
+          this.#scheduleDispatchLifecycleRetry(record, nextDelayMs)
         })
         .finally(() => this.#dispatchLifecycleDrives.delete(drive))
       this.#dispatchLifecycleDrives.add(drive)
@@ -8049,6 +8104,9 @@ export class FactoryLoop implements Factory {
       return
     }
     if (lifecycle.phase === 'releasing') {
+      // The boolean is discarded here, as it always was — and that is exactly
+      // why the scheduler's success handler must not refund the release budget
+      // (#379 review, P1). A failed release resolves through this line.
       await this.#finishDurableRelease(record, lifecycle.releaseReason)
     }
   }
