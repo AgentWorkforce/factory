@@ -585,7 +585,9 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
 
   it(
     'must-fire: the shutdown lever arms even while an unrelated held-agent sweep is still in flight',
-    { timeout: 30_000 },
+    // Generous on purpose: every bound inside is a failure deadline, so this is
+    // only ever consumed by a run that is already failing.
+    { timeout: 60_000 },
     async () => {
       // The pair for the test above. That one proves the lever exists; this one
       // proves WHEN it is armed, which is the half a passing shutdown cannot
@@ -597,10 +599,9 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
       // `grace` — an unrelated subsystem silently extending the one bound this
       // change exists to provide, without limit if that sweep never returns.
       //
-      // The grace itself is `STOP_TEARDOWN_TIMEOUT_MS` (factory.ts), 2.5 s. The
-      // observation below sits at 3.2 s: past the grace, and far short of the
-      // 60 s budget, so a run that reads the counter as set cannot be a budget
-      // that simply expired on its own.
+      // The grace itself is `STOP_TEARDOWN_TIMEOUT_MS` (factory.ts), 2.5 s, and
+      // the budget here is 60 s — so a counter that is set can only have been
+      // set by the lever, never by a budget that expired on its own.
       const root = await mkdtemp(join(tmpdir(), 'factory-sweep-budget-held-'))
       const mount = new HangingWatermarkMount({ [issuePath(901)]: issueFile(901) })
       // As above: serve the pre-backfill read and the backfill's own, so the
@@ -633,9 +634,23 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
         await withDeadline(fleet.parked, 8_000, 'the held-agent deadline sweep never started')
 
         const stopping = factory.stop()
-        await new Promise((resolve) => setTimeout(resolve, 3_200))
-        // Before the fix this is `undefined`: `stop()` is still parked on the
-        // held-agent sweep and has not armed the timer that spends the budget.
+        // POLLED, not slept (cubic-dev-ai, #374 review). A fixed wait just past
+        // the 2.5 s grace leaves a few hundred ms of headroom, which on a loaded
+        // worker is a new flake — in a suite that already carries two (#342,
+        // #373) and in a PR whose whole subject is a wedge. Polling costs the
+        // discrimination nothing: the held-agent sweep stays parked until
+        // `unpark()` below, so against the previous ordering `stop()` never
+        // reaches the arming call at all and this can only end in its own
+        // deadline. The margin disappears; the must-fire does not.
+        await withDeadline(
+          (async () => {
+            while (factory.status().counters.discoverySweepBudgetsCutShortForStop === undefined) {
+              await new Promise((resolve) => setTimeout(resolve, 25))
+            }
+          })(),
+          12_000,
+          'the shutdown lever never armed while an unrelated held-agent sweep was in flight',
+        )
         expect(factory.status().counters.discoverySweepBudgetsCutShortForStop).toBe(1)
 
         fleet.unpark()
