@@ -14490,8 +14490,15 @@ describe('FactoryLoop', () => {
       const {
         root, fleet, factory, spawnGate, spawnStarted, markInProgress, startDispatch,
       } = await inFlightFixture(number, triage())
+      // Hoisted so `finally` can drain it. Left inside the `try`, a throw at
+      // the deadline below would leave this dispatch running across
+      // `factory.stop()` and `rm(root)`, and its late rejection would surface
+      // from teardown instead of the assertion that actually failed (#369
+      // review, CodeRabbit). `.catch` keeps that drain from throwing here for
+      // the same reason; the assertion below is what proves the dispatch
+      // actually landed a lifecycle.
+      const dispatched = startDispatch().catch(() => undefined)
       try {
-        const dispatched = startDispatch().catch(() => undefined)
         await withDeadline(spawnStarted.promise, 12_000, 'the spawn was never entered')
         spawnGate.resolve()
         await dispatched
@@ -14506,6 +14513,7 @@ describe('FactoryLoop', () => {
         expect(factory.status().counters.githubOrphanedLifecycleClaimsReleased).toBe(1)
       } finally {
         spawnGate.resolve()
+        await dispatched
         await factory.stop()
         await rm(root, { recursive: true, force: true })
       }
