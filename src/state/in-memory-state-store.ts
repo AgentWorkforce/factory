@@ -967,8 +967,8 @@ export class InMemoryStateStore implements StateStore {
     return generations.delete(ownershipKey)
   }
 
-  async recordCanonicalState(workspaceId: string, key: string, stateId: string): Promise<void> {
-    this.#workspace(workspaceId).canonicalIssueStates.set(key, stateId)
+  async recordCanonicalState(workspaceId: string, key: string, role: string): Promise<void> {
+    this.#workspace(workspaceId).canonicalIssueStates.set(key, role)
   }
 
   async getCanonicalState(workspaceId: string, key: string): Promise<string | undefined> {

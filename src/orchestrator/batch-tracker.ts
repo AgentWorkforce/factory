@@ -47,6 +47,15 @@ export interface InFlightIssue {
    * writeback from a foreign one (factory#319).
    */
   issueWritebackConfirmedAtMs?: number
+  /**
+   * Set once this completion recorded a terminal canonical role for the unit.
+   *
+   * The terminal role is recorded at the provider write, but the durable rows
+   * that refuse a redispatch are written much later. This marker is what lets
+   * the terminal save recheck whether a reopen was observed inside that window
+   * and consumed the reopen edge before there was anything to clear (#334).
+   */
+  canonicalTerminalRoleRecorded?: boolean
 }
 
 export interface QueuedIssue {

@@ -32,7 +32,7 @@ import {
 import { LatePlacementReleasedError, changeEventPath } from './factory'
 import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
 import { RelayfileOperationTimeoutError } from '../mount/relayfile-operation-timeout'
-import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubIssueCloseWriteResult, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
@@ -553,8 +553,25 @@ class RecordingGithubWriteback implements GithubWriteback {
     this.statuses.push({ key: issue.key, status })
   }
 
-  async closeIssue(issue: LinearIssue, body: string): Promise<void> {
+  async closeIssue(issue: LinearIssue, body: string): Promise<GithubIssueCloseWriteResult | void> {
     this.closes.push({ key: issue.key, body })
+  }
+}
+
+/**
+ * A GitHub writeback whose provider calls land and are acknowledged but carry
+ * no actor attribution — the shape the GitHub App path returns. By the port
+ * contract the visible transition exists; only its author is unproven.
+ */
+class AcknowledgingGithubWriteback extends RecordingGithubWriteback {
+  override async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult> {
+    await super.setStatus(issue, status)
+    return 'acknowledged'
+  }
+
+  override async closeIssue(issue: LinearIssue, body: string): Promise<GithubIssueCloseWriteResult> {
+    await super.closeIssue(issue, body)
+    return 'acknowledged'
   }
 }
 
@@ -1040,6 +1057,39 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
     if (!this.exitImplementerOnReconcile) return
     const implementer = this.hydrated.find((agent) => agent.name.includes('-impl-'))
     if (implementer) this.emitAgentExit(implementer.name, 'exited')
+  }
+}
+
+/**
+ * Fires a hook from inside `#finishDurableRelease`'s agent release: after
+ * completion recorded the terminal role at the provider write, and before the
+ * durable rows that refuse a redispatch exist. That is the window a reopen can
+ * land in (#334, #375 review).
+ */
+class ReleaseHookFleetClient extends RemoteLifecycleFleetClient {
+  onCompletionRelease?: () => Promise<void>
+
+  override async release(name: string, reason?: string): Promise<void> {
+    if (reason === 'issue-done' || reason === 'issue-human-review') {
+      const hook = this.onCompletionRelease
+      this.onCompletionRelease = undefined
+      await hook?.()
+    }
+    await super.release(name, reason)
+  }
+}
+
+/** The same hook on a local-placement fleet, where no durable lifecycle row exists. */
+class LocalReleaseHookFleetClient extends FakeFleetClient {
+  onCompletionRelease?: () => Promise<void>
+
+  override async release(name: string, reason?: string): Promise<void> {
+    if (reason === 'issue-done' || reason === 'issue-human-review') {
+      const hook = this.onCompletionRelease
+      this.onCompletionRelease = undefined
+      await hook?.()
+    }
+    await super.release(name, reason)
   }
 }
 
@@ -7729,6 +7779,372 @@ describe('FactoryLoop', () => {
       'ar-366-review',
     ])
     expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
+  })
+
+  // #334. The same reopen, arriving GitHub-native on a GitHub-sourced Factory.
+  // On 2026-08-25 the deployed instance refused seven work units across five
+  // repositories with `dispatch lifecycle already terminal`: GitHub ingestion
+  // recorded no canonical issue state at all, so the reopen cleanup below was
+  // never reached and the terminal row a completed run left behind refused the
+  // reopened work forever.
+  it('re-dispatches a GitHub-native issue after a human-review to ready re-open', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 364)
+    const mount = new FakeMountClient({ [path]: githubIssueFile(364, { labels: ['factory'] }) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    const first = await factory.runOnce()
+    expect(first.dispatched.map((result) => result.issue.key)).toEqual(['364'])
+
+    // Completion parks the unit for human review (a GitHub issue only closes
+    // behind a merged PR), which is the terminal lifecycle a reopen must clear.
+    fleet.emitAgentExit('ar-364-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.humanReview).toBe(1))
+    expect(githubWriteback.statuses).toContainEqual({ key: '364', status: 'human-review' })
+    await mount.writeFile(path, githubIssueFile(364, { labels: ['factory', 'factory:human-review'] }))
+
+    const parked = await factory.runOnce()
+    expect(parked.dispatched).toEqual([])
+
+    // The reopen: a human takes the park label off and the unit is ready again.
+    await mount.writeFile(path, githubIssueFile(364, { labels: ['factory'] }))
+    const reopened = await factory.runOnce()
+
+    expect(reopened.skipped).toEqual([])
+    expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['364'])
+    expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
+    await factory.stop()
+  })
+
+  // #334 MUST-NOT-FIRE. The trivial wrong fix — clear the terminal row whenever
+  // a ready unit is refused by one — re-dispatches finished work. This unit is
+  // genuinely still terminal: it completed and nobody reopened it.
+  it('does not resurrect a GitHub-native unit that is still parked for human review', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 372)
+    const mount = new FakeMountClient({ [path]: githubIssueFile(372, { labels: ['factory'] }) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-372-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.humanReview).toBe(1))
+    await mount.writeFile(path, githubIssueFile(372, { labels: ['factory', 'factory:human-review'] }))
+
+    const parkedAgain = await factory.runOnce()
+    expect(parkedAgain.dispatched).toEqual([])
+    // And a completed-and-closed unit stays completed.
+    await mount.writeFile(path, githubIssueFile(372, { state: 'closed', labels: ['factory'] }))
+    const closed = await factory.runOnce()
+    expect(closed.dispatched).toEqual([])
+
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-372-impl-pear', 'ar-372-review-pear'])
+    expect(factory.status().counters.dispatchTerminalReopened).toBeUndefined()
+    await factory.stop()
+  })
+
+  // #334 deliverable 2: the canonical-state key is the work unit, so a role
+  // observed through one surface is visible to the other. `issueStateKey` is
+  // surface scoped — `AR-448` for the Linear mirror, `448:<uuid>:<path>` for
+  // the GitHub-native ref — and under it this reopen is invisible.
+  it('sees a terminal role recorded from a Linear mirror when the same unit arrives GitHub-native', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 448)
+    const githubRef = { uuid: 'AgentWorkforce/pear#448', key: '448', path }
+    const mirrorRef = {
+      uuid: 'uuid-448',
+      key: 'AR-448',
+      path: '/linear/issues/AR-448__uuid-448.json',
+      origin: { provider: 'github' as const, owner: 'AgentWorkforce', repo: 'pear', number: 448 },
+    }
+    // One work unit, two surfaces, two different surface keys.
+    expect(dispatchIssueIdentity(mirrorRef)).toBe(dispatchIssueIdentity(githubRef))
+    expect(mirrorRef.key).not.toBe(githubRef.key)
+
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const mount = new FakeMountClient({ [path]: githubIssueFile(448, { labels: ['factory'] }) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    // A completed run recorded through the mirror: the terminal lifecycle row
+    // and the canonical role that says the unit reached a terminal state.
+    const decision = await new StaticTriage().triage(parseGithubFactoryIssue(path, githubIssueFile(448, { labels: ['factory'] })))
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      dispatchIssueIdentity(mirrorRef),
+      {
+        runId: 'mirror-run',
+        issue: mirrorRef,
+        decision: { ...decision, issue: mirrorRef },
+        dryRun: false,
+        phase: 'complete',
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 1_000,
+      },
+      'previous-owner',
+      1_000,
+      1,
+    )
+    await stateStore.recordCanonicalState('factory-test', dispatchIssueIdentity(mirrorRef), 'humanReview')
+
+    const reopened = await factory.runOnce()
+
+    expect(reopened.skipped).toEqual([])
+    expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['448'])
+    expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
+    await factory.stop()
+  })
+
+  // #334 boundary, stated as a test so the limitation is verifiable rather than
+  // asserted: canonical issue state lives only in memory, so a terminal row
+  // that outlived the process which wrote it has no remembered terminal role to
+  // reopen from and stays refused. This is why the fix prevents new occurrences
+  // rather than clearing rows already stuck in production.
+  it('leaves a terminal lifecycle in place when no terminal role was ever observed', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 350)
+    const githubRef = { uuid: 'AgentWorkforce/pear#350', key: '350', path }
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const mount = new FakeMountClient({ [path]: githubIssueFile(350, { labels: ['factory'] }) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const decision = await new StaticTriage().triage(parseGithubFactoryIssue(path, githubIssueFile(350, { labels: ['factory'] })))
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      dispatchIssueIdentity(githubRef),
+      {
+        runId: 'restarted-before-this-process',
+        issue: githubRef,
+        decision: { ...decision, issue: githubRef },
+        dryRun: false,
+        phase: 'complete',
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: 1_000,
+      },
+      'previous-owner',
+      1_000,
+      1,
+    )
+
+    const report = await factory.runOnce()
+
+    expect(report.dispatched).toEqual([])
+    expect(report.skipped).toEqual([
+      expect.objectContaining({ reason: 'dispatch lifecycle already terminal', code: 'dispatch-failed' }),
+    ])
+    expect(factory.status().counters.dispatchTerminalReopened).toBeUndefined()
+    await factory.stop()
+  })
+
+  // #375 review (cubic-dev-ai P2). A reopened work unit is routinely seen in a
+  // non-ready shape before it is seen ready — reopened while an intermediate
+  // state still hangs on it, or reopened one event before readiness is
+  // reapplied. Writing that intermediate role erased the remembered terminal
+  // role, disarming the reopen edge so the later ready observation refused the
+  // work exactly as #334 did.
+  it('keeps a remembered terminal role through a non-ready intermediate observation', async () => {
+    const mount = new FakeMountClient({ [issuePath(376)]: issueFile(376) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    const first = await factory.runOnce()
+    expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-376'])
+
+    fleet.emitAgentExit('ar-376-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+
+    // The reopen arrives in two observations. This is the first one.
+    await mount.writeFile(issuePath(376), issuePayload(376, planning))
+    const intermediate = await factory.runOnce()
+    expect(intermediate.dispatched).toEqual([])
+
+    // And this is the one that must still read as terminal -> ready.
+    await mount.writeFile(issuePath(376), issuePayload(376, ready))
+    const reopened = await factory.runOnce()
+
+    expect(reopened.skipped).toEqual([])
+    expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-376'])
+    expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
+    await factory.stop()
+  })
+
+  // #375 review (chatgpt-codex-connector P1). Completion records the terminal
+  // role at the provider write, but `#recordDispatchTerminal` and the
+  // `complete` lifecycle save happen after the completion comment, the Slack
+  // thread and every agent release. A reopen observed inside that window finds
+  // nothing terminal to clear and consumes the reopen edge anyway; the terminal
+  // rows then land on a ready work unit that no later read can ever reopen.
+  it('clears a terminal lifecycle when the reopen was observed while completion was still writing it', async () => {
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const mount = new FakeMountClient({ [issuePath(377)]: issueFile(377) })
+    const fleet = new ReleaseHookFleetClient()
+    const factory = createFactory(config(), { mount, fleet, stateStore, triage: new StaticTriage() })
+
+    const first = await factory.runOnce()
+    expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-377'])
+
+    const identity = dispatchIssueIdentity({ uuid: 'uuid-377', key: 'AR-377', path: issuePath(377) })
+    // Exactly what `#recordCanonicalIssueState` leaves behind for a reopen read
+    // that lands in the gap: it found no terminal row to clear and wrote
+    // `readyForAgent` over the terminal role this completion had just recorded.
+    fleet.onCompletionRelease = async () => {
+      await stateStore.recordCanonicalState('factory-test', identity, 'readyForAgent')
+    }
+
+    fleet.emitAgentExit('ar-377-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+
+    expect(factory.status().counters.dispatchTerminalReopenedDuringCompletion).toBe(1)
+
+    // The reopened unit as the next sweep reads it. Its canonical role already
+    // says `readyForAgent`, so this sweep clears nothing: only the recheck at
+    // the terminal save could have released the refusal.
+    await mount.writeFile(issuePath(377), issuePayload(377, ready))
+    const reopened = await factory.runOnce()
+    expect(reopened.skipped).toEqual([])
+    expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-377'])
+    await factory.stop()
+  })
+
+  // MUST-NOT-FIRE for the recheck above: same window, same hook, one value
+  // changed. No reopen was observed, so the terminal lifecycle must survive its
+  // own save. A recheck that cleared here would make every completion
+  // redispatchable.
+  it('leaves the terminal lifecycle intact when no reopen was observed during completion', async () => {
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const mount = new FakeMountClient({ [issuePath(379)]: issueFile(379) })
+    const fleet = new ReleaseHookFleetClient()
+    const factory = createFactory(config(), { mount, fleet, stateStore, triage: new StaticTriage() })
+
+    await factory.runOnce()
+    const identity = dispatchIssueIdentity({ uuid: 'uuid-379', key: 'AR-379', path: issuePath(379) })
+    fleet.onCompletionRelease = async () => {
+      await stateStore.recordCanonicalState('factory-test', identity, 'done')
+    }
+
+    fleet.emitAgentExit('ar-379-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+
+    expect(factory.status().counters.dispatchTerminalReopenedDuringCompletion).toBeUndefined()
+    const lifecycles = [...await stateStore.listDispatchLifecycles('factory-test')]
+    expect(lifecycles.filter(([, lifecycle]) => lifecycle.phase === 'complete')).toHaveLength(1)
+    await factory.stop()
+  })
+
+  // #375 review (cubic-dev-ai P3). A reopen that lands after the terminal rows
+  // exist is cleared by the observation path itself and leaves behind the same
+  // `readyForAgent` row the recheck reads. Counting the read rather than the
+  // repair would file that reopen — which completion never raced — under the
+  // completion window. Here the observation path cleared everything, so the
+  // recheck finds nothing to repair and must count nothing.
+  it('counts no completion-window reopen when the observation path already cleared the refusal', async () => {
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const mount = new FakeMountClient({ [issuePath(381)]: issueFile(381) })
+    const fleet = new LocalReleaseHookFleetClient()
+    const factory = createFactory(config(), { mount, fleet, stateStore, triage: new StaticTriage() })
+
+    await factory.runOnce()
+    const identity = dispatchIssueIdentity({ uuid: 'uuid-381', key: 'AR-381', path: issuePath(381) })
+    fleet.onCompletionRelease = async () => {
+      await stateStore.recordDispatchAttempt('factory-test', 'AR-381', {
+        attempts: 0,
+        inFlight: false,
+        terminal: false,
+        backoffUntilMs: 0,
+      })
+      await stateStore.recordCanonicalState('factory-test', identity, 'readyForAgent')
+    }
+
+    fleet.emitAgentExit('ar-381-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+
+    expect(factory.status().counters.dispatchTerminalReopenedDuringCompletion).toBeUndefined()
+    await factory.stop()
+  })
+
+  // #375 review (cubic-dev-ai P1). Canonical state answers "what state is this
+  // unit in", which is a different question from the "who created this
+  // transition" that ownership gates ask. An acknowledged write is by contract
+  // a visible transition, so the terminal role it observed must be recorded —
+  // otherwise a reopen arriving before the next sweep read has no terminal role
+  // to reopen from and the terminal lifecycle refuses the work forever.
+  it('records the terminal role from an acknowledged GitHub write', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 378)
+    const mount = new FakeMountClient({ [path]: githubIssueFile(378, { labels: ['factory'] }) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new AcknowledgingGithubWriteback(),
+    })
+
+    const first = await factory.runOnce()
+    expect(first.dispatched.map((result) => result.issue.key)).toEqual(['378'])
+
+    fleet.emitAgentExit('ar-378-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.humanReview).toBe(1))
+
+    // No sweep observed the parked unit: the next read is the reopen itself.
+    const reopened = await factory.runOnce()
+
+    expect(reopened.skipped).toEqual([])
+    expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['378'])
+    expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
+    await factory.stop()
+  })
+
+  // MUST-NOT-FIRE for the receipt widening: a legacy writeback that returns no
+  // receipt at all proves nothing about the provider's visible state, so no
+  // terminal role is recorded from it and the unit stays refused until a sweep
+  // reads the provider. The counter below records that degradation.
+  it('records no terminal role when a legacy GitHub writeback returns no receipt', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 380)
+    const mount = new FakeMountClient({ [path]: githubIssueFile(380, { labels: ['factory'] }) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-380-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.humanReview).toBe(1))
+
+    const after = await factory.runOnce()
+
+    expect(after.dispatched).toEqual([])
+    expect(after.skipped).toEqual([
+      expect.objectContaining({ reason: 'dispatch already terminal', code: 'dispatch-terminal' }),
+    ])
+    expect(factory.status().counters.dispatchTerminalReopened).toBeUndefined()
+    await factory.stop()
   })
 
   it('does not re-dispatch a terminal issue from a stale ready alias when canonical state is still done', async () => {
@@ -30727,8 +31143,10 @@ describe('work-unit identity at the triage boundary (#211)', () => {
       1_000,
       1,
     )
-    // The mirror itself was Done and is now back at Ready.
-    await stateStore.recordCanonicalState('factory-test', mirrorRef.key, done)
+    // The mirror itself was Done and is now back at Ready. Canonical state is
+    // keyed on the work unit and valued as a role, not on the surface key with
+    // a Linear state UUID — that split is what #334 fixed.
+    await stateStore.recordCanonicalState('factory-test', dispatchIssueIdentity(mirrorRef), 'done')
 
     const factory = createFactory(config(), {
       mount: new FakeMountClient({ [mirrorPath]: mirrorFile }),
