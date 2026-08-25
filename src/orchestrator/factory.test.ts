@@ -515,6 +515,30 @@ class StaticTriage implements TriageEngine {
   }
 }
 
+/**
+ * Triage that routes somewhere the ISSUE ITSELF gives no evidence of — the
+ * shape `keywordRules` produces, where the repository is chosen from the issue
+ * text rather than from a label or project. Probe routing cannot see this
+ * decision, which is exactly why it must not guess.
+ */
+class KeywordRoutedTriage extends StaticTriage {
+  constructor(private readonly repo: string, private readonly clonePath: string) {
+    super()
+  }
+
+  override async triage(issue: LinearIssue): Promise<TriageDecision> {
+    const base = await super.triage(issue)
+    return {
+      ...base,
+      routes: [{ repo: this.repo, clonePath: this.clonePath, rationale: 'keyword route' }],
+      implementers: base.implementers.map((spec) => ({ ...spec, repo: this.repo, clonePath: this.clonePath })),
+      reviewer: base.reviewer
+        ? { ...base.reviewer, repo: this.repo, clonePath: this.clonePath }
+        : base.reviewer,
+    }
+  }
+}
+
 class ThrowOnceTriage extends StaticTriage {
   #failed = false
 
@@ -20704,6 +20728,219 @@ describe('FactoryLoop', () => {
       'release:ar-18-impl-pear',
       'release:ar-18-review',
     ])
+  })
+
+  // The probe PR resolver walks mounted PR metadata one `readFile` at a time.
+  // These three tests pin the SHAPE of that walk by read count rather than by
+  // wall clock, because the production symptom — a sweep silent for 11m53s and
+  // then reported stalled — was a read count problem wearing a latency costume.
+  const probePrRecordReads = (mount: FakeMountClient): string[] =>
+    mount.reads.filter((path) => path.includes('/pulls/') && !path.endsWith('_index.json'))
+
+  const probeLinearWriteback: LinearWriteback = {
+    async setState() {},
+    async postComment() {},
+    async createIssue() {
+      throw new Error('not used')
+    },
+    async verify() {
+      return true
+    },
+  }
+
+  it('scopes the probe PR mount walk to the issue repository instead of every configured repo', async () => {
+    // Four pull requests in EACH of three configured repositories. AR-702 is
+    // labelled `pear`, so its PR can only live in AgentWorkforce/pear: a scoped
+    // walk reads 4 records, an unscoped one reads all 12. That is the O(N) vs
+    // O(N x R) distinction, and with 21 live repositories it is the difference
+    // between a walk and a wedge.
+    const repos = ['AgentWorkforce/pear', 'AgentWorkforce/hoopsheet', 'AgentWorkforce/citrus']
+    const files: Record<string, unknown> = { [issuePath(702)]: issueFile(702) }
+    repos.forEach((repo, repoIndex) => {
+      const flat = repo.replace('/', '__')
+      for (let index = 0; index < 4; index += 1) {
+        const number = 7020 + repoIndex * 10 + index
+        files[`/github/repos/${flat}/pulls/by-id/${number}.json`] = prFile(number, {
+          title: `Unrelated work ${number}`,
+          body: '',
+          head_ref: `unrelated-${number}`,
+          state: 'OPEN',
+        })
+      }
+    })
+    // The one PR that actually belongs to AR-702, in the routed repository.
+    files['/github/repos/AgentWorkforce__pear/pulls/by-id/702.json'] = prFile(702, {
+      title: 'AR-702 work',
+      body: '',
+      head_ref: 'factory/ar-702-work',
+      state: 'OPEN',
+    })
+
+    const mount = new FakeMountClient(files)
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(
+      config({
+        repos: {
+          byLabel: { pear: repos[0]!, hoopsheet: repos[1]!, citrus: repos[2]! },
+          byProject: {},
+          keywordRules: [],
+          clonePaths: { [repos[0]!]: '/work/pear' },
+          default: repos[0]!,
+        },
+      }),
+      {
+        mount,
+        fleet,
+        triage: new StaticTriage(),
+        linear: probeLinearWriteback,
+        probeCloser: async (input) => ({ repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }),
+      },
+    )
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(702), issueFile(702))))
+    fleet.emitAgentExit('ar-702-impl-pear', 'issue-done')
+    await flush()
+
+    const reads = probePrRecordReads(mount)
+    // Scales with the routed repository's PR count, not with the repo count.
+    expect(reads).toHaveLength(5)
+    expect(reads.every((path) => path.includes('AgentWorkforce__pear'))).toBe(true)
+    expect(reads.some((path) => path.includes('hoopsheet') || path.includes('citrus'))).toBe(false)
+  })
+
+  it('reads each probe PR record once when the same PR is mounted under both pull roots', async () => {
+    // `githubPullRoots` lists a repository twice — the nested canonical layout
+    // and the flat by-id alias — and relayfile-adapters writes the alias as the
+    // canonical bytes verbatim. Before the dedupe the union of both roots read
+    // the same pull request twice under two path spellings.
+    const mount = new FakeMountClient({
+      [issuePath(703)]: issueFile(703),
+      '/github/repos/AgentWorkforce/pear/pulls/703__ar-703-work/meta.json': prFile(703, {
+        title: 'AR-703 work',
+        body: '',
+        head_ref: 'factory/ar-703-work',
+        state: 'OPEN',
+      }),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/703.json': prFile(703, {
+        title: 'AR-703 work',
+        body: '',
+        head_ref: 'factory/ar-703-work',
+        state: 'OPEN',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      linear: probeLinearWriteback,
+      probeCloser: async (input) => ({ repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(703), issueFile(703))))
+    fleet.emitAgentExit('ar-703-impl-pear', 'issue-done')
+    await flush()
+
+    // One pull request, one read — not one read per path spelling.
+    expect(probePrRecordReads(mount)).toHaveLength(1)
+    // The resolution itself is unchanged: PR 703 is still the answer.
+    expect(factory.status().counters.mergeGateSyntheticClosed).toBe(1)
+  })
+
+  it('serves a repeated probe PR resolution for one issue from cache without re-reading the mount', async () => {
+    // A single completion resolves the same issue's PR more than once
+    // (`#issueHasCompletionPr`, then `#closeSyntheticProbeIfPresent`) under one
+    // cache key. The mount branch is the common hit and used to return without
+    // ever writing the cache it reads, so every one of those calls repeated the
+    // whole tree walk. The clock never advances here, so both calls are inside
+    // the TTL and the second must cost ZERO additional mount reads.
+    const clock = new ManualClock()
+    const mount = new FakeMountClient({
+      [issuePath(704)]: issueFile(704),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/704.json': prFile(704, {
+        title: 'AR-704 work',
+        body: '',
+        head_ref: 'factory/ar-704-work',
+        state: 'OPEN',
+      }),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/9704.json': prFile(9704, {
+        title: 'Unrelated work',
+        body: '',
+        head_ref: 'unrelated-9704',
+        state: 'OPEN',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      clock,
+      linear: probeLinearWriteback,
+      probeCloser: async (input) => ({ repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }),
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(704), issueFile(704))))
+    fleet.emitAgentExit('ar-704-impl-pear', 'issue-done')
+    await flush()
+
+    // Two PRs on the mount, each read exactly once across the whole completion —
+    // one walk, not one walk per probe call.
+    expect(probePrRecordReads(mount)).toHaveLength(2)
+    expect(factory.status().counters.probePrMountReads).toBe(2)
+    expect(factory.status().counters.mergeGateSyntheticClosed).toBe(1)
+  })
+
+  it('walks unscoped rather than scoping a keyword-routed probe to repos.default', async () => {
+    // Routing precedence is byLabel, byProject, keywordRules, default. A
+    // keyword-routed issue carries no label or project evidence of its repo —
+    // triage picked citrus by matching the issue TEXT — and the probe's routing
+    // helper can see neither the triage decision nor `keywordRules`. Falling
+    // through to `repos.default` would scope the walk to pear and miss a PR that
+    // really exists in citrus. A mis-scoped probe is WRONG where an unscoped one
+    // is merely slow, so ambiguity must widen the walk, never narrow it.
+    const keywordRoutedIssue = realIssueFile(705, ready, { labels: [] })
+    const mount = new FakeMountClient({
+      [issuePath(705)]: keywordRoutedIssue,
+      // The PR dispatch actually opened, in the keyword-selected repository —
+      // NOT in `repos.default`.
+      '/github/repos/AgentWorkforce__citrus/pulls/by-id/705.json': prFile(705, {
+        title: 'AR-705 work',
+        body: '',
+        head_ref: 'factory/ar-705-work',
+        state: 'OPEN',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(
+      config({
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear', citrus: 'AgentWorkforce/citrus' },
+          byProject: {},
+          keywordRules: [{ pattern: 'factory issue 705', repo: 'AgentWorkforce/citrus' }],
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear', 'AgentWorkforce/citrus': '/work/citrus' },
+          default: 'AgentWorkforce/pear',
+        },
+      }),
+      {
+        mount,
+        fleet,
+        triage: new KeywordRoutedTriage('AgentWorkforce/citrus', '/work/citrus'),
+        linear: probeLinearWriteback,
+        probeCloser: async (input) => ({ repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }),
+      },
+    )
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(705), keywordRoutedIssue)))
+    const implementer = fleet.spawns.find((spawn) => spawn.name.includes('impl'))
+    expect(implementer).toBeDefined()
+    fleet.emitAgentExit(implementer!.name, 'issue-done')
+    await flush()
+
+    // The PR is found and closed, which can only happen if the walk reached
+    // citrus at all.
+    expect(factory.status().counters.mergeGateSyntheticClosed).toBe(1)
+    expect(probePrRecordReads(mount).some((path) => path.includes('citrus'))).toBe(true)
   })
 
   it('does not treat a factory label as a synthetic probe marker', async () => {

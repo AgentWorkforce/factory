@@ -807,6 +807,10 @@ export class FactoryLoop implements Factory {
   // owner/repo#number identity. GitHub-native records outrank Linear mirrors.
   readonly #dependencyIssues = new Map<string, { issue: LinearIssue; rank: number }>()
   readonly #terminalDependencyIdentities = new Set<string>()
+  /** Sweep-scoped memo of `#dependencyIsTerminalOrMerged`'s mount walk, including
+   * the negative answer that `#terminalDependencyIdentities` cannot hold. Cleared
+   * with it at the top of every sweep. */
+  readonly #dependencyPrProbes = new Map<string, boolean>()
   readonly #dependencyParkNotices = new Map<string, string>()
   #dependencyGithubPathsByIdentity?: Map<string, string>
   #dependencyLinearTreeLoaded = false
@@ -1198,7 +1202,8 @@ export class FactoryLoop implements Factory {
     this.#customProbePrResolver = Boolean(ports.probePrResolver)
     this.#hasProbePrGhRunner = Boolean(ports.probePrGhRunner)
     this.#probePrGhRunner = ports.probePrGhRunner ?? failClosedGhRunner
-    this.#probePrResolver = ports.probePrResolver ?? ((issue) => this.#resolveIssuePr(issue))
+    this.#probePrResolver = ports.probePrResolver ??
+      ((issue) => this.#resolveIssuePr(issue, { repo: this.#probeRepoForIssue(issue) }))
     this.#logger = normalizeLogger(ports.logger ?? console)
     this.#clock = ports.clock ?? realClock
     this.#fleetControlPlane = new FleetControlPlaneCircuit({
@@ -2745,7 +2750,14 @@ export class FactoryLoop implements Factory {
             }
             if (pr.draft) {
               this.#increment('completionSweepDraftPr')
-              this.#probePrGhBackoffUntilMs.set(issueStateKey(issueRef(issue)), this.#clock.now() + PROBE_PR_GH_BACKOFF_MS)
+              // Must match the key `#completionPrForIssue` resolves under —
+              // same options, same repo scope — or this backoff is written
+              // under a name nothing reads and the draft PR is re-fetched from
+              // gh on every pass.
+              this.#probePrGhBackoffUntilMs.set(
+                this.#probePrCacheKey(issue, { repo: this.#probeRepoForIssue(issue) }),
+                this.#clock.now() + PROBE_PR_GH_BACKOFF_MS,
+              )
               return undefined
             }
             if (record.decision.implementers.length > 1 && !await this.#allImplementersHaveCompletionPr(record)) {
@@ -2984,6 +2996,7 @@ export class FactoryLoop implements Factory {
     }
     return this.#resolveIssuePr(issue, {
       titleMarker: FACTORY_E2E_MARKER,
+      repo: this.#probeRepoForIssue(issue),
     })
   }
 
@@ -2994,7 +3007,65 @@ export class FactoryLoop implements Factory {
     return this.#resolveIssuePr(issue, {
       titleMarker: FACTORY_E2E_MARKER,
       openOnly: true,
+      repo: this.#probeRepoForIssue(issue),
     })
+  }
+
+  /**
+   * Which repository a probe walk may scope itself to.
+   *
+   * `resolveIssuePrFromMount` has always accepted `opts.repo`, but
+   * `#resolveIssuePr` had no way to express one, so every probe crawled the PR
+   * tree of EVERY configured repository — 21 of them in the live workspace — to
+   * find a PR that can only ever live in one. This is the same routing answer
+   * `#dependencyIsTerminalOrMerged` already uses for its own probe, so the two
+   * probes now scope identically.
+   *
+   * `undefined` means the routing is genuinely ambiguous (a decision spanning
+   * several routes, an issue whose labels match no single repo). The walk then
+   * stays unscoped, exactly as before: narrowing on a guess would silently fail
+   * to find a PR that is really there, which is worse than a slow walk.
+   *
+   * `allowDefault: false` is the whole point of this wrapper. Routing precedence
+   * is byLabel, byProject, keywordRules, default, and `dependencyRepoForIssue`
+   * can see neither the triage decision nor `keywordRules`. Left to its own
+   * fallback it answers `repos.default` for every keyword-routed issue, while
+   * dispatch opened that PR in the keyword-selected repository — so the probe
+   * would walk one repository, confidently, and find nothing. Reporting "no PR"
+   * for an issue that has one is a correctness bug; the unscoped walk it falls
+   * back to instead is merely slow, and the dedupe and cache in this same change
+   * already blunt that cost.
+   */
+  #probeRepoForIssue(issue: LinearIssue): string | undefined {
+    return dependencyRepoForIssue(issue, undefined, this.#config, { allowDefault: false })
+  }
+
+  /**
+   * The key for BOTH `#probePrResolvedCache` and `#probePrGhBackoffUntilMs`.
+   *
+   * Shared rather than inlined because those two maps are written from more than
+   * one place: `#resolveIssuePr` writes both, and the completion sweep writes a
+   * draft-PR backoff directly. Those writes must agree on the key or the backoff
+   * is set under a name nothing reads, which silently costs a gh call per pass.
+   *
+   * `repo` is part of the key because it narrows which pull requests the
+   * resolution can even see — an issue whose route changes must not be served
+   * the previous repository's PR, or held off gh by the previous repository's
+   * negative backoff, because the completion path probes and CLOSES what this
+   * returns. `*` marks the unscoped walk, a genuinely different resolution that
+   * must not share an entry with any single-repo one.
+   *
+   * Every dimension is a trailing `:`-prefixed segment so the completion
+   * invalidation — which clears `stateKey` plus everything starting
+   * `${stateKey}:` — keeps clearing the whole family as the key grows.
+   */
+  #probePrCacheKey(
+    issue: LinearIssue,
+    opts: { openOnly?: boolean; allowLegacyGithubBranch?: boolean; repo?: string } = {},
+  ): string {
+    const issueKey = issueStateKey(issueRef(issue))
+    const repoScope = opts.repo ? opts.repo.trim().toLowerCase() : '*'
+    return `${opts.openOnly ? `${issueKey}:open` : issueKey}${opts.allowLegacyGithubBranch ? ':legacy' : ''}:repo=${repoScope}`
   }
 
   async #resolveIssuePr(
@@ -3005,10 +3076,10 @@ export class FactoryLoop implements Factory {
       openOnly?: boolean
       failOnLookupError?: boolean
       allowLegacyGithubBranch?: boolean
+      repo?: string
     } = {},
   ): Promise<ResolvedIssuePr | undefined> {
-    const issueKey = issueStateKey(issueRef(issue))
-    const key = `${opts.openOnly ? `${issueKey}:open` : issueKey}${opts.allowLegacyGithubBranch ? ':legacy' : ''}`
+    const key = this.#probePrCacheKey(issue, opts)
     const now = this.#clock.now()
     const cached = this.#probePrResolvedCache.get(key)
     if (cached && cached.expiresAtMs > now) {
@@ -3021,8 +3092,21 @@ export class FactoryLoop implements Factory {
       issue,
       opts,
       (prefix) => this.#listRelayfileTree(prefix, 'PR probe resolution'),
+      this.#probeMountWalkProgress('[factory] PR probe mount read progress', issue),
     )
     if (mountPr) {
+      // The mount branch runs first and is the common hit, and until now it was
+      // the one branch that never wrote the cache it reads at the top of this
+      // method. The cache had a reader and no writer on the hot path, so the
+      // full tree walk repeated for every caller, on every sweep, forever.
+      //
+      // Cached on the same terms as the gh branch below — same key, same TTL,
+      // same draft exclusion — because the reason to keep a draft uncached is a
+      // property of the PR (its state is about to flip and the caller wants to
+      // see that promptly), not of which resolver observed it.
+      if (!mountPr.draft) {
+        this.#probePrResolvedCache.set(key, { pr: mountPr, expiresAtMs: now + PROBE_PR_GH_BACKOFF_MS })
+      }
       return mountPr
     }
 
@@ -3563,6 +3647,7 @@ export class FactoryLoop implements Factory {
       // current provider snapshots (or merged PR metadata) so a reopened issue
       // cannot remain permanently resolved after an earlier close event.
       this.#terminalDependencyIdentities.clear()
+      this.#dependencyPrProbes.clear()
       this.#dependencyGithubPathsByIdentity = undefined
       this.#dependencyLinearTreeLoaded = false
       const issueSource = await this.#issueSource()
@@ -4710,6 +4795,7 @@ export class FactoryLoop implements Factory {
       openOnly: true,
       failOnLookupError: true,
       allowLegacyGithubBranch: true,
+      repo: this.#probeRepoForIssue(issue),
     })
   }
 
@@ -5147,6 +5233,52 @@ export class FactoryLoop implements Factory {
 
   #elapsedSince(startedAtMs: number): number {
     return Math.max(0, this.#clock.now() - startedAtMs)
+  }
+
+  /**
+   * Progress reporting for the mount PR walk.
+   *
+   * `listTree` inside that walk is wrapped by `#listRelayfileTree` — named,
+   * timed and logged. The `readFile` per candidate path was not: it ran inside a
+   * bare try/catch that swallows failures into `undefined`, with no logger, no
+   * counter and no progress line. A walk of several thousand paths at ~175ms
+   * each therefore emitted its last log line at the final `listTree` and then
+   * went silent for twelve minutes, which is indistinguishable from a hung
+   * process. Three investigation layers could not tell those apart from the logs
+   * alone, so the missing instrumentation is a defect in its own right and not a
+   * nice-to-have.
+   *
+   * Same cadence helper the ready-issue read loop uses, so a long PR probe reads
+   * like a long issue read; the counter carries the same signal into /evidence.
+   */
+  #probeMountWalkProgress(message: string, issue: LinearIssue): ProbeMountWalkObserver {
+    const startedAtMs = this.#clock.now()
+    let lastLoggedAtMs = startedAtMs
+    return {
+      onRead: (progress) => {
+        this.#increment('probePrMountReads')
+        lastLoggedAtMs = this.#logTimedProgress(message, startedAtMs, lastLoggedAtMs, {
+          issue: issue.key,
+          read: progress.read,
+          total: progress.total,
+          path: progress.path,
+        })
+      },
+      // One line per repository saying why the tree walk was necessary. The walk
+      // is a permanent silent fallback today, and a silent permanent fallback is
+      // indistinguishable from a fast path that is working. This makes the day
+      // the index becomes usable (relayfile-adapters#271) show up in the logs
+      // instead of passing unnoticed.
+      onIndexFallback: (repo, reason) => {
+        this.#increment('probePrIndexFallbacks')
+        this.#increment(PROBE_PR_INDEX_FALLBACK_COUNTERS[reason])
+        this.#logger.debug?.('[factory] PR probe fell back to a full mount walk', {
+          issue: issue.key,
+          repo,
+          reason,
+        })
+      },
+    }
   }
 
   #logTimedProgress(
@@ -9182,6 +9314,16 @@ export class FactoryLoop implements Factory {
     if (!issue) return false
     const repo = dependencyRepoForIssue(issue, undefined, this.#config)
     if (!repo) return false
+    // This probe does NOT go through `#resolveIssuePr` — it must not fall back to
+    // gh — so it never saw that method's cache, and `#terminalDependencyIdentities`
+    // only ever memoises the TRUE answer. A dependency that is not merged was
+    // therefore re-walked in full for every issue declaring it, on every sweep;
+    // several issues blocked on one dependency multiplied a single tree walk by
+    // the number of blocked issues. Memoise the negative answer too, on exactly
+    // the lifetime of the terminal set beside it: cleared at the top of each
+    // sweep, so a PR that merges between sweeps is still observed.
+    const memoized = this.#dependencyPrProbes.get(identity)
+    if (memoized !== undefined) return memoized
     const pullRequest = await resolveIssuePrFromMount(
       this.#mount,
       this.#config,
@@ -9191,8 +9333,12 @@ export class FactoryLoop implements Factory {
         repo,
       },
       (prefix) => this.#listRelayfileTree(prefix, 'dependency PR probe resolution'),
+      this.#probeMountWalkProgress('[factory] dependency PR probe mount read progress', issue),
     )
-    if (normalizePrState(pullRequest?.state) !== 'MERGED') return false
+    if (normalizePrState(pullRequest?.state) !== 'MERGED') {
+      this.#dependencyPrProbes.set(identity, false)
+      return false
+    }
     this.#terminalDependencyIdentities.add(identity)
     return true
   }
@@ -16068,8 +16214,25 @@ export class FactoryLoop implements Factory {
       settleIssueWritebackOnce()
       this.#completionInFlight.delete(completionKey)
       const stateKey = issueStateKey(record.issue)
-      this.#probePrGhBackoffUntilMs.delete(stateKey)
-      this.#probePrResolvedCache.delete(stateKey)
+      // Both maps are keyed by issue state key PLUS the option suffixes
+      // `#resolveIssuePr` appends (`:open`, `:legacy`, `:open:legacy`), but this
+      // invalidation only ever deleted the bare key. Every `openOnly` probe —
+      // `#openPrForIssue` and `#openCompletionPr`, i.e. the completion path — was
+      // therefore never invalidated at all. That was survivable only because the
+      // mount branch never wrote the cache; now that it does, a stale OPEN entry
+      // outliving completion would be a live correctness bug, so clear the whole
+      // family. Suffixes always start with ':', and no other issue's state key can
+      // be this one followed by ':', so the prefix test cannot over-delete.
+      for (const cacheKey of [...this.#probePrResolvedCache.keys()]) {
+        if (cacheKey === stateKey || cacheKey.startsWith(`${stateKey}:`)) {
+          this.#probePrResolvedCache.delete(cacheKey)
+        }
+      }
+      for (const backoffKey of [...this.#probePrGhBackoffUntilMs.keys()]) {
+        if (backoffKey === stateKey || backoffKey.startsWith(`${stateKey}:`)) {
+          this.#probePrGhBackoffUntilMs.delete(backoffKey)
+        }
+      }
       // Cancellation must see the subscription identity so it can issue the
       // idempotent Relayfile DELETE before clearing the local owner maps.
       await this.#cancelBabysittersForIssue(record.issue)
@@ -19069,6 +19232,7 @@ export class FactoryLoop implements Factory {
       ? await this.#probePrResolver(issue)
       : await this.#resolveIssuePr(issue, {
         titleMarker: FACTORY_E2E_MARKER,
+        repo: this.#probeRepoForIssue(issue),
       })
     if (!probe) {
       return
@@ -19375,6 +19539,7 @@ function dependencyRepoForIssue(
   issue: LinearIssue,
   decision: TriageDecision | undefined,
   config: FactoryConfig,
+  opts: { allowDefault?: boolean } = {},
 ): string | undefined {
   const source = githubIssueSourceRef(issue)
   if (source) return `${source.owner}/${source.repo}`
@@ -19411,7 +19576,18 @@ function dependencyRepoForIssue(
     ? Object.entries(config.repos.byProject)
       .find(([project]) => project.trim().toLowerCase() === issue.project!.trim().toLowerCase())?.[1]
     : undefined
-  return normalize(projectRepo) ?? normalize(config.repos.default)
+  const projectResolved = normalize(projectRepo)
+  if (projectResolved) return projectResolved
+  // `repos.default` is a DISPATCH fallback, not evidence of where a PR already
+  // lives. Routing precedence is byLabel, byProject, keywordRules, default —
+  // and this helper cannot see `keywordRules` at all, because those match on
+  // title/description through triage rather than on the issue's own fields. So
+  // for a keyword-routed issue the default answer here is confidently wrong:
+  // dispatch opened the PR in the keyword-selected repository, not in
+  // `repos.default`. Callers that only need a dispatch target still want that
+  // fallback; a PROBE must not have it, because a mis-scoped probe reports "no
+  // PR" for an issue that has one, which is worse than a slow unscoped walk.
+  return opts.allowDefault === false ? undefined : normalize(config.repos.default)
 }
 
 function dependencyIdentityForIssue(issue: LinearIssue, repo: string | undefined): string | undefined {
@@ -20586,6 +20762,83 @@ const linearIssueMirrorsGithubIssue = (issue: LinearIssue, ghIssue: GithubIssueS
     .some((line) => line.trim() === `${GITHUB_MIRROR_SOURCE_PREFIX}${ghIssue.url}`)
 }
 
+/**
+ * Why this walk could not be answered from `pulls/_index.json`.
+ *
+ * `index-absent`              — no index file at the canonical path.
+ * `index-shape-unrecognised`  — an index exists but is not the documented bare
+ *                               array of rows. The eager backfill writer
+ *                               (relayfile-adapters `lazy.ts`) wraps it as
+ *                               `{ pulls: [...] }`, while the incremental
+ *                               index emitter writes the bare array, so the
+ *                               shape depends on which writer last touched it.
+ * `index-without-head-ref`    — a readable index, but its rows carry no
+ *                               `headRef`. This is the normal case today and
+ *                               it is why the walk cannot be short-circuited:
+ *                               the primary match (score 30) is a branch-name
+ *                               match, and a row without `headRef` cannot rule
+ *                               out a branch match on any other pull request.
+ * `index-usable`              — rows carry `headRef`; the walk is now avoidable
+ *                               and this resolver should be taught the fast path.
+ */
+type PullIndexFallbackReason =
+  | 'index-absent'
+  | 'index-shape-unrecognised'
+  | 'index-without-head-ref'
+  | 'index-usable'
+
+const PROBE_PR_INDEX_FALLBACK_COUNTERS: Record<PullIndexFallbackReason, string> = {
+  'index-absent': 'probePrIndexAbsent',
+  'index-shape-unrecognised': 'probePrIndexShapeUnrecognised',
+  'index-without-head-ref': 'probePrIndexWithoutHeadRef',
+  // Not a fallback condition so much as a standing invitation: rows carry
+  // `headRef`, so the walk is now avoidable and this counter going non-zero is
+  // the cue to build the fast path.
+  'index-usable': 'probePrIndexUsableButUnused',
+}
+
+type ProbeMountWalkObserver = {
+  onRead?: (progress: { read: number; total: number; path: string }) => void
+  onIndexFallback?: (repo: string, reason: PullIndexFallbackReason) => void
+}
+
+/**
+ * Classify the pull index without acting on it.
+ *
+ * Deliberately diagnostic only. Factory's issue-side reader
+ * (`#githubIssuePathsFromIndex`) uses its index as a NARROWING FILTER over
+ * paths it still reads individually, which is safe because it can only
+ * over-select. A pull index cannot be used that way today: it carries no
+ * `headRef`, so it cannot exclude any pull request from a branch match, and a
+ * title hit alone (score 20) must never be returned as the answer while an
+ * unread branch match (score 30) could outrank it. Until the row contract
+ * carries `headRef` (relayfile-adapters#271), the only honest thing to do with
+ * the index is say out loud why it did not help.
+ */
+const classifyPullIndexFallback = async (
+  mount: MountClient,
+  repo: string,
+): Promise<PullIndexFallbackReason> => {
+  const [owner, name] = repo.split('/')
+  if (!owner || !name) return 'index-absent'
+  let parsed: unknown
+  try {
+    const { content } = await mount.readFile(`${GITHUB_ISSUE_ROOT}/${owner}/${name}/pulls/_index.json`)
+    parsed = parseJsonContent(content)
+  } catch (error) {
+    // A mount that is failing pass-wide must not be reported as "no index" —
+    // that is the same convention the tree reads below already follow.
+    if (isPassWideRelayfileFault(error)) throw error
+    return 'index-absent'
+  }
+  if (!Array.isArray(parsed)) return 'index-shape-unrecognised'
+  // An empty index proves nothing about the row contract, so it must not read
+  // as usable — `[].every(...)` is vacuously true.
+  return parsed.length > 0 && parsed.every((entry) => typeof asRecord(entry)?.headRef === 'string')
+    ? 'index-usable'
+    : 'index-without-head-ref'
+}
+
 const resolveIssuePrFromMount = async (
   mount: MountClient,
   config: FactoryConfig,
@@ -20599,10 +20852,14 @@ const resolveIssuePrFromMount = async (
     repo?: string
   } = {},
   listTree: (prefix: string) => Promise<string[]> = (prefix) => mount.listTree(prefix),
+  observer: ProbeMountWalkObserver = {},
 ): Promise<ResolvedIssuePr | undefined> => {
   const candidates: Array<ResolvedIssuePr & { score: number }> = []
   const listErrors: unknown[] = []
   for (const repo of opts.repo ? [opts.repo] : reposFromConfig(config)) {
+    if (observer.onIndexFallback) {
+      observer.onIndexFallback(repo, await classifyPullIndexFallback(mount, repo))
+    }
     const paths = new Set<string>()
     for (const root of githubPullRoots(repo)) {
       try {
@@ -20612,9 +20869,41 @@ const resolveIssuePrFromMount = async (
         listErrors.push(error)
       }
     }
+
+    // `githubPullRoots` is plural, and both of its roots describe the SAME
+    // repository: the nested `<owner>/<repo>/pulls/` layout and the flat
+    // `<owner>__<repo>/pulls/by-id/` one. A pull request is generally present
+    // under both, spelled differently, so the union walked most PRs twice — in
+    // the live workspace 2877 nested paths plus 1156 by-id paths for roughly
+    // 1156 actual pull requests.
+    //
+    // Collapse them on the identity the PATH already carries. `githubPullPathParts`
+    // reads owner/repo/number out of either spelling and costs no mount read, so
+    // the dedupe is free. Insertion order is preserved and the first spelling
+    // encountered wins, which is the same candidate the existing stable sort kept
+    // when two spellings of one PR tied — so the winner does not move.
+    //
+    // Paths the matcher does not recognise (`pulls/_index.json`, per-PR
+    // `comments/*.json`) carry no PR identity, so they are left in the walk and
+    // still read exactly as before rather than being filtered on a guess.
+    const walk: string[] = []
+    const seenPulls = new Set<string>()
     for (const path of paths) {
       if (!path.endsWith('.json')) continue
+      const parts = githubPullPathParts(path)
+      if (parts) {
+        const identity = `${parts.owner}/${parts.repo}#${parts.number}`.toLowerCase()
+        if (seenPulls.has(identity)) continue
+        seenPulls.add(identity)
+      }
+      walk.push(path)
+    }
+
+    let read = 0
+    for (const path of walk) {
       const pr = await readProbePrCandidate(mount, path)
+      read += 1
+      observer.onRead?.({ read, total: walk.length, path })
       if (opts.openOnly && normalizePrState(pr?.state) !== 'OPEN') continue
       const score = pr
         ? issuePrMatchScore(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)
