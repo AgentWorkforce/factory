@@ -62,11 +62,13 @@ const subscriptionSchema = z.object({
 export const DEFAULT_READINESS_RECONCILE_TIMEOUT_MS = 90 * 60_000
 
 /**
- * Aggregate budget for one discovery sweep (#372).
+ * Aggregate budget for one discovery sweep (#372), when nothing narrows it.
  *
- * Defaults to `DEFAULT_READINESS_RECONCILE_TIMEOUT_MS` on purpose. The two
- * numbers describe the same envelope; what changes is the MECHANISM, and the
- * mechanism is the deliverable. `reconcileTimeoutMs` rejects the caller's wait
+ * Equal to `DEFAULT_READINESS_RECONCILE_TIMEOUT_MS` on purpose — and a config
+ * that omits `sweepBudgetMs` tracks whatever `reconcileTimeoutMs` it set, not
+ * this constant (see `resolvedSweepBudgetMs`). The two numbers describe the
+ * same envelope; what changes is the MECHANISM, and the mechanism is the
+ * deliverable. `reconcileTimeoutMs` rejects the caller's wait
  * and leaves `runOnce()` running, so every later cycle coalesces onto the
  * wedged pass and the daemon never recovers. The sweep budget rejects from
  * inside the fence, so the lease is released and the next cycle starts clean.
@@ -80,6 +82,17 @@ export const DEFAULT_READINESS_RECONCILE_TIMEOUT_MS = 90 * 60_000
  * is a config dial and not a constant.
  */
 export const DEFAULT_DISCOVERY_SWEEP_BUDGET_MS = DEFAULT_READINESS_RECONCILE_TIMEOUT_MS
+
+/**
+ * The effective budget for a config, given what it did or did not set.
+ *
+ * Exported so the orchestrator's field initializer and the schema agree on one
+ * rule rather than two that happen to match today.
+ */
+export const resolvedSweepBudgetMs = (
+  sweepBudgetMs: number | undefined,
+  reconcileTimeoutMs: number,
+): number => Math.min(sweepBudgetMs ?? reconcileTimeoutMs, reconcileTimeoutMs)
 
 const liveSubscriptionSchema = z.object({
   transport: z.enum(['subscribe-and-poll', 'subscribe', 'poll']).default('subscribe-and-poll'),
@@ -115,8 +128,7 @@ const liveSubscriptionSchema = z.object({
    * the entire pass, so a sweep cannot outlive it however many calls, retries
    * or transports it is spread across.
    */
-  sweepBudgetMs: z.number().int().min(50).max(6 * 60 * 60_000)
-    .default(DEFAULT_DISCOVERY_SWEEP_BUDGET_MS),
+  sweepBudgetMs: z.number().int().min(50).max(6 * 60 * 60_000).optional(),
 }).superRefine((value, ctx) => {
   // A deadline below the interval kills every pass that takes longer than one
   // tick, which is most of them on a cold mirror.
@@ -129,15 +141,25 @@ const liveSubscriptionSchema = z.object({
   }
   // The sweep budget has to be the tighter of the two, or the wait gives up
   // first and the sweep it abandoned keeps running for the next cycle to
-  // coalesce onto — the exact behaviour the budget exists to remove.
-  if (value.sweepBudgetMs > value.reconcileTimeoutMs) {
+  // coalesce onto — the exact behaviour the budget exists to remove. Checked
+  // only when it was set explicitly: an omitted one is derived below and
+  // cannot violate this.
+  if (value.sweepBudgetMs !== undefined && value.sweepBudgetMs > value.reconcileTimeoutMs) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['sweepBudgetMs'],
       message: `sweepBudgetMs (${value.sweepBudgetMs}) must not exceed reconcileTimeoutMs (${value.reconcileTimeoutMs})`,
     })
   }
-}).default({})
+}).transform((value) => ({
+  ...value,
+  // Derived from the SIBLING, never from a constant. A fixed 90-minute default
+  // would reject every config that already tightened `reconcileTimeoutMs`
+  // below it — the schema throws, so Factory would not start — and would
+  // silently cap every config that loosened it above. "Omitted" means "the
+  // same envelope as the wait", whatever that wait is configured to be.
+  sweepBudgetMs: value.sweepBudgetMs ?? value.reconcileTimeoutMs,
+})).default({})
 
 export const DEFAULT_AGENT_HOLD_TIMEOUT_MS = 4 * 60 * 60_000
 

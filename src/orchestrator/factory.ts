@@ -7,6 +7,7 @@ import {
   DEFAULT_DISCOVERY_SWEEP_BUDGET_MS,
   DEFAULT_READINESS_RECONCILE_TIMEOUT_MS,
   FactoryConfigSchema,
+  resolvedSweepBudgetMs,
   type FactoryConfig,
 } from '../config/schema'
 import {
@@ -1148,7 +1149,7 @@ export class FactoryLoop implements Factory {
     // Also read here, not only in `#startLiveSubscription`: a standalone
     // `runOnce()` never starts the live subscription and must still be bounded.
     this.#relayfileOperationTimeoutMs = config.liveSubscription.relayfileOperationTimeoutMs
-    this.#discoverySweepBudgetMs = Math.min(
+    this.#discoverySweepBudgetMs = resolvedSweepBudgetMs(
       config.liveSubscription.sweepBudgetMs,
       config.liveSubscription.reconcileTimeoutMs,
     )
@@ -1997,7 +1998,10 @@ export class FactoryLoop implements Factory {
     // Same re-application as the deadline above: `start()` overrides bypass the
     // schema's cross-field check, and a budget looser than the wait is not a
     // budget.
-    this.#discoverySweepBudgetMs = Math.min(options.sweepBudgetMs, this.#readinessReconcileTimeoutMs)
+    this.#discoverySweepBudgetMs = resolvedSweepBudgetMs(
+      options.sweepBudgetMs,
+      this.#readinessReconcileTimeoutMs,
+    )
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     const highWatermark = await this.#currentEventHighWatermark()
@@ -3103,6 +3107,49 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  /**
+   * Claim the sweep lease under the budget, compensating for a claim that
+   * lands after we stopped waiting for it.
+   *
+   * The budget abandons the wait, not the call, so the store can still persist
+   * a lease for a claim this sweep has already given up on — and that lease
+   * would be held by an owner that will never renew, commit or release it, so
+   * every later sweep defers until it expires. It is self-expiring and a later
+   * sweep reclaims it as an orphan, which makes this a latency fix rather than
+   * a correctness one; the latency is one whole lease window with no discovery,
+   * which is the thing this PR exists to stop paying.
+   */
+  async #claimDiscoverySweepUnderBudget(budget: DiscoverySweepBudget): Promise<DiscoverySweepClaim> {
+    const claim = this.#state.claimDiscoverySweep(
+      this.#workspaceId,
+      this.#discoverySweepOwner,
+      this.#clock.now(),
+      DISCOVERY_SWEEP_LEASE_MS,
+    )
+    try {
+      return await budget.run('discovery-lease-claim', () => claim)
+    } catch (error) {
+      if (!(error instanceof DiscoverySweepBudgetExceededError)) throw error
+      void claim.then(
+        async (late) => {
+          if (!late.acquired || !late.lease) return
+          this.#increment('discoverySweepStrandedClaimsReleased')
+          this.#logger.warn?.('[factory] releasing a discovery lease that was claimed after the sweep budget expired', {
+            epoch: late.lease.epoch,
+            budgetMs: error.budgetMs,
+          })
+          await this.#sweepTeardownStep('stranded discovery lease release', () => this.#state.releaseDiscoverySweep(
+            this.#workspaceId,
+            this.#discoverySweepOwner,
+            late.lease!.epoch,
+          ))
+        },
+        () => undefined,
+      ).catch(() => undefined)
+      throw error
+    }
+  }
+
   async #runDiscoverySweep(
     opts: { dryRun?: boolean },
     budget: DiscoverySweepBudget,
@@ -3114,12 +3161,7 @@ export class FactoryLoop implements Factory {
       // #368 covers. The budget does not care which one it is.
       await budget.run('fleet-control-plane-probe', () => this.#assertFleetControlPlaneAvailable())
     }
-    let claim = await budget.run('discovery-lease-claim', () => this.#state.claimDiscoverySweep(
-      this.#workspaceId,
-      this.#discoverySweepOwner,
-      this.#clock.now(),
-      DISCOVERY_SWEEP_LEASE_MS,
-    ))
+    let claim = await this.#claimDiscoverySweepUnderBudget(budget)
     if (!claim.acquired && claim.reason === 'backoff') {
       const delayMs = Math.max(0, claim.state.backoffUntilMs - this.#clock.now())
       this.#increment('discoveryBackoffWaits')
@@ -3129,12 +3171,7 @@ export class FactoryLoop implements Factory {
         consecutiveOverloads: claim.state.consecutiveOverloads,
       })
       await budget.run('discovery-backoff-wait', () => this.#clock.sleep(delayMs))
-      claim = await budget.run('discovery-lease-claim', () => this.#state.claimDiscoverySweep(
-        this.#workspaceId,
-        this.#discoverySweepOwner,
-        this.#clock.now(),
-        DISCOVERY_SWEEP_LEASE_MS,
-      ))
+      claim = await this.#claimDiscoverySweepUnderBudget(budget)
     }
     if (!claim.acquired || !claim.lease) {
       this.#increment('discoverySweepsSkippedInFlight')
@@ -3583,6 +3620,10 @@ export class FactoryLoop implements Factory {
       }
 
       for (const { issue } of issueEntries) {
+        // The dispatch half of the same fence as the read loop above. Without
+        // it a pass abandoned during enumeration would go on to dispatch after
+        // its lease had been handed back, racing the sweep that replaced it.
+        budget?.assertNotExpired('run-once')
         await this.#refreshLiveHeartbeatIfDue()
         if (!issue) {
           continue
@@ -4840,9 +4881,35 @@ export class FactoryLoop implements Factory {
     return paths ? [...paths] : undefined
   }
 
+  /**
+   * True when this call is a continuation of a sweep that has already ended.
+   *
+   * #372: the aggregate budget abandons the WAIT, not the call, so a read
+   * issued by an aborted sweep can still resolve — by which time the shared
+   * `#discoverySession` and `#discoverySweepEpoch` may belong to the sweep
+   * that replaced it. `discoveryEnumerationPass` is an `AsyncLocalStorage`, so
+   * its store follows the async continuation and still carries the epoch that
+   * ISSUED the read; comparing the two is what tells a live write from a
+   * late one.
+   *
+   * Only when a store exists: a caller outside a discovery pass legitimately
+   * has none, and treating that as stale would silence the live event drain.
+   */
+  #isStaleDiscoveryContinuation(): boolean {
+    const issuingPass = discoveryEnumerationPass.getStore()
+    return issuingPass !== undefined && issuingPass.epoch !== this.#discoverySweepEpoch
+  }
+
   async #rememberDiscoveryTree(prefix: string, paths: string[]): Promise<void> {
     const session = this.#discoverySession
     if (!session) return
+    // Committing this listing would put a tree from an abandoned pass into the
+    // replacement sweep's checkpoint, under a watermark that claims to describe
+    // the replacement. That is checkpoint corruption, and it outlives the sweep.
+    if (this.#isStaleDiscoveryContinuation()) {
+      this.#increment('discoveryStaleTreeWritesDropped')
+      return
+    }
     const uniquePaths = new Set<string>()
     for (let index = 0; index < paths.length; index += 1) {
       uniquePaths.add(paths[index]!)
@@ -4938,7 +5005,10 @@ export class FactoryLoop implements Factory {
       return result
     } catch (error) {
       const overload = relayfileOverload(error)
-      if (overload && this.#discoverySweepEpoch !== undefined) {
+      // The stale check for the same reason as the tree write above: a 429 that
+      // arrives after its sweep was abandoned is not this sweep's evidence, and
+      // attributing it here would drive the replacement's overload ratchet.
+      if (overload && this.#discoverySweepEpoch !== undefined && !this.#isStaleDiscoveryContinuation()) {
         this.#discoveryOverloadError ??= error
         this.#discoverySweepOverloads += 1
         if (overload.retryAfterSeconds !== undefined) {

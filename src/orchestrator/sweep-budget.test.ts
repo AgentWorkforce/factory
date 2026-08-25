@@ -4,6 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  DEFAULT_DISCOVERY_SWEEP_BUDGET_MS,
+  DEFAULT_READINESS_RECONCILE_TIMEOUT_MS,
+  resolvedSweepBudgetMs,
+} from '../config/schema'
+import {
   FactoryConfigSchema,
   createFactory,
   type FactoryConfig,
@@ -14,6 +19,7 @@ import {
 import { FakeFleetClient, FakeMountClient } from '../testing'
 import { withDeadline } from '../testing/deadline'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
+import type { DiscoverySweepClaim } from '../ports/state'
 import {
   DISCOVERY_SWEEP_TEARDOWN_TIMEOUT_MS,
   DiscoverySweepBudgetExceededError,
@@ -184,6 +190,50 @@ describe('sweep teardown deadline', () => {
   })
 })
 
+describe('the configured budget', () => {
+  const live = (liveSubscription: Record<string, unknown>) => FactoryConfigSchema.parse({
+    workspaceId: 'factory-sweep-budget-config',
+    repos: {
+      byLabel: { pear: 'AgentWorkforce/pear' },
+      clonePaths: { 'AgentWorkforce/pear': '/work/pear' },
+      default: 'AgentWorkforce/pear',
+    },
+    stateIds: { readyForAgent: ready, agentImplementing: implementing, done, inPlanning: planning },
+    liveSubscription,
+  }).liveSubscription
+
+  it('must-not-fire: a config that already tightened reconcileTimeoutMs still parses', () => {
+    // The regression that would have taken Factory down on deploy rather than
+    // fixing it: a fixed 90-minute default is ABOVE such a config's timeout, so
+    // the cross-field check rejects it and `FactoryConfigSchema.parse` throws
+    // before the daemon can start.
+    expect(live({ reconcileTimeoutMs: 5 * 60_000 }).sweepBudgetMs).toBe(5 * 60_000)
+  })
+
+  it('must-not-fire: a config that loosened reconcileTimeoutMs is not silently capped at 90 minutes', () => {
+    expect(live({ reconcileTimeoutMs: 3 * 60 * 60_000 }).sweepBudgetMs).toBe(3 * 60 * 60_000)
+  })
+
+  it('must-not-fire: an omitted budget tracks the default timeout', () => {
+    expect(live({}).sweepBudgetMs).toBe(DEFAULT_DISCOVERY_SWEEP_BUDGET_MS)
+    expect(DEFAULT_DISCOVERY_SWEEP_BUDGET_MS).toBe(DEFAULT_READINESS_RECONCILE_TIMEOUT_MS)
+  })
+
+  it('must-fire: an explicit budget looser than the wait is still rejected', () => {
+    // A budget the wait gives up on first is not a budget: the sweep it
+    // abandoned keeps running and the next cycle coalesces onto it.
+    expect(() => live({ reconcileTimeoutMs: 60_000, sweepBudgetMs: 120_000 })).toThrow(/sweepBudgetMs/)
+    expect(live({ reconcileTimeoutMs: 120_000, sweepBudgetMs: 60_000 }).sweepBudgetMs).toBe(60_000)
+  })
+
+  it('must-not-fire: resolving is the same rule on both sides of the schema', () => {
+    expect(resolvedSweepBudgetMs(undefined, 5 * 60_000)).toBe(5 * 60_000)
+    expect(resolvedSweepBudgetMs(60_000, 5 * 60_000)).toBe(60_000)
+    // `start()` overrides bypass the schema, so the clamp has to hold here too.
+    expect(resolvedSweepBudgetMs(10 * 60_000, 5 * 60_000)).toBe(5 * 60_000)
+  })
+})
+
 /* ------------------------------------------------------------------------- */
 /* The same invariant, driven through a real sweep.                          */
 /* ------------------------------------------------------------------------- */
@@ -280,9 +330,15 @@ class HangingWatermarkMount extends FakeMountClient {
    * How many watermark reads to serve before hanging.
    *
    * `#startLiveSubscription` reads the watermark once itself, BEFORE the
-   * startup backfill and outside the sweep — that read is bounded by the
-   * per-call relayfile deadline, not by this budget. Serving it is what puts
-   * the hang inside the sweep, which is the subject here.
+   * startup backfill and outside the sweep, so no sweep budget covers it.
+   * Nothing in the orchestrator bounds it either: `#currentEventHighWatermark`
+   * (factory.ts:2192) awaits `mount.getEventHighWatermark()` under a bare
+   * try/catch, not through `#withRelayfileOperation`. What bounds it in
+   * production is one layer lower — the deployed client's own `#bounded()`
+   * (relayfile-cloud-mount-client.ts:1057, #368), fed from
+   * `relayfileOperationTimeoutMs` at cli/fleet.ts:2215 — so a `MountClient`
+   * without that deadline has none here at all. Serving the read is what puts
+   * the hang inside the sweep, which is the subject of this file.
    */
   serveFirst = 0
   served = 0
@@ -301,6 +357,20 @@ class HangingWatermarkMount extends FakeMountClient {
 /** A store that records the lease handbacks, so "released" is observed, not inferred. */
 class LeaseWatchingStateStore extends InMemoryStateStore {
   readonly released: number[] = []
+  /** Milliseconds a claim takes to answer. Long enough and the budget gives up first. */
+  claimDelayMs = 0
+
+  override async claimDiscoverySweep(
+    workspaceId: string,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<DiscoverySweepClaim> {
+    if (this.claimDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.claimDelayMs))
+    }
+    return await super.claimDiscoverySweep(workspaceId, owner, nowMs, leaseMs)
+  }
 
   override async releaseDiscoverySweep(workspaceId: string, owner: string, epoch: number): Promise<void> {
     this.released.push(epoch)
@@ -316,7 +386,7 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
     })
     const fleet = new FakeFleetClient()
     const stateStore = new LeaseWatchingStateStore({ batchSize: 4 })
-    const factory = createFactory(config(150, root), {
+    const factory = createFactory(config(400, root), {
       mount,
       fleet,
       stateStore,
@@ -328,15 +398,22 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
       // BEFORE this change this call never settles and the test dies at
       // vitest's 5 s default — the production defect, not an assertion detail.
       // The 4 s guard is inside that default so the failure names itself.
-      await expect(withDeadline(factory.runOnce(), 4_000, 'sweep never settled'))
-        .rejects.toMatchObject({
-          name: 'DiscoverySweepBudgetExceededError',
-          // The abandoned await is named, which is the diagnostic no per-call
-          // bound can produce once the sweep is already wedged.
-          phase: 'discovery-session',
-          budgetMs: 150,
-        })
+      const aborted = await withDeadline(
+        factory.runOnce().then(() => undefined, (error: unknown) => error),
+        4_000,
+        'sweep never settled',
+      )
+      expect(aborted).toMatchObject({ name: 'DiscoverySweepBudgetExceededError', budgetMs: 400 })
+      // Asserted BEFORE the phase, so a mis-timed run says which sweep phase
+      // actually ran out rather than blaming a string. One hung call is the
+      // proof that the budget reached `#prepareDiscoverySession`; the two
+      // phases ahead of it here are a fake fleet roster and an in-memory lease
+      // claim, and 400 ms is roughly three orders of magnitude of headroom
+      // over both.
       expect(mount.hungCalls).toBe(1)
+      // The abandoned await is named, which is the diagnostic no per-call
+      // bound can produce once the sweep is already wedged.
+      expect((aborted as { phase?: string }).phase).toBe('discovery-session')
       // The lease is handed back on the way out. Without this the next cycle
       // has nothing to claim and the wedge simply moves.
       expect(stateStore.released).toHaveLength(1)
@@ -387,6 +464,45 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
     }
   })
 
+  it('must-fire: a lease that lands after the budget gave up on the claim is handed straight back', async () => {
+    // The budget abandons the WAIT, not the call, so the store can persist a
+    // lease for a claim this sweep has already left. Nobody would renew,
+    // commit or release it, so every later sweep would defer for a full lease
+    // window — the wedge this PR exists to stop, one layer down.
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-budget-claim-'))
+    const stateStore = new LeaseWatchingStateStore({ batchSize: 4 })
+    stateStore.claimDelayMs = 600
+    const factory = createFactory(config(150, root), {
+      mount: new FakeMountClient({ [issuePath(901)]: issueFile(901) }),
+      fleet: new FakeFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      logger: {},
+    })
+    try {
+      await expect(withDeadline(factory.runOnce(), 4_000, 'sweep never settled'))
+        .rejects.toMatchObject({
+          name: 'DiscoverySweepBudgetExceededError',
+          phase: 'discovery-lease-claim',
+        })
+      // The claim was still in flight when the budget expired; the compensation
+      // fires when it lands.
+      await withDeadline(
+        (async () => {
+          while (stateStore.released.length === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 25))
+          }
+        })(),
+        4_000,
+        'stranded lease was never released',
+      )
+      expect(stateStore.released).toHaveLength(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('must-not-fire: a sweep that completes inside its budget is not aborted and its result is unchanged', async () => {
     // Without this the trivial wrong fix — abort every sweep immediately —
     // passes the must-fire above.
@@ -407,6 +523,11 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
           dispatched: report.dispatched.length,
           skipped: report.skipped.length,
           spawns: fleet.spawns.map((spawn) => spawn.name),
+          // The risk the stale-continuation fence introduces is the opposite of
+          // the one it removes: a fence that mistook a LIVE write for a late
+          // one would silently drop this sweep's own tree listings and the
+          // checkpoint would go empty. Zero, on a sweep that enumerated.
+          staleTreeWritesDropped: factory.status().counters.discoveryStaleTreeWritesDropped ?? 0,
         }
       } finally {
         await factory.stop()
@@ -419,6 +540,7 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
     const budgeted = await run(30_000)
     const control = await run(90 * 60_000)
     expect(budgeted.dispatched).toBeGreaterThan(0)
+    expect(budgeted.staleTreeWritesDropped).toBe(0)
     expect(budgeted).toEqual(control)
   })
 })

@@ -143,7 +143,14 @@ export function startDiscoverySweepBudget(timeoutMs: number | undefined): Discov
       controller.abort(new DiscoverySweepBudgetExceededError(budgetMs, 'run-once'))
       expire()
     }, budgetMs)
-    timer.unref?.()
+    // Deliberately NOT unref'd, unlike the per-call deadline in
+    // `relayfile-operation-timeout.ts`. That one is created thousands of times
+    // per sweep and can afford to lose a race with process exit; this one is
+    // the guarantee. Under a one-shot `runOnce()` whose only pending work is a
+    // promise nothing else references, an unref'd timer lets Node exit before
+    // the budget fires — the command would return without ever reporting the
+    // wedge or releasing the lease. It lives for at most one budget and
+    // `dispose()` clears it from a `finally` on every path.
   }
 
   const assertNotExpired = (phase: DiscoverySweepPhase): void => {
@@ -219,8 +226,9 @@ export async function withSweepTeardownDeadline<T>(
     const outcome = await Promise.race<SweepOutcome<T> | typeof TEARDOWN_TIMED_OUT>([
       inFlight,
       new Promise<typeof TEARDOWN_TIMED_OUT>((resolve) => {
+        // Referenced, for the same reason as the budget timer above: this is
+        // the deadline that guarantees the lease is handed back.
         timer = setTimeout(() => resolve(TEARDOWN_TIMED_OUT), budget)
-        timer.unref?.()
       }),
     ])
     if (outcome === TEARDOWN_TIMED_OUT) return undefined
