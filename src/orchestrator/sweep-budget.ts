@@ -103,6 +103,15 @@ export interface DiscoverySweepBudget {
   run<T>(phase: DiscoverySweepPhase, start: () => Promise<T>): Promise<T>
   /** Throw if the budget is already spent. A between-await check; see above. */
   assertNotExpired(phase: DiscoverySweepPhase): void
+  /**
+   * Spend the budget now.
+   *
+   * Shutdown's lever. `stop()` drains the sweep it started, so a wedged sweep
+   * would otherwise hold shutdown open for the whole budget — 90 minutes by
+   * default. Expiring it turns that into the sweep's ordinary abort path:
+   * lease released, teardown bounded, `stop()` free to continue.
+   */
+  expire(): void
   /** Releases the timer. Always call it, or a settled sweep leaves one pending. */
   dispose(): void
 }
@@ -135,14 +144,18 @@ export function startDiscoverySweepBudget(timeoutMs: number | undefined): Discov
     expire = () => resolve(BUDGET_EXPIRED)
   })
 
+  const spend = (): void => {
+    if (expired || budgetMs === undefined) return
+    expired = true
+    if (timer) clearTimeout(timer)
+    // `run()` supplies the phase on the throw; the abort reason cannot know
+    // which await was in flight, so it names the sweep as a whole.
+    controller.abort(new DiscoverySweepBudgetExceededError(budgetMs, 'run-once'))
+    expire()
+  }
+
   if (budgetMs !== undefined) {
-    timer = setTimeout(() => {
-      expired = true
-      // `run()` supplies the phase on the throw; the abort reason cannot know
-      // which await was in flight, so it names the sweep as a whole.
-      controller.abort(new DiscoverySweepBudgetExceededError(budgetMs, 'run-once'))
-      expire()
-    }, budgetMs)
+    timer = setTimeout(spend, budgetMs)
     // Deliberately NOT unref'd, unlike the per-call deadline in
     // `relayfile-operation-timeout.ts`. That one is created thousands of times
     // per sweep and can afford to lose a race with process exit; this one is
@@ -162,6 +175,7 @@ export function startDiscoverySweepBudget(timeoutMs: number | undefined): Discov
     signal: controller.signal,
     expired: () => expired,
     assertNotExpired,
+    expire: spend,
     async run<T>(phase: DiscoverySweepPhase, start: () => Promise<T>): Promise<T> {
       if (budgetMs === undefined) return await start()
       // Decided before the call is made, so an already-spent budget cannot

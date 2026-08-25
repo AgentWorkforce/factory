@@ -905,6 +905,16 @@ export class FactoryLoop implements Factory {
    * exists to remove.
    */
   #discoverySweepBudgetMs = DEFAULT_DISCOVERY_SWEEP_BUDGET_MS
+  /**
+   * The budgets of every sweep currently in flight.
+   *
+   * `stop()` drains the sweep it started (see `#readinessReconcileAbandonedWait`
+   * below), so a wedged sweep holds shutdown open for the whole budget — 90
+   * minutes at the default, and unbounded before this budget existed. A set
+   * rather than one field because a live sweep and a mismatched dry-run one can
+   * be in flight at the same time.
+   */
+  readonly #discoverySweepBudgets = new Set<DiscoverySweepBudget>()
   // Set for exactly as long as a sweep is running. `state` is derived from
   // this, so an in-flight pass can no longer masquerade as the last settled one.
   #readinessReconcileInFlightSinceMs?: number
@@ -1585,15 +1595,24 @@ export class FactoryLoop implements Factory {
     this.#readinessReconcileTimer = undefined
     if (this.#previewSweepTimer) clearTimeout(this.#previewSweepTimer)
     this.#previewSweepTimer = undefined
-    await this.#readinessReconcileInFlight
-    // #301 review: the deadline ends the *wait*, so `#readinessReconcileInFlight`
-    // can settle with its `runOnce()` still live. Shutdown releases dispatch
-    // lifecycle leases and disposes ports below, and `#isPassFatalFailure` only
-    // fences a stopping sweep once something in it throws — so a sweep whose
-    // dependency recovers cleanly would otherwise dispatch through torn-down
-    // state. Draining here restores exactly the pre-deadline shutdown contract:
-    // stop() outlives the sweep it started.
-    await this.#readinessReconcileAbandonedWait
+    // #372: the drain below is unbounded in the one case that matters — a
+    // wedged sweep — so shutdown inherits the sweep budget, 90 minutes at the
+    // default. Spending it after one teardown window bounds shutdown without
+    // discarding a sweep that was about to finish.
+    const releaseSweepBudgetGrace = this.#cutSweepBudgetsShortForStop()
+    try {
+      await this.#readinessReconcileInFlight
+      // #301 review: the deadline ends the *wait*, so `#readinessReconcileInFlight`
+      // can settle with its `runOnce()` still live. Shutdown releases dispatch
+      // lifecycle leases and disposes ports below, and `#isPassFatalFailure` only
+      // fences a stopping sweep once something in it throws — so a sweep whose
+      // dependency recovers cleanly would otherwise dispatch through torn-down
+      // state. Draining here restores exactly the pre-deadline shutdown contract:
+      // stop() outlives the sweep it started.
+      await this.#readinessReconcileAbandonedWait
+    } finally {
+      releaseSweepBudgetGrace()
+    }
     await this.#previewSweepInFlight
     this.#stoppingHeartbeatRefreshActive = await this.#stopLiveHeartbeat('stopping')
     try {
@@ -3085,7 +3104,11 @@ export class FactoryLoop implements Factory {
    */
   async #runOnceWithDiscoveryFence(opts: { dryRun?: boolean }): Promise<IterationReport> {
     const budget = startDiscoverySweepBudget(this.#discoverySweepBudgetMs)
+    this.#discoverySweepBudgets.add(budget)
     const sweepStartedAtMs = this.#clock.now()
+    // A sweep that starts while shutdown is already draining would otherwise
+    // get a full fresh budget to hold `stop()` open with.
+    if (this.#stopping) budget.expire()
     try {
       return await this.#runDiscoverySweep(opts, budget)
     } catch (error) {
@@ -3103,8 +3126,38 @@ export class FactoryLoop implements Factory {
       }
       throw error
     } finally {
+      this.#discoverySweepBudgets.delete(budget)
       budget.dispose()
     }
+  }
+
+  /**
+   * Cut every in-flight sweep's budget short once shutdown starts draining.
+   *
+   * `stop()` deliberately outlives the sweep it started (#301), so a wedged
+   * sweep makes shutdown as long as the budget. The grace window is what keeps
+   * an ordinary restart from throwing away a sweep that was about to commit;
+   * after it, expiry routes the sweep into exactly the abort path a real expiry
+   * takes — lease released, teardown bounded — instead of holding the process.
+   *
+   * Returns the cancel for the grace timer. Always call it: on a prompt
+   * shutdown there is nothing to cut short.
+   */
+  #cutSweepBudgetsShortForStop(): () => void {
+    if (this.#discoverySweepBudgets.size === 0) return () => undefined
+    const timer = setTimeout(() => {
+      for (const budget of this.#discoverySweepBudgets) {
+        if (budget.expired()) continue
+        this.#increment('discoverySweepBudgetsCutShortForStop')
+        this.#logger.warn?.('[factory] shutdown is draining a sweep; spending its budget now', {
+          graceMs: STOP_TEARDOWN_TIMEOUT_MS,
+          budgetMs: budget.budgetMs,
+        })
+        budget.expire()
+      }
+    }, STOP_TEARDOWN_TIMEOUT_MS)
+    timer.unref?.()
+    return () => clearTimeout(timer)
   }
 
   /**
@@ -3120,16 +3173,23 @@ export class FactoryLoop implements Factory {
    * which is the thing this PR exists to stop paying.
    */
   async #claimDiscoverySweepUnderBudget(budget: DiscoverySweepBudget): Promise<DiscoverySweepClaim> {
-    const claim = this.#state.claimDiscoverySweep(
-      this.#workspaceId,
-      this.#discoverySweepOwner,
-      this.#clock.now(),
-      DISCOVERY_SWEEP_LEASE_MS,
-    )
+    // Issued INSIDE the budget callback, so a budget that is already spent
+    // rejects the phase without opening a lease it could only hand straight
+    // back. The handle is kept out here because the compensation below needs
+    // the promise the wait was abandoned on.
+    let claim: Promise<DiscoverySweepClaim> | undefined
     try {
-      return await budget.run('discovery-lease-claim', () => claim)
+      return await budget.run('discovery-lease-claim', () => {
+        claim = this.#state.claimDiscoverySweep(
+          this.#workspaceId,
+          this.#discoverySweepOwner,
+          this.#clock.now(),
+          DISCOVERY_SWEEP_LEASE_MS,
+        )
+        return claim
+      })
     } catch (error) {
-      if (!(error instanceof DiscoverySweepBudgetExceededError)) throw error
+      if (!(error instanceof DiscoverySweepBudgetExceededError) || claim === undefined) throw error
       void claim.then(
         async (late) => {
           if (!late.acquired || !late.lease) return

@@ -151,6 +151,24 @@ describe('sweep budget primitive', () => {
     }
   })
 
+  it('must-not-fire: the budget timer holds the event loop, and stops holding it the moment the sweep settles', async () => {
+    // The pair for the shutdown lever below. The trivially wrong way to stop a
+    // deadline timer holding the process open is to `unref()` it — which also
+    // lets Node exit before the budget fires, so a one-shot `runOnce()` returns
+    // having neither reported the wedge nor released the lease. This assertion
+    // fails for that version: `getActiveResourcesInfo()` lists only resources
+    // that are KEEPING THE EVENT LOOP ALIVE, so an unref'd timer never appears.
+    const timers = () => process.getActiveResourcesInfo().filter((resource) => resource === 'Timeout').length
+    const before = timers()
+    const budget = startDiscoverySweepBudget(90 * 60_000)
+    expect(timers()).toBe(before + 1)
+    expect(await budget.run('run-once', async () => 'served')).toBe('served')
+    budget.dispose()
+    // ...and the other half: a settled sweep leaves nothing behind, which is
+    // what makes keeping it referenced affordable at a 90-minute budget.
+    expect(timers()).toBe(before)
+  })
+
   it('must-not-fire: with no budget the same hung call stays pending, so the rejections above are the budget', async () => {
     // The control for every must-fire above. Without it a wrapper that
     // rejected unconditionally would pass all of them.
@@ -354,9 +372,22 @@ class HangingWatermarkMount extends FakeMountClient {
   }
 }
 
+/** A fleet whose control-plane probe is slow enough to spend a tight budget. */
+class SlowRosterFleet extends FakeFleetClient {
+  rosterDelayMs = 0
+
+  override async roster(): ReturnType<FakeFleetClient['roster']> {
+    if (this.rosterDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.rosterDelayMs))
+    }
+    return await super.roster()
+  }
+}
+
 /** A store that records the lease handbacks, so "released" is observed, not inferred. */
 class LeaseWatchingStateStore extends InMemoryStateStore {
   readonly released: number[] = []
+  claims = 0
   /** Milliseconds a claim takes to answer. Long enough and the budget gives up first. */
   claimDelayMs = 0
 
@@ -366,6 +397,7 @@ class LeaseWatchingStateStore extends InMemoryStateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<DiscoverySweepClaim> {
+    this.claims += 1
     if (this.claimDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.claimDelayMs))
     }
@@ -460,6 +492,107 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
       await withDeadline(factory.stop(), 4_000, 'stop never completed')
     } finally {
       await factory.stop().catch(() => undefined)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('must-fire: shutdown does not inherit the sweep budget when a sweep is wedged', async () => {
+    // `stop()` deliberately outlives the sweep it started (#301), so without a
+    // shutdown lever a wedged sweep makes shutdown as long as the budget — 90
+    // minutes at the default. A 60 s budget here stands in for that: if
+    // shutdown waited for it, the 4 s guard below fires.
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-budget-drain-'))
+    const mount = new HangingWatermarkMount({ [issuePath(901)]: issueFile(901) })
+    // Serve the pre-backfill read AND the startup backfill's own, so the
+    // daemon comes up healthy and it is a LATER, periodic sweep that wedges.
+    mount.serveFirst = 2
+    const factory = createFactory(config(60_000, root), {
+      mount,
+      fleet: new FakeFleetClient(),
+      stateStore: new LeaseWatchingStateStore({ batchSize: 4 }),
+      triage: new StaticTriage(),
+      logger: {},
+    })
+    try {
+      await withDeadline(factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50, reconcileTimeoutMs: 60_000 },
+      }), 4_000, 'start never returned')
+      await withDeadline(
+        (async () => {
+          while (mount.hungCalls === 0) await new Promise((resolve) => setTimeout(resolve, 25))
+        })(),
+        4_000,
+        'no periodic sweep ever wedged',
+      )
+      await withDeadline(factory.stop(), 4_000, 'stop waited for the whole sweep budget')
+    } finally {
+      await factory.stop().catch(() => undefined)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('must-fire: a sweep aborted before the claim phase never opens a lease', async () => {
+    // A lease taken after the budget expired makes every later sweep defer —
+    // the same "later cycles wait on a pass that is already over" failure the
+    // PR's table pins on `reconcileTimeoutMs`.
+    //
+    // Scope, stated because it is narrower than it looks: this drives the
+    // ordinary path, where the budget is spent in an EARLIER phase and that
+    // phase's own `budget.run` throws first. Every entry into
+    // `#claimDiscoverySweepUnderBudget` is preceded by such a `budget.run`, so
+    // "already spent on entry" is not reachable by construction — it is the
+    // microtask gap between that check and the claim, which `stop()` made
+    // reachable when it gained the ability to spend a budget asynchronously.
+    // Issuing the claim inside the budget callback closes it by construction;
+    // the guarantee that makes that work is asserted directly on the primitive
+    // above ("refuses to start new work once the budget is spent", which
+    // asserts the thunk is never invoked).
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-budget-spent-'))
+    const stateStore = new LeaseWatchingStateStore({ batchSize: 4 })
+    const fleet = new SlowRosterFleet()
+    // Longer than the budget, so the budget is already spent by the time the
+    // claim phase is entered.
+    fleet.rosterDelayMs = 500
+    const factory = createFactory(config(150, root), {
+      mount: new FakeMountClient({ [issuePath(901)]: issueFile(901) }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      logger: {},
+    })
+    try {
+      await expect(withDeadline(factory.runOnce(), 4_000, 'sweep never settled'))
+        .rejects.toMatchObject({
+          name: 'DiscoverySweepBudgetExceededError',
+          phase: 'fleet-control-plane-probe',
+        })
+      expect(stateStore.claims).toBe(0)
+      expect(stateStore.released).toHaveLength(0)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('must-not-fire: a healthy sweep still claims exactly once and hands the lease back', async () => {
+    // The pair for the test above: the trivially wrong way to stop a spent
+    // budget from claiming is to stop claiming.
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-budget-claims-'))
+    const stateStore = new LeaseWatchingStateStore({ batchSize: 4 })
+    const factory = createFactory(config(30_000, root), {
+      mount: new FakeMountClient({ [issuePath(901)]: issueFile(901) }),
+      fleet: new SlowRosterFleet(),
+      stateStore,
+      triage: new StaticTriage(),
+      logger: {},
+    })
+    try {
+      const report = await withDeadline(factory.runOnce(), 4_000, 'healthy sweep never settled')
+      expect(report.dispatched).toHaveLength(1)
+      expect(stateStore.claims).toBe(1)
+    } finally {
+      await factory.stop()
       await rm(root, { recursive: true, force: true })
     }
   })
