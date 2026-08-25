@@ -3,7 +3,12 @@ import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
 
-import { DEFAULT_READINESS_RECONCILE_TIMEOUT_MS, FactoryConfigSchema, type FactoryConfig } from '../config/schema'
+import {
+  DEFAULT_DISCOVERY_SWEEP_BUDGET_MS,
+  DEFAULT_READINESS_RECONCILE_TIMEOUT_MS,
+  FactoryConfigSchema,
+  type FactoryConfig,
+} from '../config/schema'
 import {
   DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS,
   RelayfileOperationTimeoutError,
@@ -65,6 +70,13 @@ import type { Clock, Logger } from '../ports/system'
 import type { AgentWorktree, AgentWorktreeManager, AgentWorktreeRepository } from '../ports/worktree'
 import { factoryWorktreeIssueSlug, factoryWorktreePath } from '../git/agent-worktree'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
+import {
+  DISCOVERY_SWEEP_TEARDOWN_TIMEOUT_MS,
+  DiscoverySweepBudgetExceededError,
+  startDiscoverySweepBudget,
+  withSweepTeardownDeadline,
+  type DiscoverySweepBudget,
+} from './sweep-budget'
 import {
   dispatchHandedOffToBabysitters,
   dispatchLifecycleOccupiesSlot,
@@ -877,6 +889,21 @@ export class FactoryLoop implements Factory {
    * returns: a deadline checked between awaits never regains control to check.
    */
   #relayfileOperationTimeoutMs = DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS
+  /**
+   * Aggregate budget for ONE sweep (#372).
+   *
+   * The third bound on this path and the only transport-agnostic one.
+   * `#relayfileOperationTimeoutMs` bounds one relayfile call and cannot see the
+   * retry loop around it; `#readinessReconcileTimeoutMs` bounds the *wait* and
+   * leaves `runOnce()` running for the next cycle to coalesce onto. This is
+   * charged against one timer for the whole pass, so however many calls,
+   * retries and transports the sweep is spread across, it cannot outlive this.
+   *
+   * Held at `min(configured, #readinessReconcileTimeoutMs)`: a budget looser
+   * than the wait would let the wait give up first, which is the behaviour it
+   * exists to remove.
+   */
+  #discoverySweepBudgetMs = DEFAULT_DISCOVERY_SWEEP_BUDGET_MS
   // Set for exactly as long as a sweep is running. `state` is derived from
   // this, so an in-flight pass can no longer masquerade as the last settled one.
   #readinessReconcileInFlightSinceMs?: number
@@ -1121,6 +1148,10 @@ export class FactoryLoop implements Factory {
     // Also read here, not only in `#startLiveSubscription`: a standalone
     // `runOnce()` never starts the live subscription and must still be bounded.
     this.#relayfileOperationTimeoutMs = config.liveSubscription.relayfileOperationTimeoutMs
+    this.#discoverySweepBudgetMs = Math.min(
+      config.liveSubscription.sweepBudgetMs,
+      config.liveSubscription.reconcileTimeoutMs,
+    )
     this.#mount = ports.mount
     // Resolved role<->state mapping. The CLI injects a name-resolved, per-team
     // resolution via ports; fall back to one built from explicit stateIds plus
@@ -1963,6 +1994,10 @@ export class FactoryLoop implements Factory {
     // floor here: a deadline under one interval would kill every pass.
     this.#readinessReconcileTimeoutMs = Math.max(options.reconcileTimeoutMs, options.reconcileIntervalMs)
     this.#relayfileOperationTimeoutMs = options.relayfileOperationTimeoutMs
+    // Same re-application as the deadline above: `start()` overrides bypass the
+    // schema's cross-field check, and a budget looser than the wait is not a
+    // budget.
+    this.#discoverySweepBudgetMs = Math.min(options.sweepBudgetMs, this.#readinessReconcileTimeoutMs)
     this.#liveConnectStartedAtMs = this.#clock.now()
     this.#liveReplaySkewMarginMs = options.replaySkewMarginMs
     const highWatermark = await this.#currentEventHighWatermark()
@@ -2137,6 +2172,7 @@ export class FactoryLoop implements Factory {
       reconcileTimeoutMs: overrides.reconcileTimeoutMs ?? this.#config.liveSubscription.reconcileTimeoutMs,
       relayfileOperationTimeoutMs: overrides.relayfileOperationTimeoutMs
         ?? this.#config.liveSubscription.relayfileOperationTimeoutMs,
+      sweepBudgetMs: overrides.sweepBudgetMs ?? this.#config.liveSubscription.sweepBudgetMs,
     }
   }
 
@@ -3028,17 +3064,62 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  /**
+   * One sweep, under one aggregate budget (#372).
+   *
+   * The budget wraps the fence rather than the fence's caller, and that is the
+   * whole point. #296's deadline lives in `#runOnceWithReadinessDeadline`,
+   * outside `runOnce()`: expiry rejects the wait and leaves the sweep running,
+   * so the next cycle coalesces onto the same wedged promise (`runOnce()`, the
+   * `#runOnceInFlight` branch) and the daemon never recovers. Expiring in HERE
+   * unwinds the body below, which releases the discovery lease on its way out
+   * and lets `runOnce()` clear `#runOnceInFlight` — so the next cycle claims a
+   * fresh lease and runs clean.
+   *
+   * See `sweep-budget.ts` for what the mechanism can and cannot interrupt. In
+   * short: it abandons the in-flight await, it does not cancel the call.
+   */
   async #runOnceWithDiscoveryFence(opts: { dryRun?: boolean }): Promise<IterationReport> {
+    const budget = startDiscoverySweepBudget(this.#discoverySweepBudgetMs)
+    const sweepStartedAtMs = this.#clock.now()
+    try {
+      return await this.#runDiscoverySweep(opts, budget)
+    } catch (error) {
+      if (error instanceof DiscoverySweepBudgetExceededError) {
+        this.#increment('discoverySweepBudgetExceeded')
+        this.#logger.error?.('[factory] discovery sweep aborted at its aggregate budget', {
+          budgetMs: error.budgetMs,
+          // The await the sweep was abandoned on. The one diagnostic no
+          // per-call bound can produce once the sweep is already wedged: it
+          // says WHICH transport this wedge is on without anyone having to
+          // guess which layer to bound next.
+          phase: error.phase,
+          elapsedMs: this.#elapsedSince(sweepStartedAtMs),
+        })
+      }
+      throw error
+    } finally {
+      budget.dispose()
+    }
+  }
+
+  async #runDiscoverySweep(
+    opts: { dryRun?: boolean },
+    budget: DiscoverySweepBudget,
+  ): Promise<IterationReport> {
     const sweepStartedAtMs = this.#clock.now()
     if (!(opts.dryRun ?? this.#config.dryRun)) {
-      await this.#assertFleetControlPlaneAvailable()
+      // Under the budget, and first, because this is where the 2026-08-25
+      // 07:52:59Z wedge sat: a pre-claim probe on a transport neither #351 nor
+      // #368 covers. The budget does not care which one it is.
+      await budget.run('fleet-control-plane-probe', () => this.#assertFleetControlPlaneAvailable())
     }
-    let claim = await this.#state.claimDiscoverySweep(
+    let claim = await budget.run('discovery-lease-claim', () => this.#state.claimDiscoverySweep(
       this.#workspaceId,
       this.#discoverySweepOwner,
       this.#clock.now(),
       DISCOVERY_SWEEP_LEASE_MS,
-    )
+    ))
     if (!claim.acquired && claim.reason === 'backoff') {
       const delayMs = Math.max(0, claim.state.backoffUntilMs - this.#clock.now())
       this.#increment('discoveryBackoffWaits')
@@ -3047,13 +3128,13 @@ export class FactoryLoop implements Factory {
         backoffUntilMs: claim.state.backoffUntilMs,
         consecutiveOverloads: claim.state.consecutiveOverloads,
       })
-      await this.#clock.sleep(delayMs)
-      claim = await this.#state.claimDiscoverySweep(
+      await budget.run('discovery-backoff-wait', () => this.#clock.sleep(delayMs))
+      claim = await budget.run('discovery-lease-claim', () => this.#state.claimDiscoverySweep(
         this.#workspaceId,
         this.#discoverySweepOwner,
         this.#clock.now(),
         DISCOVERY_SWEEP_LEASE_MS,
-      )
+      ))
     }
     if (!claim.acquired || !claim.lease) {
       this.#increment('discoverySweepsSkippedInFlight')
@@ -3099,13 +3180,16 @@ export class FactoryLoop implements Factory {
     this.#startDiscoverySweepRenewal(claim.lease.epoch)
     let leaseReleased = false
     try {
-      this.#discoverySession = await this.#prepareDiscoverySession(claim)
+      this.#discoverySession = await budget.run(
+        'discovery-session',
+        () => this.#prepareDiscoverySession(claim),
+      )
       // #297: a 429 raised anywhere in the sweep used to latch and be rethrown
       // here, discarding a completed pass — every issue read, every dispatch —
       // because of one transient shed operation. The work this sweep did is
       // now kept instead, and the ratchet below records that the dependency is
       // shedding but still serving.
-      const report = await this.#performRunOnce(opts)
+      const report = await budget.run('run-once', () => this.#performRunOnce(opts, budget))
       // The exception, and the reason skipping shed units cannot make a sweep
       // unconditionally green: a sweep that was shed AND got no work unit
       // through accomplished nothing. There is no progress to preserve, and
@@ -3116,17 +3200,23 @@ export class FactoryLoop implements Factory {
       if (this.#discoveryOverloadError !== undefined && !this.#discoverySweepProgress) {
         throw this.#discoveryOverloadError
       }
-      const checkpoint = await this.#finalizeDiscoveryCheckpoint()
+      const checkpoint = await budget.run('discovery-checkpoint', () => this.#finalizeDiscoveryCheckpoint())
       // Do not clear the durable lease while a renewal can still be waiting on
       // the same state-file lock. A late renewal that observes the completed
       // (lease-less) checkpoint is a false lease-loss signal and can poison an
       // otherwise successful reconcile cycle.
-      await this.#stopDiscoverySweepRenewal()
+      await budget.run('discovery-renewal-stop', () => this.#stopDiscoverySweepRenewal())
       if (this.#discoverySweepLeaseLost) {
         throw new Error('discovery sweep lease was lost before checkpoint commit')
       }
       const residual = this.#discoveryOverloadOutcome(claim.state.consecutiveOverloads, 'committed')
-      const completed = await this.#commitDiscoverySweep(claim.lease.epoch, checkpoint, residual)
+      // Under the budget too. A hung commit is the same class of wedge as a
+      // hung read, and the epoch guard in the store makes a late one a no-op:
+      // the teardown below has already released this epoch's lease.
+      const completed = await budget.run(
+        'discovery-commit',
+        () => this.#commitDiscoverySweep(claim.lease!.epoch, checkpoint, residual),
+      )
       leaseReleased = completed
       if (!completed) throw new Error('discovery sweep lease was lost before completion')
       // This is the progress boundary consumed by deployment health. A timer
@@ -3141,17 +3231,23 @@ export class FactoryLoop implements Factory {
       })
       return report
     } catch (error) {
-      await this.#stopDiscoverySweepRenewal()
+      await this.#sweepTeardownStep('discovery sweep renewal stop', () => this.#stopDiscoverySweepRenewal())
       const overload = relayfileOverload(error)
       if (overload) {
         const outcome = this.#discoveryOverloadOutcome(claim.state.consecutiveOverloads, 'aborted', error)!
-        leaseReleased = await this.#state.deferDiscoverySweep(
-          this.#workspaceId,
-          this.#discoverySweepOwner,
-          claim.lease.epoch,
-          outcome.backoffUntilMs,
-          outcome.consecutiveOverloads,
-        )
+        // Bounded for the same reason the release below is: this is the other
+        // path that hands the lease back, and an unbounded one would hold
+        // `#runOnceInFlight` open past the budget that just expired.
+        leaseReleased = await withSweepTeardownDeadline(
+          DISCOVERY_SWEEP_TEARDOWN_TIMEOUT_MS,
+          () => this.#state.deferDiscoverySweep(
+            this.#workspaceId,
+            this.#discoverySweepOwner,
+            claim.lease!.epoch,
+            outcome.backoffUntilMs,
+            outcome.consecutiveOverloads,
+          ),
+        ) ?? false
         this.#logger.warn?.('[factory] Relayfile discovery overloaded; backing off before another sweep', {
           status: overload.status,
           reason: overload.reason,
@@ -3171,7 +3267,7 @@ export class FactoryLoop implements Factory {
       }
       throw error
     } finally {
-      await this.#stopDiscoverySweepRenewal()
+      await this.#sweepTeardownStep('discovery sweep renewal stop', () => this.#stopDiscoverySweepRenewal())
       this.#discoverySession = undefined
       this.#discoverySweepEpoch = undefined
       this.#discoverySweepStartedAtMs = undefined
@@ -3188,12 +3284,45 @@ export class FactoryLoop implements Factory {
       // happens to run and reset it at the top of this method.
       this.#discoverySweepLeaseLost = false
       if (!leaseReleased) {
-        await this.#state.releaseDiscoverySweep(
+        // The half of the budget that makes the NEXT cycle clean, so it gets
+        // its own deadline rather than the spent one: an unbounded release
+        // would re-create the wedge one layer down, which is the pattern this
+        // change exists to end. An abandoned release is survivable — the
+        // durable lease carries its own expiry and a later sweep reclaims it
+        // as an orphan (`claim.reclaimedLease` above).
+        await this.#sweepTeardownStep('discovery sweep lease release', () => this.#state.releaseDiscoverySweep(
           this.#workspaceId,
           this.#discoverySweepOwner,
-          claim.lease.epoch,
-        )
+          claim.lease!.epoch,
+        ))
       }
+    }
+  }
+
+  /**
+   * One sweep-teardown step, under its own deadline.
+   *
+   * Teardown cannot run under the sweep's aggregate budget: on the path that
+   * matters the budget is already spent, so every step would reject and the
+   * lease would never be released. It gets a short independent deadline
+   * instead. Abandoning it costs an orphaned lease for one expiry window;
+   * NOT bounding it costs the whole invariant, because a hung release holds
+   * `#runOnceInFlight` open and every later cycle coalesces onto it.
+   */
+  async #sweepTeardownStep(label: string, step: () => Promise<unknown>): Promise<void> {
+    const outcome = await withSweepTeardownDeadline(
+      DISCOVERY_SWEEP_TEARDOWN_TIMEOUT_MS,
+      async () => {
+        await step()
+        return true as const
+      },
+    )
+    if (outcome === undefined) {
+      this.#increment('discoverySweepTeardownDeadlineExceeded')
+      this.#logger.warn?.('[factory] discovery sweep teardown step abandoned at its deadline', {
+        step: label,
+        timeoutMs: DISCOVERY_SWEEP_TEARDOWN_TIMEOUT_MS,
+      })
     }
   }
 
@@ -3310,7 +3439,10 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #performRunOnce(opts: { dryRun?: boolean } = {}): Promise<IterationReport> {
+  async #performRunOnce(
+    opts: { dryRun?: boolean } = {},
+    budget?: DiscoverySweepBudget,
+  ): Promise<IterationReport> {
     const dryRun = opts.dryRun ?? this.#config.dryRun
     const startedAtMs = this.#clock.now()
     const relayfileWaitWarningsAtStart = this.#counters.relayfileOperationWaitWarnings ?? 0
@@ -3371,6 +3503,12 @@ export class FactoryLoop implements Factory {
 
       const issueEntries: Array<{ path: string; issue?: LinearIssue }> = []
       for (const path of paths) {
+        // A between-await check, worth exactly what #368 said such a check is
+        // worth against a call that never returns: nothing. What it buys is
+        // the other half — a pass already abandoned at the budget unwinds at
+        // its next iteration if it ever regains control, instead of running to
+        // completion beside the sweep that replaced it.
+        budget?.assertNotExpired('run-once')
         let issue: LinearIssue | undefined
         let shed = false
         try {

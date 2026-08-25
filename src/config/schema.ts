@@ -61,6 +61,26 @@ const subscriptionSchema = z.object({
  */
 export const DEFAULT_READINESS_RECONCILE_TIMEOUT_MS = 90 * 60_000
 
+/**
+ * Aggregate budget for one discovery sweep (#372).
+ *
+ * Defaults to `DEFAULT_READINESS_RECONCILE_TIMEOUT_MS` on purpose. The two
+ * numbers describe the same envelope; what changes is the MECHANISM, and the
+ * mechanism is the deliverable. `reconcileTimeoutMs` rejects the caller's wait
+ * and leaves `runOnce()` running, so every later cycle coalesces onto the
+ * wedged pass and the daemon never recovers. The sweep budget rejects from
+ * inside the fence, so the lease is released and the next cycle starts clean.
+ *
+ * Shipping it equal keeps this change free of new timing risk: no sweep that
+ * survives today is killed by it. Tightening it is a separate, evidence-driven
+ * decision with a real cost — the sweep commits its checkpoint only at the end,
+ * so a budget below realistic cold-mirror hydration (#36 measured 61 minutes in
+ * production) converts a slow boot into a loop that never makes progress,
+ * which is the same trap `reconcileTimeoutMs` documents above. That is why this
+ * is a config dial and not a constant.
+ */
+export const DEFAULT_DISCOVERY_SWEEP_BUDGET_MS = DEFAULT_READINESS_RECONCILE_TIMEOUT_MS
+
 const liveSubscriptionSchema = z.object({
   transport: z.enum(['subscribe-and-poll', 'subscribe', 'poll']).default('subscribe-and-poll'),
   pollIntervalMs: z.number().int().min(50).default(5_000),
@@ -84,6 +104,19 @@ const liveSubscriptionSchema = z.object({
    */
   relayfileOperationTimeoutMs: z.number().int().min(50).max(60 * 60_000)
     .default(DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS),
+  /**
+   * Bounds the WHOLE sweep (#372).
+   *
+   * Distinct from both neighbours above, and the only one of the three that is
+   * agnostic to which dependency hangs. `relayfileOperationTimeoutMs` bounds one
+   * relayfile call and cannot see a retry loop around it or a call on another
+   * transport; `reconcileTimeoutMs` bounds the caller's wait and leaves the
+   * sweep running underneath it. This one is charged against a single timer for
+   * the entire pass, so a sweep cannot outlive it however many calls, retries
+   * or transports it is spread across.
+   */
+  sweepBudgetMs: z.number().int().min(50).max(6 * 60 * 60_000)
+    .default(DEFAULT_DISCOVERY_SWEEP_BUDGET_MS),
 }).superRefine((value, ctx) => {
   // A deadline below the interval kills every pass that takes longer than one
   // tick, which is most of them on a cold mirror.
@@ -92,6 +125,16 @@ const liveSubscriptionSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ['reconcileTimeoutMs'],
       message: `reconcileTimeoutMs (${value.reconcileTimeoutMs}) must be at least reconcileIntervalMs (${value.reconcileIntervalMs})`,
+    })
+  }
+  // The sweep budget has to be the tighter of the two, or the wait gives up
+  // first and the sweep it abandoned keeps running for the next cycle to
+  // coalesce onto — the exact behaviour the budget exists to remove.
+  if (value.sweepBudgetMs > value.reconcileTimeoutMs) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['sweepBudgetMs'],
+      message: `sweepBudgetMs (${value.sweepBudgetMs}) must not exceed reconcileTimeoutMs (${value.reconcileTimeoutMs})`,
     })
   }
 }).default({})
