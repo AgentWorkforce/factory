@@ -366,6 +366,7 @@ export function formatSweepOutcome(
   }
   return `${readiness.candidates} candidate(s), ${readiness.dispatched ?? 0} dispatched, ` +
     `${readiness.skipped ?? 0} skipped` +
+    formatTreeReadReading(readiness) +
     (readiness.discoveryDeferred
       // Name the instant, not just "an earlier pass" (#359 review): retained
       // counts sit beside an ever-fresh `lastCompletedAtMs`, so without this
@@ -376,6 +377,32 @@ export function formatSweepOutcome(
           : ` measured ${formatInstant(readiness.lastEnumeratedAtMs)}`} — the most recent pass deferred ` +
         'to another process holding the discovery lease and enumerated nothing'
       : '')
+}
+
+/**
+ * The tree-read pair, turned into the sentence an operator needs (#363 review).
+ *
+ * The numbers reaching `/healthz` is half the fix; the other half is that
+ * `candidates: 0, treeReads: 3, emptyTreeReads: 3` and
+ * `candidates: 0, treeReads: 3, emptyTreeReads: 1` mean opposite things and
+ * nothing on this surface said which was which. The first is a mount serving
+ * nothing at all — dispatch is dead upstream of eligibility; the second is a
+ * workspace with no ready work.
+ *
+ * Silent about a zero `treeReads`: a sweep that issued no enumerating read
+ * (deferred, or shed) has nothing to report here, and a ratio over zero reads
+ * is not a fact about the mount.
+ */
+export function formatTreeReadReading(
+  readiness: FactoryPublicReadinessReconcileHealth | undefined,
+): string {
+  const treeReads = readiness?.treeReads
+  const emptyTreeReads = readiness?.emptyTreeReads
+  if (treeReads === undefined || emptyTreeReads === undefined || treeReads === 0) return ''
+  return emptyTreeReads === treeReads
+    ? ` — every one of ${treeReads} tree read(s) came back empty: the mount served nothing at all,` +
+      ' so a zero candidate count here is not evidence the workspace is empty'
+    : ` (${emptyTreeReads}/${treeReads} tree read(s) empty — the mount served content)`
 }
 
 /** The skip breakdown, ordered as the record carries it. */
@@ -547,6 +574,17 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
               ? ` (${formatSkipReasons(readiness.dispatchFailureReasons)})`
               : ''
           }`,
+        )
+      }
+      // Rendered whenever the producer reports the pair, zeroes included: the
+      // raw numbers are what an operator diffs across two samples, and the
+      // reading beside them is what they act on (#363 review).
+      if (readiness.treeReads !== undefined && readiness.emptyTreeReads !== undefined) {
+        lines.push(
+          `    tree reads         : ${readiness.treeReads} served, ${readiness.emptyTreeReads} empty` +
+            (readiness.treeReads > 0 && readiness.emptyTreeReads === readiness.treeReads
+              ? ' — SILENT MOUNT: it served nothing at all'
+              : ''),
         )
       }
     }

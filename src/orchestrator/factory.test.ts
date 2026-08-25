@@ -13498,7 +13498,12 @@ describe('FactoryLoop', () => {
           // Self-healing: a later cycle STARTED while the dependency is still
           // hung. This is the number that stayed frozen for 22 minutes.
           expect(status.counters.readinessReconcileSweeps ?? 0).toBeGreaterThan(sweepsWhileHung)
-        }, { timeout: 5_000 })
+          // ...and a later cycle also FINISHED. A second independent failure is
+          // what proves `#runOnceInFlight` was cleared: had it still held the
+          // wedged promise, cycle two would have coalesced onto it and never
+          // settled, leaving this at exactly 1 forever (#351 review).
+          expect(status.readinessReconcile?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(2)
+        }, { timeout: 8_000 })
 
         // And it recovers on its own once the dependency answers again — no
         // restart, which is the only thing that cleared this in production.
@@ -13515,6 +13520,255 @@ describe('FactoryLoop', () => {
       }
       // Two sequential `vi.waitFor` windows do not fit the suite's 5s default.
     }, 20_000)
+
+    // The unwind is what makes the bound a fix rather than a shorter hang: the
+    // #296 sweep deadline rejects the wait while `runOnce()` keeps the durable
+    // lease, so the next cycle finds the workspace owned and defers. Asserted
+    // directly rather than inferred from "the next cycle ran" (#351 review).
+    it('releases the discovery lease when a hung read aborts the sweep', async () => {
+      const mount = new HangingListTreeMount()
+      const stateStore = new InMemoryStateStore({ batchSize: 2 })
+      const factory = createFactory(config({ issueSource: 'github' }), {
+        mount,
+        stateStore,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      })
+
+      await factory.start({
+        mode: 'live',
+        liveSubscription: {
+          transport: 'subscribe',
+          reconcileIntervalMs: 20,
+          reconcileTimeoutMs: 60_000,
+          relayfileOperationTimeoutMs: 50,
+        },
+      })
+      try {
+        mount.hangListTree = true
+        await mount.hangStarted
+        await vi.waitFor(() => {
+          expect(factory.status().readinessReconcile?.consecutiveFailures ?? 0)
+            .toBeGreaterThanOrEqual(1)
+        }, { timeout: 5_000 })
+
+        // Stop first so no live cycle is holding the lease legitimately — the
+        // probe would otherwise race the 20ms loop. `stop()` has no release of
+        // its own (the fence's finally is the only `releaseDiscoverySweep`
+        // call site), so a lease free here was freed by the aborted sweep.
+        await factory.stop()
+        const probe = await stateStore.claimDiscoverySweep(
+          'factory-test', 'probe-owner', Date.now(), 1_000,
+        )
+        expect(probe).toMatchObject({ acquired: true })
+        expect(probe.reclaimedLease).toBeUndefined()
+      } finally {
+        mount.release()
+        await factory.stop()
+      }
+    }, 20_000)
+
+    // The companion to the timeout, asked for on #351 and missing from #354.
+    //
+    // A bounded read that HANGS is now loud. A bounded read the mount ANSWERS
+    // WITH NOTHING is not: no timeout, no failure, no `lastError`, and a sweep
+    // that completes `healthy` having dispatched nothing. `candidates: 0`
+    // cannot separate that from a workspace with no ready work, so the two
+    // states that both mean "dispatch is dead" look identical on the surface.
+    describe('empty reads versus timeouts', () => {
+      // Isolated registry and heartbeat per factory. The config default points
+      // every instance at one shared path, so a live-mode fixture that writes
+      // there leaks rows into whatever test runs next.
+      const startEmptyReadFactory = async (mount: CountingEventsMount) => {
+        const root = await mkdtemp(join(tmpdir(), 'factory-empty-reads-'))
+        const factory = createFactory(config({
+          issueSource: 'github',
+          loop: {
+            heartbeatPath: join(root, 'heartbeat.json'),
+            registryPath: join(root, 'registry.json'),
+          },
+        }), {
+          mount,
+          stateStore: new InMemoryStateStore({ batchSize: 2 }),
+          fleet: new FakeFleetClient(),
+          triage: new StaticTriage(),
+          githubWriteback: new RecordingGithubWriteback(),
+          logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        })
+        await factory.start({
+          mode: 'live',
+          liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 20 },
+        })
+        return {
+          factory,
+          heartbeatPath: join(root, 'heartbeat.json'),
+          cleanup: async () => { await rm(root, { recursive: true, force: true }) },
+        }
+      }
+
+      // MUST-FIRE for the scoping (#363 review, codex P2). The counters used to
+      // increment on EVERY served `listTree` in the process, and in live mode
+      // event drains and completion timers issue those concurrently with
+      // `runOnce()`. A populated lookup landing in the denominator makes
+      // `emptyTreeReads < treeReads` on a sweep whose every discovery read was
+      // empty, which erases exactly the signal the pair exists to raise; an
+      // unrelated empty lookup distorts it the other way.
+      //
+      // One-shot rather than live on purpose: the concurrency is what makes the
+      // bug real, but a fixed sweep is what makes the arithmetic assertable.
+      // This run serves seven tree reads, and only the two the discovery pass
+      // itself issued may appear in the pair.
+      it('counts only the discovery pass\'s own reads, not every list in the process', async () => {
+        class MixedReadMount extends CountingEventsMount {
+          readonly listed: Array<{ prefix: string; count: number }> = []
+
+          constructor() {
+            super()
+            this.setSubRoot('/linear/issues', 'absent')
+            // Enumeration: one path form exists, the other does not. That empty
+            // read is the ordinary one the pair is designed to tolerate.
+            this.files.set('/github/repos/AgentWorkforce/pear/issues/by-id/1.json', {
+              content: githubIssueFile(1, { labels: ['factory'] }),
+            })
+            // Reached only by the dispatch path's own lookups, never by
+            // discovery — the reads that must stay outside the ratio.
+            this.files.set('/github/repos/AgentWorkforce/pear/pulls/7/metadata.json', {
+              content: prFile(7, { title: 'GitHub factory issue 1', head_ref: 'gh-1', state: 'OPEN' }),
+            })
+          }
+
+          override async listTree(prefix: string): Promise<string[]> {
+            const paths = await super.listTree(prefix)
+            this.listed.push({ prefix, count: paths.length })
+            return paths
+          }
+        }
+
+        const mount = new MixedReadMount()
+        const factory = createFactory(config({ issueSource: 'github' }), {
+          mount,
+          stateStore: new InMemoryStateStore({ batchSize: 2 }),
+          fleet: new FakeFleetClient(),
+          triage: new StaticTriage(),
+          githubWriteback: new RecordingGithubWriteback(),
+          logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        })
+        const report = await factory.runOnce()
+        expect(report.dispatched).toHaveLength(1)
+
+        const isEnumerationRoot = (prefix: string) =>
+          prefix === '/github/repos/AgentWorkforce/pear/issues' ||
+          prefix === '/github/repos/AgentWorkforce__pear/issues'
+        const outsideDiscovery = mount.listed.filter(({ prefix }) => !isEnumerationRoot(prefix))
+
+        // The fixture earns the assertion below: the mount really did serve
+        // reads that were not the discovery pass, and at least one came back
+        // empty — the exact shape that used to inflate `emptyTreeReads`.
+        expect(outsideDiscovery.length).toBeGreaterThanOrEqual(1)
+        expect(outsideDiscovery.some(({ count }) => count === 0)).toBe(true)
+
+        // The discovery pass listed two path forms, one of which exists. That
+        // is the whole ratio; unconditional counting reported 7 and 4 here.
+        expect(report.treeReads).toBe(2)
+        expect(mount.listed.length).toBeGreaterThan(report.treeReads ?? 0)
+        // MUST-NOT-FIRE, the opposite direction: scoping the counters must not
+        // silently stop counting. The enumeration's own empty read is still in
+        // the numerator, so the ordinary case stays visible and a later
+        // all-empty sweep is still distinguishable from this one.
+        expect(report.emptyTreeReads).toBe(1)
+        expect(factory.status().counters.relayfileEmptyTreeReads).toBe(1)
+      }, 20_000)
+
+      it('counts a served-but-empty read so a silent mount is distinguishable', async () => {
+        // Every tree read is served, promptly, with nothing in it.
+        class EmptyTreeMount extends CountingEventsMount {
+          constructor() {
+            super()
+            this.setSubRoot('/linear/issues', 'absent')
+          }
+
+          override async listTree(_prefix: string): Promise<string[]> {
+            return []
+          }
+        }
+
+        const mount = new EmptyTreeMount()
+        const { factory, heartbeatPath, cleanup } = await startEmptyReadFactory(mount)
+        try {
+          await vi.waitFor(() => {
+            const readiness = factory.status().readinessReconcile
+            // The surface an operator reads is green in every existing field...
+            expect(readiness?.state).toBe('healthy')
+            expect(readiness?.consecutiveFailures).toBe(0)
+            expect(readiness?.lastError).toBeUndefined()
+            expect(readiness?.candidates).toBe(0)
+            // ...and this pair is what says why. Not the empty count alone —
+            // an empty read is ordinary; EVERY read empty is the fault.
+            expect(readiness?.treeReads ?? 0).toBeGreaterThanOrEqual(1)
+            expect(readiness?.emptyTreeReads).toBe(readiness?.treeReads)
+          }, { timeout: 5_000 })
+
+          expect(factory.status().counters.relayfileEmptyTreeReads ?? 0)
+            .toBeGreaterThanOrEqual(1)
+
+          // ...and it reaches the ONLY surface a deployed operator can read.
+          // `factory diagnose --deployed` goes to the unauthenticated /healthz
+          // route, which serves this projection of this file — so a pair that
+          // stops at the in-process `status()` object above does not exist
+          // where the fault is met (#363 review, codex P1).
+          await vi.waitFor(async () => {
+            const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+            const published = publicHealthFromHeartbeat(heartbeat!, { nowMs: Date.now() })
+              .readinessReconcile
+            expect(published?.treeReads ?? 0).toBeGreaterThanOrEqual(1)
+            expect(published?.emptyTreeReads).toBe(published?.treeReads)
+          }, { timeout: 5_000 })
+        } finally {
+          await factory.stop()
+          await cleanup()
+        }
+      }, 20_000)
+
+      // The control, and it earned its place: the first version of this signal
+      // was a bare empty-read count, and this test caught it firing on a
+      // perfectly healthy sweep. A healthy sweep lists two path forms per repo
+      // and only one of them exists, so `emptyTreeReads >= 1` is normal and
+      // only the ratio discriminates.
+      it('control: a mount serving content reports zero empty reads', async () => {
+        class PopulatedTreeMount extends CountingEventsMount {
+          constructor() {
+            super()
+            this.setSubRoot('/linear/issues', 'absent')
+            // Present in the tree, but not ready — so `candidates` still lands
+            // at 0 and only `emptyReads` separates this from the case above.
+            this.files.set(
+              '/github/repos/AgentWorkforce/pear/issues/by-id/1.json',
+              { content: { number: 1, title: 'not ready', state: 'open', labels: [] } },
+            )
+          }
+        }
+
+        const mount = new PopulatedTreeMount()
+        const { factory, cleanup } = await startEmptyReadFactory(mount)
+        try {
+          await vi.waitFor(() => {
+            expect(factory.status().readinessReconcile?.lastEnumeratedAtMs).toBeDefined()
+          }, { timeout: 5_000 })
+
+          const readiness = factory.status().readinessReconcile
+          expect(readiness?.state).toBe('healthy')
+          // Content was served, so not every read was empty — which is exactly
+          // the comparison an operator makes against a zero `candidates`.
+          expect(readiness?.treeReads ?? 0).toBeGreaterThanOrEqual(1)
+          expect(readiness?.emptyTreeReads ?? 0).toBeLessThan(readiness?.treeReads ?? 0)
+        } finally {
+          await factory.stop()
+          await cleanup()
+        }
+      }, 20_000)
+    })
 
     // With the real cloud mount the TRANSPORT deadline wins the race by design,
     // and the mount does not know which phase it was serving — so without the

@@ -1132,4 +1132,85 @@ describe('sweep counters on the public surface (#355)', () => {
     expect(JSON.stringify(reread)).not.toContain('workspace-key')
     expect(reread?.readinessReconcile?.dispatchFailureReasons).toEqual({ other: 7 })
   })
+
+  // MUST-FIRE (#363 review, codex P1). The tree-read pair reached the internal
+  // `status()` object and stopped there: `sweepOutcome()` did not read it and
+  // `normalizePublicHealth()` therefore stripped it, so the one surface a
+  // deployed operator can actually reach — the unauthenticated `/healthz`
+  // route behind `factory diagnose --deployed` — still could not tell a mount
+  // serving nothing from a workspace with nothing ready. That is the whole
+  // fault the pair was added for, on the only instance where it is met.
+  it('carries the tree-read pair onto the unauthenticated surface, and back off it', () => {
+    const silentMount = swept({
+      candidates: 0,
+      dispatched: 0,
+      skipped: 0,
+      treeReads: 3,
+      emptyTreeReads: 3,
+    })
+    expect(silentMount?.treeReads).toBe(3)
+    expect(silentMount?.emptyTreeReads).toBe(3)
+
+    // And survives the round trip a remote reader makes: the container serves
+    // this block inside its heartbeat and `diagnose --deployed` re-parses it.
+    const reread = normalizePublicHealth({
+      schemaVersion: FACTORY_PUBLIC_HEALTH_SCHEMA_VERSION,
+      ok: true,
+      status: 'ok',
+      stale: false,
+      degradedSubsystems: [],
+      readinessReconcile: silentMount,
+    })
+    expect(reread?.readinessReconcile?.treeReads).toBe(3)
+    expect(reread?.readinessReconcile?.emptyTreeReads).toBe(3)
+
+    // The reading that separates the two zero-candidate diagnoses survives too.
+    const emptyWorkspace = swept({
+      candidates: 0,
+      dispatched: 0,
+      skipped: 0,
+      treeReads: 3,
+      emptyTreeReads: 1,
+    })
+    expect(emptyWorkspace?.emptyTreeReads).toBeLessThan(emptyWorkspace?.treeReads ?? 0)
+  })
+
+  // MUST-NOT-FIRE. Half a pair is worse than no pair: `emptyTreeReads` alone
+  // reads as "the mount is sick" on a sweep where an empty read is ordinary,
+  // and `treeReads` alone says nothing about what came back. A zero pair is a
+  // real measurement and must NOT collapse to an absence, and a producer that
+  // has never heard of the fields must keep the trio it does publish.
+  it('publishes the pair whole, or not at all', () => {
+    // A sweep that issued no enumerating read at all: zeroes, not absences.
+    const noReads = swept({ candidates: 0, dispatched: 0, skipped: 0, treeReads: 0, emptyTreeReads: 0 })
+    expect(noReads?.treeReads).toBe(0)
+    expect(Object.hasOwn(noReads ?? {}, 'emptyTreeReads')).toBe(true)
+
+    // Half a pair from a producer we do not understand: both go.
+    const halfPair = swept({ candidates: 0, dispatched: 0, skipped: 0, treeReads: 4 })
+    expect(Object.hasOwn(halfPair ?? {}, 'treeReads')).toBe(false)
+    expect(Object.hasOwn(halfPair ?? {}, 'emptyTreeReads')).toBe(false)
+    // ...and the trio it DID publish is untouched, which is the whole reason
+    // this pair is not joined to it.
+    expect(halfPair).toMatchObject({ candidates: 0, dispatched: 0, skipped: 0 })
+
+    // Arithmetically impossible: more empty reads than reads. Publishing the
+    // ratio anyway would hand a reader a fabricated silent-mount verdict.
+    const impossible = swept({ candidates: 0, dispatched: 0, skipped: 0, treeReads: 2, emptyTreeReads: 3 })
+    expect(Object.hasOwn(impossible ?? {}, 'treeReads')).toBe(false)
+    expect(Object.hasOwn(impossible ?? {}, 'emptyTreeReads')).toBe(false)
+
+    // Unusable numbers, and a producer that predates the pair entirely.
+    const rubbish = swept({
+      candidates: 0,
+      dispatched: 0,
+      skipped: 0,
+      treeReads: Number.NaN as unknown as number,
+      emptyTreeReads: -1,
+    })
+    expect(Object.hasOwn(rubbish ?? {}, 'treeReads')).toBe(false)
+    const olderProducer = swept({ candidates: 4, dispatched: 4, skipped: 0 })
+    expect(Object.hasOwn(olderProducer ?? {}, 'treeReads')).toBe(false)
+    expect(olderProducer).toMatchObject({ candidates: 4, dispatched: 4, skipped: 0 })
+  })
 })

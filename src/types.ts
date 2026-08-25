@@ -258,6 +258,22 @@ export interface FactoryReadinessReconcileStatus {
    * nobody yet.
    */
   candidates?: number
+  /**
+   * Tree reads the last enumerating sweep made, and how many were served empty
+   * (#351 follow-up).
+   *
+   * Read as a pair, against `candidates`. An empty read on its own is ordinary
+   * — a healthy sweep lists two path forms per repo and only one exists. The
+   * fault is `emptyTreeReads === treeReads` with `treeReads > 0`: the mount
+   * served nothing at all, which raises no timeout, no failure and no
+   * `lastError`, and is otherwise indistinguishable on a `healthy` surface from
+   * a workspace that simply has no ready work.
+   *
+   * Optional and never defaulted, like `candidates`: absent means no sweep has
+   * enumerated *or* the producer predates the fields.
+   */
+  treeReads?: number
+  emptyTreeReads?: number
   /** Work units the last enumerating sweep actually dispatched. */
   dispatched?: number
   /** Work units the last enumerating sweep saw and declined. */
@@ -357,6 +373,25 @@ export interface FactoryPublicReadinessReconcileHealth {
    */
   dispatchFailures?: number
   dispatchFailureReasons?: Partial<Record<FactoryDispatchFailureReasonCode, number>>
+  /**
+   * Tree reads the last enumerating sweep made, and how many came back empty
+   * (#351 follow-up; #363 review, codex P1).
+   *
+   * The counterpart of `FactoryReadinessReconcileStatus.treeReads` on the
+   * UNAUTHENTICATED surface, which is where `factory diagnose --deployed`
+   * reads it — the fault this pair exists to name is one an operator only ever
+   * meets on a deployed instance, so a signal that stops at the internal
+   * `status()` object does not exist where it is needed.
+   *
+   * Counts only, and a pair: published together or not at all, because
+   * `emptyTreeReads` alone is not a signal (a healthy sweep lists two path
+   * forms per repo and only one exists) and `treeReads` alone says nothing.
+   * The fault is `emptyTreeReads === treeReads` with `treeReads > 0` beside a
+   * zero `candidates`: the mount served nothing at all, rather than the
+   * workspace having no ready work.
+   */
+  treeReads?: number
+  emptyTreeReads?: number
   /**
    * When the pass the counts describe finished enumerating. Dates them —
    * `lastCompletedAtMs` does not, since it advances on deferred passes too.
@@ -707,6 +742,17 @@ export interface IterationReport {
    * sweep tried to build the context and could not.
    */
   orphanRecoveryDegraded?: 'dry-run' | 'context-unavailable'
+  /**
+   * Tree reads this sweep issued that the backend served, and how many of them
+   * came back with zero entries (#351 follow-up).
+   *
+   * The companion to the per-call timeout: a bounded read that hangs is loud, a
+   * bounded read served with nothing is not, and both end in a sweep that
+   * dispatches nothing. Meaningful only as a pair — an empty read is ordinary,
+   * `emptyTreeReads === treeReads` is the mount serving nothing at all.
+   */
+  treeReads?: number
+  emptyTreeReads?: number
   /** A cross-process owner was already enumerating this workspace. */
   discoveryDeferred?: 'sweep-in-flight'
   error?: { message: string; stack?: string }
