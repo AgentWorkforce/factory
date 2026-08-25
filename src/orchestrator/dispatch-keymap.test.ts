@@ -36,7 +36,9 @@ const KEY_FNS = new Set([
   'issueStateKey',
   'trackerKey',
 ])
-const ACCESSORS = new Set(['get', 'set', 'has', 'delete'])
+// `add` included so a `Set` written under one key function and tested under
+// another is caught too, not just a `Map` (#369 review, CodeRabbit).
+const ACCESSORS = new Set(['get', 'set', 'has', 'delete', 'add'])
 
 // Fields resolved on the current file. A refactor may legitimately move this
 // number; a collapse towards zero means the scan stopped seeing its subject.
@@ -93,7 +95,17 @@ const analyse = (filePath: string): {
     let scoped = scopes
     if (ts.isFunctionLike(node)) scoped = [...scopes, new Map<string, string>()]
 
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+    // `const` only. A `let`/`var` can be reassigned after its initializer, and
+    // this scan does not track assignments — carrying the initializer's key
+    // function past a reassignment would let it vouch for a binding that no
+    // longer holds that key, hiding a genuine mismatch (#369 review,
+    // CodeRabbit).
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      ts.isVariableDeclarationList(node.parent) &&
+      (node.parent.flags & ts.NodeFlags.Const) !== 0
+    ) {
       const keyFn = classify(node.initializer, scoped)
       if (keyFn) scoped[scoped.length - 1]!.set(node.name.text, keyFn)
     }
