@@ -31583,3 +31583,155 @@ describe('changeEventPath (resource-less event tolerance)', () => {
     expect(changeEventPath({ resource: { path: 123 } } as unknown as ChangeEvent)).toBeUndefined()
   })
 })
+
+/**
+ * The release retry loop (#379).
+ *
+ * Production on 0.1.76 logged the same three `no pid available to terminate
+ * ... during completion` lines over and over inside one evidence payload. The
+ * missing PID is a co-symptom, not the cause: `#terminationRoots` returning
+ * `unresolved` only logs, and never reaches `failed[]`. What repeated was the
+ * whole completion release, once a second, indefinitely, because
+ * `#finishDurableRelease` returns `false` on a failed release and re-arms
+ * itself at `DISPATCH_LIFECYCLE_RETRY_MS` — through the RESOLVED path, which
+ * is why no `.catch()` in either scheduler ever bounded it.
+ *
+ * Each pass costs a `#terminationRoots` process scan per agent in the release
+ * and another per agent in `#writeInFlightRegistry`, plus a durable read and
+ * write. That is the same serialized-store spin #303 already measured once, at
+ * 1477 state GETs in 111 s.
+ */
+class CompletionReleaseFailingFleetClient extends FakeFleetClient {
+  readonly releaseAttempts: Array<{ name: string; reason?: string }> = []
+  failReleases = true
+  /**
+   * Fail exactly this many completion releases and then succeed. Set instead of
+   * flipping `failReleases` from the test body, so the transient case does not
+   * race the retry cadence it is running under.
+   */
+  remainingFailures?: number
+
+  override async release(name: string, reason?: string): Promise<void> {
+    this.releaseAttempts.push({ name, reason })
+    if (reason === 'issue-done') {
+      if (this.remainingFailures !== undefined) {
+        if (this.remainingFailures > 0) {
+          this.remainingFailures -= 1
+          throw new Error(`control plane unavailable for ${name}`)
+        }
+      } else if (this.failReleases) {
+        throw new Error(`control plane unavailable for ${name}`)
+      }
+    }
+    await super.release(name, reason)
+  }
+
+  /** Reproduces the production shape: no PID resolves for any agent. */
+  async resolveAgentPid(_name: string): Promise<{ status: 'unresolved' }> {
+    return { status: 'unresolved' }
+  }
+}
+
+describe('completion release retry budget (#379)', () => {
+  const completionReleases = (fleet: CompletionReleaseFailingFleetClient) =>
+    fleet.releaseAttempts.filter((attempt) => attempt.reason === 'issue-done')
+
+  // The production floor is 1 s, so exhausting the budget honestly would cost
+  // ten real seconds per case. The cadence is a test-only port override for the
+  // same reason `babysitterWakeUnreachableRetryMs` is: this suite already
+  // carries flakes (#342, #373) and a slower file is how a fourth is bought.
+  // The BUDGET under test is the real one; only the delay between attempts moves.
+  const RETRY_MS = 5
+
+  it('stops re-arming a completion release that never succeeds, instead of spinning at 1 Hz forever', async () => {
+    const mount = new FakeMountClient({ [issuePath(70)]: issueFile(70) })
+    const fleet = new CompletionReleaseFailingFleetClient()
+    const errors: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      logger: { warn: () => undefined, error: (...args: unknown[]) => errors.push(args) },
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-70-impl-pear', 'issue-done')
+
+    // Against `origin/main` this never arrives: the loop re-arms for as long as
+    // the process lives, so the wait can only end in its own deadline. That is
+    // the fail-first, and it is a property of the loop rather than of any
+    // number chosen here.
+    await vi.waitFor(
+      () => expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
+      { timeout: 10_000, interval: 5 },
+    )
+    expect(errors.map(([message]) => message)).toContain(
+      '[factory] release retries exhausted; abandoning cleanup for this work unit',
+    )
+
+    // Time is what the unbounded loop turns into work, so the decisive
+    // assertion is that MORE time buys no further attempts — here, 100 further
+    // re-arm windows' worth.
+    const bounded = completionReleases(fleet).length
+    await new Promise((resolve) => setTimeout(resolve, RETRY_MS * 100))
+    expect(completionReleases(fleet).length).toBe(bounded)
+  }, 20_000)
+
+  /**
+   * The trivially wrong way to stop a retry loop is to stop retrying. A
+   * release that succeeds must still complete the work unit, and must not
+   * leave the dead-letter counter set.
+   */
+  it('does not bound a completion release that succeeds', async () => {
+    const mount = new FakeMountClient({ [issuePath(71)]: issueFile(71) })
+    const fleet = new CompletionReleaseFailingFleetClient()
+    fleet.failReleases = false
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      logger: {},
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-71-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 10_000, interval: 5 })
+
+    expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBeUndefined()
+    // Each agent released exactly once: no retry, and no duplicate release.
+    const names = completionReleases(fleet).map((attempt) => attempt.name)
+    expect(names.length).toBe(new Set(names).size)
+    expect(names).toEqual(['ar-71-impl-pear', 'ar-71-review'])
+  }, 30_000)
+
+  /**
+   * A transient failure is what the retry exists for and must still be
+   * recovered from: the budget bounds CONSECUTIVE failures, not the lifetime
+   * of a work unit that gets there in the end.
+   */
+  it('still completes a release that fails a few times and then succeeds', async () => {
+    const mount = new FakeMountClient({ [issuePath(72)]: issueFile(72) })
+    const fleet = new CompletionReleaseFailingFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      logger: {},
+    })
+
+    // Three failures, then success — well inside the ten-attempt budget.
+    fleet.remainingFailures = 3
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-72-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 10_000, interval: 5 })
+
+    // It genuinely retried rather than succeeding first time...
+    expect(completionReleases(fleet).length).toBeGreaterThan(2)
+    // ...and the budget never tripped.
+    expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBeUndefined()
+  }, 20_000)
+})

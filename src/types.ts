@@ -62,6 +62,12 @@ export interface FactoryPorts {
    * active in the background. Test-only override of the built-in default.
    */
   startupAgentExitDrainTimeoutMs?: number
+  /**
+   * Re-arm delay for the dispatch-lifecycle and completion-release retries.
+   * Test-only override of the built-in 1 s floor, so a suite can exercise the
+   * release retry budget without spending ten real seconds waiting for it.
+   */
+  dispatchLifecycleRetryMs?: number
   relayflows?: FactoryRelayflowDispatchPort
   /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
   worktrees?: AgentWorktreeManager
