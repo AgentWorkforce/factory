@@ -15523,6 +15523,20 @@ describe('FactoryLoop', () => {
   // took neither: the subsystem reported `healthy` with zero failures while
   // dispatching nothing, and only a process restart recovered it.
   describe('bounded readiness reconciliation', () => {
+    /**
+     * Selects the pre-#372 backstop these assertions are about.
+     *
+     * The aggregate sweep budget aborts a wedged sweep at or before the
+     * readiness deadline, so at its default there IS no abandoned-but-still-
+     * running sweep left for this block to observe — which is the fix, covered
+     * in `sweep-budget.test.ts`. What survives underneath it is what this block
+     * has always tested: the #296/#301 abandoned-wait accounting, which is
+     * still the behaviour when the budget is disabled, and still the shape a
+     * sweep degrades to if a future teardown path cannot be abandoned. `0`
+     * disables the budget, the same idiom #368 used for its own control.
+     */
+    const NO_SWEEP_BUDGET = { sweepBudgetMs: 0 } as const
+
     class HangingDiscoveryStateStore extends InMemoryStateStore {
       hangClaims = false
       readonly hangStarted: Promise<void>
@@ -15576,7 +15590,7 @@ describe('FactoryLoop', () => {
 
       await factory.start({
         mode: 'live',
-        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50, reconcileTimeoutMs: 300 },
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50, reconcileTimeoutMs: 300, ...NO_SWEEP_BUDGET },
       })
       try {
         stateStore.hangClaims = true
@@ -16134,7 +16148,7 @@ describe('FactoryLoop', () => {
 
       await factory.start({
         mode: 'live',
-        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 300, reconcileTimeoutMs: 300 },
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 300, reconcileTimeoutMs: 300, ...NO_SWEEP_BUDGET },
       })
       let stopped = false
       let stopping: Promise<void> | undefined
@@ -16182,7 +16196,7 @@ describe('FactoryLoop', () => {
       // possible by carrying the abandoned sweep's own start time.
       await factory.start({
         mode: 'live',
-        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 400, reconcileTimeoutMs: 1_000 },
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 400, reconcileTimeoutMs: 1_000, ...NO_SWEEP_BUDGET },
       })
       try {
         stateStore.hangClaims = true
@@ -16221,7 +16235,7 @@ describe('FactoryLoop', () => {
 
       await factory.start({
         mode: 'live',
-        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 400, reconcileTimeoutMs: 400 },
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 400, reconcileTimeoutMs: 400, ...NO_SWEEP_BUDGET },
       })
       try {
         stateStore.hangClaims = true
@@ -16262,7 +16276,7 @@ describe('FactoryLoop', () => {
 
       await factory.start({
         mode: 'live',
-        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 300, reconcileTimeoutMs: 300 },
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 300, reconcileTimeoutMs: 300, ...NO_SWEEP_BUDGET },
       })
       try {
         stateStore.hangClaims = true
@@ -16307,7 +16321,7 @@ describe('FactoryLoop', () => {
 
       await factory.start({
         mode: 'live',
-        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 300, reconcileTimeoutMs: 300 },
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 300, reconcileTimeoutMs: 300, ...NO_SWEEP_BUDGET },
       })
       let stopped = false
       let stopping: Promise<void> | undefined
@@ -16370,7 +16384,7 @@ describe('FactoryLoop', () => {
 
       await factory.start({
         mode: 'live',
-        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 100, reconcileTimeoutMs: 200 },
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 100, reconcileTimeoutMs: 200, ...NO_SWEEP_BUDGET },
       })
       try {
         stateStore.hangClaims = true

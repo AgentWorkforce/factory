@@ -276,13 +276,24 @@ class StaticTriage implements TriageEngine {
  */
 class HangingWatermarkMount extends FakeMountClient {
   hang = true
+  /**
+   * How many watermark reads to serve before hanging.
+   *
+   * `#startLiveSubscription` reads the watermark once itself, BEFORE the
+   * startup backfill and outside the sweep — that read is bounded by the
+   * per-call relayfile deadline, not by this budget. Serving it is what puts
+   * the hang inside the sweep, which is the subject here.
+   */
+  serveFirst = 0
+  served = 0
   hungCalls = 0
 
   override async getEventHighWatermark(opts: { provider?: string } = {}): Promise<string | undefined> {
-    if (this.hang) {
+    if (this.hang && this.served >= this.serveFirst) {
       this.hungCalls += 1
       return await NEVER()
     }
+    this.served += 1
     return await super.getEventHighWatermark(opts)
   }
 }
@@ -340,6 +351,38 @@ describe('a wedged sweep is bounded end to end (#372)', () => {
       expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-901-impl-pear', 'ar-901-review'])
     } finally {
       await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('must-fire: a live daemon whose sweep is wedged still shuts down, because nothing is left in flight', async () => {
+    // The counterpart to the #296/#301 abandoned-wait tests, which assert that
+    // `stop()` must NOT complete while a sweep abandoned by the readiness
+    // deadline is still running. That state is real, and it is exactly what
+    // held the deployed daemon: the sweep outlives every wait on it. With the
+    // budget it cannot happen — the sweep is aborted, not abandoned — so
+    // shutdown has nothing to drain.
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-budget-stop-'))
+    const mount = new HangingWatermarkMount({ [issuePath(901)]: issueFile(901) })
+    mount.serveFirst = 1
+    const factory = createFactory(config(200, root), {
+      mount,
+      fleet: new FakeFleetClient(),
+      stateStore: new LeaseWatchingStateStore({ batchSize: 4 }),
+      triage: new StaticTriage(),
+      logger: {},
+    })
+    try {
+      // The startup backfill is a discovery pass like any other and wedges on
+      // the same call. Before this change `start()` itself never returns.
+      await withDeadline(factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50, reconcileTimeoutMs: 60_000 },
+      }), 4_000, 'start never returned')
+      expect(mount.hungCalls).toBeGreaterThan(0)
+      await withDeadline(factory.stop(), 4_000, 'stop never completed')
+    } finally {
+      await factory.stop().catch(() => undefined)
       await rm(root, { recursive: true, force: true })
     }
   })
