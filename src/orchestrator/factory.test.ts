@@ -515,6 +515,30 @@ class StaticTriage implements TriageEngine {
   }
 }
 
+/**
+ * Triage that routes somewhere the ISSUE ITSELF gives no evidence of — the
+ * shape `keywordRules` produces, where the repository is chosen from the issue
+ * text rather than from a label or project. Probe routing cannot see this
+ * decision, which is exactly why it must not guess.
+ */
+class KeywordRoutedTriage extends StaticTriage {
+  constructor(private readonly repo: string, private readonly clonePath: string) {
+    super()
+  }
+
+  override async triage(issue: LinearIssue): Promise<TriageDecision> {
+    const base = await super.triage(issue)
+    return {
+      ...base,
+      routes: [{ repo: this.repo, clonePath: this.clonePath, rationale: 'keyword route' }],
+      implementers: base.implementers.map((spec) => ({ ...spec, repo: this.repo, clonePath: this.clonePath })),
+      reviewer: base.reviewer
+        ? { ...base.reviewer, repo: this.repo, clonePath: this.clonePath }
+        : base.reviewer,
+    }
+  }
+}
+
 class ThrowOnceTriage extends StaticTriage {
   #failed = false
 
@@ -20865,6 +20889,58 @@ describe('FactoryLoop', () => {
     expect(probePrRecordReads(mount)).toHaveLength(2)
     expect(factory.status().counters.probePrMountReads).toBe(2)
     expect(factory.status().counters.mergeGateSyntheticClosed).toBe(1)
+  })
+
+  it('walks unscoped rather than scoping a keyword-routed probe to repos.default', async () => {
+    // Routing precedence is byLabel, byProject, keywordRules, default. A
+    // keyword-routed issue carries no label or project evidence of its repo —
+    // triage picked citrus by matching the issue TEXT — and the probe's routing
+    // helper can see neither the triage decision nor `keywordRules`. Falling
+    // through to `repos.default` would scope the walk to pear and miss a PR that
+    // really exists in citrus. A mis-scoped probe is WRONG where an unscoped one
+    // is merely slow, so ambiguity must widen the walk, never narrow it.
+    const keywordRoutedIssue = realIssueFile(705, ready, { labels: [] })
+    const mount = new FakeMountClient({
+      [issuePath(705)]: keywordRoutedIssue,
+      // The PR dispatch actually opened, in the keyword-selected repository —
+      // NOT in `repos.default`.
+      '/github/repos/AgentWorkforce__citrus/pulls/by-id/705.json': prFile(705, {
+        title: 'AR-705 work',
+        body: '',
+        head_ref: 'factory/ar-705-work',
+        state: 'OPEN',
+      }),
+    })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(
+      config({
+        repos: {
+          byLabel: { pear: 'AgentWorkforce/pear', citrus: 'AgentWorkforce/citrus' },
+          byProject: {},
+          keywordRules: [{ pattern: 'factory issue 705', repo: 'AgentWorkforce/citrus' }],
+          clonePaths: { 'AgentWorkforce/pear': '/work/pear', 'AgentWorkforce/citrus': '/work/citrus' },
+          default: 'AgentWorkforce/pear',
+        },
+      }),
+      {
+        mount,
+        fleet,
+        triage: new KeywordRoutedTriage('AgentWorkforce/citrus', '/work/citrus'),
+        linear: probeLinearWriteback,
+        probeCloser: async (input) => ({ repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }),
+      },
+    )
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(705), keywordRoutedIssue)))
+    const implementer = fleet.spawns.find((spawn) => spawn.name.includes('impl'))
+    expect(implementer).toBeDefined()
+    fleet.emitAgentExit(implementer!.name, 'issue-done')
+    await flush()
+
+    // The PR is found and closed, which can only happen if the walk reached
+    // citrus at all.
+    expect(factory.status().counters.mergeGateSyntheticClosed).toBe(1)
+    expect(probePrRecordReads(mount).some((path) => path.includes('citrus'))).toBe(true)
   })
 
   it('does not treat a factory label as a synthetic probe marker', async () => {

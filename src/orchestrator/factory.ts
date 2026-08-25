@@ -2750,7 +2750,14 @@ export class FactoryLoop implements Factory {
             }
             if (pr.draft) {
               this.#increment('completionSweepDraftPr')
-              this.#probePrGhBackoffUntilMs.set(issueStateKey(issueRef(issue)), this.#clock.now() + PROBE_PR_GH_BACKOFF_MS)
+              // Must match the key `#completionPrForIssue` resolves under —
+              // same options, same repo scope — or this backoff is written
+              // under a name nothing reads and the draft PR is re-fetched from
+              // gh on every pass.
+              this.#probePrGhBackoffUntilMs.set(
+                this.#probePrCacheKey(issue, { repo: this.#probeRepoForIssue(issue) }),
+                this.#clock.now() + PROBE_PR_GH_BACKOFF_MS,
+              )
               return undefined
             }
             if (record.decision.implementers.length > 1 && !await this.#allImplementersHaveCompletionPr(record)) {
@@ -3018,9 +3025,47 @@ export class FactoryLoop implements Factory {
    * several routes, an issue whose labels match no single repo). The walk then
    * stays unscoped, exactly as before: narrowing on a guess would silently fail
    * to find a PR that is really there, which is worse than a slow walk.
+   *
+   * `allowDefault: false` is the whole point of this wrapper. Routing precedence
+   * is byLabel, byProject, keywordRules, default, and `dependencyRepoForIssue`
+   * can see neither the triage decision nor `keywordRules`. Left to its own
+   * fallback it answers `repos.default` for every keyword-routed issue, while
+   * dispatch opened that PR in the keyword-selected repository — so the probe
+   * would walk one repository, confidently, and find nothing. Reporting "no PR"
+   * for an issue that has one is a correctness bug; the unscoped walk it falls
+   * back to instead is merely slow, and the dedupe and cache in this same change
+   * already blunt that cost.
    */
   #probeRepoForIssue(issue: LinearIssue): string | undefined {
-    return dependencyRepoForIssue(issue, undefined, this.#config)
+    return dependencyRepoForIssue(issue, undefined, this.#config, { allowDefault: false })
+  }
+
+  /**
+   * The key for BOTH `#probePrResolvedCache` and `#probePrGhBackoffUntilMs`.
+   *
+   * Shared rather than inlined because those two maps are written from more than
+   * one place: `#resolveIssuePr` writes both, and the completion sweep writes a
+   * draft-PR backoff directly. Those writes must agree on the key or the backoff
+   * is set under a name nothing reads, which silently costs a gh call per pass.
+   *
+   * `repo` is part of the key because it narrows which pull requests the
+   * resolution can even see — an issue whose route changes must not be served
+   * the previous repository's PR, or held off gh by the previous repository's
+   * negative backoff, because the completion path probes and CLOSES what this
+   * returns. `*` marks the unscoped walk, a genuinely different resolution that
+   * must not share an entry with any single-repo one.
+   *
+   * Every dimension is a trailing `:`-prefixed segment so the completion
+   * invalidation — which clears `stateKey` plus everything starting
+   * `${stateKey}:` — keeps clearing the whole family as the key grows.
+   */
+  #probePrCacheKey(
+    issue: LinearIssue,
+    opts: { openOnly?: boolean; allowLegacyGithubBranch?: boolean; repo?: string } = {},
+  ): string {
+    const issueKey = issueStateKey(issueRef(issue))
+    const repoScope = opts.repo ? opts.repo.trim().toLowerCase() : '*'
+    return `${opts.openOnly ? `${issueKey}:open` : issueKey}${opts.allowLegacyGithubBranch ? ':legacy' : ''}:repo=${repoScope}`
   }
 
   async #resolveIssuePr(
@@ -3034,8 +3079,7 @@ export class FactoryLoop implements Factory {
       repo?: string
     } = {},
   ): Promise<ResolvedIssuePr | undefined> {
-    const issueKey = issueStateKey(issueRef(issue))
-    const key = `${opts.openOnly ? `${issueKey}:open` : issueKey}${opts.allowLegacyGithubBranch ? ':legacy' : ''}`
+    const key = this.#probePrCacheKey(issue, opts)
     const now = this.#clock.now()
     const cached = this.#probePrResolvedCache.get(key)
     if (cached && cached.expiresAtMs > now) {
@@ -19495,6 +19539,7 @@ function dependencyRepoForIssue(
   issue: LinearIssue,
   decision: TriageDecision | undefined,
   config: FactoryConfig,
+  opts: { allowDefault?: boolean } = {},
 ): string | undefined {
   const source = githubIssueSourceRef(issue)
   if (source) return `${source.owner}/${source.repo}`
@@ -19531,7 +19576,18 @@ function dependencyRepoForIssue(
     ? Object.entries(config.repos.byProject)
       .find(([project]) => project.trim().toLowerCase() === issue.project!.trim().toLowerCase())?.[1]
     : undefined
-  return normalize(projectRepo) ?? normalize(config.repos.default)
+  const projectResolved = normalize(projectRepo)
+  if (projectResolved) return projectResolved
+  // `repos.default` is a DISPATCH fallback, not evidence of where a PR already
+  // lives. Routing precedence is byLabel, byProject, keywordRules, default —
+  // and this helper cannot see `keywordRules` at all, because those match on
+  // title/description through triage rather than on the issue's own fields. So
+  // for a keyword-routed issue the default answer here is confidently wrong:
+  // dispatch opened the PR in the keyword-selected repository, not in
+  // `repos.default`. Callers that only need a dispatch target still want that
+  // fallback; a PROBE must not have it, because a mis-scoped probe reports "no
+  // PR" for an issue that has one, which is worse than a slow unscoped walk.
+  return opts.allowDefault === false ? undefined : normalize(config.repos.default)
 }
 
 function dependencyIdentityForIssue(issue: LinearIssue, repo: string | undefined): string | undefined {
