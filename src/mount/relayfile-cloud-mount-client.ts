@@ -1013,9 +1013,29 @@ export class RelayfileCloudMountClient implements MountClient {
     })
   }
 
+  /**
+   * The change-log tail read, under the same per-call deadline as every other
+   * relayfile read (#351 follow-up).
+   *
+   * `listLastNChanges` takes a `ProactiveRequestContext` with no `signal`
+   * field, so this one cannot be cancelled at the transport and is bounded by
+   * `withRelayfileCallDeadline`'s race instead — the abandoned-wait backstop
+   * that module documents for mounts which cannot honour a signal. That is
+   * weaker than `listTree`'s cancellation (the socket and the SDK's retry loop
+   * stay live) but it is the half that matters here: the rejection unwinds the
+   * sweep, which releases the discovery lease, so the next cycle starts clean
+   * instead of coalescing onto a wedged `runOnce()`.
+   */
+  #boundedListLastNChanges(limit: number): Promise<{ events: ChangeEvent[] }> {
+    const listLastNChanges = this.#client.listLastNChanges
+    if (!listLastNChanges) throw new Error('relayfile client cannot list recent changes')
+    return this.#bounded('listLastNChanges', this.#operationTimeoutMs, () =>
+      listLastNChanges.call(this.#client, limit, { workspaceId: this.workspaceId }))
+  }
+
   async getEvents(opts: { cursor?: string; limit?: number; provider?: string; last?: number }): Promise<EventPage> {
     if (opts.last !== undefined && this.#client.listLastNChanges) {
-      const response = await this.#client.listLastNChanges(opts.last, { workspaceId: this.workspaceId })
+      const response = await this.#boundedListLastNChanges(opts.last)
       const events = opts.provider
         ? response.events.filter((event) => eventProvider(event) === opts.provider)
         : response.events
@@ -1024,7 +1044,8 @@ export class RelayfileCloudMountClient implements MountClient {
         nextCursor: null,
       }
     }
-    const response = await this.#client.getEvents(this.workspaceId, opts)
+    const response = await this.#bounded('getEvents', this.#operationTimeoutMs, (signal) =>
+      this.#client.getEvents(this.workspaceId, { ...opts, ...(signal ? { signal } : {}) }))
     return {
       events: response.events as unknown as EventPage['events'],
       nextCursor: response.nextCursor,
@@ -1033,7 +1054,7 @@ export class RelayfileCloudMountClient implements MountClient {
 
   async getEventHighWatermark(opts: { provider?: string } = {}): Promise<string | undefined> {
     if (!this.#client.listLastNChanges) return undefined
-    const response = await this.#client.listLastNChanges(10, { workspaceId: this.workspaceId })
+    const response = await this.#boundedListLastNChanges(10)
     const events = opts.provider
       ? response.events.filter((event) => event.resource.provider === opts.provider)
       : response.events
