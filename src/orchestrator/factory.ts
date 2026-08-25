@@ -5004,12 +5004,18 @@ export class FactoryLoop implements Factory {
   }
 
   /**
-   * Is a `dispatch()` call for this work unit running in this process right now?
+   * Is a `dispatch()` call that could own this work unit's durable lifecycle
+   * running in this process right now?
    *
-   * `#dispatchInFlight` is keyed by work unit *plus* the dry-run and phase the
-   * call was made under, so membership is a prefix match on the same
-   * provider-neutral identity — the shape `stop()` already uses to find the
-   * dispatches a claim fence belongs to.
+   * `#dispatchInFlight` is keyed by work unit *plus* the dry-run flag and phase
+   * the call was made under, so this must be built from the same three parts
+   * `dispatch()` writes rather than from the bare identity.
+   *
+   * Only the live dispatch phase qualifies. A dry run never claims a lifecycle
+   * at all (`durableDispatch` is `!dryRun && …`), and an escalation returns from
+   * `#dispatchUnlocked` before one is created — so matching those would preserve
+   * a genuinely orphaned claim for a call that cannot own it (#369 review,
+   * codex).
    *
    * #367: this was `#dispatchInFlight.has(issueKey(issue))`, which no key in
    * the map can ever equal. `issueKey` is `<key>:<uuid>:<path>`, while every
@@ -5018,11 +5024,7 @@ export class FactoryLoop implements Factory {
    * as abandoned while its own dispatch was still mid-flight.
    */
   #hasDispatchCallInFlight(issue: IssueRef): boolean {
-    const prefix = `${dispatchLifecycleKey(issue)}:`
-    for (const key of this.#dispatchInFlight.keys()) {
-      if (key.startsWith(prefix)) return true
-    }
-    return false
+    return this.#dispatchInFlight.has(`${dispatchLifecycleKey(issue)}:live:dispatch`)
   }
 
   async #dispatchUnlocked(decision: TriageDecision, opts: { dryRun?: boolean; labelsValidated?: boolean } = {}): Promise<DispatchResult> {
