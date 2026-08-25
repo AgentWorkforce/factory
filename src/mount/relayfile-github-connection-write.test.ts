@@ -16,6 +16,19 @@ const gitRunnerForBranch = (branch: string): GitCommandRunner => vi.fn(async (ar
 })
 
 describe('RelayfileGithubConnectionWrite', () => {
+  it('reads a private issue through the authenticated connected projection', async () => {
+    const path = '/github/repos/PrivateOrg__private-repo/issues/by-id/42.json'
+    const content = { payload: { number: 42, labels: [{ name: 'factory:human-review' }] } }
+    const write = new RelayfileGithubConnectionWrite({
+      mount: new FakeMountClient({ [path]: content }),
+    })
+
+    await expect(write.getIssue('PrivateOrg/private-repo', 42)).resolves.toEqual({
+      outcome: 'found',
+      issue: { repo: 'PrivateOrg/private-repo', number: 42, path, content },
+    })
+  })
+
   it('publishes an already-pushed remote branch without reading an orchestrator-local clone', async () => {
     const pullRequestPath = '/github/repos/AgentWorkforce/factory/pull-requests/factory-factory-ar-85-agentworkforce-factory-pushed.json'
     class ReceiptMount extends FakeMountClient {
@@ -234,20 +247,23 @@ describe('RelayfileGithubConnectionWrite', () => {
       description: 'Factory agents are working on this issue.',
       author: 'app',
     })
-    await write.mutateIssueLabel({
+    const addReceipt = await write.mutateIssueLabel({
       repo: 'AgentWorkforce/factory',
       number: 221,
       operation: 'add',
       label: 'factory:in-progress',
       author: 'app',
     })
-    await write.mutateIssueLabel({
+    const removeReceipt = await write.mutateIssueLabel({
       repo: 'AgentWorkforce/factory',
       number: 221,
       operation: 'remove',
       label: 'factory:human-review',
       author: 'app',
     })
+
+    expect(addReceipt).toBe('acknowledged')
+    expect(removeReceipt).toBe('acknowledged')
 
     expect(mount.writes).toEqual([
       {

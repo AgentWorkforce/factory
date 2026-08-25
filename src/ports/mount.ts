@@ -137,6 +137,8 @@ export interface FactoryIntegrationConnections {
  * writeback drafts interpreted by the server-side GitHub adapter.
  */
 export interface GithubConnectionWrite {
+  /** Authenticated issue read through the same connected GitHub App, when supported. */
+  getIssue?(repo: string, number: number): Promise<GithubIssueLookup>
   publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult>
   closePullRequest(input: { repo: string; number: number }): Promise<void>
   /** App-authored issue comment through the workspace GitHub connection. */
@@ -161,10 +163,13 @@ export interface GithubConnectionWrite {
     operation: 'add' | 'remove'
     label: string
     author: 'app'
-  }): Promise<void>
+  }): Promise<GithubConnectionMutationReceipt | void>
   /** App-authored partial issue update through the workspace GitHub connection. */
   updateIssue?(input: GithubConnectionIssueUpdateInput): Promise<void>
 }
+
+/** Whether a connected App mutation proves it created the visible change. */
+export type GithubConnectionMutationReceipt = 'applied' | 'already-matched' | 'acknowledged'
 
 type GithubConnectionIssueUpdateTarget = {
   repo: string
@@ -206,7 +211,11 @@ export interface MountClient {
   /** Stop SDK-owned local mount processes created by this client. */
   dispose?(): Promise<void>
   readFile(path: string): Promise<{ content: unknown; revision?: string }>
-  writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void>
+  writeFile(path: string, content: unknown, opts?: {
+    guarded?: boolean
+    /** Require this exact source revision and do not retry a conflict. */
+    baseRevision?: string
+  }): Promise<{ targetRevision: string } | void>
   deleteFile(path: string): Promise<void>
   setDefaultAllowedDraftPredicate?(
     predicate: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>,

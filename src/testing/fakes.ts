@@ -65,12 +65,24 @@ export class FakeMountClient implements MountClient {
     return { ...entry }
   }
 
-  async writeFile(path: string, content: unknown, _opts?: { guarded?: boolean }): Promise<void> {
+  async writeFile(
+    path: string,
+    content: unknown,
+    opts?: { guarded?: boolean; baseRevision?: string },
+  ): Promise<{ targetRevision: string } | void> {
+    // A missing path reads as revision '0', matching the cloud mount: when a
+    // caller supplies no base it writes a missing file at '0' (404 -> keep the
+    // default), so '0' is the create sentinel and must not read as a conflict
+    // here (#346 review, cubic).
+    if (opts?.baseRevision !== undefined && (this.files.get(path)?.revision ?? '0') !== opts.baseRevision) {
+      throw Object.assign(new Error(`Revision conflict for ${path}`), { status: 409 })
+    }
     const revision = String((Number(this.files.get(path)?.revision ?? 0) || 0) + 1)
     const existing = this.files.get(path)?.content
     const storedContent = mergedLinearIssueContent(existing, content) ?? content
     this.files.set(path, { content: storedContent, revision })
     this.writes.push({ path, content })
+    return { targetRevision: revision }
   }
 
   async deleteFile(path: string): Promise<void> {

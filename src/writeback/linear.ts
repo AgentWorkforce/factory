@@ -257,16 +257,101 @@ export const MountLinearWriteback = (
   }
 
   const adapter = {
-    async setState(issue: LinearIssue, stateId: string): Promise<void> {
+    async getIssueStateId(issue: LinearIssue): Promise<string | undefined> {
+      // The primary issue path may be only a sparse change-event stub. Reuse
+      // the guarded canonical lookup so recovery observes the effective
+      // by-id/by-uuid record rather than a stale or state-less alias.
+      const current = await readIssuePayloadForGuard(mount, issue)
+      // A state-only primary was not a canonical issue read. Without guard
+      // fields from the full record, treating its state as authoritative could
+      // release a cancellation fence on stale sparse-sync data.
+      if (!hasGuardFields(current)) return undefined
+      if (typeof current.stateId === 'string' && current.stateId) return current.stateId
+      const state = asRecord(current.state)
+      if (typeof state?.id === 'string' && state.id) return state.id
+      // Not the dispatch snapshot: the only caller reads the issue fresh and
+      // backfills a missing id from the live state NAME through the authoritative
+      // state catalog before calling here (`FactoryLoop.#readIssue` ->
+      // `StateResolver.idForName`). Relayfile can sync a canonical Linear record
+      // carrying only that name (relayfile-adapters#205), so refusing it outright
+      // would strand those issues in a cancellation fence nothing can clear.
+      // Reuse the caller's resolved id only when the live canonical name still
+      // matches the projection it was resolved from — the name match is the whole
+      // proof, so a canonical name that has moved on falls through to `undefined`
+      // (#346 review, CodeRabbit).
+      if (
+        typeof state?.name === 'string' &&
+        state.name &&
+        state.name === issue.state?.name &&
+        issue.stateId
+      ) return issue.stateId
+      return undefined
+    },
+
+    async setState(issue: LinearIssue, stateId: string): Promise<{ claimToken: string } | void> {
       const path = issuePath(issue)
       const canonical = await canonicalForIssue(issue)
       assertInFactoryScope(scopeIssueFromPayload(canonical.payload, issue.key), safety)
-      await mount.writeFile(path, {
+      const receipt = await mount.writeFile(path, {
         ...canonical.writable,
         stateId,
       }, { guarded: true })
-      updateCanonicalState(path, issue, canonical, stateId)
       await confirmWriteback(mount, path, () => verifyStateReadback(mount, issue, stateId), logger, readbackConfirm)
+      updateCanonicalState(path, issue, canonical, stateId)
+      return receipt?.targetRevision
+        ? { claimToken: receipt.targetRevision }
+        : undefined
+    },
+
+    async compareAndSetState(
+      issue: LinearIssue,
+      expectedStateId: string,
+      claimToken: string,
+      stateId: string,
+    ): Promise<'applied' | 'superseded' | 'unproven'> {
+      const path = issuePath(issue)
+      const canonical = await canonicalForIssue(issue)
+      assertInFactoryScope(scopeIssueFromPayload(canonical.payload, issue.key), safety)
+      const current = await mount.readFile(path)
+      const currentPayload = wrappedPayload(current.content)
+      if (currentPayload.stateId !== expectedStateId) return 'superseded'
+      if (current.revision === undefined) return 'unproven'
+      // Matching only the effective state is insufficient: another actor may
+      // have restored the same state after this dispatch claim. The exact
+      // target revision returned by the original write identifies ownership.
+      if (current.revision !== claimToken) return 'unproven'
+      // A revision only protects the exact mounted resource. If that resource
+      // is a sparse/state-only projection, Factory cannot prove that a full
+      // rewrite would preserve concurrent provider fields, so fail closed.
+      if (!payloadInFactoryScope(currentPayload, safety)) return 'unproven'
+      const currentCanonical: CachedIssuePayload = {
+        payload: { ...currentPayload },
+        writable: createIssueWritePayload(currentPayload),
+      }
+      try {
+        await mount.writeFile(path, {
+          ...currentCanonical.writable,
+          stateId,
+        }, { guarded: true, baseRevision: claimToken })
+      } catch (error) {
+        if (isRevisionConflict(error)) {
+          // A conflict invalidates the immutable claim token. Re-read only to
+          // distinguish a real state transition (`superseded`) from a same-
+          // state edit whose ownership is now ambiguous (`unproven`). Never
+          // retry with the newer revision: it could belong to another claim
+          // with the same effective state.
+          try {
+            const latest = wrappedPayload((await mount.readFile(path)).content)
+            return latest.stateId === expectedStateId ? 'unproven' : 'superseded'
+          } catch {
+            return 'unproven'
+          }
+        }
+        throw error
+      }
+      await confirmWriteback(mount, path, () => verifyStateReadback(mount, issue, stateId), logger, readbackConfirm)
+      updateCanonicalState(path, issue, currentCanonical, stateId)
+      return 'applied'
     },
 
     async postComment(issue: LinearIssue, body: string): Promise<void> {
@@ -316,6 +401,12 @@ export const MountLinearWriteback = (
 
   return adapter
 }
+
+const isRevisionConflict = (error: unknown): boolean =>
+  Boolean(error && typeof error === 'object' && (
+    ('status' in error && error.status === 409)
+    || ('statusCode' in error && error.statusCode === 409)
+  ))
 
 const isStateOnlyDraft = (payload: Record<string, unknown>): boolean => {
   const keys = Object.keys(payload)

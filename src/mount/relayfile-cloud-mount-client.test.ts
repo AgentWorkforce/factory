@@ -1511,6 +1511,25 @@ describe('RelayfileCloudMountClient', () => {
       }
     }
 
+    class HangingReadFileClient extends FakeRelayFileClient {
+      seenSignal?: AbortSignal
+
+      override async readFile(
+        workspaceId: string,
+        path: string,
+        _correlationId?: string,
+        signal?: AbortSignal,
+      ): Promise<never> {
+        this.readFileCalls.push({ workspaceId, path })
+        this.seenSignal = signal
+        return await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            reject((signal as AbortSignal & { reason?: unknown }).reason)
+          })
+        })
+      }
+    }
+
     it('cancels a read that stops answering and names the operation', async () => {
       const client = new HangingListTreeClient()
       const mount = new RelayfileCloudMountClient({
@@ -1544,6 +1563,38 @@ describe('RelayfileCloudMountClient', () => {
         name: 'RelayfileOperationTimeoutError',
         operation: 'ensureSubRoot',
       })
+    })
+
+    it('cancels the revision read before an unguarded write', async () => {
+      const client = new HangingReadFileClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 25,
+      })
+
+      await expect(mount.writeFile('/tmp/draft.json', { draft: true })).rejects.toMatchObject({
+        name: 'RelayfileOperationTimeoutError',
+        operation: 'writeFile.readRevision',
+      })
+      expect(client.seenSignal?.aborted).toBe(true)
+      expect(client.writeFileCalls).toEqual([])
+    })
+
+    it('cancels the current-revision read before a delete', async () => {
+      const client = new HangingReadFileClient()
+      const mount = new RelayfileCloudMountClient({
+        workspaceId: 'rw_test',
+        client,
+        operationTimeoutMs: 25,
+      })
+
+      await expect(mount.deleteFile('/tmp/draft.json')).rejects.toMatchObject({
+        name: 'RelayfileOperationTimeoutError',
+        operation: 'deleteFile.readCurrent',
+      })
+      expect(client.seenSignal?.aborted).toBe(true)
+      expect(client.deleteFileCalls).toEqual([])
     })
 
     it('caps an explicit ensureSubRoot timeout at the tighter client-wide budget', async () => {
@@ -1766,7 +1817,8 @@ describe('RelayfileCloudMountClient', () => {
     })
     const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake, isAllowedDraft: () => true })
 
-    await mount.writeFile('/linear/issues/AR-1.json', { stateId: 'new' })
+    await expect(mount.writeFile('/linear/issues/AR-1.json', { stateId: 'new' }))
+      .resolves.toEqual({ targetRevision: 'next' })
 
     expect(fake.writeFileCalls).toEqual([{
       workspaceId: 'rw_test',
@@ -1775,6 +1827,33 @@ describe('RelayfileCloudMountClient', () => {
       content: '{"stateId":"new"}',
       contentType: 'application/json',
     }])
+  })
+
+  it('does not refresh or retry an explicit baseRevision after a conflict', async () => {
+    const fake = new FakeRelayFileClient()
+    const conflict = Object.assign(new Error('revision conflict'), { status: 409 })
+    const write = vi.spyOn(fake, 'writeFile').mockRejectedValue(conflict)
+    const mount = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: () => true,
+    })
+
+    await expect(mount.writeFile(
+      '/linear/issues/AR-1.json',
+      { stateId: 'ready' },
+      { baseRevision: '7' },
+    )).rejects.toBe(conflict)
+
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(write).toHaveBeenCalledWith({
+      workspaceId: 'rw_test',
+      path: '/linear/issues/AR-1.json',
+      baseRevision: '7',
+      content: '{"stateId":"ready"}',
+      contentType: 'application/json',
+    })
+    expect(fake.readFileCalls).toEqual([])
   })
 
   it('uses baseRevision 0 for creates and confirms the queued operation', async () => {

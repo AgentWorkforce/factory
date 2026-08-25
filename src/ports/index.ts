@@ -7,6 +7,7 @@ export type {
   FactoryIntegrationProvider,
   GithubConnectionIssue,
   GithubConnectionIssueUpdateInput,
+  GithubConnectionMutationReceipt,
   GithubConnectionRead,
   GithubConnectionWrite,
   GithubIssueLookup,
@@ -47,7 +48,11 @@ export type {
 } from './fleet'
 export type {
   GithubRead,
+  GithubIssueCloseWriteResult,
   GithubIssueStatus,
+  GithubStatusWriteResult,
+  GithubStatusClaimReceipt,
+  GithubStatusRollbackResult,
   GithubWriteback,
   LinearWriteback,
   SlackWriteback,

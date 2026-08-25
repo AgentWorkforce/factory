@@ -681,7 +681,11 @@ export class RelayfileCloudMountClient implements MountClient {
     }
   }
 
-  async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+  async writeFile(
+    path: string,
+    content: unknown,
+    opts?: { guarded?: boolean; baseRevision?: string },
+  ): Promise<{ targetRevision: string }> {
     if (isProviderWritebackPath(path) && await this.#isAllowedDraft?.(path, content, opts) !== true) {
       throw new Error(`Refusing provider writeback draft for ${path}: draft predicate rejected or is unset`)
     }
@@ -691,9 +695,19 @@ export class RelayfileCloudMountClient implements MountClient {
     this.#confirmedFailureReasonByPath.delete(path)
 
     const writeAtCurrentRevision = async (): Promise<WriteQueuedResponse> => {
-      let baseRevision = '0'
+      let baseRevision = opts?.baseRevision ?? '0'
+      if (opts?.baseRevision !== undefined) {
+        return this.#client.writeFile({
+          workspaceId: this.workspaceId,
+          path,
+          baseRevision,
+          content: serialized.content,
+          contentType: serialized.contentType,
+        })
+      }
       try {
-        baseRevision = (await this.#client.readFile(this.workspaceId, path)).revision
+        baseRevision = (await this.#bounded('writeFile.readRevision', this.#operationTimeoutMs, (signal) =>
+          this.#client.readFile(this.workspaceId, path, undefined, signal))).revision
       } catch (error) {
         if (!isHttpStatus(error, 404)) throw error
       }
@@ -707,18 +721,22 @@ export class RelayfileCloudMountClient implements MountClient {
       })
     }
 
+    let queued: WriteQueuedResponse
     try {
-      this.#lastOpByPath.set(path, (await writeAtCurrentRevision()).opId)
+      queued = await writeAtCurrentRevision()
     } catch (error) {
-      if (!isHttpStatus(error, 409)) throw error
-      this.#lastOpByPath.set(path, (await writeAtCurrentRevision()).opId)
+      if (opts?.baseRevision !== undefined || !isHttpStatus(error, 409)) throw error
+      queued = await writeAtCurrentRevision()
     }
+    this.#lastOpByPath.set(path, queued.opId)
+    return { targetRevision: queued.targetRevision }
   }
 
   async deleteFile(path: string): Promise<void> {
     this.#confirmedExternalIdByPath.delete(path)
     this.#confirmedFailureReasonByPath.delete(path)
-    const current = await this.#client.readFile(this.workspaceId, path)
+    const current = await this.#bounded('deleteFile.readCurrent', this.#operationTimeoutMs, (signal) =>
+      this.#client.readFile(this.workspaceId, path, undefined, signal))
     const currentContent = parseRemoteContent(current)
     if (isProviderPath(path)) {
       await this.#assertProviderDeleteAllowed(path, currentContent)
