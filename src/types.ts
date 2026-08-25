@@ -62,6 +62,12 @@ export interface FactoryPorts {
    * active in the background. Test-only override of the built-in default.
    */
   startupAgentExitDrainTimeoutMs?: number
+  /**
+   * Re-arm delay for the dispatch-lifecycle and completion-release retries.
+   * Test-only override of the built-in 1 s floor, so a suite can exercise the
+   * release retry budget without spending ten real seconds waiting for it.
+   */
+  dispatchLifecycleRetryMs?: number
   relayflows?: FactoryRelayflowDispatchPort
   /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
   worktrees?: AgentWorktreeManager
@@ -233,6 +239,29 @@ export interface FactoryReadinessReconcileStatus {
   failureThreshold: number
   /** Sweep cadence — the denominator that turns `inFlightMs` into missed passes. */
   intervalMs?: number
+  /**
+   * The deadline on the *caller's wait* for one sweep (#296).
+   *
+   * Published because its absence was read as its non-existence. An operator
+   * looking at a climbing `inFlightMs` beside `intervalMs: 60000` and nothing
+   * else has no way to tell "this is bounded, the bound is just far away" from
+   * "nothing will ever preempt this" — and the second reading has now been
+   * reached twice from the same stanza. `intervalMs` is a scheduler tick and
+   * cannot preempt anything; these two are the numbers that can.
+   */
+  timeoutMs?: number
+  /**
+   * The aggregate budget for one sweep (#372/#374) — the bound that UNWINDS.
+   *
+   * Distinct from `timeoutMs` on purpose. `timeoutMs` ends the wait and leaves
+   * `runOnce()` running for later cycles to coalesce onto; this one expires
+   * from inside the sweep, so the lease goes back and the next cycle starts
+   * clean. When a reader wants to know "how long until this recovers", this is
+   * the field, and `missedPasses` is how far through it the current pass is.
+   */
+  sweepBudgetMs?: number
+  /** `inFlightMs` expressed in sweeps that should have run and did not. */
+  missedPasses?: number
   lastDurationMs?: number
   lastStartedAtMs?: number
   /**
@@ -349,6 +378,10 @@ export interface FactoryPublicReadinessReconcileHealth {
   consecutiveFailures: number
   failureThreshold: number
   intervalMs?: number
+  /** The deadline on the caller's wait. See the same field on the status record. */
+  timeoutMs?: number
+  /** The aggregate per-sweep budget — the bound that unwinds and frees the lease. */
+  sweepBudgetMs?: number
   lastDurationMs?: number
   lastStartedAtMs?: number
   lastCompletedAtMs?: number

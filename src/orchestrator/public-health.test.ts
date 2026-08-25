@@ -741,6 +741,69 @@ describe('publicHealthFromHeartbeat (#295)', () => {
     // A duration is genuinely fractional; only the count is not.
     expect(health?.readinessReconcile?.inFlightMs).toBe(90_000)
   })
+
+  /**
+   * The stanza published `intervalMs` — a scheduler tick that cannot preempt
+   * anything — and neither of the two deadlines that can. A reader watching
+   * `inFlightMs` climb 1:1 with wall clock beside it had no field that could
+   * distinguish "bounded, but the bound is 90 minutes away" from "nothing will
+   * ever stop this", and the second reading has now been reported twice off
+   * this exact stanza. Publishing the bounds is what makes them falsifiable.
+   */
+  it('publishes the deadlines that can preempt a sweep, not just the cadence that cannot', () => {
+    const health = publicHealthFromHeartbeat(heartbeat({
+      readinessReconcile: {
+        state: 'healthy',
+        consecutiveFailures: 0,
+        failureThreshold: 3,
+        intervalMs: 60_000,
+        timeoutMs: 5_400_000,
+        sweepBudgetMs: 5_400_000,
+        lastStartedAtMs: BOOT_MS - 268_232,
+        inFlightSinceMs: BOOT_MS - 268_232,
+      },
+    }), { nowMs: BOOT_MS })
+
+    expect(health.readinessReconcile?.timeoutMs).toBe(5_400_000)
+    expect(health.readinessReconcile?.sweepBudgetMs).toBe(5_400_000)
+    // The production reading that produced the misdiagnosis: a pass 268s old on
+    // a 60s cadence. `missedPasses` says how far in, the budget says how far to
+    // go, and the two together are what `intervalMs` alone could not say.
+    expect(health.readinessReconcile?.missedPasses).toBe(4)
+  })
+
+  /**
+   * The trivially wrong version of the change above publishes a zero for a
+   * daemon that recorded no bound, which reads as an instant deadline rather
+   * than an unknown one. Absent and zero are different facts here for the same
+   * reason they are for `candidates` (#355).
+   */
+  it('omits an unset or non-positive bound instead of publishing it as zero', () => {
+    const health = normalizePublicHealth({
+      schemaVersion: 1,
+      ok: true,
+      status: 'ok',
+      stale: false,
+      loopStatus: 'running',
+      degradedSubsystems: [],
+      readinessReconcile: {
+        state: 'healthy',
+        consecutiveFailures: 0,
+        failureThreshold: 3,
+        intervalMs: 60_000,
+        timeoutMs: 0,
+        sweepBudgetMs: -1,
+      },
+    })
+
+    expect(health?.readinessReconcile?.timeoutMs).toBeUndefined()
+    expect(health?.readinessReconcile?.sweepBudgetMs).toBeUndefined()
+    // And an instance that predates the fields at all still projects cleanly.
+    const legacy = publicHealthFromHeartbeat(heartbeat(), { nowMs: BOOT_MS })
+    expect(legacy.readinessReconcile?.timeoutMs).toBeUndefined()
+    expect(legacy.readinessReconcile?.sweepBudgetMs).toBeUndefined()
+    expect(legacy.readinessReconcile?.state).toBe('healthy')
+  })
 })
 
 
