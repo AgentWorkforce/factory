@@ -14215,6 +14215,348 @@ describe('FactoryLoop', () => {
     }
   }, 40_000)
 
+  /**
+   * #367. `#abandonedDispatchReasons` is the FIRST thing
+   * `#dispatchLifecycleStillOwned` consults, and during the window between the
+   * reaper fencing a dispatch and the durable row actually reaching a terminal
+   * phase it is the ONLY signal that the dispatch is gone. #329 rekeyed all
+   * three readers of that map to the provider-neutral `dispatchLifecycleKey`
+   * and left the only writer on `issueKey`, whose key space it can never
+   * collide with — `issueKey` is `<key>:<uuid>:<path>`, the lifecycle key is
+   * `github:<owner>/<repo>#<n>` | `linear:<uuid>` | `issue:<uuid>`. Throughout
+   * that window the predicate therefore answered "still owned" for a dispatch
+   * that had been explicitly abandoned, and a placement landing inside it was
+   * recorded onto a record the reaper had already fenced and would never
+   * release.
+   *
+   * The #303 late-placement coverage above cannot see this: there the abandon
+   * has already run to completion, so `isTerminalDispatchLifecycle` answers on
+   * its own and the fence is never reached. These two arms hold the
+   * `abandoning` save open instead, which keeps the lease, the cached epoch and
+   * a nonterminal persisted row all intact — every other arm of the predicate
+   * says "owned", so the fence is the only thing that can decide.
+   *
+   * The arms differ in exactly one value: `agentlessHoldTimeoutMs`. Swapping
+   * them fails both.
+   */
+  describe('the abandon fence and the ownership predicate share a key space (#367)', () => {
+    const abandonFenceFixture = async (opts: { agentlessHoldTimeoutMs: number; number: number }) => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-abandon-fence-'))
+      const watchStatePath = join(root, 'state.json')
+      const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+      const spawnGate = Promise.withResolvers<void>()
+      const spawnStarted = Promise.withResolvers<void>()
+      const abandoningReached = Promise.withResolvers<void>()
+      const abandoningGate = Promise.withResolvers<void>()
+
+      class HangingSpawnFleetClient extends RemoteLifecycleFleetClient {
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          spawnStarted.resolve()
+          await spawnGate.promise
+          return await super.spawn(input)
+        }
+      }
+
+      // Parks the lifecycle inside the `abandoning` write. On the must-fire arm
+      // that is what holds the fence installed while the row is still
+      // `dispatching` and still leased to us. On the control arm nothing ever
+      // reaches this branch — the two arms are otherwise identical so that the
+      // deadline is the only variable.
+      class PausedAbandonStateStore extends FileStateStore {
+        override async saveDispatchLifecycle(
+          workspaceId: string,
+          key: string,
+          owner: string,
+          epoch: number,
+          nowMs: number,
+          lifecycle: DispatchLifecycle,
+        ): Promise<boolean> {
+          if (lifecycle.phase === 'abandoning') {
+            abandoningReached.resolve()
+            await abandoningGate.promise
+          }
+          return await super.saveDispatchLifecycle(workspaceId, key, owner, epoch, nowMs, lifecycle)
+        }
+      }
+
+      const fleet = new HangingSpawnFleetClient()
+      const factory = createFactory(config({
+        batchSize: 1,
+        // The ordinary held-agent deadline stays hours away in both arms: only
+        // the never-placed deadline can fence this dispatch.
+        dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: opts.agentlessHoldTimeoutMs },
+        loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+      }), {
+        mount: new FakeMountClient({ [issuePath(opts.number)]: issueFile(opts.number) }),
+        fleet,
+        stateStore: new PausedAbandonStateStore({ batchSize: 1, watchStatePath }),
+        triage: new StaticTriage(),
+      })
+      return { root, state, fleet, factory, spawnGate, spawnStarted, abandoningReached, abandoningGate }
+    }
+
+    // MUST FIRE. Before the fix this asserted `false` — the fence was written
+    // where no reader could see it, so the late placement was accepted onto a
+    // fenced record and never released.
+    it('releases a late placement on the fence alone, before the row goes terminal', async () => {
+      const {
+        root, state, fleet, factory, spawnGate, spawnStarted, abandoningReached, abandoningGate,
+      } = await abandonFenceFixture({ agentlessHoldTimeoutMs: 1_000, number: 367 })
+      const dispatched = factory
+        .triageIssue(parseLinearIssue(issuePath(367), issueFile(367)))
+        .then((decision) => factory.dispatch(decision))
+        .catch(() => undefined)
+      try {
+        await withDeadline(spawnStarted.promise, 12_000, 'the spawn was never entered')
+        // The reaper has now fenced this dispatch and is parked inside its
+        // `abandoning` write.
+        await withDeadline(abandoningReached.promise, 20_000, 'the abandoning save was never reached')
+
+        // The precondition that makes this a test of the fence and nothing
+        // else: the persisted row is still nonterminal, so every other arm of
+        // `#dispatchLifecycleStillOwned` still answers "owned".
+        const key = dispatchIssueIdentity(parseLinearIssue(issuePath(367), issueFile(367)))
+        expect(await state().getDispatchLifecycle('factory-test', key)).toMatchObject({ phase: 'dispatching' })
+
+        // The placement now lands inside that window.
+        spawnGate.resolve()
+        await vi.waitFor(() => expect(fleet.releases).toContainEqual({
+          name: 'ar-367-impl-pear',
+          reason: 'dispatch-released-before-placement',
+        }), { timeout: 10_000 })
+        expect(factory.status().counters.lateSpawnPlacementsReleased).toBeGreaterThanOrEqual(1)
+      } finally {
+        spawnGate.resolve()
+        abandoningGate.resolve()
+        await dispatched
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    }, 60_000)
+
+    // MUST NOT FIRE, and the control for the arm above. Same fixture, same
+    // late-returning spawn, same paused-abandon state store — only the
+    // never-placed deadline moves out of reach, so nothing fences this
+    // dispatch. The placement must be accepted. Without this arm, making
+    // `#dispatchLifecycleStillOwned` return `false` unconditionally would
+    // satisfy the must-fire.
+    it('CONTROL: accepts the same late placement when nothing abandoned the dispatch', async () => {
+      const {
+        root, state, fleet, factory, spawnGate, spawnStarted, abandoningGate,
+      } = await abandonFenceFixture({ agentlessHoldTimeoutMs: 60 * 60_000, number: 368 })
+      const dispatched = factory
+        .triageIssue(parseLinearIssue(issuePath(368), issueFile(368)))
+        .then((decision) => factory.dispatch(decision))
+      try {
+        await withDeadline(spawnStarted.promise, 12_000, 'the spawn was never entered')
+        const key = dispatchIssueIdentity(parseLinearIssue(issuePath(368), issueFile(368)))
+        // The same never-placed shape the must-fire arm reaps: a planned spec
+        // with no result yet, and no `heldSinceAtMs`.
+        await vi.waitFor(async () => {
+          const pending = await state().getDispatchLifecycle('factory-test', key)
+          expect(pending?.phase).toBe('dispatching')
+          expect(pending?.heldSinceAtMs).toBeUndefined()
+          expect(pending?.agents.map((agent) => agent.tracked.result)).toEqual([undefined])
+        }, { timeout: 10_000 })
+
+        spawnGate.resolve()
+        await dispatched
+        expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-368-impl-pear', 'ar-368-review'])
+        expect(fleet.releases).toEqual([])
+        expect(factory.status().counters.lateSpawnPlacementsReleased).toBeUndefined()
+        expect(factory.status().counters.agentlessSlotPastDeadlineReleases).toBeUndefined()
+        await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+          .toMatchObject({ phase: 'running' }), { timeout: 10_000 })
+      } finally {
+        spawnGate.resolve()
+        abandoningGate.resolve()
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    }, 60_000)
+  })
+
+  /**
+   * #367, second field. `#dispatchInFlight` is the per-work-unit dispatch
+   * concurrency gate, and orphan recovery consults it to answer "is a
+   * `dispatch()` call for this lifecycle running right now?" before it may
+   * class the row as an abandoned claim. Its entries are
+   * `<dispatchLifecycleKey>:<dry-run|live>:<phase>`; the read was
+   * `has(issueKey(issue))`, which is `<key>:<uuid>:<path>` — unsatisfiable by
+   * construction, so the guard was dead and a dispatch that was still mid-spawn
+   * could have its own claim released underneath it.
+   *
+   * The arms differ only in whether that dispatch call is still in flight.
+   */
+  describe('orphan recovery sees a dispatch that is still in flight (#367)', () => {
+    // Low confidence and NO routes. `labelDerivedDispatchDecision` resolves the
+    // repository from the live `pear` label, and `authoritativeRoutedDecision`
+    // then upgrades this to `confidence: 'high'` — which is precisely how a call
+    // keyed `:live:escalation` by `dispatch()` goes on to create a lifecycle.
+    class RoutelessLowConfidenceTriage extends StaticTriage {
+      override async triage(issue: LinearIssue): Promise<TriageDecision> {
+        return { ...await super.triage(issue), routes: [], confidence: 'low' }
+      }
+    }
+
+    const inFlightFixture = async (number: number, triage: TriageEngine = new StaticTriage()) => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-orphan-inflight-'))
+      const path = githubIssuePath('AgentWorkforce', 'pear', number)
+      const ready = githubIssueFile(number, { labels: ['factory', 'pear'] })
+      const mount = new FakeMountClient({ [path]: ready })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const spawnGate = Promise.withResolvers<void>()
+      const spawnStarted = Promise.withResolvers<void>()
+      class HangingSpawnFleetClient extends RemoteLifecycleFleetClient {
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          spawnStarted.resolve()
+          await spawnGate.promise
+          return await super.spawn(input)
+        }
+      }
+      const fleet = new HangingSpawnFleetClient()
+      const factory = createFactory(config({
+        issueSource: 'github',
+        // Nothing may reap this row on a deadline: the orphan-recovery
+        // classification is the only thing under test here.
+        dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 4 * 60 * 60_000 },
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage,
+        githubWriteback: new RecordingGithubWriteback(),
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+      // The dispatch claims the issue on the provider; the fake mount is not
+      // written through by the writeback, so stamp the resulting
+      // `factory:in-progress` projection here. Done only once the spawn has
+      // started, so it cannot race the dispatch's own live re-read.
+      const markInProgress = (): void => {
+        mount.files.set(path, {
+          content: githubIssueFile(number, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+        })
+      }
+      const startDispatch = (): Promise<unknown> => factory
+        .triageIssue(parseGithubFactoryIssue(path, ready))
+        .then((decision) => factory.dispatch(decision))
+      return { root, fleet, factory, spawnGate, spawnStarted, markInProgress, startDispatch }
+    }
+
+    // MUST NOT FIRE. The claim belongs to a `dispatch()` this process is still
+    // inside. Before the fix the guard could not see it and the row was
+    // classed as an orphan.
+    it('preserves the claim of a dispatch whose spawn has not returned', async () => {
+      const {
+        root, fleet, factory, spawnGate, spawnStarted, markInProgress, startDispatch,
+      } = await inFlightFixture(369)
+      const dispatched = startDispatch().catch(() => undefined)
+      try {
+        await withDeadline(spawnStarted.promise, 12_000, 'the spawn was never entered')
+        markInProgress()
+
+        // Bounded on purpose. With the guard dead this sweep classes the row
+        // as an orphan, recovers it, and re-dispatches the same work unit —
+        // which joins the very `dispatch()` promise that is still parked on
+        // the spawn gate, so the failure arrives as a hang rather than an
+        // assertion. Name it instead of letting it read as a slow test.
+        await withDeadline(factory.runOnce(), 15_000, 'the readiness sweep never completed')
+
+        expect(factory.status().counters.githubOrphanedLifecycleClaimsReleased).toBeUndefined()
+        expect(fleet.releases).toEqual([])
+      } finally {
+        spawnGate.resolve()
+        await dispatched
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    }, 40_000)
+
+    // MUST FIRE, and the control for BOTH must-not-fire arms — one per key
+    // phase. Identical fixture and an identical orphan-shaped row; the dispatch
+    // simply is not in flight any more.
+    //
+    // The escalation arm needs its own control rather than borrowing the
+    // dispatch one (#369 review, cubic). The two use different triages and so
+    // produce different key phases, and an orphan sweep that silently skipped
+    // escalation-keyed lifecycles altogether would green the escalation
+    // must-not-fire while releasing nothing. Only a positive control on the
+    // same triage rules that out.
+    it.each([
+      { label: 'dispatch-keyed', number: 370, triage: () => new StaticTriage() },
+      { label: 'escalation-keyed', number: 372, triage: () => new RoutelessLowConfidenceTriage() },
+    ])('CONTROL: still releases the same $label claim once no dispatch is in flight', async ({ number, triage }) => {
+      const {
+        root, fleet, factory, spawnGate, spawnStarted, markInProgress, startDispatch,
+      } = await inFlightFixture(number, triage())
+      // Hoisted so `finally` can drain it. Left inside the `try`, a throw at
+      // the deadline below would leave this dispatch running across
+      // `factory.stop()` and `rm(root)`, and its late rejection would surface
+      // from teardown instead of the assertion that actually failed (#369
+      // review, CodeRabbit). `.catch` keeps that drain from throwing here for
+      // the same reason; the assertion below is what proves the dispatch
+      // actually landed a lifecycle.
+      const dispatched = startDispatch().catch(() => undefined)
+      try {
+        await withDeadline(spawnStarted.promise, 12_000, 'the spawn was never entered')
+        spawnGate.resolve()
+        await dispatched
+        markInProgress()
+        // Take the placements back off the roster so the row is agent-less
+        // again: the same shape the arm above holds, minus the live call.
+        for (const spawn of [...fleet.spawns]) await fleet.release(spawn.name, 'test-teardown')
+        fleet.releases.length = 0
+
+        await factory.runOnce()
+
+        expect(factory.status().counters.githubOrphanedLifecycleClaimsReleased).toBe(1)
+      } finally {
+        spawnGate.resolve()
+        await dispatched
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    }, 40_000)
+
+    // MUST NOT FIRE, for the phase half of the key specifically. `dispatch()`
+    // picks the phase from the INCOMING decision (`:4983`), while
+    // `#dispatchUnlocked` re-derives the escalation reason from the
+    // POST-ROUTING decision (`:5109`) — and `authoritativeRoutedDecision`
+    // (`:19321`) upgrades a routeless `confidence: 'low'` triage to `'high'`
+    // once the live labels resolve a repository. So a call keyed
+    // `:live:escalation` does reach lifecycle creation, and a guard that
+    // matched only `:live:dispatch` would reopen #367 for it.
+    //
+    // Paired with the `escalation-keyed` CONTROL above, which uses this same
+    // triage and does release once the call is no longer in flight — so a
+    // sweep that simply ignored escalation-keyed rows cannot green this.
+    it('preserves the claim of a dispatch keyed for escalation before routing upgraded it', async () => {
+      const {
+        root, fleet, factory, spawnGate, spawnStarted, markInProgress, startDispatch,
+      } = await inFlightFixture(371, new RoutelessLowConfidenceTriage())
+      const dispatched = startDispatch().catch(() => undefined)
+      try {
+        await withDeadline(spawnStarted.promise, 12_000, 'the spawn was never entered')
+        markInProgress()
+
+        // Reaching the spawn at all is what proves the phase transition
+        // happened: an escalation returns from `#dispatchUnlocked` above the
+        // spawn, so a decision still carrying `confidence: 'low'` here would
+        // never have placed an agent.
+        await withDeadline(factory.runOnce(), 15_000, 'the readiness sweep never completed')
+
+        expect(factory.status().counters.githubOrphanedLifecycleClaimsReleased).toBeUndefined()
+        expect(fleet.releases).toEqual([])
+      } finally {
+        spawnGate.resolve()
+        await dispatched
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    }, 40_000)
+  })
+
   // #303 must-not-fire control. The window between `promoteDispatchLifecycle`
   // and the first `recordSpawn` legitimately has zero agents. Reaping it on
   // sight would convert a wedge into a dispatch race.

@@ -4103,7 +4103,7 @@ export class FactoryLoop implements Factory {
         const activeAgents = lifecycle.agents.filter((agent) => agent.releasedAtMs === undefined)
         const hasLiveAgent = activeAgents.some((agent) => onlineAgents.has(agent.name))
         const exitRecoveryActive = activeAgents.some((agent) => this.#agentExitsInFlight.has(agent.name))
-        const dispatchCallActive = this.#dispatchInFlight.has(issueKey(lifecycle.issue))
+        const dispatchCallActive = this.#hasDispatchCallInFlight(lifecycle.issue)
         // The provider's `factory:in-progress` transition happens immediately
         // before the durable lifecycle advances from dispatching to running.
         // A crash can therefore leave any nonterminal phase behind while the
@@ -5001,6 +5001,44 @@ export class FactoryLoop implements Factory {
         this.#dispatchInFlight.delete(key)
       }
     }
+  }
+
+  /**
+   * Is a `dispatch()` call that could own this work unit's durable lifecycle
+   * running in this process right now?
+   *
+   * `#dispatchInFlight` is keyed by work unit *plus* the dry-run flag and phase
+   * the call was made under, so this must be built from the same three parts
+   * `dispatch()` writes rather than from the bare identity.
+   *
+   * Live only, but BOTH phases — the same `` `${key}:live:` `` prefix `stop()`
+   * uses at `:1531`, and for the same reason.
+   *
+   * The dry-run half of the key is decided once and is stable across both
+   * functions, and `durableDispatch` is `!dryRun && …`, so a `:dry-run:*` call
+   * provably never claims a lifecycle and matching it would preserve a
+   * genuinely orphaned claim (#369 review, codex).
+   *
+   * The phase half is NOT stable. `dispatch()` derives it from the incoming
+   * decision, while `#dispatchUnlocked` re-derives the escalation reason from
+   * the post-routing decision — and `authoritativeRoutedDecision` upgrades a
+   * routeless `confidence: 'low'` triage to `'high'` when the live labels
+   * resolve a repository. A call keyed `:live:escalation` therefore does reach
+   * lifecycle creation, so excluding that phase would reopen exactly the defect
+   * below for it (#369 review, cubic).
+   *
+   * #367: this was `#dispatchInFlight.has(issueKey(issue))`, which no key in
+   * the map can ever equal. `issueKey` is `<key>:<uuid>:<path>`, while every
+   * entry is `<dispatchLifecycleKey>:<dry-run|live>:<phase>` — so the guard was
+   * unsatisfiable by construction and orphan recovery could class a lifecycle
+   * as abandoned while its own dispatch was still mid-flight.
+   */
+  #hasDispatchCallInFlight(issue: IssueRef): boolean {
+    const livePrefix = `${dispatchLifecycleKey(issue)}:live:`
+    for (const key of this.#dispatchInFlight.keys()) {
+      if (key.startsWith(livePrefix)) return true
+    }
+    return false
   }
 
   async #dispatchUnlocked(decision: TriageDecision, opts: { dryRun?: boolean; labelsValidated?: boolean } = {}): Promise<DispatchResult> {
