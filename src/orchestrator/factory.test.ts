@@ -14389,7 +14389,17 @@ describe('FactoryLoop', () => {
    * The arms differ only in whether that dispatch call is still in flight.
    */
   describe('orphan recovery sees a dispatch that is still in flight (#367)', () => {
-    const inFlightFixture = async (number: number) => {
+    // Low confidence and NO routes. `labelDerivedDispatchDecision` resolves the
+    // repository from the live `pear` label, and `authoritativeRoutedDecision`
+    // then upgrades this to `confidence: 'high'` — which is precisely how a call
+    // keyed `:live:escalation` by `dispatch()` goes on to create a lifecycle.
+    class RoutelessLowConfidenceTriage extends StaticTriage {
+      override async triage(issue: LinearIssue): Promise<TriageDecision> {
+        return { ...await super.triage(issue), routes: [], confidence: 'low' }
+      }
+    }
+
+    const inFlightFixture = async (number: number, triage: TriageEngine = new StaticTriage()) => {
       const root = await mkdtemp(join(tmpdir(), 'factory-orphan-inflight-'))
       const path = githubIssuePath('AgentWorkforce', 'pear', number)
       const ready = githubIssueFile(number, { labels: ['factory', 'pear'] })
@@ -14415,7 +14425,7 @@ describe('FactoryLoop', () => {
         mount,
         fleet,
         stateStore: new InMemoryStateStore({ batchSize: 4 }),
-        triage: new StaticTriage(),
+        triage,
         githubWriteback: new RecordingGithubWriteback(),
         probePrGhRunner: async () => ({ stdout: '[]' }),
       })
@@ -14487,6 +14497,42 @@ describe('FactoryLoop', () => {
         expect(factory.status().counters.githubOrphanedLifecycleClaimsReleased).toBe(1)
       } finally {
         spawnGate.resolve()
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    }, 40_000)
+
+    // MUST NOT FIRE, for the phase half of the key specifically. `dispatch()`
+    // picks the phase from the INCOMING decision (`:4983`), while
+    // `#dispatchUnlocked` re-derives the escalation reason from the
+    // POST-ROUTING decision (`:5109`) — and `authoritativeRoutedDecision`
+    // (`:19321`) upgrades a routeless `confidence: 'low'` triage to `'high'`
+    // once the live labels resolve a repository. So a call keyed
+    // `:live:escalation` does reach lifecycle creation, and a guard that
+    // matched only `:live:dispatch` would reopen #367 for it.
+    //
+    // The CONTROL above is shared: it is the same fixture with no call in
+    // flight, and it still releases.
+    it('preserves the claim of a dispatch keyed for escalation before routing upgraded it', async () => {
+      const {
+        root, fleet, factory, spawnGate, spawnStarted, markInProgress, startDispatch,
+      } = await inFlightFixture(371, new RoutelessLowConfidenceTriage())
+      const dispatched = startDispatch().catch(() => undefined)
+      try {
+        await withDeadline(spawnStarted.promise, 12_000, 'the spawn was never entered')
+        markInProgress()
+
+        // Reaching the spawn at all is what proves the phase transition
+        // happened: an escalation returns from `#dispatchUnlocked` above the
+        // spawn, so a decision still carrying `confidence: 'low'` here would
+        // never have placed an agent.
+        await withDeadline(factory.runOnce(), 15_000, 'the readiness sweep never completed')
+
+        expect(factory.status().counters.githubOrphanedLifecycleClaimsReleased).toBeUndefined()
+        expect(fleet.releases).toEqual([])
+      } finally {
+        spawnGate.resolve()
+        await dispatched
         await factory.stop()
         await rm(root, { recursive: true, force: true })
       }

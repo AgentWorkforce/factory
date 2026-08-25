@@ -5011,11 +5011,21 @@ export class FactoryLoop implements Factory {
    * the call was made under, so this must be built from the same three parts
    * `dispatch()` writes rather than from the bare identity.
    *
-   * Only the live dispatch phase qualifies. A dry run never claims a lifecycle
-   * at all (`durableDispatch` is `!dryRun && …`), and an escalation returns from
-   * `#dispatchUnlocked` before one is created — so matching those would preserve
-   * a genuinely orphaned claim for a call that cannot own it (#369 review,
-   * codex).
+   * Live only, but BOTH phases — the same `` `${key}:live:` `` prefix `stop()`
+   * uses at `:1531`, and for the same reason.
+   *
+   * The dry-run half of the key is decided once and is stable across both
+   * functions, and `durableDispatch` is `!dryRun && …`, so a `:dry-run:*` call
+   * provably never claims a lifecycle and matching it would preserve a
+   * genuinely orphaned claim (#369 review, codex).
+   *
+   * The phase half is NOT stable. `dispatch()` derives it from the incoming
+   * decision, while `#dispatchUnlocked` re-derives the escalation reason from
+   * the post-routing decision — and `authoritativeRoutedDecision` upgrades a
+   * routeless `confidence: 'low'` triage to `'high'` when the live labels
+   * resolve a repository. A call keyed `:live:escalation` therefore does reach
+   * lifecycle creation, so excluding that phase would reopen exactly the defect
+   * below for it (#369 review, cubic).
    *
    * #367: this was `#dispatchInFlight.has(issueKey(issue))`, which no key in
    * the map can ever equal. `issueKey` is `<key>:<uuid>:<path>`, while every
@@ -5024,7 +5034,11 @@ export class FactoryLoop implements Factory {
    * as abandoned while its own dispatch was still mid-flight.
    */
   #hasDispatchCallInFlight(issue: IssueRef): boolean {
-    return this.#dispatchInFlight.has(`${dispatchLifecycleKey(issue)}:live:dispatch`)
+    const livePrefix = `${dispatchLifecycleKey(issue)}:live:`
+    for (const key of this.#dispatchInFlight.keys()) {
+      if (key.startsWith(livePrefix)) return true
+    }
+    return false
   }
 
   async #dispatchUnlocked(decision: TriageDecision, opts: { dryRun?: boolean; labelsValidated?: boolean } = {}): Promise<DispatchResult> {
