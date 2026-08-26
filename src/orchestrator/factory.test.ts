@@ -3630,7 +3630,7 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('keeps the default gh lifecycle path in auto mode even when an app connection is available', async () => {
+  it('uses the connected App lifecycle path in auto mode without invoking local gh', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-default-gh-writeback-'))
     const ghLogPath = join(root, 'gh.log')
     const ghPath = join(root, 'gh')
@@ -3657,12 +3657,16 @@ describe('FactoryLoop', () => {
       const path = githubIssuePath('AgentWorkforce', 'pear', number)
       const appPostIssueComment = vi.fn(async () => undefined)
       const appUpdateIssue = vi.fn(async () => undefined)
+      const appEnsureRepositoryLabel = vi.fn(async () => undefined)
+      const appMutateIssueLabel = vi.fn(async () => ({ receiptId: 'app-label-receipt' }))
       const mount = new FakeMountClient({
         [path]: githubIssueFile(number, { labels: ['factory'] }),
       }, {
         publishPullRequest: async () => { throw new Error('unexpected publish') },
         closePullRequest: async () => undefined,
         postIssueComment: appPostIssueComment,
+        ensureRepositoryLabel: appEnsureRepositoryLabel,
+        mutateIssueLabel: appMutateIssueLabel,
         updateIssue: appUpdateIssue,
       })
       mount.setSubRoot('/linear/issues', 'absent')
@@ -3674,11 +3678,24 @@ describe('FactoryLoop', () => {
 
       await factory.runOnce()
 
-      const ghCalls = await readFile(ghLogPath, 'utf8')
-      expect(ghCalls).toContain('label create factory:in-progress')
-      expect(ghCalls).toContain('issue edit 220')
-      expect(ghCalls).toContain('issue comment 220')
-      expect(appPostIssueComment).not.toHaveBeenCalled()
+      await expect(readFile(ghLogPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(appEnsureRepositoryLabel).toHaveBeenCalledWith(expect.objectContaining({
+        repo: 'AgentWorkforce/pear',
+        name: 'factory:in-progress',
+        author: 'app',
+      }))
+      expect(appMutateIssueLabel).toHaveBeenCalledWith(expect.objectContaining({
+        repo: 'AgentWorkforce/pear',
+        number,
+        operation: 'add',
+        label: 'factory:in-progress',
+        author: 'app',
+      }))
+      expect(appPostIssueComment).toHaveBeenCalledWith(expect.objectContaining({
+        repo: 'AgentWorkforce/pear',
+        number,
+        author: 'app',
+      }))
       expect(appUpdateIssue).not.toHaveBeenCalled()
     } finally {
       vi.unstubAllEnvs()
@@ -19654,6 +19671,36 @@ describe('FactoryLoop', () => {
       'GitHub identity "app" requires a connected workspace GitHub App lifecycle write path; refusing to fall back to the local gh user',
     )
     expect(fleet.spawns).toEqual([])
+  })
+
+  it('fails loudly instead of selecting local gh for auto identity in the cloud container without an App writer', () => {
+    const mount = new FakeMountClient({ [issuePath(54)]: issueFile(54) })
+    Object.defineProperty(mount, 'writebackTransport', { value: 'relayfile-cloud' })
+
+    expect(() => createFactory(config({ github: { identity: 'auto' } }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })).toThrow(/identity "auto".*cloud container.*connected workspace GitHub App lifecycle write path.*does not contain gh/iu)
+  })
+
+  it('fails loudly when explicit local-user identity is selected in the gh-less cloud container', () => {
+    const mount = new FakeMountClient({ [issuePath(55)]: issueFile(55) })
+    Object.defineProperty(mount, 'writebackTransport', { value: 'relayfile-cloud' })
+
+    expect(() => createFactory(config({ github: { identity: 'user' } }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })).toThrow(/identity "user".*local gh.*cloud container does not contain gh/iu)
+  })
+
+  it('retains the explicit local-user adapter outside the cloud container', () => {
+    expect(() => createFactory(config({ github: { identity: 'user' } }), {
+      mount: new FakeMountClient({ [issuePath(56)]: issueFile(56) }),
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })).not.toThrow()
   })
 
   it('installs the scoped GitHub issue draft predicate for direct library mounts', async () => {
