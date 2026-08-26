@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
+import { localGhMutationAllowed, localGhMutationRefusal, type GithubWriteIdentity } from './gh-identity'
+
 const execFileAsync = promisify(execFile)
 
 export interface GhRunResult {
@@ -49,9 +51,17 @@ export interface GithubMergeGate {
 
 export class GhCliGithubMergeGate implements GithubMergeGate {
   readonly #run: GhRunner
+  readonly #identity: GithubWriteIdentity
 
-  constructor(run: GhRunner = defaultGhRunner) {
+  /**
+   * @param identity the configured `github.identity`. `check` is a read and
+   *   ignores it; `merge` mutates GitHub and refuses under exact `app` rather
+   *   than squash-merging as the operator's own account. Defaults to `auto`
+   *   so a directly-constructed gate keeps its historical behavior.
+   */
+  constructor(run: GhRunner = defaultGhRunner, identity: GithubWriteIdentity = 'auto') {
     this.#run = run
+    this.#identity = identity
   }
 
   async check(input: GithubMergeGateInput): Promise<GithubMergeGateVerdict> {
@@ -78,6 +88,20 @@ export class GhCliGithubMergeGate implements GithubMergeGate {
   }
 
   async merge(input: GithubMergeInput): Promise<GithubMergeResult> {
+    // Fail closed before spawning `gh`. A guarded merge run through the local
+    // CLI is recorded by GitHub as the operator merging, which is precisely
+    // the split audit trail `github.identity: "app"` exists to remove. There
+    // is no app-authored merge to fall through to, so refuse and say why.
+    if (!localGhMutationAllowed(this.#identity)) {
+      return {
+        merged: false,
+        reason: localGhMutationRefusal(
+          `the guarded squash merge of ${input.repo}#${input.number}`,
+          'mergePullRequest',
+        ),
+      }
+    }
+
     try {
       const result = await this.#run([
         'pr',
@@ -173,8 +197,14 @@ export function evaluateGithubMergeGate(
 }
 
 export const defaultGhRunner: GhRunner = async (args) => {
-  // TODO(issue-52): retire this compatibility runner when merge-gate reads and
-  // guarded merges are fully represented by the mounted GitHub connection.
+  // Compatibility runner. Retire it when merge-gate reads and guarded merges
+  // are fully represented by the mounted GitHub connection: that needs a
+  // `mergePullRequest` capability on `GithubConnectionWrite`, fulfilled
+  // server-side by Relayfile Cloud so Factory still holds no GitHub
+  // credential. Until then `merge` refuses under `github.identity: "app"`
+  // rather than merging as the operator (see ./gh-identity). Tracked on
+  // AgentWorkforce/factory#221; the previous marker cited issue 52, which is
+  // closed as completed and no longer owns this work.
   const { stdout, stderr } = await execFileAsync('gh', args, { maxBuffer: 1024 * 1024 })
   return { stdout, stderr }
 }

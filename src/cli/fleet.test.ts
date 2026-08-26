@@ -25,6 +25,7 @@ import {
 import { MountAuthScopeError, mountAuthRemediation } from '../mount/mount-auth-error'
 import { DocumentStateStore, FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
+import { GhCliIssuePublisher } from '../intake/notion'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, GithubWriteback, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import type { RelayMessaging } from '@agent-relay/sdk'
@@ -848,6 +849,113 @@ describe('fleet CLI runtime', () => {
         ok: true,
         dispatch: false,
         results: [{ status: 'ready', target: { repo: 'AgentWorkforce/cloud' } }],
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('honours github.identity "app" for Notion intake instead of writing as the local gh user', async () => {
+    // The gate in GhCliIssuePublisher is worthless if this call site hardcodes
+    // an identity: this is the only production caller of runNotionIntake, so
+    // the refusal must be reachable from the resolved contract.
+    const root = await mkdtemp(join(tmpdir(), 'factory-cli-notion-identity-'))
+    try {
+      const mountedPage = join(root, 'notion', 'pages', '3b36800c-1c90-801d-b1cf-c8f2e1cff7cf')
+      await mkdir(mountedPage, { recursive: true })
+      await writeFile(join(mountedPage, 'content.md'), [
+        '# Chief Spec',
+        'Status: ready',
+        'Title: Verify identity gating',
+        'Summary: Prove intake refuses under an app identity.',
+        'Recipe: single',
+        'Repos: AgentWorkforce/cloud',
+      ].join('\n'))
+      const manifestPath = join(root, 'notion.json')
+      await writeFile(manifestPath, JSON.stringify({
+        version: 1,
+        mountRoot: './notion',
+        statePath: './state.json',
+        tasks: [{ page: '3b36800c1c90801db1cfc8f2e1cff7cf' }],
+      }))
+      const configPath = join(root, 'factory.config.json')
+      // Deliberately the SPLIT contract shape. A reader that only looked at a
+      // flat `github` key would miss this and fall back to `auto`, silently
+      // permitting the local-user write.
+      await writeFile(configPath, JSON.stringify({
+        workspaceConfig: { repos: { org: 'AgentWorkforce', names: ['cloud'] } },
+        nodeConfig: { github: { identity: 'app' } },
+      }))
+
+      const durableClaims = new Map<string, { sourceKey: string; digest: string; claimedAt: string }>()
+      const notionClaims = {
+        get: vi.fn(async (sourceKey: string) => durableClaims.get(sourceKey)),
+        findBySourcePrefix: vi.fn(async () => []),
+        claim: vi.fn(async (claim: { sourceKey: string; digest: string; claimedAt: string }) => {
+          durableClaims.set(claim.sourceKey, claim)
+          return { status: 'claimed' as const, claim }
+        }),
+        dispose: vi.fn(async () => undefined),
+      }
+      const output = buffer()
+      // Capture the identity the CLI resolved, and keep the publisher's reads
+      // hermetic so the refusal is the only thing that can block the task.
+      const resolved: string[] = []
+      const notionGithub = (identity: string) => {
+        resolved.push(identity)
+        const publisher = new GhCliIssuePublisher(
+          identity as 'app' | 'user' | 'auto',
+          async () => { throw new Error('gh must not be invoked in this test') },
+        )
+        return Object.assign(publisher, {
+          repositoryVisibility: async () => 'private' as const,
+          missingLabels: async () => [],
+          findBySource: async () => undefined,
+          createIssue: async () => ({ number: 42, url: 'https://github.test/issues/42' }),
+        })
+      }
+
+      const code = await runFleetCli(
+        ['intake', 'notion', manifestPath, '--config', configPath],
+        { fleet: new FakeFleetClient(), notionClaims, notionGithub, stdout: output, stderr: buffer() },
+      )
+
+      // The CLI read the SPLIT contract's node half, not a flat github key.
+      expect(resolved).toEqual(['app'])
+      expect(code).toBe(1)
+      expect(JSON.parse(output.text())).toMatchObject({
+        ok: false,
+        results: [{
+          status: 'blocked',
+          reason: expect.stringContaining('GitHub identity "app"'),
+        }],
+      })
+      // The refusal must not have consumed the exactly-once claim.
+      expect(notionClaims.claim).not.toHaveBeenCalled()
+      expect(durableClaims.size).toBe(0)
+
+      // Split config is a shallow top-level merge. An explicitly present,
+      // empty node github block replaces the workspace block, so the schema
+      // default is `auto`; falling back to the workspace identity here would
+      // disagree with loadFactoryConfig.
+      await writeFile(configPath, JSON.stringify({
+        workspaceConfig: {
+          repos: { org: 'AgentWorkforce', names: ['cloud'] },
+          github: { identity: 'app' },
+        },
+        nodeConfig: { github: {} },
+      }))
+      const permittedOutput = buffer()
+      const permittedCode = await runFleetCli(
+        ['intake', 'notion', manifestPath, '--config', configPath],
+        { fleet: new FakeFleetClient(), notionClaims, notionGithub, stdout: permittedOutput, stderr: buffer() },
+      )
+
+      expect(resolved).toEqual(['app', 'auto'])
+      expect(permittedCode).toBe(0)
+      expect(JSON.parse(permittedOutput.text())).toMatchObject({
+        ok: true,
+        results: [{ status: 'dispatched' }],
       })
     } finally {
       await rm(root, { recursive: true, force: true })

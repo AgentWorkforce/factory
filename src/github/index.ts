@@ -5,6 +5,11 @@ export {
   evaluateGithubMergeGate,
 } from './merge-gate'
 export {
+  assertLocalGhMutationAllowed,
+  localGhMutationAllowed,
+  localGhMutationRefusal,
+} from './gh-identity'
+export {
   closeProbePr,
 } from './probe-closer'
 export {
@@ -37,3 +42,4 @@ export type {
   StandalonePullRequest,
 } from './standalone-babysitter'
 export type { RoutedPrCandidate, RoutedPrDiscoveryReport } from './routed-pr-babysitter'
+export type { GithubWriteIdentity } from './gh-identity'

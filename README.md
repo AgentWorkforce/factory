@@ -792,8 +792,47 @@ mount acknowledges the provider mutation. Provider-authoritative issue reads
 remain optional on the writeback interface; when unavailable, their existing
 call sites keep their conservative fallback behavior.
 
-This identity setting does not change Notion intake's separate GitHub issue
-publisher, which still requires local `gh` authentication when enabled.
+#### Writes that still shell out to `gh`
+
+Two Factory GitHub mutations are not represented on the connected App surface
+and therefore cannot be performed as the app today. Under `"app"` they refuse
+rather than writing as the operator, so an explicit app identity never produces
+a human-attributed write:
+
+| Write | Refuses under `"app"` | Missing connected capability |
+|---|---|---|
+| Guarded squash merge (`mergePolicy: "on-green-with-review"`) | the merge is declined and logged; nothing is merged | `mergePullRequest` |
+| Notion intake issue create | the run is blocked with the reason, before any durable claim is taken | `createIssue` |
+| Notion intake issue edit | the run is blocked with the reason, before any durable claim is taken | `updateIssue` |
+
+Both refusals name the missing capability and the recovery path: set
+`github.identity` to `"user"` or `"auto"` to deliberately accept local-user
+attribution for that operation. Under `"auto"` and `"user"` both paths behave
+exactly as they always have. Neither refusal is reachable in the default cloud
+deployment, which runs `mergePolicy: "never"` and does not run Notion intake.
+
+Notion intake is a separate surface from the Factory lifecycle writeback and
+still requires local `gh` authentication when enabled. Its CLI entry point
+resolves `github.identity` from the selected contract — including a split
+`workspaceConfig`/`nodeConfig` contract, where the node half wins — so `"app"`
+refuses while `"user"` and `"auto"` proceed. An absent contract resolves to
+`"auto"`, matching the schema's own synthesis of an unset `github` block; a
+contract that exists but cannot be parsed is an error rather than a silent
+downgrade to the permissive value.
+
+Only the mutations refuse. Reconciliation of an already-dispatched task
+performs no GitHub write, so it continues to work under `"app"`: the refusal is
+raised immediately before the issue create or the issue edit, and in the create
+path before the durable delivery claim is taken, so a refused run never
+consumes the exactly-once claim and can be retried under a permitted
+identity.
+
+Read paths are deliberately unaffected. `gh pr view` carries no authorship, so
+merge-gate reads, Notion intake label/visibility lookups, and the standalone
+babysitter's PR metadata read (whose `source: 'gh'` provenance marker is
+retained for exactly this reason) continue to work under every identity.
+Review replies and pushes on a babysat PR are performed by the dispatched agent
+under the agent's own credential, not by the Factory process.
 
 Authenticated Factory progress reporting is enabled by default for real CLI
 sessions. Factory sends privacy-bounded lifecycle events, worker ownership,

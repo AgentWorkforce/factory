@@ -415,12 +415,22 @@ const previewSchema = z.object({
   }
 }).optional()
 
+/**
+ * The GitHub write identity, and the single place its values are declared.
+ *
+ * Exported because callers outside the loaded config must resolve the same
+ * value the schema would — notably the Notion intake CLI, which reads a
+ * contract that may not exist. Absent input becomes `auto`, which is the
+ * compatibility value, so this default must never be changed casually.
+ */
+export const githubIdentitySchema = z.enum(['app', 'user', 'auto']).default('auto')
+
 const githubSchema = z.object({
   // Controls the credential identity used for GitHub writes. Exact `app`
   // selects the connected App for both PR publication and issue lifecycle
   // writes. `auto` preserves compatibility: PRs prefer the App, while issue
   // lifecycle writes retain the operator's local `gh` authentication.
-  identity: z.enum(['app', 'user', 'auto']).default('auto'),
+  identity: githubIdentitySchema,
 }).default({})
 
 const verificationSchema = z.object({

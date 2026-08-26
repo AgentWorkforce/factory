@@ -184,6 +184,72 @@ describe('Notion spec intake', () => {
     expect(github.createIssue).toHaveBeenCalledTimes(1)
   })
 
+  it('refuses an app-identity intake WITHOUT consuming the exactly-once delivery claim', async () => {
+    // A refusal raised from createIssue would land after claimNotionDelivery,
+    // burning the claim: the operator's retry under a permitted identity would
+    // then hit `durable Notion claim already exists` forever. The policy check
+    // must happen before anything durable is reserved.
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+
+    const refusing = fakeGithub({ visibility: 'private' })
+    refusing.assertWritable = () => {
+      throw new Error('GitHub identity "app" refuses creating or editing Notion intake lifecycle issues')
+    }
+
+    const blocked = await runNotionIntake({ manifest, dispatch: true, claims, github: refusing })
+
+    expect(blocked.ok).toBe(false)
+    expect(blocked.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: expect.stringContaining('GitHub identity "app"'),
+    })
+    // Nothing durable and nothing remote was touched.
+    expect(vi.mocked(claims.claim)).not.toHaveBeenCalled()
+    expect(durableClaims.size).toBe(0)
+    expect(refusing.createIssue).not.toHaveBeenCalled()
+    // Reads carry no authorship and stay available: the refusal is raised at
+    // the mutation, not at the top of the task.
+    expect(refusing.repositoryVisibility).toHaveBeenCalled()
+
+    // MUST NOT FIRE: the operator switches to a permitted identity and the
+    // retry succeeds, proving the aborted run left no wedge behind.
+    const permitted = fakeGithub({ visibility: 'private' })
+    const retried = await runNotionIntake({ manifest, dispatch: true, claims, github: permitted })
+
+    expect(retried.ok).toBe(true)
+    expect(permitted.createIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('still reconciles an already-dispatched task under an app identity, because it writes nothing', async () => {
+    // A blanket refusal at the top of publishRepoTask would break read-only
+    // reconciliation for every app-configured host. Only mutations refuse.
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+
+    const permitted = fakeGithub({ visibility: 'private' })
+    const first = await runNotionIntake({ manifest, dispatch: true, claims, github: permitted })
+    expect(first.ok).toBe(true)
+    const created = await vi.mocked(permitted.createIssue).mock.results[0]!.value as { number: number; url: string }
+
+    const refusing = fakeGithub({ visibility: 'private' })
+    refusing.assertWritable = () => { throw new Error('GitHub identity "app" refuses') }
+    refusing.findBySource = vi.fn(async () => ({
+      ...created,
+      body: vi.mocked(permitted.createIssue).mock.calls[0]![0].body,
+    }))
+
+    const reconciled = await runNotionIntake({ manifest, dispatch: true, claims, github: refusing })
+
+    expect(reconciled.ok).toBe(true)
+    expect(reconciled.results[0]).toMatchObject({ status: 'already-dispatched' })
+    expect(refusing.updateIssue).not.toHaveBeenCalled()
+  })
+
   it('preserves an explicit Factory title prefix without duplicating it', async () => {
     const { root, manifest } = await fixtureManifest('private mounted body', {
       bootstrap: {
@@ -317,6 +383,61 @@ describe('Notion spec intake', () => {
     expect(github.updateIssue).toHaveBeenCalledTimes(1)
     const reconciled = JSON.parse(await readFile(manifest.statePath, 'utf8'))
     expect(reconciled.receipts[`notion:${pageId}:repo:agentworkforce/cloud`].delivery.messageIds).toEqual(['message-1'])
+  })
+
+  it('refuses portable issue migration before its claim or contract publication while preserving metadata reconciliation', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted implementation detail', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    await runNotionIntake({ manifest, dispatch: true, claims, github })
+    const originalBody = vi.mocked(github.createIssue).mock.calls[0]![0].body
+    vi.mocked(github.findBySource).mockResolvedValue({
+      number: 42,
+      url: 'https://github.test/issues/42',
+      body: originalBody,
+    })
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+    durableClaims.clear()
+    vi.mocked(claims.claim).mockClear()
+    github.assertWritable = () => { throw new Error('GitHub identity "app" refuses') }
+
+    const blocked = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
+
+    expect(blocked.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: expect.stringContaining('GitHub identity "app"'),
+    })
+    expect(claims.claim).not.toHaveBeenCalled()
+    expect(durableClaims.size).toBe(0)
+    expect(contracts.publish).not.toHaveBeenCalled()
+    expect(github.updateIssue).not.toHaveBeenCalled()
+
+    delete github.assertWritable
+    const migrated = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
+    expect(migrated.results[0]).toMatchObject({ status: 'already-dispatched' })
+    const migratedBody = vi.mocked(github.updateIssue).mock.calls[0]![0].body
+    vi.mocked(github.findBySource).mockResolvedValue({
+      number: 42,
+      url: 'https://github.test/issues/42',
+      body: migratedBody,
+    })
+    github.assertWritable = () => { throw new Error('GitHub identity "app" refuses') }
+    vi.mocked(github.updateIssue).mockClear()
+
+    const reconciled = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
+
+    expect(reconciled.results[0]).toMatchObject({ status: 'already-dispatched' })
+    expect(github.updateIssue).not.toHaveBeenCalled()
   })
 
   it('refuses to overwrite a manually edited lifecycle issue during portable mount migration', async () => {

@@ -29,7 +29,8 @@ import {
   type TriageEngine,
   type WorkflowRunnerInput,
 } from '../index'
-import { LatePlacementReleasedError, changeEventPath } from './factory'
+import { LatePlacementReleasedError, changeEventPath, defaultMergeGate } from './factory'
+import type { GhRunner } from '../github'
 import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
 import { RelayfileOperationTimeoutError } from '../mount/relayfile-operation-timeout'
 import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubIssueCloseWriteResult, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
@@ -32807,5 +32808,52 @@ describe('probe PR resolution from the pull index', () => {
     expect(fast?.prNumber).toBe(807)
     expect(fastReads).toEqual([byIdPath(807)])
     expect(walkedReads).toHaveLength(61)
+  })
+})
+
+describe('merge gate identity selection', () => {
+  // The guard in `src/github/gh-identity.ts` is only worth anything if the
+  // FactoryLoop actually hands it the configured identity. Without this pair
+  // it would be a gate nobody invokes: `GhCliGithubMergeGate` refusing
+  // correctly while the loop kept constructing it with the default.
+  const mergeInput = { repo: 'AgentWorkforce/example', number: 7, expectedHeadSha: 'a'.repeat(40) }
+  // Every gh invocation is faked. Nothing here may reach the real binary: the
+  // operation on the other side is an irreversible squash merge.
+  const fakeGh = (): { run: GhRunner; calls: string[][] } => {
+    const calls: string[][] = []
+    return { calls, run: async (args) => { calls.push(args); return { stdout: '', stderr: '' } } }
+  }
+  const configFor = (identity?: 'app' | 'user' | 'auto') =>
+    FactoryConfigSchema.parse({
+      repos: { org: 'AgentWorkforce', names: ['factory'] },
+      ...(identity ? { github: { identity } } : {}),
+    })
+
+  it('MUST FIRE: identity "app" yields a merge gate that refuses without invoking gh', async () => {
+    const { run, calls } = fakeGh()
+    const result = await defaultMergeGate(configFor('app'), run).merge(mergeInput)
+
+    expect(result.merged).toBe(false)
+    expect(calls).toEqual([])
+    expect(result.reason).toContain('GitHub identity "app"')
+    expect(result.reason).toContain('mergePullRequest')
+  })
+
+  it('MUST NOT FIRE: identity "user" yields a gate that still performs the merge', async () => {
+    const { run, calls } = fakeGh()
+    const result = await defaultMergeGate(configFor('user'), run).merge(mergeInput)
+
+    expect(result.merged).toBe(true)
+    expect(calls[0]?.slice(0, 2)).toEqual(['pr', 'merge'])
+  })
+
+  it('MUST NOT FIRE: an absent github key is synthesised to auto and still merges', async () => {
+    const config = configFor()
+    expect(config.github.identity).toBe('auto')
+
+    const { run, calls } = fakeGh()
+    const result = await defaultMergeGate(config, run).merge(mergeInput)
+    expect(result.merged).toBe(true)
+    expect(calls).toHaveLength(1)
   })
 })

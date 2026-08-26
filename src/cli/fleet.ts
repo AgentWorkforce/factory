@@ -7,6 +7,8 @@ import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
 
 import { stringifyLogValue } from '../logging'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
+import { loadFactoryConfig } from '../config/schema'
+import type { GithubWriteIdentity } from '../github'
 import { initializeFactory } from './init'
 import { diagnoseDeployedFactory, renderDeployedDiagnosis } from './diagnose'
 import {
@@ -104,6 +106,7 @@ import {
 } from '../version-info'
 import {
   GhCliIssuePublisher,
+  type GithubIssuePublisher,
   NotionApiFactoryTasksClient,
   RelayChannelNotionClaimStore,
   RelayChannelNotionContractPublisher,
@@ -179,6 +182,12 @@ export interface FleetCliDeps {
   notionContracts?: NotionContractPublisher
   /** Hermetic workspace-global Notion claim store for tests and alternate runtimes. */
   notionClaims?: NotionIntakeClaimStore
+  /**
+   * Hermetic GitHub issue publisher for intake tests and alternate runtimes.
+   * Receives the identity resolved from the selected contract, so a test can
+   * assert the CLI honours `github.identity` without reaching the gh binary.
+   */
+  notionGithub?: (identity: GithubWriteIdentity) => GithubIssuePublisher
   /** Hermetic Factory Tasks reader for manifest-generation tests and alternate runtimes. */
   notionFactoryTasks?: FactoryTasksNotionClient
   /** Hermetic verification-environment sweep for CLI tests and alternate runtimes. */
@@ -364,7 +373,14 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         manifest,
         dispatch: !globals.dryRun,
         ...(!globals.dryRun ? {
-          github: new GhCliIssuePublisher(),
+          // Notion intake has no app-authored issue-create route, so under an
+          // explicit `github.identity: "app"` it refuses rather than writing
+          // as the operator. Hardcoding `'user'` here would make that gate
+          // unreachable from the only production caller.
+          github: await (async () => {
+            const identity = await resolveNotionIntakeIdentity(globals.config)
+            return deps.notionGithub?.(identity) ?? new GhCliIssuePublisher(identity)
+          })(),
           workspace,
           ...(notionClaims ? { claims: notionClaims } : {}),
           ...(notionContracts ? { contracts: notionContracts } : {}),
@@ -1669,6 +1685,33 @@ function parseFactoryStartFlags(args: Array<string | undefined>): { mode: 'live'
     throw new Error(`Unknown factory start option: ${flag}`)
   }
   return { mode }
+}
+
+/**
+ * The GitHub write identity Notion intake must honour.
+ *
+ * Notion intake does not otherwise require a Factory contract on disk, so an
+ * absent one is not an error — it is the same as an unset `github` block,
+ * which the schema synthesises to `auto`. A file that exists but cannot be
+ * read or parsed IS an error: silently degrading it to `auto` would resolve a
+ * deliberate `app` selection into the permissive value and reintroduce the
+ * silent local-user write this gate exists to prevent.
+ *
+ * Use the canonical config loader for both contract shapes. In particular,
+ * split config is a shallow top-level merge: a present `nodeConfig.github`
+ * replaces `workspaceConfig.github` even when the node block is empty, after
+ * which the GitHub schema supplies its `auto` default.
+ */
+async function resolveNotionIntakeIdentity(path?: string): Promise<GithubWriteIdentity> {
+  const configPath = path ?? resolve(process.cwd(), 'factory.config.json')
+  let raw: string
+  try {
+    raw = await readFile(configPath, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'auto'
+    throw error
+  }
+  return loadFactoryConfig(JSON.parse(raw)).factoryConfig.github.identity
 }
 
 async function loadConfig(path?: string, options: LocalClonePathOptions = {}): Promise<LoadedConfig> {
