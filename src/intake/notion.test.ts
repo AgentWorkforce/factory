@@ -385,6 +385,61 @@ describe('Notion spec intake', () => {
     expect(reconciled.receipts[`notion:${pageId}:repo:agentworkforce/cloud`].delivery.messageIds).toEqual(['message-1'])
   })
 
+  it('refuses portable issue migration before its claim or contract publication while preserving metadata reconciliation', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted implementation detail', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    await runNotionIntake({ manifest, dispatch: true, claims, github })
+    const originalBody = vi.mocked(github.createIssue).mock.calls[0]![0].body
+    vi.mocked(github.findBySource).mockResolvedValue({
+      number: 42,
+      url: 'https://github.test/issues/42',
+      body: originalBody,
+    })
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+    durableClaims.clear()
+    vi.mocked(claims.claim).mockClear()
+    github.assertWritable = () => { throw new Error('GitHub identity "app" refuses') }
+
+    const blocked = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
+
+    expect(blocked.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: expect.stringContaining('GitHub identity "app"'),
+    })
+    expect(claims.claim).not.toHaveBeenCalled()
+    expect(durableClaims.size).toBe(0)
+    expect(contracts.publish).not.toHaveBeenCalled()
+    expect(github.updateIssue).not.toHaveBeenCalled()
+
+    delete github.assertWritable
+    const migrated = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
+    expect(migrated.results[0]).toMatchObject({ status: 'already-dispatched' })
+    const migratedBody = vi.mocked(github.updateIssue).mock.calls[0]![0].body
+    vi.mocked(github.findBySource).mockResolvedValue({
+      number: 42,
+      url: 'https://github.test/issues/42',
+      body: migratedBody,
+    })
+    github.assertWritable = () => { throw new Error('GitHub identity "app" refuses') }
+    vi.mocked(github.updateIssue).mockClear()
+
+    const reconciled = await runNotionIntake({ manifest, dispatch: true, claims, github, contracts })
+
+    expect(reconciled.results[0]).toMatchObject({ status: 'already-dispatched' })
+    expect(github.updateIssue).not.toHaveBeenCalled()
+  })
+
   it('refuses to overwrite a manually edited lifecycle issue during portable mount migration', async () => {
     const { root, manifest } = await fixtureManifest('private mounted implementation detail', {
       bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),

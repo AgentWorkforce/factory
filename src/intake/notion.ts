@@ -503,24 +503,22 @@ async function publishRepoTask(
     if (currentDigest !== task.digest) {
       return { ...base, status: 'blocked', issue: existing, reason: 'mounted spec changed after the lifecycle issue was created' }
     }
-    await ensureNotionWorkUnitClaim(task, input)
     let claim = await observeNotionDeliveryClaim(task, input)
-    if (!claim) {
-      if (!receipt) {
-        return {
-          ...base,
-          status: 'blocked',
-          issue: existing,
-          reason: 'lifecycle issue marker has neither a durable shared claim nor a local migration receipt',
-        }
+    if (!claim && !receipt) {
+      return {
+        ...base,
+        status: 'blocked',
+        issue: existing,
+        reason: 'lifecycle issue marker has neither a durable shared claim nor a local migration receipt',
       }
-      claim = (await claimNotionDelivery(task, input)).claim
     }
     const bodyDelivery = contractDeliveryFromBody(existing.body)
     if (input.manifest.workerMountTransport.kind === 'local') {
       if (receipt?.delivery || bodyDelivery) {
         return { ...base, status: 'blocked', issue: existing, reason: 'portable Notion delivery cannot be downgraded to a local worker mount' }
       }
+      await ensureNotionWorkUnitClaim(task, input)
+      claim ??= (await claimNotionDelivery(task, input)).claim
       state.receipts[task.sourceKey] = receipt ?? {
         kind: 'github',
         digest: task.digest,
@@ -546,15 +544,20 @@ async function publishRepoTask(
     if (receipt?.delivery && bodyDelivery && !sameContractDelivery(receipt.delivery, bodyDelivery)) {
       return { ...base, status: 'blocked', issue: existing, reason: 'lifecycle issue portable delivery does not match its local receipt cache' }
     }
-    const delivery = await prepareContractDelivery(task, input, receipt?.delivery ?? bodyDelivery)
-    if (delivery && !bodyDelivery) {
-      // The only mutation on the reconciliation path. Everything above it is
-      // a read and stays available under an app identity.
+    if (!bodyDelivery) {
+      // A portable migration must edit the issue. Refuse before either claim
+      // can be reserved and before the Relay contract publisher emits any
+      // messages. Existing body metadata takes the read-only path below.
       try {
         input.github.assertWritable?.()
       } catch (error) {
         return { ...base, status: 'blocked', issue: existing, reason: error instanceof Error ? error.message : String(error) }
       }
+    }
+    await ensureNotionWorkUnitClaim(task, input)
+    claim ??= (await claimNotionDelivery(task, input)).claim
+    const delivery = await prepareContractDelivery(task, input, receipt?.delivery ?? bodyDelivery)
+    if (delivery && !bodyDelivery) {
       await assertMountedTaskUnchanged(task)
       await input.github.updateIssue({
         repo: target.repo,

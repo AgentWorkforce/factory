@@ -897,6 +897,7 @@ describe('fleet CLI runtime', () => {
           repositoryVisibility: async () => 'private' as const,
           missingLabels: async () => [],
           findBySource: async () => undefined,
+          createIssue: async () => ({ number: 42, url: 'https://github.test/issues/42' }),
         })
       }
 
@@ -918,6 +919,30 @@ describe('fleet CLI runtime', () => {
       // The refusal must not have consumed the exactly-once claim.
       expect(notionClaims.claim).not.toHaveBeenCalled()
       expect(durableClaims.size).toBe(0)
+
+      // Split config is a shallow top-level merge. An explicitly present,
+      // empty node github block replaces the workspace block, so the schema
+      // default is `auto`; falling back to the workspace identity here would
+      // disagree with loadFactoryConfig.
+      await writeFile(configPath, JSON.stringify({
+        workspaceConfig: {
+          repos: { org: 'AgentWorkforce', names: ['cloud'] },
+          github: { identity: 'app' },
+        },
+        nodeConfig: { github: {} },
+      }))
+      const permittedOutput = buffer()
+      const permittedCode = await runFleetCli(
+        ['intake', 'notion', manifestPath, '--config', configPath],
+        { fleet: new FakeFleetClient(), notionClaims, notionGithub, stdout: permittedOutput, stderr: buffer() },
+      )
+
+      expect(resolved).toEqual(['app', 'auto'])
+      expect(permittedCode).toBe(0)
+      expect(JSON.parse(permittedOutput.text())).toMatchObject({
+        ok: true,
+        results: [{ status: 'dispatched' }],
+      })
     } finally {
       await rm(root, { recursive: true, force: true })
     }

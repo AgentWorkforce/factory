@@ -7,7 +7,7 @@ import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
 
 import { stringifyLogValue } from '../logging'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
-import { githubIdentitySchema } from '../config/schema'
+import { loadFactoryConfig } from '../config/schema'
 import type { GithubWriteIdentity } from '../github'
 import { initializeFactory } from './init'
 import { diagnoseDeployedFactory, renderDeployedDiagnosis } from './diagnose'
@@ -1697,11 +1697,10 @@ function parseFactoryStartFlags(args: Array<string | undefined>): { mode: 'live'
  * deliberate `app` selection into the permissive value and reintroduce the
  * silent local-user write this gate exists to prevent.
  *
- * Both contract shapes are read. A split contract carries `workspaceConfig`
- * and `nodeConfig`, and `combineSplitConfigInput` merges them as
- * `{ ...workspace, ...node }`, so the node half wins — reading only the flat
- * `github` key would miss a split contract's `identity: "app"` entirely and
- * fall back to `auto`.
+ * Use the canonical config loader for both contract shapes. In particular,
+ * split config is a shallow top-level merge: a present `nodeConfig.github`
+ * replaces `workspaceConfig.github` even when the node block is empty, after
+ * which the GitHub schema supplies its `auto` default.
  */
 async function resolveNotionIntakeIdentity(path?: string): Promise<GithubWriteIdentity> {
   const configPath = path ?? resolve(process.cwd(), 'factory.config.json')
@@ -1712,16 +1711,7 @@ async function resolveNotionIntakeIdentity(path?: string): Promise<GithubWriteId
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'auto'
     throw error
   }
-  const record = asRecord(JSON.parse(raw))
-  const identityIn = (half: unknown): unknown => asRecord(asRecord(half)?.github)?.identity
-  const declared = record && (
-    Object.prototype.hasOwnProperty.call(record, 'workspaceConfig') ||
-    Object.prototype.hasOwnProperty.call(record, 'nodeConfig')
-  )
-    // Node half wins, matching combineSplitConfigInput's spread order.
-    ? identityIn(record.nodeConfig) ?? identityIn(record.workspaceConfig)
-    : identityIn(record)
-  return githubIdentitySchema.parse(declared)
+  return loadFactoryConfig(JSON.parse(raw)).factoryConfig.github.identity
 }
 
 async function loadConfig(path?: string, options: LocalClonePathOptions = {}): Promise<LoadedConfig> {
