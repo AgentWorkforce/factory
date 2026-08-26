@@ -861,7 +861,7 @@ categories:
       - id: pr-completion-detection
         name: Completion PR Detection
         api: Factory.start() / Factory.runLoop()
-        description: Resolve an issue's PR from mounted GitHub records with guarded gh fallback and bounded polling sweeps
+        description: Resolve an issue's PR from mounted GitHub records with bounded polling sweeps and no local GitHub CLI dependency
         location: src/orchestrator/factory.ts
         verify_tier: 5
 
