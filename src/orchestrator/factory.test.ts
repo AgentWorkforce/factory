@@ -5666,6 +5666,167 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('heals a stale durable GitHub tree cache from the current issue index before remote dispatch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-index-cache-heal-'))
+    const indexPath = '/github/repos/AgentWorkforce/pear/issues/_index.json'
+    const readyPath = githubIssueCompactPath('AgentWorkforce', 'pear', 394)
+    const mount = new CountingListTreeMount()
+    // Persist a checkpoint with both repository roots present but empty. This
+    // is the production failure shape: "all roots cached" currently bypasses
+    // the index even when the index has newer authoritative eligibility data.
+    mount.emit(changeEvent('/factory/observability/mount-health/current.json', 'event-cache-seed'))
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const create = (fleet: RemoteLifecycleFleetClient) => createFactory(config({
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    try {
+      const seedFactory = create(new RemoteLifecycleFleetClient())
+      expect((await seedFactory.runOnce()).pulled).toEqual([])
+      await seedFactory.stop()
+      expect(mount.listTreePrefixes).toEqual([
+        '/github/repos/AgentWorkforce/pear/issues',
+        '/github/repos/AgentWorkforce__pear/issues',
+      ])
+
+      // The index and body are now valid at the checkpoint's current
+      // watermark, but the cached tree membership is stale. Discovery must
+      // use the index as its healing authority instead of trusting the empty
+      // roots forever.
+      mount.files.set(indexPath, { content: [
+        {
+          id: '394',
+          number: 394,
+          title: '[factory] Canary 4',
+          updated: '2026-08-26T16:47:21Z',
+          state: 'open',
+          labels: ['factory'],
+        },
+      ] })
+      mount.files.set(readyPath, {
+        content: githubIssueFile(394, {
+          title: '[factory] Canary 4',
+          labels: ['factory'],
+          updatedAt: '2026-08-26T16:47:21Z',
+        }),
+      })
+
+      const remoteFleet = new RemoteLifecycleFleetClient()
+      const factory = create(remoteFleet)
+      const report = await factory.runOnce()
+
+      expect(report.pulled.map((issue) => issue.key)).toEqual(['394'])
+      expect(report.dispatched).toHaveLength(1)
+      expect(remoteFleet.spawns).not.toHaveLength(0)
+      expect(remoteFleet.spawns.every((spawn) => spawn.node === 'sf-mini')).toBe(true)
+      expect(mount.reads).toContain(indexPath)
+      expect(factory.status().counters.githubIssueIndexReposUsed).toBe(1)
+      expect(factory.status().counters.githubIssueDiscoveryCacheReposUsed).toBeUndefined()
+      await factory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('lets a valid empty GitHub issue index retire stale cached candidates', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-index-cache-retire-'))
+    const indexPath = '/github/repos/AgentWorkforce/pear/issues/_index.json'
+    const stalePath = githubIssueCompactPath('AgentWorkforce', 'pear', 395)
+    const mount = new CountingListTreeMount({
+      [stalePath]: githubIssueFile(395, {
+        title: '[factory] Previously ready',
+        labels: ['factory'],
+      }),
+    })
+    mount.emit(changeEvent('/factory/observability/mount-health/current.json', 'event-cache-retire'))
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const create = (fleet: RemoteLifecycleFleetClient) => createFactory(config({
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    try {
+      const seedFactory = create(new RemoteLifecycleFleetClient())
+      expect((await seedFactory.runOnce({ dryRun: true })).pulled.map((issue) => issue.key)).toEqual(['395'])
+      await seedFactory.stop()
+
+      // Relayfile's valid empty index says there are no open scope-labelled
+      // issues. The durable tree still contains the older candidate path.
+      mount.files.set(indexPath, { content: [] })
+      const remoteFleet = new RemoteLifecycleFleetClient()
+      const factory = create(remoteFleet)
+      const report = await factory.runOnce()
+
+      expect(report.pulled).toEqual([])
+      expect(remoteFleet.spawns).toEqual([])
+      expect(mount.reads).toContain(indexPath)
+      expect(factory.status().counters.githubIssueIndexReposUsed).toBe(1)
+      expect(factory.status().counters.githubIssueDiscoveryCacheReposUsed).toBeUndefined()
+      await factory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('retains the durable GitHub tree fallback when the issue index is malformed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-index-cache-fallback-'))
+    const indexPath = '/github/repos/AgentWorkforce/pear/issues/_index.json'
+    const readyPath = githubIssueCompactPath('AgentWorkforce', 'pear', 396)
+    const mount = new CountingListTreeMount({
+      [indexPath]: { rows: 'not-an-array' },
+      [readyPath]: githubIssueFile(396, {
+        title: '[factory] Fallback candidate',
+        labels: ['factory'],
+      }),
+    })
+    mount.emit(changeEvent('/factory/observability/mount-health/current.json', 'event-cache-fallback'))
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const create = (fleet: RemoteLifecycleFleetClient) => createFactory(config({
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    try {
+      const seedFactory = create(new RemoteLifecycleFleetClient())
+      expect((await seedFactory.runOnce({ dryRun: true })).pulled.map((issue) => issue.key)).toEqual(['396'])
+      await seedFactory.stop()
+
+      mount.reads.length = 0
+      const remoteFleet = new RemoteLifecycleFleetClient()
+      const factory = create(remoteFleet)
+      const report = await factory.runOnce()
+
+      expect(report.pulled.map((issue) => issue.key)).toEqual(['396'])
+      expect(factory.status().counters.githubIssueDiscoveryCacheReposUsed).toBe(1)
+      expect(factory.status().counters.githubIssueIndexReposUsed).toBeUndefined()
+      await factory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('recovers an orphaned in-progress GitHub issue with no agents, durable lifecycle, or open PR', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-recovery-'))
     try {
