@@ -27137,6 +27137,17 @@ describe('FactoryLoop PR babysitter', () => {
 
   it('pins a remote babysitter to the preview node and gives it the live URL', async () => {
     class RemotePreviewFleetClient extends RemoteLifecycleFleetClient {
+      override async roster(): Promise<RosterEntry> {
+        const roster = await super.roster()
+        return {
+          ...roster,
+          nodes: [
+            ...roster.nodes,
+            { name: 'preview-node', capabilities: ['spawn:claude'], live: true },
+          ],
+        }
+      }
+
       override async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
         return { ...await super.createPreview(input), node: 'preview-node' }
       }
