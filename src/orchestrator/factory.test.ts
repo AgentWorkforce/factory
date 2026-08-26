@@ -31891,6 +31891,199 @@ describe('completion release retry budget (#379)', () => {
 })
 
 /**
+ * The dead-letter that keeps its lease (the AR-1540 livelock).
+ *
+ * Production 0.1.79 — which already contains #379 — dispatched nothing for
+ * three days. Four issues, including a canary filed purely to test dispatch,
+ * were all simultaneously stuck on:
+ *
+ *   [factory] durable dispatch is leased by another publisher; waiting for
+ *   lease release {"issue":"1540","leaseRemainingMs":189205,"retryMs":1000}
+ *
+ * while the lease holder logged, continuously:
+ *
+ *   [factory] failed to release ar-1540-impl-relay during completion
+ *     RelayError: Agent "ar-1540-impl-relay" has no live host node
+ *     code transport_error, statusCode 503, rawCode agent_host_unavailable
+ *
+ * #379's bound DOES fire on this shape — a 503 `agent_host_unavailable` is not
+ * `isAgentAlreadyGoneOnRelease`, so it lands in `failed[]` exactly like the
+ * plain `Error` the #379 suite throws, and `#chargeReleaseAttempt` runs. What
+ * #379 did not do is give the lease back. `#releaseDeadLetteredSlot` hands back
+ * the BATCH slot and leaves `#dispatchLifecycleEpochs` holding the key, so the
+ * 60 s `#renewDispatchLifecycles` interval re-stamps a fresh 5-minute lease on
+ * a work unit this process has permanently sworn off driving — for the life of
+ * the process. `leaseRemainingMs` of ~189 s on a 300 s TTL is that renewal,
+ * observed 111 s in.
+ *
+ * The result is strictly worse than the spin #379 replaced: the spin was loud
+ * and local, whereas a retained lease on a non-terminal `releasing` row is
+ * silent and blocks every other publisher — including a restart of this one —
+ * from ever claiming the key again.
+ *
+ * The invariant under test: a work unit whose agents are gone must not be able
+ * to hold the dispatch lease indefinitely.
+ */
+class HostUnavailableReleaseFleetClient extends RemoteLifecycleFleetClient {
+  readonly releaseAttempts: Array<{ name: string; reason?: string }> = []
+
+  /** The verbatim production error shape, fields and all. */
+  static hostUnavailable(name: string): Error {
+    return Object.assign(
+      new Error(`Agent "${name}" has no live host node; cannot dispatch release`),
+      {
+        name: 'RelayError',
+        code: 'transport_error',
+        retryable: true,
+        statusCode: 503,
+        status: 503,
+        rawCode: 'agent_host_unavailable',
+      },
+    )
+  }
+
+  override async release(name: string, reason?: string): Promise<void> {
+    this.releaseAttempts.push({ name, reason })
+    if (reason === 'issue-done') throw HostUnavailableReleaseFleetClient.hostUnavailable(name)
+    await super.release(name, reason)
+  }
+}
+
+describe('a dead-lettered release must not keep the durable dispatch lease', () => {
+  const RETRY_MS = 5
+  const WORKSPACE = 'factory-test'
+
+  /** The stuck `releasing` row, found by issue rather than by re-deriving its key. */
+  const stuckLifecycle = async (stateStore: InMemoryStateStore, issueKey: string) => {
+    const entries = await stateStore.listDispatchLifecycles(WORKSPACE)
+    const found = [...entries].find(([, lifecycle]) => lifecycle.issue.key === issueKey)
+    expect(found).toBeDefined()
+    return found!
+  }
+
+  /**
+   * True once no live lease stands on the key. Asserting on this rather than on
+   * a counter is what keeps the test a statement about the INVARIANT — the key
+   * is claimable — instead of a statement about which line of the fix ran. It
+   * is also read-only, so polling it cannot itself take the lease that the
+   * subsequent claim is trying to prove is available.
+   */
+  const leaseIsFree = async (stateStore: InMemoryStateStore, issueKey: string) => {
+    const [, lifecycle] = await stuckLifecycle(stateStore, issueKey)
+    return lifecycle.lease === undefined || lifecycle.lease.leaseUntilMs <= Date.now()
+  }
+
+  it('frees the lease once the release budget is exhausted, so another publisher can claim the key', async () => {
+    const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
+    const fleet = new HostUnavailableReleaseFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const errors: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      logger: { warn: () => undefined, error: (...args: unknown[]) => errors.push(args) },
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-75-impl-pear', 'issue-done')
+
+    // STEP 1, stated as an assertion rather than an assumption: the 503 DOES
+    // reach `#chargeReleaseAttempt`. If this line ever fails, the bug is
+    // upstream of the lease and #379 does not fix the case it was written for.
+    await vi.waitFor(
+      () => expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
+      { timeout: 10_000, interval: 5 },
+    )
+    expect(errors.map(([message]) => message)).toContain(
+      '[factory] release retries exhausted; abandoning cleanup for this work unit',
+    )
+
+    // The row is deliberately left non-terminal so a successor re-drives it.
+    // That is only a recovery story if a successor can actually claim it.
+    expect((await stuckLifecycle(stateStore, 'AR-75'))[1].phase).toBe('releasing')
+
+    // THE PRODUCTION SYMPTOM. On origin/main this wait can only end in its own
+    // deadline: the renewal interval re-stamps a full TTL on the key forever,
+    // and the waiter logs "leased by another publisher" at 1 Hz until somebody
+    // notices three days later.
+    await vi.waitFor(
+      async () => expect(await leaseIsFree(stateStore, 'AR-75')).toBe(true),
+      { timeout: 10_000, interval: 5 },
+    )
+
+    const [key, lifecycle] = await stuckLifecycle(stateStore, 'AR-75')
+    const successor = await stateStore.claimDispatchLifecycle(
+      WORKSPACE,
+      key,
+      lifecycle,
+      'successor-publisher',
+      Date.now(),
+      60_000,
+    )
+    expect(successor.acquired).toBe(true)
+    // And the row it inherits is still the un-finished cleanup, not a lie about
+    // the work being done.
+    expect(successor.lifecycle.phase).toBe('releasing')
+  }, 20_000)
+
+  /**
+   * Freeing the lease at the dead-letter is not enough on its own: the renewal
+   * interval walks `#dispatchLifecycleEpochs` and re-stamps a full TTL on
+   * everything it finds. If the abandoned key is still in that map, the lease
+   * comes straight back and the livelock resumes a minute later — which is
+   * exactly the shape production was in. This asserts the epoch is dropped, so
+   * there is nothing left for the renewer to re-stamp.
+   */
+  it('does not let the renewal interval re-stamp the abandoned key', async () => {
+    const mount = new FakeMountClient({ [issuePath(76)]: issueFile(76) })
+    const fleet = new HostUnavailableReleaseFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      logger: { warn: () => undefined, error: () => undefined },
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-76-impl-pear', 'issue-done')
+    await vi.waitFor(
+      () => expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
+      { timeout: 10_000, interval: 5 },
+    )
+
+    await vi.waitFor(
+      async () => expect(await leaseIsFree(stateStore, 'AR-76')).toBe(true),
+      { timeout: 10_000, interval: 5 },
+    )
+
+    // A successor takes the key...
+    const [key, lifecycle] = await stuckLifecycle(stateStore, 'AR-76')
+    const successor = await stateStore.claimDispatchLifecycle(
+      WORKSPACE,
+      key,
+      lifecycle,
+      'successor-publisher',
+      Date.now(),
+      60_000,
+    )
+    expect(successor.acquired).toBe(true)
+
+    // ...and the abandoning process must not be able to renew it back out from
+    // under them. `renewDispatchLifecycle` is owner+epoch fenced, so this is
+    // really asserting that the abandoner no longer believes it owns the key.
+    await new Promise((resolve) => setTimeout(resolve, RETRY_MS * 40))
+    const after = await stateStore.getDispatchLifecycle(WORKSPACE, key)
+    expect(after?.lease?.owner).toBe('successor-publisher')
+  }, 20_000)
+})
+
+/**
  * Differential equivalence between the pull-index fast path and the record walk.
  *
  * The fast path answers "which PR belongs to this issue?" from

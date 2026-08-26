@@ -7720,7 +7720,17 @@ export class FactoryLoop implements Factory {
    * the only thing still running is the spin.
    */
   #chargeReleaseAttempt(record: InFlightIssue, key: string, context: string): boolean {
-    if (this.#dispatchLifecycleReleaseAbandoned.has(key)) return false
+    if (this.#dispatchLifecycleReleaseAbandoned.has(key)) {
+      // Re-entry, and the reason relinquishing the lease once is not enough.
+      // `#driveDispatchLifecycle` re-claims the lease at the TOP of every
+      // drive, before it has read the phase, so anything that drives an
+      // already-dead-lettered key — the held-agent-deadline sweep, a registry
+      // restore, a takeover — puts the epoch straight back into the renewal
+      // map and re-arms the livelock this bound just escaped. Whenever the
+      // budget declines a re-arm, ownership goes back too.
+      this.#trackDispatchLifecycleDrive(this.#relinquishDispatchLifecycleLease(key, record.issue.key))
+      return false
+    }
     const attempts = (this.#dispatchLifecycleReleaseAttempts.get(key) ?? 0) + 1
     this.#dispatchLifecycleReleaseAttempts.set(key, attempts)
     if (attempts <= DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS) return true
@@ -7742,16 +7752,69 @@ export class FactoryLoop implements Factory {
       // spin, it does not declare the work unit clean.
       durableLifecycleRetained,
     })
-    const drive = this.#releaseDeadLetteredSlot(record, key)
-      .catch((error) => {
-        this.#logger.warn?.('[factory] dead-lettered release could not free its batch slot', {
-          issue: record.issue.key,
-          error: describeError(error).errorMessage,
-        })
-      })
-      .finally(() => this.#dispatchLifecycleDrives.delete(drive))
-    this.#dispatchLifecycleDrives.add(drive)
+    this.#trackDispatchLifecycleDrive(
+      this.#releaseDeadLetteredSlot(record, key)
+        .catch((error) => {
+          this.#logger.warn?.('[factory] dead-lettered release could not free its batch slot', {
+            issue: record.issue.key,
+            error: describeError(error).errorMessage,
+          })
+        }),
+    )
     return false
+  }
+
+  /** Keeps a lifecycle-side effect awaitable by `stop()` without leaking the set entry. */
+  #trackDispatchLifecycleDrive(promise: Promise<void>): void {
+    const drive = promise.finally(() => this.#dispatchLifecycleDrives.delete(drive))
+    this.#dispatchLifecycleDrives.add(drive)
+  }
+
+  /**
+   * Stop asserting durable ownership of a work unit this process will not drive
+   * again.
+   *
+   * `#dispatchLifecycleEpochs` is not merely a cache. `#renewDispatchLifecycles`
+   * walks it every `DISPATCH_LIFECYCLE_RENEW_MS` and re-stamps a full
+   * `DISPATCH_LIFECYCLE_LEASE_MS` onto every key it finds, unconditionally.
+   *
+   * A dead-lettered release deliberately leaves its row in the non-terminal
+   * `releasing` phase so a successor or a restart can re-drive the cleanup with
+   * a fresh budget. That is only a recovery path if the successor can CLAIM the
+   * row — and a lease renewed forever by a process that has permanently given
+   * up driving it is a claim nobody can ever win. #379 bounded the retry and
+   * handed back the batch slot, then kept the key locked for the life of the
+   * process, which is how production reached four issues (a dispatch canary
+   * among them) all logging `durable dispatch is leased by another publisher`
+   * at 1 Hz for three days while the holder logged nothing but 503
+   * `agent_host_unavailable`.
+   *
+   * The epoch is dropped BEFORE the durable release so a renewal tick already
+   * in flight cannot re-stamp the lease after it has been relinquished. If the
+   * durable release itself fails, the dropped epoch alone still ends the
+   * livelock: nothing renews the lease any more, so it expires within
+   * `DISPATCH_LIFECYCLE_LEASE_MS` instead of never.
+   */
+  async #relinquishDispatchLifecycleLease(key: string, issueKey: string): Promise<void> {
+    const epoch = this.#dispatchLifecycleEpochs.get(key)
+    if (epoch === undefined) return
+    this.#dispatchLifecycleEpochs.delete(key)
+    try {
+      await this.#state.releaseDispatchLifecycleLease(
+        this.#workspaceId,
+        key,
+        this.#dispatchLifecycleOwner,
+        epoch,
+      )
+      this.#increment('dispatchLifecycleLeasesRelinquished')
+    } catch (error) {
+      this.#logger.warn?.('[factory] could not relinquish the dispatch lease of an abandoned work unit', {
+        issue: issueKey,
+        // The lease still expires on its own now that nothing renews it.
+        expiresWithinMs: DISPATCH_LIFECYCLE_LEASE_MS,
+        error: describeError(error).errorMessage,
+      })
+    }
   }
 
   /**
@@ -7769,12 +7832,20 @@ export class FactoryLoop implements Factory {
    * local slot does not write a terminal phase. On a local lifecycle there is
    * no durable record to retain, so the batch record is all there is and
    * completing it is what keeps capacity honest.
+   *
+   * The DURABLE lease has to go back with the slot. Retaining the row for a
+   * successor while renewing the lease that locks the successor out is not a
+   * handoff, it is a permanent block on the key — see
+   * `#relinquishDispatchLifecycleLease`.
    */
   async #releaseDeadLetteredSlot(record: InFlightIssue, key: string): Promise<void> {
     const batch = await this.#batch()
     const next = batch.complete(record.issue)
     this.#uncompensatedDispatchClaims.delete(key)
     await this.#writeInFlightRegistry()
+    // Before admitting anything else, and before `dispatch` gets a chance to
+    // throw: this process is done with the key either way.
+    await this.#relinquishDispatchLifecycleLease(key, record.issue.key)
     // A freed slot that nothing is admitted into is only half the repair.
     if (next && !this.#stopping) await this.dispatch(next.decision, { dryRun: next.dryRun })
   }
