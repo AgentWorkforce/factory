@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import { GhCliGithubMergeGate, evaluateGithubMergeGate, type GhRunner } from './merge-gate'
+import type { MountClient } from '../ports'
+import { GhCliGithubMergeGate, MountedGithubMergeGate, evaluateGithubMergeGate, type GhRunner } from './merge-gate'
 
 const input = {
   repo: 'AgentWorkforce/pear',
@@ -19,14 +20,42 @@ const live = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 })
 
-describe('GithubMergeGate', () => {
-  it('returns READY only for MERGEABLE+CLEAN, matching head, and no blocking checks', async () => {
-    const gate = new GhCliGithubMergeGate(async () => ({ stdout: JSON.stringify(live()) }))
+const mountedPath = '/github/repos/AgentWorkforce/pear/pulls/123/metadata.json'
 
-    await expect(gate.check(input)).resolves.toMatchObject({
+const mountedPull = (overrides: Record<string, unknown> = {}) => ({
+  provider: 'github',
+  objectType: 'pull_request',
+  objectId: '123',
+  payload: {
+    number: 123,
+    ...live(),
+    ...overrides,
+  },
+})
+
+const pullMount = (content: unknown): Pick<MountClient, 'readFile'> => ({
+  readFile: async (path) => {
+    if (path !== mountedPath) throw new Error(`unexpected mounted PR path ${path}`)
+    return { content }
+  },
+})
+
+describe('GithubMergeGate', () => {
+  it('returns READY from the exact mounted PR record without invoking local gh', async () => {
+    let ghInvoked = false
+    const gate = new MountedGithubMergeGate(
+      pullMount(mountedPull()),
+      new GhCliGithubMergeGate(async () => {
+        ghInvoked = true
+        throw new Error('local gh must not be used for merge-gate reads')
+      }),
+    )
+
+    await expect(gate.check({ ...input, path: mountedPath })).resolves.toMatchObject({
       verdict: 'READY',
       ready: true,
     })
+    expect(ghInvoked).toBe(false)
   })
 
   it('returns READY for MERGEABLE+CLEAN with neutral, skipped, or expected advisory checks', () => {
@@ -82,30 +111,33 @@ describe('GithubMergeGate', () => {
     })
   })
 
-  it('fails closed when gh returns UNKNOWN, errors, or partial output', async () => {
-    const unknown = new GhCliGithubMergeGate(async () => ({
-      stdout: JSON.stringify(live({ mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' })),
-    }))
-    await expect(unknown.check(input)).resolves.toMatchObject({
+  it('fails closed when mounted GitHub reports UNKNOWN or partial gate metadata', async () => {
+    const unknown = new MountedGithubMergeGate(pullMount(mountedPull({
+      mergeable: 'UNKNOWN',
+      mergeStateStatus: 'UNKNOWN',
+    })))
+    await expect(unknown.check({ ...input, path: mountedPath })).resolves.toMatchObject({
       verdict: 'REFUSE',
       ready: false,
     })
 
-    const errorRunner: GhRunner = async () => {
-      throw new Error('gh timed out')
-    }
-    await expect(new GhCliGithubMergeGate(errorRunner).check(input)).resolves.toMatchObject({
-      verdict: 'REFUSE',
-      ready: false,
+    const partial = new MountedGithubMergeGate(pullMount(mountedPull({
+      reviewDecision: undefined,
+    })))
+    await expect(partial.check({ ...input, path: mountedPath })).rejects.toThrow(
+      /capability unavailable.*mounted PR metadata.*reviewDecision.*does not fall back to local gh/i,
+    )
+  })
+
+  it('fails loudly when only the local-gh merge adapter is asked to read readiness', async () => {
+    let ghInvoked = false
+    const gate = new GhCliGithubMergeGate(async () => {
+      ghInvoked = true
+      return { stdout: JSON.stringify(live()) }
     })
 
-    const partial = new GhCliGithubMergeGate(async () => ({
-      stdout: JSON.stringify({ mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }),
-    }))
-    await expect(partial.check(input)).resolves.toMatchObject({
-      verdict: 'REFUSE',
-      ready: false,
-    })
+    await expect(gate.check(input)).rejects.toThrow(/requires mounted PR metadata/i)
+    expect(ghInvoked).toBe(false)
   })
 
   it('refuses missing, blocking, pending, or unknown status checks', () => {

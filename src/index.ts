@@ -137,6 +137,7 @@ export type {
 export {
   GhCliGithubMergeGate,
   GithubMergeGate,
+  MountedGithubMergeGate,
   closeProbePr,
   defaultGhRunner,
   evaluateGithubMergeGate,

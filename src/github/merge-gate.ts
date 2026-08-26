@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
+import type { MountClient } from '../ports'
+import { wrappedPayload } from '../writeback/shared'
 import { localGhMutationAllowed, localGhMutationRefusal, type GithubWriteIdentity } from './gh-identity'
 
 const execFileAsync = promisify(execFile)
@@ -16,6 +18,8 @@ export interface GithubMergeGateInput {
   repo: string
   number: number
   expectedHeadSha?: string
+  /** Exact mounted PR metadata path returned by discovery. */
+  path?: string
 }
 
 export interface GithubMergeInput {
@@ -65,26 +69,10 @@ export class GhCliGithubMergeGate implements GithubMergeGate {
   }
 
   async check(input: GithubMergeGateInput): Promise<GithubMergeGateVerdict> {
-    try {
-      const result = await this.#run([
-        'pr',
-        'view',
-        String(input.number),
-        '--repo',
-        input.repo,
-        '--json',
-        'mergeable,mergeStateStatus,statusCheckRollup,headRefOid,reviewDecision',
-      ])
-      if (result.stdout.trim().length === 0) {
-        return refuse('gh returned empty output', { checkStates: [] })
-      }
-
-      return evaluateGithubMergeGate(input, parseGhJson(result.stdout))
-    } catch (error) {
-      return refuse(`gh merge gate failed: ${error instanceof Error ? error.message : String(error)}`, {
-        checkStates: [],
-      })
-    }
+    throw new Error(
+      `GitHub merge-gate readiness for ${input.repo}#${input.number} requires mounted PR metadata; ` +
+      'the local-gh adapter supports mutations only and Factory will not disguise a missing read capability as REFUSE',
+    )
   }
 
   async merge(input: GithubMergeInput): Promise<GithubMergeResult> {
@@ -130,6 +118,44 @@ export class GhCliGithubMergeGate implements GithubMergeGate {
 }
 
 export const GithubMergeGate = GhCliGithubMergeGate
+
+/**
+ * Reads provider-authoritative merge readiness from the GitHub App projection
+ * and delegates the guarded mutation separately. Discovery passes the exact PR
+ * path, so this adds one read and never scans the pulls tree.
+ */
+export class MountedGithubMergeGate implements GithubMergeGate {
+  readonly #mount: Pick<MountClient, 'readFile'>
+  readonly #mutation: Pick<GithubMergeGate, 'merge'>
+
+  constructor(
+    mount: Pick<MountClient, 'readFile'>,
+    mutation: Pick<GithubMergeGate, 'merge'> = new GhCliGithubMergeGate(),
+  ) {
+    this.#mount = mount
+    this.#mutation = mutation
+  }
+
+  async check(input: GithubMergeGateInput): Promise<GithubMergeGateVerdict> {
+    const path = input.path ?? mountedPullByIdPath(input.repo, input.number)
+    let content: unknown
+    try {
+      content = (await this.#mount.readFile(path)).content
+    } catch (error) {
+      throw mountedMergeGateCapabilityError(
+        input,
+        `could not read ${path}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+
+    const live = mountedMergeGateFields(content, input)
+    return evaluateGithubMergeGate(input, live)
+  }
+
+  async merge(input: GithubMergeInput): Promise<GithubMergeResult> {
+    return this.#mutation.merge(input)
+  }
+}
 
 export function evaluateGithubMergeGate(
   input: GithubMergeGateInput,
@@ -197,19 +223,78 @@ export function evaluateGithubMergeGate(
 }
 
 export const defaultGhRunner: GhRunner = async (args) => {
-  // Compatibility runner. Retire it when merge-gate reads and guarded merges
-  // are fully represented by the mounted GitHub connection: that needs a
-  // `mergePullRequest` capability on `GithubConnectionWrite`, fulfilled
-  // server-side by Relayfile Cloud so Factory still holds no GitHub
-  // credential. Until then `merge` refuses under `github.identity: "app"`
-  // rather than merging as the operator (see ./gh-identity). Tracked on
-  // AgentWorkforce/factory#221; the previous marker cited issue 52, which is
-  // closed as completed and no longer owns this work.
+  // Mutation-only compatibility runner. Merge-gate reads now come from the
+  // mounted App projection. Retire this when `GithubConnectionWrite` exposes
+  // a server-side `mergePullRequest` capability so Factory still holds no
+  // GitHub credential. Until then `merge` refuses under
+  // `github.identity: "app"` rather than merging as the operator (see
+  // ./gh-identity). Tracked on AgentWorkforce/factory#221.
   const { stdout, stderr } = await execFileAsync('gh', args, { maxBuffer: 1024 * 1024 })
   return { stdout, stderr }
 }
 
-const parseGhJson = (stdout: string): unknown => JSON.parse(stdout)
+const mountedPullByIdPath = (repo: string, number: number): string => {
+  const [owner, name, ...extra] = repo.split('/')
+  if (!owner || !name || extra.length > 0 || !Number.isSafeInteger(number) || number <= 0) {
+    throw new Error(`Invalid GitHub pull request identity ${repo}#${number}`)
+  }
+  return `/github/repos/${encodeURIComponent(owner)}__${encodeURIComponent(name)}/pulls/by-id/${number}.json`
+}
+
+const mountedMergeGateFields = (
+  content: unknown,
+  input: GithubMergeGateInput,
+): Record<string, unknown> => {
+  const payload = wrappedPayload(content)
+  const explicitNumber = numberValue(payload.number)
+  if (explicitNumber !== undefined && explicitNumber !== input.number) {
+    throw mountedMergeGateCapabilityError(
+      input,
+      `mounted PR record number is ${explicitNumber}, expected ${input.number}`,
+    )
+  }
+
+  const head = asRecord(payload.head)
+  const mergeable = normalizeMergeable(payload.mergeable)
+  const mergeStateStatus = normalizedString(
+    payload.mergeStateStatus ?? payload.merge_state_status ?? payload.mergeable_state,
+  )
+  const headRefOid = stringValue(payload.headRefOid) ?? stringValue(head.sha)
+  const reviewDecision = normalizedString(payload.reviewDecision ?? payload.review_decision)
+  const statusCheckRollup = payload.statusCheckRollup ?? payload.status_check_rollup
+  const missing = [
+    ['mergeable', mergeable],
+    ['mergeStateStatus', mergeStateStatus],
+    ['headRefOid', headRefOid],
+    ['reviewDecision', reviewDecision],
+    ['statusCheckRollup', Array.isArray(statusCheckRollup) ? statusCheckRollup : undefined],
+  ].flatMap(([name, value]) => value === undefined ? [name] : [])
+  if (missing.length > 0) {
+    throw mountedMergeGateCapabilityError(
+      input,
+      `mounted PR metadata is missing ${missing.join(', ')}`,
+    )
+  }
+
+  return { mergeable, mergeStateStatus, headRefOid, reviewDecision, statusCheckRollup }
+}
+
+const mountedMergeGateCapabilityError = (input: GithubMergeGateInput, detail: string): Error =>
+  new Error(
+    `GitHub merge-gate capability unavailable for ${input.repo}#${input.number}: ${detail}; ` +
+    'Factory requires the authenticated mounted PR projection and does not fall back to local gh',
+  )
+
+const normalizeMergeable = (value: unknown): string | undefined => {
+  if (typeof value === 'boolean') return value ? 'MERGEABLE' : 'CONFLICTING'
+  return normalizedString(value)
+}
+
+const normalizedString = (value: unknown): string | undefined =>
+  typeof value === 'string' && value.trim() ? value.trim().toUpperCase() : undefined
+
+const numberValue = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
 
 const refuse = (reason: string, live: GithubMergeGateVerdict['live']): GithubMergeGateVerdict => ({
   verdict: 'REFUSE',

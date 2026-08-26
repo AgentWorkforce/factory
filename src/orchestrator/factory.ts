@@ -19,7 +19,7 @@ import {
 } from '../mount/relayfile-operation-timeout'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
-import { GithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
+import { GhCliGithubMergeGate, MountedGithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
 import {
   factoryGithubIssueCommentDraftName,
   isFactoryGithubIssueCommentDraftName,
@@ -1243,7 +1243,7 @@ export class FactoryLoop implements Factory {
     this.#githubWriteback = ports.githubWriteback ?? defaultGithubWriteback(config, ports.mount)
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
     this.#github = ports.github ?? MountGithubRead(ports.mount)
-    this.#mergeGate = ports.mergeGate ?? defaultMergeGate(config)
+    this.#mergeGate = ports.mergeGate ?? defaultMergeGate(config, ports.mount)
     this.#verificationGate = ports.verificationGate ?? (config.verification.enabled
       ? new VerificationPipeline({
           descriptorPath: config.verification.descriptorPath,
@@ -19679,10 +19679,10 @@ export class FactoryLoop implements Factory {
     this.#increment('mergeGateSyntheticClosed')
   }
 
-  async #waitForMergeReady(pr: { repo: string; prNumber: number }): Promise<Awaited<ReturnType<GithubMergeGatePort['check']>> | undefined> {
+  async #waitForMergeReady(pr: { repo: string; prNumber: number; path?: string }): Promise<Awaited<ReturnType<GithubMergeGatePort['check']>> | undefined> {
     let lastReason = 'not checked'
     for (let attempt = 1; attempt <= MERGE_GATE_MAX_ATTEMPTS; attempt += 1) {
-      const verdict = await this.#mergeGate.check({ repo: pr.repo, number: pr.prNumber })
+      const verdict = await this.#mergeGate.check({ repo: pr.repo, number: pr.prNumber, ...(pr.path ? { path: pr.path } : {}) })
       lastReason = verdict.reason
       if (verdict.ready && verdict.live.headRefOid) {
         return verdict
@@ -19719,8 +19719,8 @@ export class FactoryLoop implements Factory {
  * test may reach the real `gh` binary here, because the operation it would
  * perform is an irreversible merge.
  */
-export const defaultMergeGate = (config: FactoryConfig, run?: GhRunner): GithubMergeGatePort =>
-  new GithubMergeGate(run, config.github.identity)
+export const defaultMergeGate = (config: FactoryConfig, mount: MountClient, run?: GhRunner): GithubMergeGatePort =>
+  new MountedGithubMergeGate(mount, new GhCliGithubMergeGate(run, config.github.identity))
 
 const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): GithubWriteback => {
   if (config.github.identity !== 'app') {
