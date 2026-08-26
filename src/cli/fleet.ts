@@ -151,7 +151,6 @@ export interface FleetCliDeps {
   stderr?: Pick<NodeJS.WriteStream, 'write'>
   probeCloser?: ProbeCloser
   probePrGhRunner?: GhRunner
-  babysitPrGhRunner?: GhRunner
   now?: () => number
   stopSignalProcessLike?: Pick<NodeJS.Process, 'once' | 'off'>
   daemonExit?: (code: number) => void
@@ -1079,7 +1078,6 @@ async function runStandaloneBabysitCommand(
   const pr = await readStandalonePullRequest(
     mount,
     { repo, prNumber: command.prNumber, url: command.url },
-    deps.babysitPrGhRunner ?? defaultGhRunner,
   )
   const state = pr.state?.trim().toUpperCase()
   if (pr.merged || state === 'MERGED') {

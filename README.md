@@ -827,12 +827,10 @@ path before the durable delivery claim is taken, so a refused run never
 consumes the exactly-once claim and can be retried under a permitted
 identity.
 
-Read paths are deliberately unaffected. `gh pr view` carries no authorship, so
-merge-gate reads, Notion intake label/visibility lookups, and the standalone
-babysitter's PR metadata read (whose `source: 'gh'` provenance marker is
-retained for exactly this reason) continue to work under every identity.
-Review replies and pushes on a babysat PR are performed by the dispatched agent
-under the agent's own credential, not by the Factory process.
+The standalone babysitter reads complete PR metadata from the authenticated
+mounted projection and reports `source: 'mount'`; it does not fall back to
+local `gh`. Review replies and pushes on a babysat PR are performed by the
+dispatched agent under the agent's own credential, not by the Factory process.
 
 Authenticated Factory progress reporting is enabled by default for real CLI
 sessions. Factory sends privacy-bounded lifecycle events, worker ownership,
