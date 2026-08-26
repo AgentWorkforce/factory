@@ -482,13 +482,6 @@ async function publishRepoTask(
   }
   if (!input.dispatch) return base
   if (!input.github) return { ...base, status: 'blocked', reason: 'GitHub issue publisher is not configured' }
-  try {
-    // Ahead of every claim, receipt and network call below: a policy refusal
-    // must not consume the exactly-once delivery claim.
-    input.github.assertWritable?.()
-  } catch (error) {
-    return { ...base, status: 'blocked', reason: error instanceof Error ? error.message : String(error) }
-  }
 
   const receipt = state.receipts[task.sourceKey]
   if (receipt && receipt.kind !== 'github') {
@@ -555,6 +548,13 @@ async function publishRepoTask(
     }
     const delivery = await prepareContractDelivery(task, input, receipt?.delivery ?? bodyDelivery)
     if (delivery && !bodyDelivery) {
+      // The only mutation on the reconciliation path. Everything above it is
+      // a read and stays available under an app identity.
+      try {
+        input.github.assertWritable?.()
+      } catch (error) {
+        return { ...base, status: 'blocked', issue: existing, reason: error instanceof Error ? error.message : String(error) }
+      }
       await assertMountedTaskUnchanged(task)
       await input.github.updateIssue({
         repo: target.repo,
@@ -583,6 +583,16 @@ async function publishRepoTask(
   const missing = await input.github.missingLabels(target.repo, labels)
   if (missing.length > 0) {
     return { ...base, status: 'blocked', reason: `missing required GitHub labels: ${missing.join(', ')}` }
+  }
+  // A create is now certain, so refuse here if this publisher may not write.
+  // Deliberately after the read-only checks above -- reconciliation and
+  // already-dispatched tasks need no mutation and must keep working under an
+  // app identity -- and deliberately before the first durable claim, so a
+  // policy refusal never consumes the exactly-once claim.
+  try {
+    input.github.assertWritable?.()
+  } catch (error) {
+    return { ...base, status: 'blocked', reason: error instanceof Error ? error.message : String(error) }
   }
   await ensureNotionWorkUnitClaim(task, input)
   const delivery = await prepareContractDelivery(task, input)

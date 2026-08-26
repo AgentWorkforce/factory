@@ -25,6 +25,7 @@ import {
 import { MountAuthScopeError, mountAuthRemediation } from '../mount/mount-auth-error'
 import { DocumentStateStore, FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
+import { GhCliIssuePublisher } from '../intake/notion'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, GithubWriteback, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import type { RelayMessaging } from '@agent-relay/sdk'
@@ -864,9 +865,12 @@ describe('fleet CLI runtime', () => {
         tasks: [{ page: '3b36800c1c90801db1cfc8f2e1cff7cf' }],
       }))
       const configPath = join(root, 'factory.config.json')
+      // Deliberately the SPLIT contract shape. A reader that only looked at a
+      // flat `github` key would miss this and fall back to `auto`, silently
+      // permitting the local-user write.
       await writeFile(configPath, JSON.stringify({
-        repos: { org: 'AgentWorkforce', names: ['cloud'] },
-        github: { identity: 'app' },
+        workspaceConfig: { repos: { org: 'AgentWorkforce', names: ['cloud'] } },
+        nodeConfig: { github: { identity: 'app' } },
       }))
 
       const durableClaims = new Map<string, { sourceKey: string; digest: string; claimedAt: string }>()
@@ -880,12 +884,29 @@ describe('fleet CLI runtime', () => {
         dispose: vi.fn(async () => undefined),
       }
       const output = buffer()
+      // Capture the identity the CLI resolved, and keep the publisher's reads
+      // hermetic so the refusal is the only thing that can block the task.
+      const resolved: string[] = []
+      const notionGithub = (identity: string) => {
+        resolved.push(identity)
+        const publisher = new GhCliIssuePublisher(
+          identity as 'app' | 'user' | 'auto',
+          async () => { throw new Error('gh must not be invoked in this test') },
+        )
+        return Object.assign(publisher, {
+          repositoryVisibility: async () => 'private' as const,
+          missingLabels: async () => [],
+          findBySource: async () => undefined,
+        })
+      }
 
       const code = await runFleetCli(
         ['intake', 'notion', manifestPath, '--config', configPath],
-        { fleet: new FakeFleetClient(), notionClaims, stdout: output, stderr: buffer() },
+        { fleet: new FakeFleetClient(), notionClaims, notionGithub, stdout: output, stderr: buffer() },
       )
 
+      // The CLI read the SPLIT contract's node half, not a flat github key.
+      expect(resolved).toEqual(['app'])
       expect(code).toBe(1)
       expect(JSON.parse(output.text())).toMatchObject({
         ok: false,

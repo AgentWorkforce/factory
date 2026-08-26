@@ -812,9 +812,20 @@ exactly as they always have. Neither refusal is reachable in the default cloud
 deployment, which runs `mergePolicy: "never"` and does not run Notion intake.
 
 Notion intake is a separate surface from the Factory lifecycle writeback and
-still requires local `gh` authentication when enabled; its CLI entry point
-states `"user"` explicitly so the attribution is a decision on the record
-rather than an unnoticed default.
+still requires local `gh` authentication when enabled. Its CLI entry point
+resolves `github.identity` from the selected contract — including a split
+`workspaceConfig`/`nodeConfig` contract, where the node half wins — so `"app"`
+refuses while `"user"` and `"auto"` proceed. An absent contract resolves to
+`"auto"`, matching the schema's own synthesis of an unset `github` block; a
+contract that exists but cannot be parsed is an error rather than a silent
+downgrade to the permissive value.
+
+Only the mutations refuse. Reconciliation of an already-dispatched task
+performs no GitHub write, so it continues to work under `"app"`: the refusal is
+raised immediately before the issue create or the issue edit, and in the create
+path before the durable delivery claim is taken, so a refused run never
+consumes the exactly-once claim and can be retried under a permitted
+identity.
 
 Read paths are deliberately unaffected. `gh pr view` carries no authorship, so
 merge-gate reads, Notion intake label/visibility lookups, and the standalone

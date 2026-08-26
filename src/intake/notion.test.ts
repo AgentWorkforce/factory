@@ -210,7 +210,9 @@ describe('Notion spec intake', () => {
     expect(vi.mocked(claims.claim)).not.toHaveBeenCalled()
     expect(durableClaims.size).toBe(0)
     expect(refusing.createIssue).not.toHaveBeenCalled()
-    expect(refusing.repositoryVisibility).not.toHaveBeenCalled()
+    // Reads carry no authorship and stay available: the refusal is raised at
+    // the mutation, not at the top of the task.
+    expect(refusing.repositoryVisibility).toHaveBeenCalled()
 
     // MUST NOT FIRE: the operator switches to a permitted identity and the
     // retry succeeds, proving the aborted run left no wedge behind.
@@ -219,6 +221,33 @@ describe('Notion spec intake', () => {
 
     expect(retried.ok).toBe(true)
     expect(permitted.createIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('still reconciles an already-dispatched task under an app identity, because it writes nothing', async () => {
+    // A blanket refusal at the top of publishRepoTask would break read-only
+    // reconciliation for every app-configured host. Only mutations refuse.
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+
+    const permitted = fakeGithub({ visibility: 'private' })
+    const first = await runNotionIntake({ manifest, dispatch: true, claims, github: permitted })
+    expect(first.ok).toBe(true)
+    const created = await vi.mocked(permitted.createIssue).mock.results[0]!.value as { number: number; url: string }
+
+    const refusing = fakeGithub({ visibility: 'private' })
+    refusing.assertWritable = () => { throw new Error('GitHub identity "app" refuses') }
+    refusing.findBySource = vi.fn(async () => ({
+      ...created,
+      body: vi.mocked(permitted.createIssue).mock.calls[0]![0].body,
+    }))
+
+    const reconciled = await runNotionIntake({ manifest, dispatch: true, claims, github: refusing })
+
+    expect(reconciled.ok).toBe(true)
+    expect(reconciled.results[0]).toMatchObject({ status: 'already-dispatched' })
+    expect(refusing.updateIssue).not.toHaveBeenCalled()
   })
 
   it('preserves an explicit Factory title prefix without duplicating it', async () => {

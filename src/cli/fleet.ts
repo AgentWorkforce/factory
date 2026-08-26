@@ -106,6 +106,7 @@ import {
 } from '../version-info'
 import {
   GhCliIssuePublisher,
+  type GithubIssuePublisher,
   NotionApiFactoryTasksClient,
   RelayChannelNotionClaimStore,
   RelayChannelNotionContractPublisher,
@@ -181,6 +182,12 @@ export interface FleetCliDeps {
   notionContracts?: NotionContractPublisher
   /** Hermetic workspace-global Notion claim store for tests and alternate runtimes. */
   notionClaims?: NotionIntakeClaimStore
+  /**
+   * Hermetic GitHub issue publisher for intake tests and alternate runtimes.
+   * Receives the identity resolved from the selected contract, so a test can
+   * assert the CLI honours `github.identity` without reaching the gh binary.
+   */
+  notionGithub?: (identity: GithubWriteIdentity) => GithubIssuePublisher
   /** Hermetic Factory Tasks reader for manifest-generation tests and alternate runtimes. */
   notionFactoryTasks?: FactoryTasksNotionClient
   /** Hermetic verification-environment sweep for CLI tests and alternate runtimes. */
@@ -370,7 +377,10 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           // explicit `github.identity: "app"` it refuses rather than writing
           // as the operator. Hardcoding `'user'` here would make that gate
           // unreachable from the only production caller.
-          github: new GhCliIssuePublisher(await resolveNotionIntakeIdentity(globals.config)),
+          github: await (async () => {
+            const identity = await resolveNotionIntakeIdentity(globals.config)
+            return deps.notionGithub?.(identity) ?? new GhCliIssuePublisher(identity)
+          })(),
           workspace,
           ...(notionClaims ? { claims: notionClaims } : {}),
           ...(notionContracts ? { contracts: notionContracts } : {}),
@@ -1686,6 +1696,12 @@ function parseFactoryStartFlags(args: Array<string | undefined>): { mode: 'live'
  * read or parsed IS an error: silently degrading it to `auto` would resolve a
  * deliberate `app` selection into the permissive value and reintroduce the
  * silent local-user write this gate exists to prevent.
+ *
+ * Both contract shapes are read. A split contract carries `workspaceConfig`
+ * and `nodeConfig`, and `combineSplitConfigInput` merges them as
+ * `{ ...workspace, ...node }`, so the node half wins — reading only the flat
+ * `github` key would miss a split contract's `identity: "app"` entirely and
+ * fall back to `auto`.
  */
 async function resolveNotionIntakeIdentity(path?: string): Promise<GithubWriteIdentity> {
   const configPath = path ?? resolve(process.cwd(), 'factory.config.json')
@@ -1696,10 +1712,16 @@ async function resolveNotionIntakeIdentity(path?: string): Promise<GithubWriteId
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'auto'
     throw error
   }
-  const identity = githubIdentitySchema.parse(
-    (JSON.parse(raw) as { github?: { identity?: unknown } } | null)?.github?.identity,
+  const record = asRecord(JSON.parse(raw))
+  const identityIn = (half: unknown): unknown => asRecord(asRecord(half)?.github)?.identity
+  const declared = record && (
+    Object.prototype.hasOwnProperty.call(record, 'workspaceConfig') ||
+    Object.prototype.hasOwnProperty.call(record, 'nodeConfig')
   )
-  return identity
+    // Node half wins, matching combineSplitConfigInput's spread order.
+    ? identityIn(record.nodeConfig) ?? identityIn(record.workspaceConfig)
+    : identityIn(record)
+  return githubIdentitySchema.parse(declared)
 }
 
 async function loadConfig(path?: string, options: LocalClonePathOptions = {}): Promise<LoadedConfig> {
