@@ -68,6 +68,13 @@ export interface FactoryPorts {
    * release retry budget without spending ten real seconds waiting for it.
    */
   dispatchLifecycleRetryMs?: number
+  /**
+   * Interval at which owned dispatch-lifecycle leases are renewed. Test-only
+   * override of the built-in 60 s, so a suite can actually observe the renewer
+   * run instead of asserting around it. A test that never lets this fire cannot
+   * distinguish a relinquished lease from a retained epoch (#391 review, P2).
+   */
+  dispatchLifecycleRenewMs?: number
   relayflows?: FactoryRelayflowDispatchPort
   /** Local CLI checkout isolation. Remote fleet nodes own their own checkout lifecycle. */
   worktrees?: AgentWorktreeManager

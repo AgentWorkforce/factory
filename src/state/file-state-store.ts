@@ -291,7 +291,15 @@ export class DocumentStateStore extends InMemoryStateStore {
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const lifecycle = document.workspaces[workspaceId]?.dispatchLifecycles[key]
-      if (!lifecycle?.lease || lifecycle.lease.owner !== owner || lifecycle.lease.epoch !== epoch) return false
+      // Expiry is part of the fence. See StateStore#renewDispatchLifecycle: a
+      // relinquished lease keeps its owner and epoch, so without this a handback
+      // is undone by any renewal driven from a pre-handback snapshot.
+      if (
+        !lifecycle?.lease ||
+        lifecycle.lease.owner !== owner ||
+        lifecycle.lease.epoch !== epoch ||
+        lifecycle.lease.leaseUntilMs <= nowMs
+      ) return false
       lifecycle.lease.leaseUntilMs = nowMs + leaseMs
       lifecycle.updatedAtMs = nowMs
       await this.#persist(document)

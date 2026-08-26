@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { describe, expect, it } from 'vitest'
 
-import type { BabysitterSessionState, ConversationSessionState, DispatchLifecycle, GithubIssueCommentWatchState, WaitingClarification } from '../ports/state'
+import type { BabysitterSessionState, ConversationSessionState, DispatchLifecycle, GithubIssueCommentWatchState, StateStore, WaitingClarification } from '../ports/state'
 import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
 import { FileStateStore } from './file-state-store'
 import { InMemoryStateStore } from './in-memory-state-store'
@@ -178,6 +178,56 @@ describe('FileStateStore', () => {
         reason: 'in-flight',
         state: { lease: { owner: `${process.pid}:first`, epoch: 1 } },
       })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * Renewal must fence on expiry, not only on owner and epoch (#391 review, P2).
+   *
+   * `releaseDispatchLifecycleLease` relinquishes by dropping `leaseUntilMs` to
+   * the floor and leaving `owner` and `epoch` exactly where they were. So if
+   * renewal checks only owner and epoch, the former owner can extend a lease it
+   * has already handed back — for a full term — and re-block the key. That is
+   * not hypothetical: `#renewDispatchLifecycles` iterates a SNAPSHOT of the
+   * owned-epoch map, so a renewal tick already in flight when the handback runs
+   * holds precisely the credentials that would pass an owner+epoch-only check.
+   *
+   * `saveDispatchLifecycle` and `promoteDispatchLifecycle` already fence this
+   * way, so this closes an inconsistency in the contract rather than adding a
+   * new rule. Both stores implement it, so both are asserted here against the
+   * same script — a fence that holds in only one of them is not a fence.
+   */
+  it.each<[string, (watchStatePath: string) => StateStore]>([
+    ['FileStateStore', (watchStatePath) => new FileStateStore({ batchSize: 2, watchStatePath })],
+    ['InMemoryStateStore', () => new InMemoryStateStore({ batchSize: 2 })],
+  ])('refuses to renew a relinquished or expired dispatch lifecycle lease (%s)', async (_name, make) => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-renew-fence-'))
+    try {
+      const store = make(join(root, 'state.json'))
+      const seed = dispatchLifecycle(91)
+      const key = dispatchIssueIdentity(seed.issue)
+
+      const claim = await store.claimDispatchLifecycle('workspace-1', key, seed, 'owner-a', 1_000, 5_000)
+      expect(claim).toMatchObject({ acquired: true, lease: { owner: 'owner-a', epoch: 1 } })
+
+      // Control: a live lease renews normally, so a failure below is the fence
+      // and not a broken fixture.
+      expect(await store.renewDispatchLifecycle('workspace-1', key, 'owner-a', 1, 2_000, 5_000)).toBe(true)
+
+      // Hand it back, then try to renew with credentials that are still, by
+      // owner and epoch, entirely valid.
+      await store.releaseDispatchLifecycleLease('workspace-1', key, 'owner-a', 1)
+      expect(await store.renewDispatchLifecycle('workspace-1', key, 'owner-a', 1, 2_100, 5_000)).toBe(false)
+
+      // And the point of all of it: the key is claimable by someone else.
+      const successor = await store.claimDispatchLifecycle('workspace-1', key, seed, 'owner-b', 2_200, 5_000)
+      expect(successor).toMatchObject({ acquired: true, lease: { owner: 'owner-b', epoch: 2 } })
+
+      // A lease that lapsed on its own is the same case: it must be re-claimed,
+      // which bumps the epoch and fences the old holder, never silently extended.
+      expect(await store.renewDispatchLifecycle('workspace-1', key, 'owner-b', 2, 99_000, 5_000)).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

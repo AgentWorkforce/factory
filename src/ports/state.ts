@@ -477,6 +477,22 @@ export interface StateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<DispatchLifecycleClaim>
+  /**
+   * Extend an owned, still-live dispatch-lifecycle lease.
+   *
+   * Fenced on owner, epoch AND expiry. The expiry half is not incidental: an
+   * expired or relinquished lease must be re-CLAIMED, which bumps the epoch and
+   * fences out the previous holder, never silently extended back to life. Without
+   * it a lease that was deliberately handed back is fully resurrectable by its
+   * own former owner, because relinquishment leaves `owner` and `epoch` in place
+   * and only drops `leaseUntilMs` — so any renewal already in flight, or driven
+   * from a snapshot taken before the handback, restores it for a full term and
+   * re-blocks the key (#391 review, P2).
+   *
+   * `saveDispatchLifecycle` and `promoteDispatchLifecycle` already fence this
+   * way; renewal was the one operation that did not, which was an inconsistency
+   * in this contract rather than a deliberate allowance.
+   */
   renewDispatchLifecycle(
     workspaceId: string,
     key: string,
