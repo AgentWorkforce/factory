@@ -785,8 +785,6 @@ export class FactoryLoop implements Factory {
   readonly #probeCloser: ProbeCloser
   readonly #probePrResolver: ProbePrResolver
   readonly #customProbePrResolver: boolean
-  readonly #hasProbePrGhRunner: boolean
-  readonly #probePrGhRunner: GhRunner
   readonly #logger: Logger
   readonly #clock: Clock
   readonly #processIdentityReader: typeof readProcessIdentity
@@ -1257,8 +1255,6 @@ export class FactoryLoop implements Factory {
       : undefined)
     this.#probeCloser = ports.probeCloser ?? closeProbePr
     this.#customProbePrResolver = Boolean(ports.probePrResolver)
-    this.#hasProbePrGhRunner = Boolean(ports.probePrGhRunner)
-    this.#probePrGhRunner = ports.probePrGhRunner ?? failClosedGhRunner
     this.#probePrResolver = ports.probePrResolver ??
       ((issue) => this.#resolveIssuePr(issue, { repo: this.#probeRepoForIssue(issue) }))
     this.#logger = normalizeLogger(ports.logger ?? console)
@@ -11493,42 +11489,6 @@ export class FactoryLoop implements Factory {
     repo: string,
     expectedHeadRef: string,
   ): Promise<GithubPublishPullRequestResult | undefined> {
-    if (this.#hasProbePrGhRunner) {
-      try {
-        const result = await this.#probePrGhRunner([
-          'pr',
-          'list',
-          '--repo',
-          repo,
-          '--head',
-          expectedHeadRef,
-          '--state',
-          'open',
-          '--json',
-          'number,url,headRefName,isDraft',
-          '--limit',
-          '10',
-        ])
-        const payload = parseJsonContent(result.stdout)
-        if (Array.isArray(payload)) {
-          const candidates = payload.flatMap((entry): GithubPublishPullRequestResult[] => {
-            const candidate = asRecord(entry)
-            const number = numberValue(candidate?.number)
-            const url = stringValue(candidate?.url)
-            const headRef = stringValue(candidate?.headRefName)
-            if (!number || !url || headRef !== expectedHeadRef || candidate?.isDraft !== false) return []
-            return [{ repo, number, url, headRef }]
-          })
-          return candidates.sort((a, b) => b.number - a.number)[0]
-        }
-      } catch (error) {
-        this.#logger.warn?.('[factory] exact-head gh PR lookup failed; falling back to mounted metadata', {
-          repo,
-          headRef: expectedHeadRef,
-          error: describeError(error).errorMessage,
-        })
-      }
-    }
     const parts = githubRepoParts(repo)
     if (!parts) return undefined
     const roots = [
@@ -21894,8 +21854,6 @@ const legacyGithubPrCanBeAdopted = (issue: LinearIssue, pr: ResolvedIssuePr): bo
 }
 
 const normalizePrState = (state?: string): string | undefined => state?.toUpperCase()
-
-const failClosedGhRunner: GhRunner = async () => ({ stdout: '[]' })
 
 const ISSUE_KEY_PATTERN = /^[A-Z]+-\d+$/u
 

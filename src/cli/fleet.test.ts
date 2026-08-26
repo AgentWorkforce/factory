@@ -1651,8 +1651,10 @@ describe('fleet CLI runtime', () => {
         on: vi.fn(),
         dispose: vi.fn(),
       } as unknown as Factory
+      const probePrGhRunner = vi.fn(async () => ({ stdout: '[]' }))
       const createFactorySpy = vi.fn((_config, ports: FactoryPorts) => {
         expect(ports.reporter).toBe(reporter)
+        expect(ports).not.toHaveProperty('probePrGhRunner')
         return factory
       }) as typeof createFactory
       const cloudMountFromConfig = vi.fn(async (options) => {
@@ -1668,12 +1670,14 @@ describe('fleet CLI runtime', () => {
         fleet: new FakeFleetClient(),
         cloudMountFromConfig,
         reporter,
+        probePrGhRunner,
         createFactory: createFactorySpy,
         stdout: buffer(),
         stderr: buffer(),
       })
 
       expect(code).toBe(0)
+      expect(probePrGhRunner).not.toHaveBeenCalled()
       expect(events.map((event) => event.type)).toEqual([
         'instance.started',
         'factory.anomaly',
