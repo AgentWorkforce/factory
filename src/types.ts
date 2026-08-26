@@ -317,6 +317,25 @@ export interface FactoryReadinessReconcileStatus {
    */
   treeReads?: number
   emptyTreeReads?: number
+  /** Configured GitHub repositories examined by the last enumerating sweep. */
+  configuredRepos?: number
+  /** Repositories whose candidate paths came from the issue index. */
+  indexBackedRepos?: number
+  indexBackedEmptyRepos?: number
+  /** Repositories whose candidate paths came entirely from the durable cache. */
+  cacheBackedRepos?: number
+  cacheBackedEmptyRepos?: number
+  /** Repositories whose candidate paths required fresh tree reads. */
+  treeBackedRepos?: number
+  treeBackedEmptyRepos?: number
+  /** Candidate paths produced by all configured repository sources. */
+  discoveryPaths?: number
+  /** Consecutive successful enumerating sweeps that found zero candidates. */
+  zeroCandidateSweeps?: number
+  /** Number of consecutive empty sweeps required before the warn signal fires. */
+  zeroCandidateAlarmThreshold?: number
+  /** True once the current empty streak has reached the alarm threshold. */
+  zeroCandidateAlarmActive?: boolean
   /** Work units the last enumerating sweep actually dispatched. */
   dispatched?: number
   /** Work units the last enumerating sweep saw and declined. */
@@ -806,6 +825,16 @@ export interface IterationReport {
    */
   treeReads?: number
   emptyTreeReads?: number
+  discoverySources?: {
+    configuredRepos: number
+    indexBackedRepos: number
+    indexBackedEmptyRepos: number
+    cacheBackedRepos: number
+    cacheBackedEmptyRepos: number
+    treeBackedRepos: number
+    treeBackedEmptyRepos: number
+    paths: number
+  }
   /** A cross-process owner was already enumerating this workspace. */
   discoveryDeferred?: 'sweep-in-flight'
   error?: { message: string; stack?: string }

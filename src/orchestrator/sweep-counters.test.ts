@@ -16,6 +16,7 @@ import { FakeFleetClient, FakeMountClient } from '../testing'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import type { DiscoverySweepClaim } from '../ports/state'
 import { normalizePublicHealth } from './public-health'
+import type { ChangeEvent } from '../ports'
 import type { FactoryPublicReadinessReconcileHealth, FactoryReadinessReconcileStatus } from '../types'
 
 /**
@@ -107,6 +108,30 @@ class StaticTriage implements TriageEngine {
   }
 }
 
+class RemoteLifecycleFleetClient extends FakeFleetClient {
+  override readonly placementLocality = 'remote' as const
+  override readonly lifecycleActionName = 'factory.lifecycle'
+}
+
+class CountingListTreeMount extends FakeMountClient {
+  readonly listTreePrefixes: string[] = []
+
+  override async listTree(prefix: string): Promise<string[]> {
+    this.listTreePrefixes.push(prefix)
+    return super.listTree(prefix)
+  }
+}
+
+const changeEvent = (path: string): ChangeEvent => ({
+  id: 'silent-cache-watermark',
+  workspace: 'factory-sweep-counters',
+  type: 'relayfile.changed',
+  occurredAt: new Date().toISOString(),
+  resource: { path, kind: 'file', id: path, provider: 'github' },
+  summary: {},
+  expand: async () => ({ level: 'summary', path, summary: {} }),
+}) as unknown as ChangeEvent
+
 /**
  * Run one live daemon over `files` and return the readiness record its own
  * startup sweep produced.
@@ -175,6 +200,160 @@ const expectSweptNothing = (readiness: FactoryPublicReadinessReconcileHealth): v
 }
 
 describe('readiness sweep counters (#355)', () => {
+  it('distinguishes index-backed empty discovery from a tree that served non-candidate content', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-empty-kinds-'))
+    const create = (mount: FakeMountClient, workspaceId: string) => createFactory(config({
+      workspaceId,
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, `${workspaceId}.json`) },
+    }), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      triage: new StaticTriage(),
+      logger: {},
+    })
+
+    try {
+      const indexFactory = create(new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/_index.json': [],
+      }), 'index-empty')
+      const indexEmpty = await indexFactory.runOnce()
+      expect(indexEmpty.pulled).toEqual([])
+      expect(indexEmpty.treeReads).toBe(0)
+      expect(indexEmpty.emptyTreeReads).toBe(0)
+      expect(indexEmpty.discoverySources).toEqual({
+        configuredRepos: 1,
+        indexBackedRepos: 1,
+        indexBackedEmptyRepos: 1,
+        cacheBackedRepos: 0,
+        cacheBackedEmptyRepos: 0,
+        treeBackedRepos: 0,
+        treeBackedEmptyRepos: 0,
+        paths: 0,
+      })
+      await indexFactory.stop()
+
+      const contentFactory = create(new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/README.json': { note: 'no ready issues' },
+      }), 'content-no-candidates')
+      const genuinelyEmpty = await contentFactory.runOnce()
+      expect(genuinelyEmpty.pulled).toEqual([])
+      expect(genuinelyEmpty.treeReads).toBe(2)
+      expect(genuinelyEmpty.emptyTreeReads).toBe(1)
+      expect(genuinelyEmpty.discoverySources).toEqual({
+        configuredRepos: 1,
+        indexBackedRepos: 0,
+        indexBackedEmptyRepos: 0,
+        cacheBackedRepos: 0,
+        cacheBackedEmptyRepos: 0,
+        treeBackedRepos: 1,
+        treeBackedEmptyRepos: 0,
+        paths: 1,
+      })
+      await contentFactory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('alarms once after three cache-backed zero-candidate sweeps that issue zero tree reads', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-silent-cache-'))
+    const mount = new CountingListTreeMount()
+    mount.emit(changeEvent('/factory/observability/mount-health/current.json'))
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const create = (logger: { warn?: ReturnType<typeof vi.fn> } = {}) => createFactory(config({
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') },
+    }), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      logger,
+    })
+
+    try {
+      const seedFactory = create()
+      const seed = await seedFactory.runOnce()
+      expect(seed.discoverySources).toMatchObject({
+        configuredRepos: 1,
+        treeBackedRepos: 1,
+        treeBackedEmptyRepos: 1,
+        paths: 0,
+      })
+      expect(seed.treeReads).toBe(2)
+      expect(seed.emptyTreeReads).toBe(2)
+      await seedFactory.stop()
+      const readsAfterSeed = mount.listTreePrefixes.length
+
+      const warn = vi.fn()
+      const factory = create({ warn })
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 25 },
+      })
+
+      await vi.waitFor(() => {
+        expect(factory.status().readinessReconcile).toMatchObject({
+          zeroCandidateAlarmActive: true,
+        })
+      }, { timeout: 5_000 })
+      const snapshot = factory.status()
+      expect(snapshot.readinessReconcile).toMatchObject({
+          candidates: 0,
+          treeReads: 0,
+          emptyTreeReads: 0,
+          configuredRepos: 1,
+          indexBackedRepos: 0,
+          indexBackedEmptyRepos: 0,
+          cacheBackedRepos: 1,
+          cacheBackedEmptyRepos: 1,
+          treeBackedRepos: 0,
+          treeBackedEmptyRepos: 0,
+          discoveryPaths: 0,
+          zeroCandidateAlarmThreshold: 3,
+          zeroCandidateAlarmActive: true,
+      })
+      const emptySweeps = snapshot.readinessReconcile?.zeroCandidateSweeps
+      expect(emptySweeps).toBeGreaterThanOrEqual(3)
+      expect(snapshot.counters.readinessPersistentZeroCandidateSignals).toBe(1)
+      expect(snapshot.counters.readinessZeroCandidateSweeps).toBe(emptySweeps)
+      expect(snapshot.counters.readinessZeroTreeReadSweeps).toBe(emptySweeps)
+      expect(snapshot.counters.githubIssueDiscoveryCacheEmptyRepos).toBe(emptySweeps)
+      expect(snapshot.counters.githubIssueIndexEmptyRepos).toBeUndefined()
+      expect(snapshot.counters.githubIssueTreeEmptyRepos).toBeUndefined()
+
+      // The exact #402 failure shape: both durable repository roots are
+      // present-but-empty, so fallback uses cache, yields no paths, and issues
+      // no listTree. The fleet is explicitly remote, matching production.
+      expect(mount.listTreePrefixes).toHaveLength(readsAfterSeed)
+      expect(warn.mock.calls.filter(([message]) =>
+        message === '[factory] discovery has persistently produced zero candidates')).toHaveLength(1)
+      expect(warn.mock.calls.find(([message]) =>
+        message === '[factory] discovery has persistently produced zero candidates')?.[1]).toMatchObject({
+        consecutiveSweeps: 3,
+        threshold: 3,
+        configuredRepos: 1,
+        cacheBackedRepos: 1,
+        cacheBackedEmptyRepos: 1,
+        discoveryPaths: 0,
+        treeReads: 0,
+        emptyTreeReads: 0,
+      })
+
+      await vi.waitFor(() => {
+        expect(factory.status().readinessReconcile?.zeroCandidateSweeps).toBeGreaterThan(3)
+      }, { timeout: 5_000 })
+      expect(warn.mock.calls.filter(([message]) =>
+        message === '[factory] discovery has persistently produced zero candidates')).toHaveLength(1)
+      await factory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
   it('publishes a non-zero candidate count for a sweep that found and dispatched ready work', async () => {
     const { status, spawns } = await sweepReadiness({
       [issuePath(901)]: issueFile(901),

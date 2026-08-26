@@ -766,6 +766,7 @@ export function createFactory(config: FactoryConfig, ports: FactoryPorts): Facto
  * wrong.
  */
 const discoveryEnumerationPass = new AsyncLocalStorage<{ epoch: number }>()
+const ZERO_CANDIDATE_ALARM_THRESHOLD = 3
 
 export class FactoryLoop implements Factory {
   readonly #config: FactoryConfig
@@ -1012,6 +1013,7 @@ export class FactoryLoop implements Factory {
   #readinessReconcileLastFailureAtMs?: number
   #readinessReconcileLastError?: string
   #readinessReconcileLastErrorClass?: string
+  #readinessReconcileZeroCandidateSweeps = 0
   /**
    * The last *enumerating* sweep's arithmetic (#355).
    *
@@ -1029,6 +1031,7 @@ export class FactoryLoop implements Factory {
     /** Served tree reads, and how many were empty. Held even at zero. */
     treeReads: number
     emptyTreeReads: number
+    discoverySources: NonNullable<IterationReport['discoverySources']>
     dispatched: number
     skipped: number
     skipReasons: Partial<Record<FactorySweepSkipReasonCode, number>>
@@ -1191,6 +1194,16 @@ export class FactoryLoop implements Factory {
   #discoverySweepTreeReads = 0
   /** How many of those were served with zero entries. */
   #discoverySweepEmptyTreeReads = 0
+  #discoverySweepSources: NonNullable<IterationReport['discoverySources']> = {
+    configuredRepos: 0,
+    indexBackedRepos: 0,
+    indexBackedEmptyRepos: 0,
+    cacheBackedRepos: 0,
+    cacheBackedEmptyRepos: 0,
+    treeBackedRepos: 0,
+    treeBackedEmptyRepos: 0,
+    paths: 0,
+  }
   /**
    * The longest `Retry-After` any operation in this sweep advertised.
    *
@@ -3389,6 +3402,16 @@ export class FactoryLoop implements Factory {
     this.#discoverySweepOverloads = 0
     this.#discoverySweepTreeReads = 0
     this.#discoverySweepEmptyTreeReads = 0
+    this.#discoverySweepSources = {
+      configuredRepos: 0,
+      indexBackedRepos: 0,
+      indexBackedEmptyRepos: 0,
+      cacheBackedRepos: 0,
+      cacheBackedEmptyRepos: 0,
+      treeBackedRepos: 0,
+      treeBackedEmptyRepos: 0,
+      paths: 0,
+    }
     this.#discoverySweepRetryAfterSeconds = undefined
     this.#discoverySweepProgress = false
     this.#startDiscoverySweepRenewal(claim.lease.epoch)
@@ -3489,6 +3512,16 @@ export class FactoryLoop implements Factory {
       this.#discoverySweepOverloads = 0
       this.#discoverySweepTreeReads = 0
       this.#discoverySweepEmptyTreeReads = 0
+      this.#discoverySweepSources = {
+        configuredRepos: 0,
+        indexBackedRepos: 0,
+        indexBackedEmptyRepos: 0,
+        cacheBackedRepos: 0,
+        cacheBackedEmptyRepos: 0,
+        treeBackedRepos: 0,
+        treeBackedEmptyRepos: 0,
+        paths: 0,
+      }
       this.#discoverySweepRetryAfterSeconds = undefined
       this.#discoverySweepProgress = false
       // This sweep is over either way (committed, deferred, or lease lost) —
@@ -4013,6 +4046,7 @@ export class FactoryLoop implements Factory {
         // is still inside that try, so the counts are this sweep's own.
         treeReads: this.#discoverySweepTreeReads,
         emptyTreeReads: this.#discoverySweepEmptyTreeReads,
+        discoverySources: { ...this.#discoverySweepSources },
         slackDegraded: this.#slackDegraded,
         ...(orphanRecoveryDegraded ? { orphanRecoveryDegraded } : {}),
       }
@@ -6216,10 +6250,53 @@ export class FactoryLoop implements Factory {
       return
     }
     this.#readinessReconcileLastSweepDeferred = undefined
+    const previousEmptySweeps = this.#readinessReconcileZeroCandidateSweeps
+    const configuredEmptySweep = report.pulled.length === 0 &&
+      (report.discoverySources?.configuredRepos ?? 0) > 0
+    this.#readinessReconcileZeroCandidateSweeps = configuredEmptySweep
+      ? previousEmptySweeps + 1
+      : 0
+    if (configuredEmptySweep) {
+      this.#increment('readinessZeroCandidateSweeps')
+      if ((report.treeReads ?? 0) === 0) this.#increment('readinessZeroTreeReadSweeps')
+      const indexEmptyRepos = report.discoverySources?.indexBackedEmptyRepos ?? 0
+      const cacheEmptyRepos = report.discoverySources?.cacheBackedEmptyRepos ?? 0
+      const treeEmptyRepos = report.discoverySources?.treeBackedEmptyRepos ?? 0
+      if (indexEmptyRepos > 0) this.#increment('githubIssueIndexEmptyRepos', indexEmptyRepos)
+      if (cacheEmptyRepos > 0) this.#increment('githubIssueDiscoveryCacheEmptyRepos', cacheEmptyRepos)
+      if (treeEmptyRepos > 0) this.#increment('githubIssueTreeEmptyRepos', treeEmptyRepos)
+    }
+    if (this.#readinessReconcileZeroCandidateSweeps === ZERO_CANDIDATE_ALARM_THRESHOLD) {
+      this.#increment('readinessPersistentZeroCandidateSignals')
+      this.#logger.warn?.('[factory] discovery has persistently produced zero candidates', {
+        consecutiveSweeps: this.#readinessReconcileZeroCandidateSweeps,
+        threshold: ZERO_CANDIDATE_ALARM_THRESHOLD,
+        configuredRepos: report.discoverySources?.configuredRepos ?? 0,
+        indexBackedRepos: report.discoverySources?.indexBackedRepos ?? 0,
+        indexBackedEmptyRepos: report.discoverySources?.indexBackedEmptyRepos ?? 0,
+        cacheBackedRepos: report.discoverySources?.cacheBackedRepos ?? 0,
+        cacheBackedEmptyRepos: report.discoverySources?.cacheBackedEmptyRepos ?? 0,
+        treeBackedRepos: report.discoverySources?.treeBackedRepos ?? 0,
+        treeBackedEmptyRepos: report.discoverySources?.treeBackedEmptyRepos ?? 0,
+        discoveryPaths: report.discoverySources?.paths ?? 0,
+        treeReads: report.treeReads ?? 0,
+        emptyTreeReads: report.emptyTreeReads ?? 0,
+      })
+    }
     this.#readinessReconcileLastSweep = {
       candidates: report.pulled.length,
       treeReads: report.treeReads ?? 0,
       emptyTreeReads: report.emptyTreeReads ?? 0,
+      discoverySources: report.discoverySources ?? {
+        configuredRepos: 0,
+        indexBackedRepos: 0,
+        indexBackedEmptyRepos: 0,
+        cacheBackedRepos: 0,
+        cacheBackedEmptyRepos: 0,
+        treeBackedRepos: 0,
+        treeBackedEmptyRepos: 0,
+        paths: 0,
+      },
       dispatched: report.dispatched.length,
       skipped: report.skipped.length,
       skipReasons: factorySweepSkipReasonCounts(report.skipped),
@@ -6339,6 +6416,17 @@ export class FactoryLoop implements Factory {
             // an empty workspace, not a silent mount (#351 follow-up).
             treeReads: this.#readinessReconcileLastSweep.treeReads,
             emptyTreeReads: this.#readinessReconcileLastSweep.emptyTreeReads,
+            configuredRepos: this.#readinessReconcileLastSweep.discoverySources.configuredRepos,
+            indexBackedRepos: this.#readinessReconcileLastSweep.discoverySources.indexBackedRepos,
+            indexBackedEmptyRepos: this.#readinessReconcileLastSweep.discoverySources.indexBackedEmptyRepos,
+            cacheBackedRepos: this.#readinessReconcileLastSweep.discoverySources.cacheBackedRepos,
+            cacheBackedEmptyRepos: this.#readinessReconcileLastSweep.discoverySources.cacheBackedEmptyRepos,
+            treeBackedRepos: this.#readinessReconcileLastSweep.discoverySources.treeBackedRepos,
+            treeBackedEmptyRepos: this.#readinessReconcileLastSweep.discoverySources.treeBackedEmptyRepos,
+            discoveryPaths: this.#readinessReconcileLastSweep.discoverySources.paths,
+            zeroCandidateSweeps: this.#readinessReconcileZeroCandidateSweeps,
+            zeroCandidateAlarmThreshold: ZERO_CANDIDATE_ALARM_THRESHOLD,
+            zeroCandidateAlarmActive: this.#readinessReconcileZeroCandidateSweeps >= ZERO_CANDIDATE_ALARM_THRESHOLD,
             dispatched: this.#readinessReconcileLastSweep.dispatched,
             skipped: this.#readinessReconcileLastSweep.skipped,
             ...(Object.keys(this.#readinessReconcileLastSweep.skipReasons).length > 0
@@ -9037,6 +9125,15 @@ export class FactoryLoop implements Factory {
     try {
       const issuePaths = new Map<string, string>()
       for (const { owner, repo } of configuredGithubRepoParts(this.#config)) {
+        // The source breakdown is another per-enumeration ratio, so it inherits
+        // both load-bearing scopes from #listRelayfileTree. The async-local
+        // context excludes startup/backfill and unrelated callers; comparing
+        // its epoch again after every awaited index/tree operation prevents a
+        // stale continuation from writing into the sweep that replaced it.
+        const issuingPass = discoveryEnumerationPass.getStore()
+        const recordsCurrentPass = (): boolean => issuingPass !== undefined &&
+          issuingPass.epoch === this.#discoverySweepEpoch
+        if (recordsCurrentPass()) this.#discoverySweepSources.configuredRepos += 1
         const roots = githubIssueRepoRoots(owner, repo)
         const cachedBatches = roots.map((root) => this.#cachedDiscoveryTree(root))
         const allRootsCached = cachedBatches.every((paths): paths is string[] => paths !== undefined)
@@ -9060,15 +9157,32 @@ export class FactoryLoop implements Factory {
           // comment-replay call sites that share this cache.
           pathBatches = [indexedPaths]
           this.#increment('githubIssueIndexReposUsed')
+          if (recordsCurrentPass()) {
+            this.#discoverySweepSources.indexBackedRepos += 1
+            this.#discoverySweepSources.paths += indexedPaths.length
+            if (indexedPaths.length === 0) this.#discoverySweepSources.indexBackedEmptyRepos += 1
+          }
         } else if (allRootsCached) {
           pathBatches = cachedBatches
           this.#increment('githubIssueDiscoveryCacheReposUsed')
+          if (recordsCurrentPass()) {
+            const count = cachedBatches.reduce((sum, paths) => sum + paths.length, 0)
+            this.#discoverySweepSources.cacheBackedRepos += 1
+            this.#discoverySweepSources.paths += count
+            if (count === 0) this.#discoverySweepSources.cacheBackedEmptyRepos += 1
+          }
         } else {
           pathBatches = []
           for (const root of roots) {
             pathBatches.push(await this.#listRelayfileTree(root, 'GitHub issue ingestion', { cache: true, enumeration: true }))
           }
           this.#increment('githubIssueIndexFallbacks')
+          if (recordsCurrentPass()) {
+            const count = pathBatches.reduce((sum, paths) => sum + paths.length, 0)
+            this.#discoverySweepSources.treeBackedRepos += 1
+            this.#discoverySweepSources.paths += count
+            if (count === 0) this.#discoverySweepSources.treeBackedEmptyRepos += 1
+          }
         }
         for (const paths of pathBatches) {
           for (let index = 0; index < paths.length; index += 1) {
