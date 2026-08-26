@@ -7,6 +7,8 @@ import { ensureCloudSession, type CloudSession } from '@agent-relay/cloud'
 
 import { stringifyLogValue } from '../logging'
 import { resolveLocalFactoryConfig, type LocalClonePathOptions } from '../config/local-clone-paths'
+import { githubIdentitySchema } from '../config/schema'
+import type { GithubWriteIdentity } from '../github'
 import { initializeFactory } from './init'
 import { diagnoseDeployedFactory, renderDeployedDiagnosis } from './diagnose'
 import {
@@ -364,12 +366,11 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         manifest,
         dispatch: !globals.dryRun,
         ...(!globals.dryRun ? {
-          // Notion intake is a separate surface from the Factory lifecycle
-          // writeback and has no app-authored issue-create route, so its
-          // issues are deliberately authored by the operator's gh account.
-          // Stated explicitly here so the attribution is a decision on the
-          // record rather than an unnoticed default.
-          github: new GhCliIssuePublisher('user'),
+          // Notion intake has no app-authored issue-create route, so under an
+          // explicit `github.identity: "app"` it refuses rather than writing
+          // as the operator. Hardcoding `'user'` here would make that gate
+          // unreachable from the only production caller.
+          github: new GhCliIssuePublisher(await resolveNotionIntakeIdentity(globals.config)),
           workspace,
           ...(notionClaims ? { claims: notionClaims } : {}),
           ...(notionContracts ? { contracts: notionContracts } : {}),
@@ -1674,6 +1675,31 @@ function parseFactoryStartFlags(args: Array<string | undefined>): { mode: 'live'
     throw new Error(`Unknown factory start option: ${flag}`)
   }
   return { mode }
+}
+
+/**
+ * The GitHub write identity Notion intake must honour.
+ *
+ * Notion intake does not otherwise require a Factory contract on disk, so an
+ * absent one is not an error — it is the same as an unset `github` block,
+ * which the schema synthesises to `auto`. A file that exists but cannot be
+ * read or parsed IS an error: silently degrading it to `auto` would resolve a
+ * deliberate `app` selection into the permissive value and reintroduce the
+ * silent local-user write this gate exists to prevent.
+ */
+async function resolveNotionIntakeIdentity(path?: string): Promise<GithubWriteIdentity> {
+  const configPath = path ?? resolve(process.cwd(), 'factory.config.json')
+  let raw: string
+  try {
+    raw = await readFile(configPath, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'auto'
+    throw error
+  }
+  const identity = githubIdentitySchema.parse(
+    (JSON.parse(raw) as { github?: { identity?: unknown } } | null)?.github?.identity,
+  )
+  return identity
 }
 
 async function loadConfig(path?: string, options: LocalClonePathOptions = {}): Promise<LoadedConfig> {

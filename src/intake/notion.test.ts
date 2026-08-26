@@ -184,6 +184,43 @@ describe('Notion spec intake', () => {
     expect(github.createIssue).toHaveBeenCalledTimes(1)
   })
 
+  it('refuses an app-identity intake WITHOUT consuming the exactly-once delivery claim', async () => {
+    // A refusal raised from createIssue would land after claimNotionDelivery,
+    // burning the claim: the operator's retry under a permitted identity would
+    // then hit `durable Notion claim already exists` forever. The policy check
+    // must happen before anything durable is reserved.
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+
+    const refusing = fakeGithub({ visibility: 'private' })
+    refusing.assertWritable = () => {
+      throw new Error('GitHub identity "app" refuses creating or editing Notion intake lifecycle issues')
+    }
+
+    const blocked = await runNotionIntake({ manifest, dispatch: true, claims, github: refusing })
+
+    expect(blocked.ok).toBe(false)
+    expect(blocked.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: expect.stringContaining('GitHub identity "app"'),
+    })
+    // Nothing durable and nothing remote was touched.
+    expect(vi.mocked(claims.claim)).not.toHaveBeenCalled()
+    expect(durableClaims.size).toBe(0)
+    expect(refusing.createIssue).not.toHaveBeenCalled()
+    expect(refusing.repositoryVisibility).not.toHaveBeenCalled()
+
+    // MUST NOT FIRE: the operator switches to a permitted identity and the
+    // retry succeeds, proving the aborted run left no wedge behind.
+    const permitted = fakeGithub({ visibility: 'private' })
+    const retried = await runNotionIntake({ manifest, dispatch: true, claims, github: permitted })
+
+    expect(retried.ok).toBe(true)
+    expect(permitted.createIssue).toHaveBeenCalledTimes(1)
+  })
+
   it('preserves an explicit Factory title prefix without duplicating it', async () => {
     const { root, manifest } = await fixtureManifest('private mounted body', {
       bootstrap: {

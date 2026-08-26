@@ -802,7 +802,8 @@ a human-attributed write:
 | Write | Refuses under `"app"` | Missing connected capability |
 |---|---|---|
 | Guarded squash merge (`mergePolicy: "on-green-with-review"`) | the merge is declined and logged; nothing is merged | `mergePullRequest` |
-| Notion intake issue create/edit | the intake run fails with the reason | `createIssue` |
+| Notion intake issue create | the run is blocked with the reason, before any durable claim is taken | `createIssue` |
+| Notion intake issue edit | the run is blocked with the reason, before any durable claim is taken | `updateIssue` |
 
 Both refusals name the missing capability and the recovery path: set
 `github.identity` to `"user"` or `"auto"` to deliberately accept local-user

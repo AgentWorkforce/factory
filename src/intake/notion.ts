@@ -96,6 +96,15 @@ export interface ExistingGithubIssue {
 export type GhCommandRunner = (args: string[], input?: string) => Promise<string>
 
 export interface GithubIssuePublisher {
+  /**
+   * Refuse now if this publisher may not perform GitHub mutations at all.
+   *
+   * Called before any durable claim is reserved. An identity refusal raised
+   * from `createIssue` would arrive after `claimNotionDelivery` has already
+   * consumed the exactly-once claim, so the operator's retry under a
+   * permitted identity would then be blocked forever by its own aborted run.
+   */
+  assertWritable?(): void
   repositoryVisibility(repo: string): Promise<'public' | 'private' | 'internal'>
   missingLabels(repo: string, labels: readonly string[]): Promise<string[]>
   findBySource(repo: string, sourceKey: string): Promise<ExistingGithubIssue | undefined>
@@ -405,6 +414,14 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
     this.#gh = gh
   }
 
+  assertWritable(): void {
+    assertLocalGhMutationAllowed(
+      this.#identity,
+      'creating or editing Notion intake lifecycle issues',
+      'createIssue/updateIssue',
+    )
+  }
+
   async repositoryVisibility(repo: string): Promise<'public' | 'private' | 'internal'> {
     const output = (await this.#gh(['repo', 'view', repo, '--json', 'visibility', '--jq', '.visibility'])).trim().toLowerCase()
     if (output !== 'public' && output !== 'private' && output !== 'internal') {
@@ -465,6 +482,13 @@ async function publishRepoTask(
   }
   if (!input.dispatch) return base
   if (!input.github) return { ...base, status: 'blocked', reason: 'GitHub issue publisher is not configured' }
+  try {
+    // Ahead of every claim, receipt and network call below: a policy refusal
+    // must not consume the exactly-once delivery claim.
+    input.github.assertWritable?.()
+  } catch (error) {
+    return { ...base, status: 'blocked', reason: error instanceof Error ? error.message : String(error) }
+  }
 
   const receipt = state.receipts[task.sourceKey]
   if (receipt && receipt.kind !== 'github') {

@@ -840,6 +840,68 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('honours github.identity "app" for Notion intake instead of writing as the local gh user', async () => {
+    // The gate in GhCliIssuePublisher is worthless if this call site hardcodes
+    // an identity: this is the only production caller of runNotionIntake, so
+    // the refusal must be reachable from the resolved contract.
+    const root = await mkdtemp(join(tmpdir(), 'factory-cli-notion-identity-'))
+    try {
+      const mountedPage = join(root, 'notion', 'pages', '3b36800c-1c90-801d-b1cf-c8f2e1cff7cf')
+      await mkdir(mountedPage, { recursive: true })
+      await writeFile(join(mountedPage, 'content.md'), [
+        '# Chief Spec',
+        'Status: ready',
+        'Title: Verify identity gating',
+        'Summary: Prove intake refuses under an app identity.',
+        'Recipe: single',
+        'Repos: AgentWorkforce/cloud',
+      ].join('\n'))
+      const manifestPath = join(root, 'notion.json')
+      await writeFile(manifestPath, JSON.stringify({
+        version: 1,
+        mountRoot: './notion',
+        statePath: './state.json',
+        tasks: [{ page: '3b36800c1c90801db1cfc8f2e1cff7cf' }],
+      }))
+      const configPath = join(root, 'factory.config.json')
+      await writeFile(configPath, JSON.stringify({
+        repos: { org: 'AgentWorkforce', names: ['cloud'] },
+        github: { identity: 'app' },
+      }))
+
+      const durableClaims = new Map<string, { sourceKey: string; digest: string; claimedAt: string }>()
+      const notionClaims = {
+        get: vi.fn(async (sourceKey: string) => durableClaims.get(sourceKey)),
+        findBySourcePrefix: vi.fn(async () => []),
+        claim: vi.fn(async (claim: { sourceKey: string; digest: string; claimedAt: string }) => {
+          durableClaims.set(claim.sourceKey, claim)
+          return { status: 'claimed' as const, claim }
+        }),
+        dispose: vi.fn(async () => undefined),
+      }
+      const output = buffer()
+
+      const code = await runFleetCli(
+        ['intake', 'notion', manifestPath, '--config', configPath],
+        { fleet: new FakeFleetClient(), notionClaims, stdout: output, stderr: buffer() },
+      )
+
+      expect(code).toBe(1)
+      expect(JSON.parse(output.text())).toMatchObject({
+        ok: false,
+        results: [{
+          status: 'blocked',
+          reason: expect.stringContaining('GitHub identity "app"'),
+        }],
+      })
+      // The refusal must not have consumed the exactly-once claim.
+      expect(notionClaims.claim).not.toHaveBeenCalled()
+      expect(durableClaims.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('returns after exact-path intake while preserving the spawned worker infrastructure', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-cli-notion-dispatch-'))
     try {

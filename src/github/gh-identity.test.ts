@@ -158,6 +158,25 @@ describe('local gh mutations under github.identity', () => {
     ])
   })
 
+  it('MUST FIRE: the Notion refusal is raised by assertWritable, before any claim', () => {
+    // The refusal must be reachable WITHOUT calling createIssue, because
+    // publishRepoTask reserves an exactly-once delivery claim first. A
+    // refusal that only lived inside createIssue would burn that claim and
+    // permanently block the operator's retry under a permitted identity.
+    const { gh, calls } = fakeGh()
+
+    expect(() => new GhCliIssuePublisher('app', gh).assertWritable())
+      .toThrow(/GitHub identity "app"/u)
+    expect(calls).toEqual([])
+  })
+
+  it('MUST NOT FIRE: assertWritable permits user and auto', () => {
+    for (const identity of ['user', 'auto'] as const) {
+      const { gh } = fakeGh()
+      expect(() => new GhCliIssuePublisher(identity, gh).assertWritable()).not.toThrow()
+    }
+  })
+
   it('MUST NOT FIRE: identity "app" leaves Notion intake READS working', async () => {
     // Reads carry no authorship, so gating them would break intake without
     // removing any attribution.
