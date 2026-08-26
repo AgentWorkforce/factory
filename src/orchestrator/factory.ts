@@ -5301,11 +5301,14 @@ export class FactoryLoop implements Factory {
           path: progress.path,
         })
       },
-      // One line per repository saying why the tree walk was necessary. The walk
-      // is a permanent silent fallback today, and a silent permanent fallback is
-      // indistinguishable from a fast path that is working. This makes the day
-      // the index becomes usable (relayfile-adapters#271) show up in the logs
-      // instead of passing unnoticed.
+      // One line per repository saying why the tree walk was necessary. A silent
+      // fallback is indistinguishable from a fast path that is working, and
+      // that is precisely how twelve minutes of sequential reads hid for so
+      // long. Now that the index CAN answer the question, these reasons are the
+      // only way to tell "the index answered" from "the index exists and was
+      // useless" — and on a mount written before
+      // `@relayfile/adapter-github@0.5.7`, `index-without-head-ref` is the
+      // expected reading until a re-ingest converges the rows.
       onIndexFallback: (repo, reason) => {
         this.#increment('probePrIndexFallbacks')
         this.#increment(PROBE_PR_INDEX_FALLBACK_COUNTERS[reason])
@@ -5313,6 +5316,14 @@ export class FactoryLoop implements Factory {
           issue: issue.key,
           repo,
           reason,
+        })
+      },
+      onIndexHit: (repo, prNumber) => {
+        this.#increment('probePrIndexHits')
+        this.#logger.debug?.('[factory] PR probe resolved from the pull index', {
+          issue: issue.key,
+          repo,
+          prNumber,
         })
       },
     }
@@ -20946,7 +20957,7 @@ const linearIssueMirrorsGithubIssue = (issue: LinearIssue, ghIssue: GithubIssueS
 }
 
 /**
- * Why this walk could not be answered from `pulls/_index.json`.
+ * Why this probe still had to walk `pulls/` one `readFile` at a time.
  *
  * `index-absent`              — no index file at the canonical path.
  * `index-shape-unrecognised`  — an index exists but is not the documented bare
@@ -20955,55 +20966,114 @@ const linearIssueMirrorsGithubIssue = (issue: LinearIssue, ghIssue: GithubIssueS
  *                               `{ pulls: [...] }`, while the incremental
  *                               index emitter writes the bare array, so the
  *                               shape depends on which writer last touched it.
- * `index-without-head-ref`    — a readable index, but its rows carry no
- *                               `headRef`. This is the normal case today and
- *                               it is why the walk cannot be short-circuited:
- *                               the primary match (score 30) is a branch-name
- *                               match, and a row without `headRef` cannot rule
- *                               out a branch match on any other pull request.
- * `index-usable`              — rows carry `headRef`; the walk is now avoidable
- *                               and this resolver should be taught the fast path.
+ * `index-without-head-ref`    — a readable index with at least one row that
+ *                               carries no `headRef`. The primary match
+ *                               (score 30) is a branch-name match, so a row
+ *                               without `headRef` cannot rule out a branch
+ *                               match on the pull request it describes. This is
+ *                               the dominant reason on any mount written before
+ *                               `@relayfile/adapter-github@0.5.7`, because an
+ *                               existing mount only gains `headRef` on
+ *                               re-ingest.
+ * `index-row-malformed`       — every row carries `headRef`, but some row's
+ *                               `number`, `title` or `state` is missing or the
+ *                               wrong type, so it cannot be scored or ranked.
+ * `index-incomplete`          — the index does not describe every pull request
+ *                               the tree listing found. An unindexed PR could
+ *                               hold a score-30 branch match, so the rows are
+ *                               no longer a complete population to choose from.
+ * `index-no-match`            — a complete, usable index in which nothing
+ *                               scored 20 or better. A body-only reference
+ *                               (score 10) may still exist on disk and the
+ *                               index cannot see bodies, so the walk is the
+ *                               only way to find it.
+ * `index-disagreed`           — the index named a winner whose own record did
+ *                               not confirm it (missing file, different number,
+ *                               different score, or not open under `openOnly`).
+ *                               A stale row must never decide an answer.
  */
 type PullIndexFallbackReason =
   | 'index-absent'
   | 'index-shape-unrecognised'
   | 'index-without-head-ref'
-  | 'index-usable'
+  | 'index-row-malformed'
+  | 'index-incomplete'
+  | 'index-no-match'
+  | 'index-disagreed'
 
 const PROBE_PR_INDEX_FALLBACK_COUNTERS: Record<PullIndexFallbackReason, string> = {
   'index-absent': 'probePrIndexAbsent',
   'index-shape-unrecognised': 'probePrIndexShapeUnrecognised',
   'index-without-head-ref': 'probePrIndexWithoutHeadRef',
-  // Not a fallback condition so much as a standing invitation: rows carry
-  // `headRef`, so the walk is now avoidable and this counter going non-zero is
-  // the cue to build the fast path.
-  'index-usable': 'probePrIndexUsableButUnused',
+  'index-row-malformed': 'probePrIndexRowMalformed',
+  'index-incomplete': 'probePrIndexIncomplete',
+  'index-no-match': 'probePrIndexNoMatch',
+  'index-disagreed': 'probePrIndexDisagreed',
 }
 
 type ProbeMountWalkObserver = {
   onRead?: (progress: { read: number; total: number; path: string }) => void
   onIndexFallback?: (repo: string, reason: PullIndexFallbackReason) => void
+  onIndexHit?: (repo: string, prNumber: number) => void
 }
 
 /**
- * Classify the pull index without acting on it.
+ * The lowest `issuePrMatchScore` tier the pull index can compute for itself.
  *
- * Deliberately diagnostic only. Factory's issue-side reader
- * (`#githubIssuePathsFromIndex`) uses its index as a NARROWING FILTER over
- * paths it still reads individually, which is safe because it can only
- * over-select. A pull index cannot be used that way today: it carries no
- * `headRef`, so it cannot exclude any pull request from a branch match, and a
- * title hit alone (score 20) must never be returned as the answer while an
- * unread branch match (score 30) could outrank it. Until the row contract
- * carries `headRef` (relayfile-adapters#271), the only honest thing to do with
- * the index is say out loud why it did not help.
+ * The scores are: branch match 30, issue key in title 20, explicit reference in
+ * body 10. A row carries `headRef` and `title` but NOT `body`, so a row can be
+ * scored exactly at the 30 and 20 tiers and is blind at 10. A pull request the
+ * index scores at 20 or better therefore cannot be beaten by anything the index
+ * could not see, because the best a body-only match can ever earn is 10 — which
+ * makes an index hit of 20 or 30 provably the same winner the full walk would
+ * have chosen. Below that threshold the index proves nothing and the walk is
+ * mandatory.
+ *
+ * Deliberately expressed as a threshold rather than a "highest score wins"
+ * shortcut: the constant is the whole safety argument, and inlining `20` at the
+ * comparison would bury it.
  */
-const classifyPullIndexFallback = async (
+const PULL_INDEX_DECISIVE_SCORE = 20
+
+/**
+ * One row of `pulls/_index.json`, narrowed to the fields the probe can use.
+ *
+ * `body` is absent from the contract on purpose — see
+ * `PULL_INDEX_DECISIVE_SCORE` for why that asymmetry is safe rather than a gap.
+ */
+type PullIndexRow = {
+  number: number
+  title: string
+  headRef: string
+  state: string
+  merged?: boolean
+}
+
+type PullIndexReading =
+  | { rows: PullIndexRow[]; reason?: undefined }
+  | { rows?: undefined; reason: Exclude<PullIndexFallbackReason, 'index-incomplete' | 'index-no-match' | 'index-disagreed'> }
+
+/**
+ * Read `pulls/_index.json` and either return rows the probe may rank, or say
+ * why it may not.
+ *
+ * All-or-nothing per repository, and the discipline is copied verbatim from
+ * Factory's issue-side reader (`#githubIssuePathsFromIndex`): fall back for the
+ * ENTIRE repository if any row is legacy or malformed. `headRef` was added to
+ * the public GitHub pull index contract in `@relayfile/adapter-github@0.5.7`
+ * and an already-written mount only converges on re-ingest, so mixed indexes
+ * are the expected state, not a corruption. One legacy row is enough to poison
+ * the whole conclusion: the primary match is a branch match worth 30, so a row
+ * without `headRef` cannot be ruled out as the real winner, and ranking the
+ * remaining rows against each other would answer a different question from the
+ * one the walk answers.
+ */
+const readPullIndexForProbe = async (
   mount: MountClient,
   repo: string,
-): Promise<PullIndexFallbackReason> => {
+): Promise<PullIndexReading> => {
   const [owner, name] = repo.split('/')
-  if (!owner || !name) return 'index-absent'
+  if (!owner || !name) return { reason: 'index-absent' }
   let parsed: unknown
   try {
     const { content } = await mount.readFile(`${GITHUB_ISSUE_ROOT}/${owner}/${name}/pulls/_index.json`)
@@ -21012,17 +21082,178 @@ const classifyPullIndexFallback = async (
     // A mount that is failing pass-wide must not be reported as "no index" —
     // that is the same convention the tree reads below already follow.
     if (isPassWideRelayfileFault(error)) throw error
-    return 'index-absent'
+    return { reason: 'index-absent' }
   }
-  if (!Array.isArray(parsed)) return 'index-shape-unrecognised'
+  if (!Array.isArray(parsed)) return { reason: 'index-shape-unrecognised' }
   // An empty index proves nothing about the row contract, so it must not read
   // as usable — `[].every(...)` is vacuously true.
-  return parsed.length > 0 && parsed.every((entry) => typeof asRecord(entry)?.headRef === 'string')
-    ? 'index-usable'
-    : 'index-without-head-ref'
+  if (parsed.length === 0) return { reason: 'index-without-head-ref' }
+  const rows: PullIndexRow[] = []
+  for (const entry of parsed) {
+    const row = asRecord(entry)
+    if (typeof row?.headRef !== 'string') return { reason: 'index-without-head-ref' }
+    if (
+      !Number.isSafeInteger(row.number) || Number(row.number) <= 0 ||
+      typeof row.title !== 'string' ||
+      typeof row.state !== 'string' ||
+      (row.merged !== undefined && typeof row.merged !== 'boolean')
+    ) {
+      return { reason: 'index-row-malformed' }
+    }
+    rows.push({
+      number: Number(row.number),
+      title: row.title,
+      headRef: row.headRef,
+      state: row.state,
+      merged: row.merged,
+    })
+  }
+  return { rows }
 }
 
-const resolveIssuePrFromMount = async (
+/**
+ * Rank index rows exactly as the walk ranks records it has read.
+ *
+ * `body: ''` is a deliberate constant, not a placeholder for a value that
+ * should have been threaded through. The index carries no body, so scoring with
+ * an empty one makes `issuePrMatchScore` return only the tiers the index can
+ * actually justify — 30 for a branch match, 20 for a title match, 0 otherwise —
+ * and never invents the 10 it cannot see. Everything else (`requireTitleMarker`
+ * gating, `allowLegacyGithubBranch`, the marker itself) is the SAME call the
+ * walk makes on the same inputs, so the two paths cannot score differently.
+ *
+ * The tiebreak mirrors `b.score - a.score || b.prNumber - a.prNumber`: highest
+ * score, then highest pull request number.
+ */
+const bestPullIndexRow = (
+  rows: PullIndexRow[],
+  issue: LinearIssue,
+  marker: string,
+  opts: { requireTitleMarker?: boolean; titleMarker?: string; openOnly?: boolean; allowLegacyGithubBranch?: boolean },
+): { number: number; score: number } | undefined => {
+  let best: { number: number; score: number } | undefined
+  for (const row of rows) {
+    // Same derivation `readProbePrCandidate` applies to a record: a merged pull
+    // request reports MERGED regardless of the raw `state` the provider wrote.
+    const state = row.merged === true ? 'MERGED' : row.state
+    if (opts.openOnly && normalizePrState(state) !== 'OPEN') continue
+    const score = issuePrMatchScore({ title: row.title, body: '', headRef: row.headRef }, issue, marker, opts)
+    if (score < PULL_INDEX_DECISIVE_SCORE) continue
+    if (!best || score > best.score || (score === best.score && row.number > best.number)) {
+      best = { number: row.number, score }
+    }
+  }
+  return best
+}
+
+/**
+ * Build the resolver's candidate shape from one pull request record.
+ *
+ * Shared by the index fast path and the walk so the two can never disagree on a
+ * field. Differential equivalence is the whole safety property of the fast path
+ * and it should hold structurally, not by two copies staying in sync.
+ */
+const probePrCandidate = (
+  repo: string,
+  pr: NonNullable<Awaited<ReturnType<typeof readProbePrCandidate>>>,
+  path: string,
+  score: number,
+): ResolvedIssuePr & { score: number } => ({
+  repo,
+  prNumber: pr.number,
+  draft: pr.draft,
+  headRef: pr.headRef,
+  headRepo: pr.headRepo,
+  crossRepository: pr.crossRepository ?? (
+    pr.headRepo ? pr.headRepo.toLowerCase() !== repo.toLowerCase() : undefined
+  ),
+  state: pr.state,
+  url: pr.url,
+  path,
+  score,
+})
+
+/**
+ * Answer "which pull request belongs to this issue?" from `pulls/_index.json`
+ * instead of reading every mounted pull request record, or say why it could not.
+ *
+ * Reads at most two files: the index, and the one record the index names. That
+ * record read is not an optimisation that was left on the table — it is load
+ * bearing twice over. The index carries no `draft`, `headRepo`, `url` or mount
+ * path, all of which the resolver's result type promises and callers persist as
+ * `ownedPullRequest`; and re-scoring the real record is what turns "the index
+ * said so" into "the record agrees", so a stale row can never decide an answer
+ * on its own.
+ *
+ * The tree listing is NOT avoided, and that is deliberate. It costs two calls
+ * per repository where the record walk cost one call per pull request — 4,000
+ * of them in the live workspace, which is the cost that stalled a sweep for
+ * 11m53s. Keeping it buys two things nothing else can: the exact path spelling
+ * the walk would have reported (the nested layout's slug cannot be constructed,
+ * only listed), and the completeness check below.
+ *
+ * Every condition that still walks:
+ *
+ *  - anything `readPullIndexForProbe` refuses — absent, wrong shape, any row
+ *    without `headRef`, any row whose `number`/`title`/`state` is unusable;
+ *  - a pull request on disk with no row describing it, because an unindexed
+ *    record could hold the score-30 branch match;
+ *  - no row scoring `PULL_INDEX_DECISIVE_SCORE` or better, because a body-only
+ *    reference worth 10 may exist on disk and no index row can see a body;
+ *  - the named record failing to confirm its row — missing, different number,
+ *    different score, or not open when `openOnly` is set.
+ */
+const resolveProbePrFromPullIndex = async (
+  mount: MountClient,
+  repo: string,
+  issue: LinearIssue,
+  marker: string,
+  opts: { requireTitleMarker?: boolean; titleMarker?: string; openOnly?: boolean; allowLegacyGithubBranch?: boolean },
+  walk: string[],
+  pullNumbersOnDisk: Set<number>,
+  observer: ProbeMountWalkObserver,
+): Promise<
+  | { candidate: ResolvedIssuePr & { score: number }; reason?: undefined }
+  | { candidate?: undefined; reason: PullIndexFallbackReason }
+> => {
+  const reading = await readPullIndexForProbe(mount, repo)
+  if (!reading.rows) return { reason: reading.reason }
+
+  const indexed = new Set(reading.rows.map((row) => row.number))
+  for (const number of pullNumbersOnDisk) {
+    if (!indexed.has(number)) return { reason: 'index-incomplete' }
+  }
+
+  const best = bestPullIndexRow(reading.rows, issue, marker, opts)
+  if (!best) return { reason: 'index-no-match' }
+
+  // The first spelling of this pull request in `walk` is by construction the
+  // one the record loop below would have read: `walk` preserves the listing
+  // order of `githubPullRoots` and has already collapsed the alias spellings,
+  // keeping the first. So the fast path reports the same `path` the walk does.
+  const path = walk.find((candidatePath) => githubPullPathParts(candidatePath)?.number === best.number)
+  if (!path) return { reason: 'index-disagreed' }
+
+  const pr = await readProbePrCandidate(mount, path)
+  observer.onRead?.({ read: 1, total: 1, path })
+  if (!pr) return { reason: 'index-disagreed' }
+  if (opts.openOnly && normalizePrState(pr.state) !== 'OPEN') return { reason: 'index-disagreed' }
+  // `readProbePrCandidate` takes the number from the PAYLOAD, falling back to
+  // the path, so a record can disagree with the path that addressed it.
+  if (pr.number !== best.number) return { reason: 'index-disagreed' }
+  const score = issuePrMatchScore(pr, issue, marker, opts)
+  if (score !== best.score) return { reason: 'index-disagreed' }
+
+  observer.onIndexHit?.(repo, pr.number)
+  return { candidate: probePrCandidate(repo, pr, path, score) }
+}
+
+// Exported for the differential-equivalence suite, which has to invoke the
+// index fast path and the record walk over ONE corpus and compare their two
+// answers field for field. Driving that through the loop's public surface would
+// compare a resolution to itself; the same precedent already exists in this
+// file for `githubIssuePathParts` and `keyFromPath`.
+export const resolveIssuePrFromMount = async (
   mount: MountClient,
   config: FactoryConfig,
   issue: LinearIssue,
@@ -21040,9 +21271,6 @@ const resolveIssuePrFromMount = async (
   const candidates: Array<ResolvedIssuePr & { score: number }> = []
   const listErrors: unknown[] = []
   for (const repo of opts.repo ? [opts.repo] : reposFromConfig(config)) {
-    if (observer.onIndexFallback) {
-      observer.onIndexFallback(repo, await classifyPullIndexFallback(mount, repo))
-    }
     const paths = new Set<string>()
     for (const root of githubPullRoots(repo)) {
       try {
@@ -21071,6 +21299,10 @@ const resolveIssuePrFromMount = async (
     // still read exactly as before rather than being filtered on a guess.
     const walk: string[] = []
     const seenPulls = new Set<string>()
+    // The pull request numbers the TREE says exist, which is what makes the
+    // index's completeness checkable below. Built here rather than separately
+    // because `githubPullPathParts` has already been called on every path.
+    const pullNumbersOnDisk = new Set<number>()
     for (const path of paths) {
       if (!path.endsWith('.json')) continue
       const parts = githubPullPathParts(path)
@@ -21078,9 +21310,27 @@ const resolveIssuePrFromMount = async (
         const identity = `${parts.owner}/${parts.repo}#${parts.number}`.toLowerCase()
         if (seenPulls.has(identity)) continue
         seenPulls.add(identity)
+        pullNumbersOnDisk.add(parts.number)
       }
       walk.push(path)
     }
+
+    const marker = opts.titleMarker ?? config.safety.requireTitlePrefix
+    const fromIndex = await resolveProbePrFromPullIndex(
+      mount,
+      repo,
+      issue,
+      marker,
+      opts,
+      walk,
+      pullNumbersOnDisk,
+      observer,
+    )
+    if (fromIndex.candidate) {
+      candidates.push(fromIndex.candidate)
+      continue
+    }
+    observer.onIndexFallback?.(repo, fromIndex.reason)
 
     let read = 0
     for (const path of walk) {
@@ -21088,24 +21338,9 @@ const resolveIssuePrFromMount = async (
       read += 1
       observer.onRead?.({ read, total: walk.length, path })
       if (opts.openOnly && normalizePrState(pr?.state) !== 'OPEN') continue
-      const score = pr
-        ? issuePrMatchScore(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)
-        : 0
+      const score = pr ? issuePrMatchScore(pr, issue, marker, opts) : 0
       if (!pr || score <= 0) continue
-      candidates.push({
-        repo,
-        prNumber: pr.number,
-        draft: pr.draft,
-        headRef: pr.headRef,
-        headRepo: pr.headRepo,
-        crossRepository: pr.crossRepository ?? (
-          pr.headRepo ? pr.headRepo.toLowerCase() !== repo.toLowerCase() : undefined
-        ),
-        state: pr.state,
-        url: pr.url,
-        path,
-        score,
-      })
+      candidates.push(probePrCandidate(repo, pr, path, score))
     }
   }
 

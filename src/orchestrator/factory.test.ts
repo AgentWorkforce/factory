@@ -39,7 +39,7 @@ import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
-import { dispatchComment, githubApiFallbackCandidatesFromDispatchLifecycles, githubApiFallbackCandidatesFromWaitingClarifications, githubIssueIdentity, githubIssuePathParts, githubRepoSubscriptionGlobs, isGithubApiFallbackEligible, keyFromPath, rememberBoundedFallbackEligibility } from './factory'
+import { dispatchComment, githubApiFallbackCandidatesFromDispatchLifecycles, githubApiFallbackCandidatesFromWaitingClarifications, githubIssueIdentity, githubIssuePathParts, githubRepoSubscriptionGlobs, isGithubApiFallbackEligible, keyFromPath, rememberBoundedFallbackEligibility, resolveIssuePrFromMount } from './factory'
 import type { WaitingClarification } from '../ports/state'
 import { globMatchesPath } from '../subscriptions/globs'
 import {
@@ -31874,5 +31874,383 @@ describe('completion release retry budget (#379)', () => {
     // release charge, so it cannot dead-letter a unit that never released.
     expect(source).toContain('this.#scheduleDispatchLifecycleRetry(record, nextDelayMs)\n')
     expect(source).not.toContain('releaseAttempt = true')
+  })
+})
+
+/**
+ * Differential equivalence between the pull-index fast path and the record walk.
+ *
+ * The fast path answers "which PR belongs to this issue?" from
+ * `pulls/_index.json` instead of reading every mounted PR record. That is only
+ * safe if it returns the SAME answer, so every test here runs one corpus twice —
+ * once with the index present, once with the index deleted, which is the exact
+ * condition that forces the walk — and compares the two results field for field
+ * rather than against a hand-written expectation. A hand-written expectation
+ * would only prove that the fast path matches what the author believed the walk
+ * does; #377 already shipped a "no PR for an issue that has one" regression that
+ * the tests did not catch and the reviewer did.
+ *
+ * The corpus deliberately includes cases where the fast path MUST decline, and
+ * two of them (`index-without-head-ref`, `index-incomplete`) are built so that
+ * a fast path which declined incorrectly would return a DIFFERENT pull request,
+ * not merely a slower one.
+ */
+describe('probe PR resolution from the pull index', () => {
+  const PULL_INDEX_PATH = '/github/repos/AgentWorkforce/pear/pulls/_index.json'
+  const byIdPath = (number: number) => `/github/repos/AgentWorkforce__pear/pulls/by-id/${number}.json`
+  const nestedPath = (number: number, slug: string) =>
+    `/github/repos/AgentWorkforce/pear/pulls/${number}__${slug}/meta.json`
+
+  type Row = {
+    number: number
+    title: string
+    headRef?: string
+    state?: string
+    merged?: boolean
+  }
+
+  /** A `pulls/_index.json` row in the `@relayfile/adapter-github@0.5.7` shape. */
+  const indexRow = (row: Row): Record<string, unknown> => ({
+    id: `PR_${row.number}`,
+    number: row.number,
+    title: row.title,
+    updated: '2026-08-26T00:00:00.000Z',
+    state: row.state ?? 'open',
+    ...(row.merged === undefined ? {} : { merged: row.merged }),
+    ...(row.headRef === undefined ? {} : { headRef: row.headRef }),
+  })
+
+  type ProbeOpts = NonNullable<Parameters<typeof resolveIssuePrFromMount>[3]>
+
+  type Differential = {
+    fast: Awaited<ReturnType<typeof resolveIssuePrFromMount>>
+    walked: Awaited<ReturnType<typeof resolveIssuePrFromMount>>
+    /** `undefined` when the index answered; otherwise why it declined. */
+    reason?: string
+    /** PR record reads on the index-present arm (the index itself excluded). */
+    fastReads: string[]
+    /** PR record reads on the index-absent arm. */
+    walkedReads: string[]
+  }
+
+  /**
+   * Resolve one corpus twice: with the index, and with the index deleted.
+   *
+   * Deleting the index is how the second arm is forced to walk, and it is the
+   * production fallback rather than a test-only switch — `index-absent` is a
+   * real classification that real mounts produce.
+   */
+  const bothWays = async (
+    files: Record<string, unknown>,
+    issueNumber: number,
+    opts: ProbeOpts = {},
+  ): Promise<Differential> => {
+    const issue = parseLinearIssue(issuePath(issueNumber), issueFile(issueNumber))
+    const withoutIndex = { ...files }
+    delete withoutIndex[PULL_INDEX_PATH]
+
+    const fastMount = new FakeMountClient(files)
+    const walkMount = new FakeMountClient(withoutIndex)
+    let reason: string | undefined
+    let hits = 0
+    const fast = await resolveIssuePrFromMount(fastMount, config(), issue, opts, undefined, {
+      onIndexFallback: (_repo, indexReason) => { reason = indexReason },
+      onIndexHit: () => { hits += 1 },
+    })
+    const walked = await resolveIssuePrFromMount(walkMount, config(), issue, opts)
+
+    // The two observers are mutually exclusive by construction; if both ever
+    // fired, the reason reported below would be meaningless.
+    expect(hits === 1 || reason !== undefined).toBe(true)
+    expect(hits === 1 && reason !== undefined).toBe(false)
+
+    const records = (mount: FakeMountClient) =>
+      mount.reads.filter((path) => path.includes('/pulls/') && !path.endsWith('_index.json'))
+    return { fast, walked, reason, fastReads: records(fastMount), walkedReads: records(walkMount) }
+  }
+
+  it('returns the walk answer from the index when a branch match outranks a higher-numbered title match', async () => {
+    // PR 899 carries the issue key in its TITLE (20) and is numbered higher than
+    // PR 810, which carries it in its BRANCH (30). If score did not dominate the
+    // `b.prNumber - a.prNumber` tiebreak, 899 would win. It must not.
+    const files: Record<string, unknown> = {
+      [byIdPath(810)]: prFile(810, { title: 'Implement the thing', head_ref: 'factory/ar-800-work', state: 'OPEN' }),
+      [byIdPath(899)]: prFile(899, { title: 'AR-800: earlier attempt', head_ref: 'chore/earlier', state: 'OPEN' }),
+      [PULL_INDEX_PATH]: [
+        indexRow({ number: 810, title: 'Implement the thing', headRef: 'factory/ar-800-work' }),
+        indexRow({ number: 899, title: 'AR-800: earlier attempt', headRef: 'chore/earlier' }),
+      ],
+    }
+
+    const { fast, walked, reason, fastReads } = await bothWays(files, 800)
+    expect(reason).toBeUndefined()
+    expect(fast).toEqual(walked)
+    expect(fast?.prNumber).toBe(810)
+    // The whole point: one record read, not one per pull request.
+    expect(fastReads).toEqual([byIdPath(810)])
+  })
+
+  it('returns the walk answer from the index when a title match outranks a body match', async () => {
+    // The index cannot see a body, so this is the tier where its blindness is
+    // load bearing: 20 is decisive precisely because 10 is the ceiling of what
+    // it cannot see.
+    const files: Record<string, unknown> = {
+      [byIdPath(820)]: prFile(820, { title: 'AR-800: the work', head_ref: 'chore/twenty', state: 'OPEN' }),
+      [byIdPath(888)]: prFile(888, { title: 'Unrelated', head_ref: 'chore/ten', body: 'Fixes AR-800', state: 'OPEN' }),
+      [PULL_INDEX_PATH]: [
+        indexRow({ number: 820, title: 'AR-800: the work', headRef: 'chore/twenty' }),
+        indexRow({ number: 888, title: 'Unrelated', headRef: 'chore/ten' }),
+      ],
+    }
+
+    const { fast, walked, reason, fastReads } = await bothWays(files, 800)
+    expect(reason).toBeUndefined()
+    expect(fast).toEqual(walked)
+    // 888 is numbered higher and really does match by body, so the answer is
+    // only right if 20 beat 10 rather than the tiebreak deciding it.
+    expect(fast?.prNumber).toBe(820)
+    expect(fastReads).toEqual([byIdPath(820)])
+  })
+
+  it('still walks when the only match is in a pull request body', async () => {
+    // A body-only reference scores 10 and no index row can see it. Declining
+    // here is not a missed optimisation, it is the difference between finding
+    // the PR and reporting that the issue has none.
+    const files: Record<string, unknown> = {
+      [byIdPath(830)]: prFile(830, { title: 'Unrelated', head_ref: 'chore/none', body: 'Fixes AR-800', state: 'OPEN' }),
+      [PULL_INDEX_PATH]: [indexRow({ number: 830, title: 'Unrelated', headRef: 'chore/none' })],
+    }
+
+    const { fast, walked, reason, fastReads } = await bothWays(files, 800)
+    expect(reason).toBe('index-no-match')
+    expect(fast).toEqual(walked)
+    expect(fast?.prNumber).toBe(830)
+    expect(fastReads).toEqual([byIdPath(830)])
+  })
+
+  it('breaks a score tie on the higher pull request number exactly as the walk does', async () => {
+    const files: Record<string, unknown> = {
+      [byIdPath(840)]: prFile(840, { title: 'First attempt', head_ref: 'factory/ar-800-a', state: 'OPEN' }),
+      [byIdPath(841)]: prFile(841, { title: 'Second attempt', head_ref: 'factory/ar-800-b', state: 'OPEN' }),
+      [PULL_INDEX_PATH]: [
+        indexRow({ number: 840, title: 'First attempt', headRef: 'factory/ar-800-a' }),
+        indexRow({ number: 841, title: 'Second attempt', headRef: 'factory/ar-800-b' }),
+      ],
+    }
+
+    const { fast, walked, reason } = await bothWays(files, 800)
+    expect(reason).toBeUndefined()
+    expect(fast).toEqual(walked)
+    expect(fast?.prNumber).toBe(841)
+  })
+
+  it('applies openOnly from the index exactly as the walk applies it to records', async () => {
+    // 851 is the higher number and would win outright; it is CLOSED, so an
+    // `openOnly` probe must answer 850 instead. Running both configurations
+    // over one corpus is what proves the filter is doing the deciding.
+    const files: Record<string, unknown> = {
+      [byIdPath(850)]: prFile(850, { title: 'Open attempt', head_ref: 'factory/ar-800-open', state: 'OPEN' }),
+      [byIdPath(851)]: prFile(851, { title: 'Closed attempt', head_ref: 'factory/ar-800-closed', state: 'CLOSED' }),
+      [PULL_INDEX_PATH]: [
+        indexRow({ number: 850, title: 'Open attempt', headRef: 'factory/ar-800-open', state: 'OPEN' }),
+        indexRow({ number: 851, title: 'Closed attempt', headRef: 'factory/ar-800-closed', state: 'CLOSED' }),
+      ],
+    }
+
+    const openOnly = await bothWays(files, 800, { openOnly: true })
+    expect(openOnly.reason).toBeUndefined()
+    expect(openOnly.fast).toEqual(openOnly.walked)
+    expect(openOnly.fast?.prNumber).toBe(850)
+    expect(openOnly.fastReads).toEqual([byIdPath(850)])
+
+    const anyState = await bothWays(files, 800)
+    expect(anyState.reason).toBeUndefined()
+    expect(anyState.fast).toEqual(anyState.walked)
+    expect(anyState.fast?.prNumber).toBe(851)
+  })
+
+  it('treats a merged index row as MERGED under openOnly, exactly as the walk does', async () => {
+    // `readProbePrCandidate` reports MERGED whenever `merged` is true, whatever
+    // the raw state says. The index row derivation has to agree or an
+    // `openOnly` probe would adopt a merged pull request as open.
+    const files: Record<string, unknown> = {
+      [byIdPath(855)]: prFile(855, { title: 'Merged attempt', head_ref: 'factory/ar-800-merged', state: 'open', merged: true }),
+      [PULL_INDEX_PATH]: [
+        indexRow({ number: 855, title: 'Merged attempt', headRef: 'factory/ar-800-merged', state: 'open', merged: true }),
+      ],
+    }
+
+    const { fast, walked, reason } = await bothWays(files, 800, { openOnly: true })
+    expect(reason).toBe('index-no-match')
+    expect(fast).toEqual(walked)
+    expect(fast).toBeUndefined()
+  })
+
+  it('gates index scoring on requireTitleMarker exactly as the walk does', async () => {
+    // 861 outscores 860 (branch 30 vs title 20) but carries no marker, so a
+    // marker-gated probe must answer 860. Both arms, both configurations.
+    const files: Record<string, unknown> = {
+      [byIdPath(860)]: prFile(860, { title: '[factory-e2e] AR-800 probe', head_ref: 'chore/probe', state: 'OPEN' }),
+      [byIdPath(861)]: prFile(861, { title: 'AR-800 real work', head_ref: 'factory/ar-800-real', state: 'OPEN' }),
+      [PULL_INDEX_PATH]: [
+        indexRow({ number: 860, title: '[factory-e2e] AR-800 probe', headRef: 'chore/probe' }),
+        indexRow({ number: 861, title: 'AR-800 real work', headRef: 'factory/ar-800-real' }),
+      ],
+    }
+
+    const gated = await bothWays(files, 800, { requireTitleMarker: true, titleMarker: '[factory-e2e]' })
+    expect(gated.reason).toBeUndefined()
+    expect(gated.fast).toEqual(gated.walked)
+    expect(gated.fast?.prNumber).toBe(860)
+
+    const ungated = await bothWays(files, 800)
+    expect(ungated.reason).toBeUndefined()
+    expect(ungated.fast).toEqual(ungated.walked)
+    expect(ungated.fast?.prNumber).toBe(861)
+  })
+
+  it('falls back for the whole repository when any index row is missing headRef', async () => {
+    // The half-migration case, and the one that decides the answer rather than
+    // just the cost. PR 871 is the real winner (higher number, same score 30)
+    // and its row is legacy. A fast path that ranked only the rows it could
+    // read would confidently answer 870 — a WRONG pull request, not a slow one.
+    const files: Record<string, unknown> = {
+      [byIdPath(870)]: prFile(870, { title: 'Older attempt', head_ref: 'factory/ar-800-older', state: 'OPEN' }),
+      [byIdPath(871)]: prFile(871, { title: 'Newer attempt', head_ref: 'factory/ar-800-newer', state: 'OPEN' }),
+      [PULL_INDEX_PATH]: [
+        indexRow({ number: 870, title: 'Older attempt', headRef: 'factory/ar-800-older' }),
+        indexRow({ number: 871, title: 'Newer attempt' }),
+      ],
+    }
+
+    const { fast, walked, reason, fastReads, walkedReads } = await bothWays(files, 800)
+    expect(reason).toBe('index-without-head-ref')
+    expect(fast).toEqual(walked)
+    expect(fast?.prNumber).toBe(871)
+    // Falling back means falling back for the WHOLE repository, including the
+    // rows that were perfectly good.
+    expect(fastReads).toEqual(walkedReads)
+    expect(fastReads).toHaveLength(2)
+  })
+
+  it('falls back for the whole repository when a pull request on the mount has no index row', async () => {
+    // An unindexed record can hold a score-30 branch match, so an incomplete
+    // index is not a population the ranking may draw a conclusion from. Built
+    // so the omitted PR is the winner: declining changes the answer from 880 to
+    // 881, not merely the read count.
+    const files: Record<string, unknown> = {
+      [byIdPath(880)]: prFile(880, { title: 'AR-800: indexed title match', head_ref: 'chore/indexed', state: 'OPEN' }),
+      [byIdPath(881)]: prFile(881, { title: 'Unindexed', head_ref: 'factory/ar-800-unindexed', state: 'OPEN' }),
+      [PULL_INDEX_PATH]: [
+        indexRow({ number: 880, title: 'AR-800: indexed title match', headRef: 'chore/indexed' }),
+      ],
+    }
+
+    const { fast, walked, reason } = await bothWays(files, 800)
+    expect(reason).toBe('index-incomplete')
+    expect(fast).toEqual(walked)
+    expect(fast?.prNumber).toBe(881)
+  })
+
+  it('falls back when an index row disagrees with the record it names', async () => {
+    // A stale row must never decide an answer on its own. The row claims a
+    // branch match that the record does not carry; the record is authoritative
+    // and the real winner is the other pull request.
+    const files: Record<string, unknown> = {
+      [byIdPath(890)]: prFile(890, { title: 'Stale row', head_ref: 'chore/actually-unrelated', state: 'OPEN' }),
+      [byIdPath(891)]: prFile(891, { title: 'AR-800: real', head_ref: 'chore/real', state: 'OPEN' }),
+      [PULL_INDEX_PATH]: [
+        indexRow({ number: 890, title: 'Stale row', headRef: 'factory/ar-800-stale' }),
+        indexRow({ number: 891, title: 'AR-800: real', headRef: 'chore/real' }),
+      ],
+    }
+
+    const { fast, walked, reason } = await bothWays(files, 800)
+    expect(reason).toBe('index-disagreed')
+    expect(fast).toEqual(walked)
+    expect(fast?.prNumber).toBe(891)
+  })
+
+  it('falls back when the index is absent, malformed, or not a top-level array', async () => {
+    const record = {
+      [byIdPath(805)]: prFile(805, { title: 'The work', head_ref: 'factory/ar-800-shape', state: 'OPEN' }),
+    }
+    const usableRow = indexRow({ number: 805, title: 'The work', headRef: 'factory/ar-800-shape' })
+
+    const absent = await bothWays({ ...record }, 800)
+    expect(absent.reason).toBe('index-absent')
+    expect(absent.fast).toEqual(absent.walked)
+    expect(absent.fast?.prNumber).toBe(805)
+
+    // The eager backfill writer wraps the rows as `{ pulls: [...] }`.
+    const wrapped = await bothWays({ ...record, [PULL_INDEX_PATH]: { pulls: [usableRow] } }, 800)
+    expect(wrapped.reason).toBe('index-shape-unrecognised')
+    expect(wrapped.fast).toEqual(wrapped.walked)
+    expect(wrapped.fast?.prNumber).toBe(805)
+
+    // Unparseable bytes read the same as no index at all, which is the
+    // pre-existing convention: the catch that classifies a read failure cannot
+    // distinguish "no such file" from "not JSON".
+    const unparseable = await bothWays({ ...record, [PULL_INDEX_PATH]: '{ not json' }, 800)
+    expect(unparseable.reason).toBe('index-absent')
+    expect(unparseable.fast).toEqual(unparseable.walked)
+    expect(unparseable.fast?.prNumber).toBe(805)
+
+    // An empty index proves nothing about the row contract — `[].every()` is
+    // vacuously true — so it must never read as usable.
+    const empty = await bothWays({ ...record, [PULL_INDEX_PATH]: [] }, 800)
+    expect(empty.reason).toBe('index-without-head-ref')
+    expect(empty.fast).toEqual(empty.walked)
+    expect(empty.fast?.prNumber).toBe(805)
+
+    // `headRef` present but the rest of the row unusable: it carries no number
+    // to rank by, so the whole repository falls back.
+    const malformedRow: Record<string, unknown> = { ...usableRow }
+    delete malformedRow.number
+    const malformed = await bothWays({ ...record, [PULL_INDEX_PATH]: [malformedRow] }, 800)
+    expect(malformed.reason).toBe('index-row-malformed')
+    expect(malformed.fast).toEqual(malformed.walked)
+    expect(malformed.fast?.prNumber).toBe(805)
+  })
+
+  it('reports the same mount path the walk would have reported for an aliased pull request', async () => {
+    // One pull request under both spellings. The walk keeps the first one the
+    // roots list, and callers persist that path as `ownedPullRequest.path`, so
+    // the fast path has to name the same file rather than the one it finds
+    // easiest to construct.
+    const files: Record<string, unknown> = {
+      [nestedPath(806, 'ar-800-aliased')]: prFile(806, { title: 'Aliased', head_ref: 'factory/ar-800-aliased', state: 'OPEN' }),
+      [byIdPath(806)]: prFile(806, { title: 'Aliased', head_ref: 'factory/ar-800-aliased', state: 'OPEN' }),
+      [PULL_INDEX_PATH]: [indexRow({ number: 806, title: 'Aliased', headRef: 'factory/ar-800-aliased' })],
+    }
+
+    const { fast, walked, reason, fastReads } = await bothWays(files, 800)
+    expect(reason).toBeUndefined()
+    expect(fast).toEqual(walked)
+    expect(fast?.path).toBe(nestedPath(806, 'ar-800-aliased'))
+    expect(fastReads).toEqual([nestedPath(806, 'ar-800-aliased')])
+  })
+
+  it('reads one pull request record on the index path and every record on the fallback path', async () => {
+    // The read-count claim, stated at a size where O(1) and O(N) cannot be
+    // confused. This is the shape of the production defect: 4,000 sequential
+    // record reads for one lookup, which stalled a sweep for 11m53s.
+    const files: Record<string, unknown> = {}
+    const rows: Array<Record<string, unknown>> = []
+    for (let index = 0; index < 60; index += 1) {
+      const number = 9000 + index
+      files[byIdPath(number)] = prFile(number, { title: `Unrelated ${number}`, head_ref: `chore/unrelated-${number}`, state: 'OPEN' })
+      rows.push(indexRow({ number, title: `Unrelated ${number}`, headRef: `chore/unrelated-${number}` }))
+    }
+    files[byIdPath(807)] = prFile(807, { title: 'The work', head_ref: 'factory/ar-800-counted', state: 'OPEN' })
+    rows.push(indexRow({ number: 807, title: 'The work', headRef: 'factory/ar-800-counted' }))
+    files[PULL_INDEX_PATH] = rows
+
+    const { fast, walked, reason, fastReads, walkedReads } = await bothWays(files, 800)
+    expect(reason).toBeUndefined()
+    expect(fast).toEqual(walked)
+    expect(fast?.prNumber).toBe(807)
+    expect(fastReads).toEqual([byIdPath(807)])
+    expect(walkedReads).toHaveLength(61)
   })
 })
