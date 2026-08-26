@@ -32048,17 +32048,23 @@ describe('a dead-lettered release must not keep the durable dispatch lease', () 
    *
    * The property that actually matters: `#renewDispatchLifecycles` walks
    * `#dispatchLifecycleEpochs` and re-stamps a full TTL on every key it finds.
-   * `renewDispatchLifecycle` fences on owner and epoch but NOT on expiry, so a
-   * lease that was relinquished — `leaseUntilMs` pushed to the floor while
-   * `owner` and `epoch` stay put — is fully resurrectable by its own former
-   * owner. Relinquishing the durable lease while leaving the epoch cached
-   * therefore buys nothing: the livelock returns on the next renewal tick.
+   * Relinquishing the durable lease while leaving the epoch cached therefore
+   * buys nothing — the livelock returns on the next renewal tick — because
+   * relinquishment leaves `owner` and `epoch` in place and only drops
+   * `leaseUntilMs`.
+   *
+   * `renewDispatchLifecycle` now fences on expiry as well as owner and epoch
+   * (#391 review, P2), which is what makes a relinquished lease unrenewable
+   * however the handback and an in-flight renewal race. This test predates that
+   * fence and still passes with it: it asserts the observable property — the
+   * lease is never restored — rather than any particular mechanism, so it holds
+   * whichever layer is doing the work, and goes red if either is removed.
    *
    * So: run the renewer for real, at a test-only interval, and assert the
    * relinquished lease is never restored. Ablating just the epoch drop from
    * `#relinquishDispatchLifecycleLease` — keeping the durable release — turns
-   * this red, which is what makes it a test of the epoch rather than of the
-   * fencing.
+   * this red, which is what makes it a test of the handback rather than of the
+   * owner+epoch fencing.
    */
   it('leaves nothing for the renewal interval to re-stamp on the abandoned key', async () => {
     const mount = new FakeMountClient({ [issuePath(76)]: issueFile(76) })
@@ -32095,11 +32101,14 @@ describe('a dead-lettered release must not keep the durable dispatch lease', () 
       await new Promise((resolve) => setTimeout(resolve, RENEW_MS / 2))
     }
 
-    // And the abandoner never so much as ATTEMPTED a renewal on this key: a
-    // retained epoch would have driven `renewDispatchLifecycle`, been refused,
-    // and counted a lost lease. Zero attempts is the epoch being gone, stated
-    // without reference to who won the row.
-    expect(factory.status().counters.dispatchLifecycleLeasesLost).toBeUndefined()
+    // There was a `dispatchLifecycleLeasesLost` assertion here, justified as
+    // "a retained epoch would have driven a renewal, been refused, and counted
+    // a lost lease". That reasoning was wrong and the assertion detected
+    // nothing (#391 review, P3): renewal fences on owner and epoch, and in the
+    // bug shape both still match, so the renewal SUCCEEDS and no lease is ever
+    // counted lost. The counter stayed undefined either way. The sampling above
+    // is the whole of the detection, and the ablation table on this describe is
+    // what demonstrates that rather than asserting it.
 
     // The row is still claimable by a successor at the end of all that, which
     // is the point of relinquishing it in the first place.

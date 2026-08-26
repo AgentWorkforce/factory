@@ -251,7 +251,15 @@ export class InMemoryStateStore implements StateStore {
     leaseMs: number,
   ): Promise<boolean> {
     const lifecycle = this.#workspace(workspaceId).dispatchLifecycles.get(key)
-    if (!lifecycle?.lease || lifecycle.lease.owner !== owner || lifecycle.lease.epoch !== epoch) return false
+    // Expiry is part of the fence. See StateStore#renewDispatchLifecycle: a
+    // relinquished lease keeps its owner and epoch, so without this a handback
+    // is undone by any renewal driven from a pre-handback snapshot.
+    if (
+      !lifecycle?.lease ||
+      lifecycle.lease.owner !== owner ||
+      lifecycle.lease.epoch !== epoch ||
+      lifecycle.lease.leaseUntilMs <= nowMs
+    ) return false
     lifecycle.lease.leaseUntilMs = nowMs + leaseMs
     lifecycle.updatedAtMs = nowMs
     return true

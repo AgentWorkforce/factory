@@ -7036,6 +7036,17 @@ export class FactoryLoop implements Factory {
 
   async #renewDispatchLifecycles(): Promise<void> {
     for (const [key, epoch] of [...this.#dispatchLifecycleEpochs]) {
+      // The snapshot above can outlive the ownership it records: a relinquish
+      // that runs while this loop is awaiting the store for an earlier key
+      // leaves a stale entry here, and renewing it would re-block a key this
+      // process has already handed back (#391 review, P2). Re-read the live map
+      // rather than trusting the snapshot.
+      //
+      // This narrows the window but does not close it on its own — the delete
+      // can still land after this check and before the renew resolves. Closing
+      // it is `renewDispatchLifecycle`'s expiry fence, which makes a
+      // relinquished lease unrenewable no matter how the two race.
+      if (this.#dispatchLifecycleEpochs.get(key) !== epoch) continue
       const renewed = await this.#state.renewDispatchLifecycle(
         this.#workspaceId,
         key,
@@ -7798,9 +7809,17 @@ export class FactoryLoop implements Factory {
    * at 1 Hz for three days while the holder logged nothing but 503
    * `agent_host_unavailable`.
    *
-   * The epoch is dropped BEFORE the durable release so a renewal tick already
-   * in flight cannot re-stamp the lease after it has been relinquished. If the
-   * durable release itself fails, the dropped epoch alone still ends the
+   * The epoch is dropped BEFORE the durable release, so a renewal tick that
+   * STARTS after this point finds nothing to renew. That ordering alone is not
+   * sufficient and an earlier version of this comment wrongly claimed it was
+   * (#391 review, P2): `#renewDispatchLifecycles` iterates a snapshot array, so
+   * a tick already in flight still holds this key and would restore the lease
+   * for a full term. The guarantee comes from `renewDispatchLifecycle` fencing
+   * on expiry as well as owner and epoch, which makes a relinquished lease
+   * unrenewable however the two race; the epoch drop and the loop's live re-read
+   * narrow the window ahead of it.
+   *
+   * If the durable release itself fails, the dropped epoch alone still ends the
    * livelock: nothing renews the lease any more, so it expires within
    * `DISPATCH_LIFECYCLE_LEASE_MS` instead of never.
    */
