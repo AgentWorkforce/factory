@@ -4637,7 +4637,17 @@ describe('fleet CLI runtime', () => {
     const closes: Array<{ repo: string; number: number }> = []
     const integrations = fakeIntegrationConnections(async () => ({ ready: true, state: 'ready' }))
     const cloudMountFromConfig = vi.fn(async (opts) => {
-      const mount = mountWithIntegrationConnections({}, integrations)
+      const mount = mountWithIntegrationConnections({
+        '/github/repos/AgentWorkforce__pear/pulls/by-id/42.json': {
+          payload: {
+            number: 42,
+            state: 'OPEN',
+            headRefName: 'factory-e2e/ar-77-probe',
+            title: '[factory-e2e] AR-77 probe',
+            body: 'Closes AR-77',
+          },
+        },
+      }, integrations)
       mount.githubWrite = {
         publishPullRequest: async () => { throw new Error('unexpected publish') },
         closePullRequest: async (input) => {
@@ -4669,7 +4679,6 @@ describe('fleet CLI runtime', () => {
       }
       return mount
     })
-    let readCount = 0
 
     const code = await runFleetCli([
       'close-probe',
@@ -4683,14 +4692,6 @@ describe('fleet CLI runtime', () => {
       stderr: errors,
       resolveWorkspace: async () => ({ workspaceId: 'rw_test' }),
       cloudMountFromConfig,
-      probePrGhRunner: async () => ({
-        stdout: JSON.stringify({
-          state: readCount++ === 0 ? 'OPEN' : 'CLOSED',
-          headRefName: 'factory-e2e/ar-77-probe',
-          title: '[factory-e2e] AR-77 probe',
-          body: 'Closes AR-77',
-        }),
-      }),
     })
 
     expect(code, errors.text()).toBe(0)

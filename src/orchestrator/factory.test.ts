@@ -9,7 +9,6 @@ import {
   AppGithubWriteback,
   FactoryConfigSchema,
   checkFactoryLoopLiveness,
-  closeProbePr,
   createFactory,
   createRelayflowPolicyRegistry,
   isDispatchableIssue,
@@ -22088,46 +22087,35 @@ describe('FactoryLoop', () => {
   })
 
   it('treats already-closed mount-resolved probe PRs as completed instead of re-wedging', async () => {
+    const prPath = '/github/repos/AgentWorkforce__pear/pulls/by-id/860.json'
+    let closeCalls = 0
     const mount = new FakeMountClient({
       [issuePath(360)]: issueFile(360),
-      '/github/repos/AgentWorkforce__pear/pulls/by-id/860.json': prFile(860, {
+      [prPath]: prFile(860, {
         title: 'Add already closed probe work',
         body: '',
         head_ref: 'ar-360-closed-work',
         state: 'CLOSED',
       }),
+    }, {
+      publishPullRequest: async () => { throw new Error('unexpected publish') },
+      closePullRequest: async () => {
+        closeCalls += 1
+        throw new Error('already-closed PR must not be closed again')
+      },
     })
     const fleet = new FakeFleetClient()
-    const closeViewCalls: string[][] = []
     const factory = createFactory(config(), {
       mount,
       fleet,
       triage: new StaticTriage(),
-      probeCloser: (input) => closeProbePr({
-        ...input,
-        githubWrite: {
-          publishPullRequest: async () => { throw new Error('unexpected publish') },
-          closePullRequest: async () => { throw new Error('already-closed PR must not be closed again') },
-        },
-        runner: async (args) => {
-          closeViewCalls.push(args)
-          return {
-            stdout: JSON.stringify({
-              state: 'CLOSED',
-              title: 'Add already closed probe work',
-              body: '',
-              headRefName: 'ar-360-closed-work',
-            }),
-          }
-        },
-      }),
     })
 
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(360), issueFile(360))))
     await factory.runLoop({ maxIterations: 1 })
 
-    expect(closeViewCalls).toHaveLength(1)
-    expect(closeViewCalls[0]).toContain('view')
+    expect(mount.reads.filter((path) => path === prPath)).toHaveLength(2)
+    expect(closeCalls).toBe(0)
     expect(fleet.releases.map((release) => release.reason)).toEqual(['issue-done', 'issue-done'])
     expect(factory.status().inFlight).toEqual([])
     expect(factory.status().counters.done).toBe(1)

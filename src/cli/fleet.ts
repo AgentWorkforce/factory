@@ -406,6 +406,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         prNumber: command.prNumber,
         expectedIssueKey: command.issue,
         ...(githubWrite ? { githubWrite } : {}),
+        ...(mount ? { mount } : {}),
         ...(deps.probePrGhRunner ? { runner: deps.probePrGhRunner } : {}),
       })
       writeJson(out, result)

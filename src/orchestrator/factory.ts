@@ -783,6 +783,7 @@ export class FactoryLoop implements Factory {
   readonly #mergeGate: GithubMergeGatePort
   readonly #verificationGate?: VerificationGate
   readonly #probeCloser: ProbeCloser
+  readonly #defaultProbeCloser: boolean
   readonly #probePrResolver: ProbePrResolver
   readonly #customProbePrResolver: boolean
   readonly #logger: Logger
@@ -1253,6 +1254,7 @@ export class FactoryLoop implements Factory {
           maxTeardownTimeoutMs: config.verification.maxTeardownTimeoutMs,
         })
       : undefined)
+    this.#defaultProbeCloser = !ports.probeCloser
     this.#probeCloser = ports.probeCloser ?? closeProbePr
     this.#customProbePrResolver = Boolean(ports.probePrResolver)
     this.#probePrResolver = ports.probePrResolver ??
@@ -19633,13 +19635,22 @@ export class FactoryLoop implements Factory {
       return
     }
 
-    await this.#probeCloser({
+    const closeInput = {
       repo: probe.repo,
       prNumber: probe.prNumber,
       expectedIssueKey: issue.key,
       requireTitleMarker: false,
-      ...(this.#mount.githubWrite ? { githubWrite: this.#mount.githubWrite } : {}),
-    })
+    }
+    if (this.#defaultProbeCloser) {
+      await closeProbePr({
+        ...closeInput,
+        ...(probe.path ? { path: probe.path } : {}),
+        mount: this.#mount,
+        ...(this.#mount.githubWrite ? { githubWrite: this.#mount.githubWrite } : {}),
+      })
+    } else {
+      await this.#probeCloser(closeInput)
+    }
     this.#increment('mergeGateSyntheticClosed')
   }
 
