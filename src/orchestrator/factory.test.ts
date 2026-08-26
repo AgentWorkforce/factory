@@ -1105,7 +1105,7 @@ class NodeDiscoveryRemoteFleetClient extends RemoteLifecycleFleetClient {
     const result = await super.spawn(input)
     return {
       ...result,
-      node: input.node && input.node !== 'self' ? input.node : result.node,
+      node: input.node ?? result.node,
       locality: 'remote',
     }
   }
@@ -3238,7 +3238,7 @@ describe('remote fleet node discovery and registration admission', () => {
     const firstIssue = issueFile(392)
     const secondIssue = issueFile(393)
     const fleet = new NodeDiscoveryRemoteFleetClient()
-    fleet.unregistered.add('ar-392-impl-pear')
+    fleet.unregistered.add('ar-392-review')
     const stateStore = new InMemoryStateStore({ batchSize: 1 })
     const clock = new ManualClock()
     const factory = createFactory(config({ batchSize: 1 }), {
@@ -3256,6 +3256,10 @@ describe('remote fleet node discovery and registration admission', () => {
       )
       expect(clock.value).toBe(30_000)
 
+      expect(fleet.releases).toContainEqual({
+        name: 'ar-392-review',
+        reason: 'spawn-registration-timeout',
+      })
       expect(fleet.releases).toContainEqual({
         name: 'ar-392-impl-pear',
         reason: 'spawn-registration-timeout',

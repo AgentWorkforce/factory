@@ -10810,14 +10810,30 @@ export class FactoryLoop implements Factory {
     acknowledged: RegistryHandoffAgent[],
   ): Promise<boolean> {
     const handoffs = this.#dispatchFailureHandoffs(record, acknowledged)
-    if (
-      handoffs.some((handoff) => handoff.worktree) &&
-      !await this.#teardownFailedDispatchWorktrees(
+    await this.#persistDispatchFailureReaperHandoff(record, handoffs)
+    const hasWorktrees = handoffs.some((handoff) => handoff.worktree)
+    if (hasWorktrees) {
+      if (!await this.#teardownFailedDispatchWorktrees(
         handoffs,
         'spawn-registration-timeout',
         { skipNeverPlacedAgents: true },
+      )) return false
+    } else {
+      const failed = await this.#releaseAndTerminateAgents(
+        handoffs
+          .filter((handoff) => handoff.tracked.result !== undefined)
+          .map((handoff) => [handoff.name, handoff.tracked]),
+        'spawn-registration-timeout',
+        'completion',
       )
-    ) return false
+      if (failed.length > 0) return false
+      for (const handoff of handoffs) {
+        await this.#state.clearFailureHandoff(
+          this.#workspaceId,
+          registryHandoffKey(handoff.issue, handoff.name),
+        )
+      }
+    }
     try {
       await this.#teardownPreviews(record)
     } catch (error) {

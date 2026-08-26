@@ -819,6 +819,7 @@ describe('RelayFleetClient', () => {
     const messaging = new FakeMessaging()
     messaging.agentRows = [
       { name: 'ar-1-impl', status: 'online', node: 'alpha' },
+      { name: 'ar-offline-host-impl', status: 'online', node: 'beta' },
       { name: 'ar-hostless-impl', status: 'online' },
     ]
     messaging.nodeRows = [
@@ -833,7 +834,7 @@ describe('RelayFleetClient', () => {
       capability: 'spawn:codex',
     })).resolves.toBe(true)
     await expect(fleet.isAgentRegistered({
-      name: 'ar-1-impl',
+      name: 'ar-offline-host-impl',
       node: 'beta',
       capability: 'spawn:codex',
     })).resolves.toBe(false)
