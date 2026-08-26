@@ -31951,6 +31951,10 @@ class HostUnavailableReleaseFleetClient extends RemoteLifecycleFleetClient {
 
 describe('a dead-lettered release must not keep the durable dispatch lease', () => {
   const RETRY_MS = 5
+  // Test-only renewal cadence. The TTL the renewer stamps is the production
+  // one; only how often it runs moves, because a renewer that never fires
+  // cannot be the subject of an assertion about renewal.
+  const RENEW_MS = 10
   const WORKSPACE = 'factory-test'
 
   /** The stuck `releasing` row, found by issue rather than by re-deriving its key. */
@@ -32030,14 +32034,33 @@ describe('a dead-lettered release must not keep the durable dispatch lease', () 
   }, 20_000)
 
   /**
-   * Freeing the lease at the dead-letter is not enough on its own: the renewal
-   * interval walks `#dispatchLifecycleEpochs` and re-stamps a full TTL on
-   * everything it finds. If the abandoned key is still in that map, the lease
-   * comes straight back and the livelock resumes a minute later — which is
-   * exactly the shape production was in. This asserts the epoch is dropped, so
-   * there is nothing left for the renewer to re-stamp.
+   * Freeing the lease once is not enough on its own, and this test has to be
+   * able to prove it (#391 review, P2).
+   *
+   * The first version of this test claimed the key for a successor and then
+   * asserted `lease.owner === 'successor-publisher'` after a fixed 200 ms
+   * sleep. That assertion was VACUOUS. `renewDispatchLifecycle` is owner+epoch
+   * fenced, so once a successor holds the row the abandoner cannot take it back
+   * whether or not its epoch was dropped — and 200 ms never reaches the 60 s
+   * `DISPATCH_LIFECYCLE_RENEW_MS`, so the renewer never ran at all. It passed
+   * with the bug present. That is the third test in this file shown to be green
+   * for the wrong reason, so this one is built the other way round.
+   *
+   * The property that actually matters: `#renewDispatchLifecycles` walks
+   * `#dispatchLifecycleEpochs` and re-stamps a full TTL on every key it finds.
+   * `renewDispatchLifecycle` fences on owner and epoch but NOT on expiry, so a
+   * lease that was relinquished — `leaseUntilMs` pushed to the floor while
+   * `owner` and `epoch` stay put — is fully resurrectable by its own former
+   * owner. Relinquishing the durable lease while leaving the epoch cached
+   * therefore buys nothing: the livelock returns on the next renewal tick.
+   *
+   * So: run the renewer for real, at a test-only interval, and assert the
+   * relinquished lease is never restored. Ablating just the epoch drop from
+   * `#relinquishDispatchLifecycleLease` — keeping the durable release — turns
+   * this red, which is what makes it a test of the epoch rather than of the
+   * fencing.
    */
-  it('does not let the renewal interval re-stamp the abandoned key', async () => {
+  it('leaves nothing for the renewal interval to re-stamp on the abandoned key', async () => {
     const mount = new FakeMountClient({ [issuePath(76)]: issueFile(76) })
     const fleet = new HostUnavailableReleaseFleetClient()
     const stateStore = new InMemoryStateStore({ batchSize: 2 })
@@ -32047,6 +32070,9 @@ describe('a dead-lettered release must not keep the durable dispatch lease', () 
       stateStore,
       triage: new StaticTriage(),
       dispatchLifecycleRetryMs: RETRY_MS,
+      // The renewer is the mechanism under test, so it has to actually run.
+      // Only the interval moves; the TTL it stamps is the real one.
+      dispatchLifecycleRenewMs: RENEW_MS,
       logger: { warn: () => undefined, error: () => undefined },
     })
 
@@ -32056,13 +32082,27 @@ describe('a dead-lettered release must not keep the durable dispatch lease', () 
       () => expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
       { timeout: 10_000, interval: 5 },
     )
-
     await vi.waitFor(
       async () => expect(await leaseIsFree(stateStore, 'AR-76')).toBe(true),
       { timeout: 10_000, interval: 5 },
     )
 
-    // A successor takes the key...
+    // THE ASSERTION. Sample across many renewal intervals — a single sample
+    // cannot tell a lease that is gone from one that is about to come back.
+    const deadline = Date.now() + RENEW_MS * 25
+    while (Date.now() < deadline) {
+      expect(await leaseIsFree(stateStore, 'AR-76')).toBe(true)
+      await new Promise((resolve) => setTimeout(resolve, RENEW_MS / 2))
+    }
+
+    // And the abandoner never so much as ATTEMPTED a renewal on this key: a
+    // retained epoch would have driven `renewDispatchLifecycle`, been refused,
+    // and counted a lost lease. Zero attempts is the epoch being gone, stated
+    // without reference to who won the row.
+    expect(factory.status().counters.dispatchLifecycleLeasesLost).toBeUndefined()
+
+    // The row is still claimable by a successor at the end of all that, which
+    // is the point of relinquishing it in the first place.
     const [key, lifecycle] = await stuckLifecycle(stateStore, 'AR-76')
     const successor = await stateStore.claimDispatchLifecycle(
       WORKSPACE,
@@ -32073,13 +32113,79 @@ describe('a dead-lettered release must not keep the durable dispatch lease', () 
       60_000,
     )
     expect(successor.acquired).toBe(true)
+  }, 20_000)
 
-    // ...and the abandoning process must not be able to renew it back out from
-    // under them. `renewDispatchLifecycle` is owner+epoch fenced, so this is
-    // really asserting that the abandoner no longer believes it owns the key.
-    await new Promise((resolve) => setTimeout(resolve, RETRY_MS * 40))
-    const after = await stateStore.getDispatchLifecycle(WORKSPACE, key)
-    expect(after?.lease?.owner).toBe('successor-publisher')
+  /**
+   * P1 from the same review, and the sharpest thing in it: the first version of
+   * this fix relinquished the lease AFTER `#writeInFlightRegistry()`, on the
+   * happy path only. A rejecting registry write skipped the handback entirely
+   * and left the abandoned key renewing its lease forever, announced by nothing
+   * louder than a `warn` — the identical shape of the bug being fixed (#379
+   * freed the batch slot but not the lease, on the failure path), reproduced
+   * one level up in the fix for it.
+   *
+   * The registry write is the failure injected here because it is the one the
+   * reviewer named, but the guarantee is structural: the handback is in a
+   * `finally` spanning every await in the cleanup, so `#batch()` rejecting
+   * would be caught by this too.
+   */
+  it('still hands the lease back when the in-flight registry write fails during cleanup', async () => {
+    const mount = new FakeMountClient({ [issuePath(77)]: issueFile(77) })
+    const fleet = new HostUnavailableReleaseFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const warnings: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      dispatchLifecycleRenewMs: RENEW_MS,
+      logger: { warn: (...args: unknown[]) => warnings.push(args), error: () => undefined },
+    })
+
+    await factory.runOnce()
+
+    // Fail the registry write ONLY inside dead-letter cleanup. Failing
+    // `listFailureHandoffs` is how the rejection is injected — it is awaited
+    // inside `#writeInFlightRegistry`, so this rejects that method the way a
+    // failing durable write would — and the abandoned counter is the gate,
+    // because it is incremented before cleanup is armed and after the release
+    // loop's own registry writes.
+    //
+    // The gate matters: failing every write instead makes
+    // `#writeInFlightRegistry` throw out of `#finishDurableRelease` before the
+    // `failed.length > 0` branch, so nothing is ever charged and the
+    // dead-letter never fires. That version of this test failed for a reason
+    // unrelated to the lease, which is exactly the trap this review is about.
+    const handoffsFrom = stateStore.listFailureHandoffs.bind(stateStore)
+    stateStore.listFailureHandoffs = async (...args: Parameters<typeof handoffsFrom>) => {
+      if (factory.status().counters.dispatchLifecycleReleaseAbandoned) {
+        throw new Error('in-flight registry write failed')
+      }
+      return await handoffsFrom(...args)
+    }
+
+    fleet.emitAgentExit('ar-77-impl-pear', 'issue-done')
+    await vi.waitFor(
+      () => expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
+      { timeout: 10_000, interval: 5 },
+    )
+
+    // The registry write really did fail — otherwise this test proves nothing
+    // beyond what the happy-path one already proves.
+    await vi.waitFor(
+      () => expect(warnings.map(([message]) => message)).toContain(
+        '[factory] dead-lettered release could not free its batch slot',
+      ),
+      { timeout: 10_000, interval: 5 },
+    )
+
+    // ...and the lease came back anyway.
+    await vi.waitFor(
+      async () => expect(await leaseIsFree(stateStore, 'AR-77')).toBe(true),
+      { timeout: 10_000, interval: 5 },
+    )
   }, 20_000)
 })
 

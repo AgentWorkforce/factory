@@ -140,6 +140,7 @@ import {
   type InFlightIssue,
   issueKey,
   type ParkedIssue,
+  type QueuedIssue,
   type TrackedAgent,
 } from './batch-tracker'
 import {
@@ -777,6 +778,7 @@ export class FactoryLoop implements Factory {
   readonly #babysitterWakeUnreachableRetryMs: number
   readonly #startupAgentExitDrainTimeoutMs: number
   readonly #dispatchLifecycleRetryMs: number
+  readonly #dispatchLifecycleRenewMs: number
   readonly #state: StateStore
   readonly #workspaceId: string
   readonly #relayflows?: FactoryPorts['relayflows']
@@ -1261,6 +1263,7 @@ export class FactoryLoop implements Factory {
     this.#babysitterWakeUnreachableRetryMs = ports.babysitterWakeUnreachableRetryMs ?? BABYSITTER_WAKE_UNREACHABLE_RETRY_MS
     this.#startupAgentExitDrainTimeoutMs = ports.startupAgentExitDrainTimeoutMs ?? STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS
     this.#dispatchLifecycleRetryMs = ports.dispatchLifecycleRetryMs ?? DISPATCH_LIFECYCLE_RETRY_MS
+    this.#dispatchLifecycleRenewMs = ports.dispatchLifecycleRenewMs ?? DISPATCH_LIFECYCLE_RENEW_MS
     this.#workspaceId = config.workspaceId ?? 'default'
     this.#relayflows = ports.relayflows
     this.#worktrees = ports.worktrees
@@ -6816,7 +6819,7 @@ export class FactoryLoop implements Factory {
     if (this.#dispatchLifecycleRenewTimer || this.#dispatchLifecycleEpochs.size === 0) return
     this.#dispatchLifecycleRenewTimer = setInterval(() => {
       void this.#renewDispatchLifecycles()
-    }, DISPATCH_LIFECYCLE_RENEW_MS)
+    }, this.#dispatchLifecycleRenewMs)
     this.#dispatchLifecycleRenewTimer.unref?.()
   }
 
@@ -7738,6 +7741,21 @@ export class FactoryLoop implements Factory {
     this.#dispatchLifecycleReleaseAttempts.delete(key)
     this.#increment('dispatchLifecycleReleaseAbandoned')
     const durableLifecycleRetained = this.#usesDurableDispatchLifecycle()
+    // Cleanup is armed BEFORE anything that can throw (#391 review, P1). The
+    // only statements above are set/map writes and a counter, none of which can
+    // reject; `this.#logger.error` below is caller-supplied and can. Ordering
+    // the drive first means nothing between "this unit is abandoned" and "its
+    // lease is handed back" is allowed to fail in a way that skips the handback
+    // — which is precisely the defect shape this whole method exists to fix.
+    this.#trackDispatchLifecycleDrive(
+      this.#releaseDeadLetteredSlot(record, key)
+        .catch((error) => {
+          this.#logger.warn?.('[factory] dead-lettered release could not free its batch slot', {
+            issue: record.issue.key,
+            error: describeError(error).errorMessage,
+          })
+        }),
+    )
     // `error`, not `warn`. Every previous layer of this failure was invisible
     // until somebody read stderr by hand; a work unit whose cleanup this
     // process has permanently given up on is exactly the event that must not
@@ -7752,15 +7770,6 @@ export class FactoryLoop implements Factory {
       // spin, it does not declare the work unit clean.
       durableLifecycleRetained,
     })
-    this.#trackDispatchLifecycleDrive(
-      this.#releaseDeadLetteredSlot(record, key)
-        .catch((error) => {
-          this.#logger.warn?.('[factory] dead-lettered release could not free its batch slot', {
-            issue: record.issue.key,
-            error: describeError(error).errorMessage,
-          })
-        }),
-    )
     return false
   }
 
@@ -7837,15 +7846,30 @@ export class FactoryLoop implements Factory {
    * successor while renewing the lease that locks the successor out is not a
    * handoff, it is a permanent block on the key — see
    * `#relinquishDispatchLifecycleLease`.
+   *
+   * The handback lives in a `finally` for a reason worth stating plainly
+   * (#391 review, P1). The FIRST version of this fix relinquished after
+   * `#writeInFlightRegistry()`, on the happy path only — so a rejecting
+   * registry write would skip it and leave the abandoned key renewing its lease
+   * forever, with nothing but a `warn` to show for it. That is the identical
+   * shape of the bug being fixed (#379 freed the slot but not the lease, on the
+   * failure path), reproduced one level up. Cleanup that only runs when the
+   * rest of cleanup succeeded is not cleanup. `#batch()` and
+   * `#writeInFlightRegistry()` can both reject; neither may strand the key.
    */
   async #releaseDeadLetteredSlot(record: InFlightIssue, key: string): Promise<void> {
-    const batch = await this.#batch()
-    const next = batch.complete(record.issue)
-    this.#uncompensatedDispatchClaims.delete(key)
-    await this.#writeInFlightRegistry()
-    // Before admitting anything else, and before `dispatch` gets a chance to
-    // throw: this process is done with the key either way.
-    await this.#relinquishDispatchLifecycleLease(key, record.issue.key)
+    let next: QueuedIssue | undefined
+    try {
+      const batch = await this.#batch()
+      next = batch.complete(record.issue)
+      this.#uncompensatedDispatchClaims.delete(key)
+      await this.#writeInFlightRegistry()
+    } finally {
+      // Unconditional, and safe to put in a `finally` because
+      // `#relinquishDispatchLifecycleLease` handles its own errors and cannot
+      // throw — so it can never mask the failure that brought us here.
+      await this.#relinquishDispatchLifecycleLease(key, record.issue.key)
+    }
     // A freed slot that nothing is admitted into is only half the repair.
     if (next && !this.#stopping) await this.dispatch(next.decision, { dryRun: next.dryRun })
   }
