@@ -36,6 +36,7 @@ export interface FactoryPorts {
   verificationGate?: VerificationGate
   probeCloser?: ProbeCloser
   probePrResolver?: ProbePrResolver
+  /** @deprecated Ignored. Factory PR discovery uses the authenticated mounted projection. */
   probePrGhRunner?: GhRunner
   logger?: Logger
   /** Optional durable, no-throw progress reporter for the authenticated Cloud dashboard. */

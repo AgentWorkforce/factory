@@ -582,7 +582,6 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           fleet,
           stateStore,
           stateResolution,
-          probePrGhRunner: deps.probePrGhRunner ?? defaultGhRunner,
           logger,
           reporter,
           worktrees: globals.backend === 'internal' ? new GitAgentWorktreeManager() : undefined,

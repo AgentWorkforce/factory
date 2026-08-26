@@ -10673,12 +10673,22 @@ describe('FactoryLoop', () => {
     }, githubWrite)
     const fleet = new RemoteLifecycleFleetClient()
     const stateStore = new FileStateStore({ batchSize: 2, watchStatePath })
+    let ghCalls = 0
     const factory = createFactory(config(), {
       mount,
       fleet,
       stateStore,
       triage: new StaticTriage(),
       probePrResolver: async () => undefined,
+      probePrGhRunner: async () => {
+        ghCalls += 1
+        return { stdout: JSON.stringify([{
+          number: 999,
+          url: 'https://github.com/AgentWorkforce/pear/pull/999',
+          headRefName: branch,
+          isDraft: false,
+        }]) }
+      },
     })
     try {
       const decision = await factory.triageIssue(parseLinearIssue(issuePath(186), issueFile(186)))
@@ -10691,6 +10701,7 @@ describe('FactoryLoop', () => {
 
       await vi.waitFor(() => expect(factory.status().counters.done).toBe(1), { timeout: 4_000 })
       expect(branch).toBe(lifecycle?.decision.implementers[0]?.branch)
+      expect(ghCalls).toBe(0)
       expect(publishAttempts).toBe(1)
       expect(factory.status().counters.githubPullRequestsReconciled).toBe(1)
       expect(fleet.resumes).toEqual([])
