@@ -15,15 +15,17 @@ const githubWrite = (closes: Array<{ repo: string; number: number }> = []): Gith
   closePullRequest: async (input) => { closes.push(input) },
 })
 
-const prPath = '/github/repos/AgentWorkforce__pear/pulls/by-id/123.json'
+const prPath = (number: number): string =>
+  `/github/repos/AgentWorkforce__pear/pulls/by-id/${number}.json`
 
 const prMount = (
+  prNumber: number,
   content: unknown,
   reads: string[] = [],
 ): Pick<MountClient, 'readFile'> => ({
   readFile: async (path) => {
     reads.push(path)
-    if (path !== prPath) throw new Error(`unexpected mounted PR path ${path}`)
+    if (path !== prPath(prNumber)) throw new Error(`unexpected mounted PR path ${path}`)
     return { content }
   },
 })
@@ -38,17 +40,17 @@ describe('closeProbePr', () => {
       prNumber: 123,
       expectedIssueKey: 'AR-42',
       githubWrite: githubWrite(closes),
-      path: prPath,
-      mount: prMount({ payload: openProbe }, reads),
+      mount: prMount(123, { payload: { number: 123, ...openProbe } }, reads),
     })).resolves.toEqual({ repo: 'AgentWorkforce/pear', prNumber: 123, state: 'CLOSED' })
 
-    expect(reads).toEqual([prPath])
+    expect(reads).toEqual([prPath(123)])
     expect(closes).toEqual([{ repo: 'AgentWorkforce/pear', number: 123 }])
   })
 
   it('refuses a non-probe PR before closing', async () => {
     const reads: string[] = []
-    const mount = prMount({ payload: {
+    const mount = prMount(124, { payload: {
+      number: 124,
       state: 'OPEN',
       headRefName: 'feature/real-fix',
       title: 'Fix a real production issue',
@@ -60,15 +62,15 @@ describe('closeProbePr', () => {
       prNumber: 124,
       expectedIssueKey: 'AR-42',
       githubWrite: githubWrite(),
-      path: prPath,
       mount,
     })).rejects.toThrow(/missing \[factory-e2e\] probe marker/)
-    expect(reads).toEqual([prPath])
+    expect(reads).toEqual([prPath(124)])
   })
 
   it('requires the factory-e2e marker as a title prefix, not only body or branch text', async () => {
     const reads: string[] = []
-    const mount = prMount({ payload: {
+    const mount = prMount(128, { payload: {
+      number: 128,
       state: 'OPEN',
       headRefName: 'factory-e2e/ar-42-probe',
       title: 'AR-42 probe without title marker',
@@ -80,10 +82,9 @@ describe('closeProbePr', () => {
       prNumber: 128,
       expectedIssueKey: 'AR-42',
       githubWrite: githubWrite(),
-      path: prPath,
       mount,
     })).rejects.toThrow(/missing \[factory-e2e\] probe marker/)
-    expect(reads).toEqual([prPath])
+    expect(reads).toEqual([prPath(128)])
   })
 
   it('allows issue-gated callers to close markerless branch-convention PRs', async () => {
@@ -102,16 +103,16 @@ describe('closeProbePr', () => {
       expectedIssueKey: 'AR-229',
       requireTitleMarker: false,
       githubWrite: githubWrite(closes),
-      path: prPath,
-      mount: prMount(markerlessProbe, reads),
+      mount: prMount(279, { number: 279, ...markerlessProbe }, reads),
     })).resolves.toEqual({ repo: 'AgentWorkforce/pear', prNumber: 279, state: 'CLOSED' })
-    expect(reads).toEqual([prPath])
+    expect(reads).toEqual([prPath(279)])
     expect(closes).toEqual([{ repo: 'AgentWorkforce/pear', number: 279 }])
   })
 
   it('treats an already-closed probe PR as idempotent success', async () => {
     const reads: string[] = []
-    const mount = prMount({ payload: {
+    const mount = prMount(279, { payload: {
+      number: 279,
       state: 'CLOSED',
       headRefName: 'ar-229-is-positive',
       title: 'Add isPositive util',
@@ -124,15 +125,15 @@ describe('closeProbePr', () => {
       expectedIssueKey: 'AR-229',
       requireTitleMarker: false,
       githubWrite: githubWrite(),
-      path: prPath,
       mount,
     })).resolves.toEqual({ repo: 'AgentWorkforce/pear', prNumber: 279, state: 'CLOSED' })
-    expect(reads).toEqual([prPath])
+    expect(reads).toEqual([prPath(279)])
   })
 
   it('refuses a probe that is not tied to the expected issue key before closing', async () => {
     const reads: string[] = []
-    const mount = prMount({ payload: {
+    const mount = prMount(125, { payload: {
+      number: 125,
       ...openProbe,
       body: 'Closes AR-99',
       headRefName: 'factory-e2e/ar-99-probe',
@@ -144,10 +145,9 @@ describe('closeProbePr', () => {
       prNumber: 125,
       expectedIssueKey: 'AR-42',
       githubWrite: githubWrite(),
-      path: prPath,
       mount,
     })).rejects.toThrow(/missing issue key AR-42/)
-    expect(reads).toEqual([prPath])
+    expect(reads).toEqual([prPath(125)])
   })
 
   it('fails closed when workspace close errors and does not claim success', async () => {
@@ -160,10 +160,9 @@ describe('closeProbePr', () => {
       prNumber: 126,
       expectedIssueKey: 'AR-42',
       githubWrite: write,
-      path: prPath,
-      mount: prMount(openProbe, reads),
+      mount: prMount(126, { number: 126, ...openProbe }, reads),
     })).rejects.toThrow(/workspace close failed/)
-    expect(reads).toEqual([prPath])
+    expect(reads).toEqual([prPath(126)])
   })
 
   it('does not require an unauthenticated read-back after the App close is confirmed', async () => {
@@ -174,10 +173,9 @@ describe('closeProbePr', () => {
       prNumber: 127,
       expectedIssueKey: 'AR-42',
       githubWrite: githubWrite(),
-      path: prPath,
-      mount: prMount(openProbe, reads),
+      mount: prMount(127, { number: 127, ...openProbe }, reads),
     })).resolves.toEqual({ repo: 'AgentWorkforce/pear', prNumber: 127, state: 'CLOSED' })
-    expect(reads).toEqual([prPath])
+    expect(reads).toEqual([prPath(127)])
   })
 
   it('reports a clear connection error without reading the mount when GitHub writes are unavailable', async () => {
@@ -187,8 +185,8 @@ describe('closeProbePr', () => {
       repo: 'AgentWorkforce/pear',
       prNumber: 129,
       expectedIssueKey: 'AR-42',
-      path: prPath,
-      mount: prMount(openProbe, reads),
+      path: prPath(129),
+      mount: prMount(129, { number: 129, ...openProbe }, reads),
     })).rejects.toThrow('GitHub write path not available on this mount — connect GitHub to your workspace')
     expect(reads).toEqual([])
   })
@@ -199,7 +197,7 @@ describe('closeProbePr', () => {
       prNumber: 130,
       expectedIssueKey: 'AR-42',
       githubWrite: githubWrite(),
-      path: prPath,
+      path: prPath(130),
     })).rejects.toThrow(/mounted GitHub PR read path is unavailable/i)
   })
 })
