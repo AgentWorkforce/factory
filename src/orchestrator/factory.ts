@@ -365,8 +365,7 @@ const LIVE_EVENT_DRAIN_BATCH_SIZE = 5
 const COMPLETION_SWEEP_INTERVAL_MS = 15_000
 const COMPLETION_SWEEP_BATCH_SIZE = 2
 const PREVIEW_SWEEP_INTERVAL_MS = 60_000
-const PROBE_PR_GH_BACKOFF_MS = 60_000
-const PROBE_PR_GH_CANDIDATE_LIMIT = 200
+const PROBE_PR_RESOLVED_CACHE_MS = 60_000
 const PUBLISHED_PR_CONFIRM_ATTEMPTS = 20
 const PUBLISHED_PR_CONFIRM_DELAY_MS = 100
 const SLACK_REPLY_EVENTS_LIMIT = 100
@@ -420,8 +419,8 @@ const BABYSITTER_PR_SNAPSHOT_DEAD_LETTER_LIMIT = 256
 const BABYSITTER_PR_SNAPSHOT_DRAIN_PER_SWEEP = 16
 // A durably faulted mount would otherwise log an error per path per sweep.
 const BABYSITTER_PR_SNAPSHOT_ESCALATED_LOG_EVERY = 20
-// Adoption probes an issue's open PR through the (already gh-backed-off) probe
-// resolver, so it runs on its own slower cadence than the completion sweep.
+// Adoption probes an issue's open PR through the mounted projection, so its
+// full-tree fallback runs on a slower cadence than the completion sweep.
 const BABYSITTER_ORPHAN_SWEEP_INTERVAL_MS = 60_000
 // Warn once per PR identity that arrives unowned, then fall back to debug. The
 // counter carries the true volume; the log only has to make it discoverable.
@@ -1148,7 +1147,6 @@ export class FactoryLoop implements Factory {
   readonly #publishedPullRequests = new Map<string, GithubPublishPullRequestResult>()
   readonly #previewReferences = new Map<string, PreviewReference[]>()
   readonly #removedPreviewIds = new Set<string>()
-  readonly #probePrGhBackoffUntilMs = new Map<string, number>()
   readonly #probePrResolvedCache = new Map<string, { pr: ResolvedIssuePr; expiresAtMs: number }>()
   // GitHub issue mirror-id -> resolved Linear mirror path, so repeat ingestion
   // cycles read the mirror directly instead of re-scanning all Linear issues.
@@ -2811,14 +2809,6 @@ export class FactoryLoop implements Factory {
             }
             if (pr.draft) {
               this.#increment('completionSweepDraftPr')
-              // Must match the key `#completionPrForIssue` resolves under —
-              // same options, same repo scope — or this backoff is written
-              // under a name nothing reads and the draft PR is re-fetched from
-              // gh on every pass.
-              this.#probePrGhBackoffUntilMs.set(
-                this.#probePrCacheKey(issue, { repo: this.#probeRepoForIssue(issue) }),
-                this.#clock.now() + PROBE_PR_GH_BACKOFF_MS,
-              )
               return undefined
             }
             if (record.decision.implementers.length > 1 && !await this.#allImplementersHaveCompletionPr(record)) {
@@ -2948,9 +2938,7 @@ export class FactoryLoop implements Factory {
   }
 
   // Candidate PR meta paths for an ownerless record, newest PR first. Resolution
-  // reuses the durable dispatch receipts and then the probe resolver (which
-  // carries its own gh backoff, so a record whose implementer has not opened a
-  // PR yet costs no more than a cached miss).
+  // reuses the durable dispatch receipts and then the mounted probe resolver.
   async #orphanedPrMetaPaths(record: InFlightIssue): Promise<string[]> {
     const wanted: Array<{ repo: string; prNumber: number }> = []
     if (this.#usesDurableDispatchLifecycle()) {
@@ -3102,19 +3090,13 @@ export class FactoryLoop implements Factory {
   }
 
   /**
-   * The key for BOTH `#probePrResolvedCache` and `#probePrGhBackoffUntilMs`.
-   *
-   * Shared rather than inlined because those two maps are written from more than
-   * one place: `#resolveIssuePr` writes both, and the completion sweep writes a
-   * draft-PR backoff directly. Those writes must agree on the key or the backoff
-   * is set under a name nothing reads, which silently costs a gh call per pass.
+   * The key for `#probePrResolvedCache`.
    *
    * `repo` is part of the key because it narrows which pull requests the
    * resolution can even see — an issue whose route changes must not be served
-   * the previous repository's PR, or held off gh by the previous repository's
-   * negative backoff, because the completion path probes and CLOSES what this
-   * returns. `*` marks the unscoped walk, a genuinely different resolution that
-   * must not share an entry with any single-repo one.
+   * the previous repository's PR, because the completion path probes and
+   * CLOSES what this returns. `*` marks the unscoped walk, a genuinely
+   * different resolution that must not share an entry with any single-repo one.
    *
    * Every dimension is a trailing `:`-prefixed segment so the completion
    * invalidation — which clears `stateKey` plus everything starting
@@ -3161,34 +3143,13 @@ export class FactoryLoop implements Factory {
       // method. The cache had a reader and no writer on the hot path, so the
       // full tree walk repeated for every caller, on every sweep, forever.
       //
-      // Cached on the same terms as the gh branch below — same key, same TTL,
-      // same draft exclusion — because the reason to keep a draft uncached is a
-      // property of the PR (its state is about to flip and the caller wants to
-      // see that promptly), not of which resolver observed it.
+      // Keep drafts uncached because their state is expected to flip and callers
+      // need to observe that promptly.
       if (!mountPr.draft) {
-        this.#probePrResolvedCache.set(key, { pr: mountPr, expiresAtMs: now + PROBE_PR_GH_BACKOFF_MS })
+        this.#probePrResolvedCache.set(key, { pr: mountPr, expiresAtMs: now + PROBE_PR_RESOLVED_CACHE_MS })
       }
       return mountPr
     }
-
-    const backoffUntil = this.#probePrGhBackoffUntilMs.get(key) ?? 0
-    if (backoffUntil > now) {
-      this.#increment('probePrGhBackoffSkips')
-      return undefined
-    }
-
-    const ghPr = await resolveIssuePrFromGh(this.#probePrGhRunner, this.#config, issue, opts, this.#logger)
-    this.#increment('probePrGhResolveAttempts')
-    if (ghPr) {
-      this.#probePrGhBackoffUntilMs.delete(key)
-      if (!ghPr.draft) {
-        this.#probePrResolvedCache.set(key, { pr: ghPr, expiresAtMs: now + PROBE_PR_GH_BACKOFF_MS })
-      }
-      this.#increment('probePrGhResolveHits')
-      return ghPr
-    }
-
-    this.#probePrGhBackoffUntilMs.set(key, now + PROBE_PR_GH_BACKOFF_MS)
     return undefined
   }
 
@@ -9656,9 +9617,9 @@ export class FactoryLoop implements Factory {
     if (!issue) return false
     const repo = dependencyRepoForIssue(issue, undefined, this.#config)
     if (!repo) return false
-    // This probe does NOT go through `#resolveIssuePr` — it must not fall back to
-    // gh — so it never saw that method's cache, and `#terminalDependencyIdentities`
-    // only ever memoises the TRUE answer. A dependency that is not merged was
+    // This specialized probe does not go through `#resolveIssuePr`, so it never
+    // saw that method's cache, and `#terminalDependencyIdentities` only ever
+    // memoises the TRUE answer. A dependency that is not merged was
     // therefore re-walked in full for every issue declaring it, on every sweep;
     // several issues blocked on one dependency multiplied a single tree walk by
     // the number of blocked issues. Memoise the negative answer too, on exactly
@@ -16703,11 +16664,6 @@ export class FactoryLoop implements Factory {
           this.#probePrResolvedCache.delete(cacheKey)
         }
       }
-      for (const backoffKey of [...this.#probePrGhBackoffUntilMs.keys()]) {
-        if (backoffKey === stateKey || backoffKey.startsWith(`${stateKey}:`)) {
-          this.#probePrGhBackoffUntilMs.delete(backoffKey)
-        }
-      }
       // Cancellation must see the subscription identity so it can issue the
       // idempotent Relayfile DELETE before clearing the local owner maps.
       await this.#cancelBabysittersForIssue(record.issue)
@@ -21709,96 +21665,6 @@ export const resolveIssuePrFromMount = async (
   return resolved
 }
 
-const resolveIssuePrFromGh = async (
-  run: GhRunner,
-  config: FactoryConfig,
-  issue: LinearIssue,
-  opts: {
-    requireTitleMarker?: boolean
-    titleMarker?: string
-    openOnly?: boolean
-    failOnLookupError?: boolean
-    allowLegacyGithubBranch?: boolean
-  } = {},
-  logger?: Logger,
-): Promise<ResolvedIssuePr | undefined> => {
-  const candidates: Array<ResolvedIssuePr & { score: number; open: boolean }> = []
-  let lookupFailures = 0
-  for (const repo of reposFromConfig(config)) {
-    let payload: unknown
-    try {
-      const result = await run([
-        'pr',
-        'list',
-        '--repo',
-        repo,
-        '--state',
-        'all',
-        '--json',
-        'number,title,body,headRefName,headRepository,headRepositoryOwner,isCrossRepository,isDraft,state,url',
-        '--limit',
-        String(PROBE_PR_GH_CANDIDATE_LIMIT),
-      ])
-      if (!result.stdout.trim()) {
-        lookupFailures += 1
-        logger?.warn?.('[factory] gh PR resolver returned empty output', { issue: issue.key, repo })
-        continue
-      }
-      payload = parseJsonContent(result.stdout)
-    } catch (error) {
-      lookupFailures += 1
-      logger?.warn?.('[factory] gh PR resolver failed', { issue: issue.key, repo, error })
-      continue
-    }
-
-    if (!Array.isArray(payload)) {
-      lookupFailures += 1
-      logger?.warn?.('[factory] gh PR resolver returned non-array payload', { issue: issue.key, repo })
-      continue
-    }
-    if (payload.length >= PROBE_PR_GH_CANDIDATE_LIMIT) {
-      logger?.warn?.('[factory] gh PR resolver hit candidate limit', { issue: issue.key, repo, limit: PROBE_PR_GH_CANDIDATE_LIMIT })
-      if (opts.failOnLookupError) lookupFailures += 1
-    }
-
-    for (const entry of payload) {
-      const pr = ghProbePrCandidate(entry)
-      if (
-        !pr ||
-        (!factoryBranchMatchesIssue(pr.headRef, issue.key) &&
-          !(opts.allowLegacyGithubBranch && legacyGithubBranchMatchesIssue(pr.headRef, issue)))
-      ) continue
-      if (opts.openOnly && normalizePrState(pr.state) !== 'OPEN') continue
-      const score = issuePrMatchScore(pr, issue, opts.titleMarker ?? config.safety.requireTitlePrefix, opts)
-      if (score <= 0) continue
-      candidates.push({
-        repo,
-        prNumber: pr.number,
-        draft: pr.draft,
-        headRef: pr.headRef,
-        headRepo: pr.headRepo,
-        crossRepository: pr.crossRepository ?? (
-          pr.headRepo ? pr.headRepo.toLowerCase() !== repo.toLowerCase() : undefined
-        ),
-        state: pr.state,
-        url: pr.url,
-        score,
-        open: normalizePrState(pr.state) === 'OPEN',
-      })
-    }
-  }
-
-  const resolved = candidates.sort((a, b) =>
-    b.score - a.score ||
-    Number(b.open) - Number(a.open) ||
-    b.prNumber - a.prNumber
-  )[0]
-  if (!resolved && opts.failOnLookupError && lookupFailures > 0) {
-    throw new Error(`Unable to confirm open pull request state for ${issue.key} in ${lookupFailures} configured repository lookup(s)`)
-  }
-  return resolved
-}
-
 const reposFromConfig = (config: FactoryConfig): string[] => {
   const repos = new Set([
     ...Object.values(config.repos.byLabel),
@@ -21933,43 +21799,6 @@ const readProbePrCandidate = async (
     }
   } catch {
     return undefined
-  }
-}
-
-const ghProbePrCandidate = (
-  value: unknown,
-): {
-  number: number
-  title: string
-  body: string
-  headRef: string
-  headRepo?: string
-  crossRepository?: boolean
-  draft?: boolean
-  state?: string
-  url?: string
-} | undefined => {
-  const payload = asRecord(value)
-  if (!payload) return undefined
-  const number = numberValue(payload.number)
-  if (typeof number !== 'number' || !Number.isInteger(number) || number <= 0) return undefined
-  const headRepository = asRecord(payload.headRepository)
-  const headRepositoryOwner = asRecord(payload.headRepositoryOwner)
-  const headRepo = githubRepositoryFullName(payload.headRepository) ?? (() => {
-    const name = stringValue(headRepository?.name)
-    const owner = stringValue(headRepositoryOwner?.login) ?? stringValue(headRepositoryOwner?.name)
-    return name && owner ? `${owner}/${name}` : undefined
-  })()
-  return {
-    number,
-    title: stringValue(payload.title) ?? '',
-    body: stringValue(payload.body) ?? '',
-    headRef: stringValue(payload.headRefName) ?? '',
-    headRepo,
-    crossRepository: booleanValue(payload.isCrossRepository),
-    draft: booleanValue(payload.isDraft),
-    state: stringValue(payload.state),
-    url: stringValue(payload.url),
   }
 }
 

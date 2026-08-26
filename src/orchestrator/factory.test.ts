@@ -7101,7 +7101,7 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('preserves an in-progress GitHub issue when the open-PR safety probe fails', async () => {
+  it('recovers an in-progress GitHub issue when the mount proves no open PR without invoking gh', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-pr-probe-failure-'))
     try {
       const path = githubIssuePath('AgentWorkforce', 'pear', 56)
@@ -7110,6 +7110,7 @@ describe('FactoryLoop', () => {
       })
       const fleet = new FakeFleetClient()
       const githubWriteback = new RecordingGithubWriteback()
+      let ghCalls = 0
       const factory = createFactory(config({
         issueSource: 'github',
         loop: { registryPath: join(root, 'registry.json') },
@@ -7118,14 +7119,22 @@ describe('FactoryLoop', () => {
         fleet,
         triage: new StaticTriage(),
         githubWriteback,
-        probePrGhRunner: async () => { throw new Error('GitHub PR lookup unavailable') },
+        probePrGhRunner: async () => {
+          ghCalls += 1
+          throw new Error('local gh must not be consulted')
+        },
       })
 
       const report = await factory.runOnce()
 
-      expect(report.dispatched).toEqual([])
-      expect(githubWriteback.statuses).toEqual([])
-      expect(factory.status().counters.githubOrphanRecoveryPrProbeFailures).toBe(1)
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['56'])
+      expect(githubWriteback.statuses).toEqual([
+        { key: '56', status: 'ready' },
+        { key: '56', status: 'in-progress' },
+      ])
+      expect(ghCalls).toBe(0)
+      expect(factory.status().counters.githubOrphanedInProgressRecovered).toBe(1)
+      expect(factory.status().counters.githubOrphanRecoveryPrProbeFailures).toBeUndefined()
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -7149,6 +7158,7 @@ describe('FactoryLoop', () => {
       })
       const fleet = new FakeFleetClient()
       const githubWriteback = new RecordingGithubWriteback()
+      let ghCalls = 0
       const factory = createFactory(config({
         issueSource: 'github',
         loop: { registryPath: join(root, 'registry.json') },
@@ -7157,7 +7167,10 @@ describe('FactoryLoop', () => {
         fleet,
         triage: new StaticTriage(),
         githubWriteback,
-        probePrGhRunner: async () => { throw new Error('gh fallback must not weaken a partial mount failure') },
+        probePrGhRunner: async () => {
+          ghCalls += 1
+          throw new Error('gh must not be invoked after a partial mount failure')
+        },
       })
 
       const report = await factory.runOnce()
@@ -7165,6 +7178,7 @@ describe('FactoryLoop', () => {
       expect(report.dispatched).toEqual([])
       expect(fleet.spawns).toEqual([])
       expect(githubWriteback.statuses).toEqual([])
+      expect(ghCalls).toBe(0)
       expect(factory.status().counters.githubOrphanRecoveryPrProbeFailures).toBe(1)
       expect(report.skipped).toContainEqual(expect.objectContaining({
         issue: expect.objectContaining({ key: '56' }),
@@ -7175,7 +7189,7 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('preserves an in-progress GitHub issue when open-PR discovery is truncated', async () => {
+  it('ignores a truncated gh candidate list when the mount proves no open PR', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-pr-truncated-'))
     try {
       const path = githubIssuePath('AgentWorkforce', 'pear', 60)
@@ -7184,6 +7198,7 @@ describe('FactoryLoop', () => {
       })
       const fleet = new FakeFleetClient()
       const githubWriteback = new RecordingGithubWriteback()
+      let ghCalls = 0
       const factory = createFactory(config({
         issueSource: 'github',
         loop: { registryPath: join(root, 'registry.json') },
@@ -7192,19 +7207,27 @@ describe('FactoryLoop', () => {
         fleet,
         triage: new StaticTriage(),
         githubWriteback,
-        probePrGhRunner: async () => ({
-          stdout: JSON.stringify(Array.from({ length: 200 }, (_, index) => ghPr(index + 1, {
-            title: `Unrelated PR ${index + 1}`,
-            headRefName: `unrelated-${index + 1}`,
-          }))),
-        }),
+        probePrGhRunner: async () => {
+          ghCalls += 1
+          return {
+            stdout: JSON.stringify(Array.from({ length: 200 }, (_, index) => ghPr(index + 1, {
+              title: `Unrelated PR ${index + 1}`,
+              headRefName: `unrelated-${index + 1}`,
+            }))),
+          }
+        },
       })
 
       const report = await factory.runOnce()
 
-      expect(report.dispatched).toEqual([])
-      expect(githubWriteback.statuses).toEqual([])
-      expect(factory.status().counters.githubOrphanRecoveryPrProbeFailures).toBe(1)
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['60'])
+      expect(githubWriteback.statuses).toEqual([
+        { key: '60', status: 'ready' },
+        { key: '60', status: 'in-progress' },
+      ])
+      expect(ghCalls).toBe(0)
+      expect(factory.status().counters.githubOrphanedInProgressRecovered).toBe(1)
+      expect(factory.status().counters.githubOrphanRecoveryPrProbeFailures).toBeUndefined()
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -21588,16 +21611,14 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.completionSweepDraftPr).toBe(1)
   })
 
-  it('PR-state sweep resolves fresh PRs through gh when the mount is missing them', async () => {
+  it('PR-state sweep does not resolve fresh PRs through local gh when the mount is missing them', async () => {
     const mount = new FakeMountClient({
       [issuePath(355)]: issueFile(355),
-      [issuePath(356)]: issueFile(356),
-      [issuePath(357)]: issueFile(357),
     })
     const fleet = new FakeFleetClient()
     const closeInputs: Array<Pick<CloseProbePrInput, 'repo' | 'prNumber' | 'expectedIssueKey' | 'requireTitleMarker'>> = []
     const ghCalls: string[][] = []
-    const factory = createFactory(config({ batchSize: 2 }), {
+    const factory = createFactory(config(), {
       mount,
       fleet,
       triage: new StaticTriage(),
@@ -21641,52 +21662,54 @@ describe('FactoryLoop', () => {
     await factory.runOnce()
     await factory.runLoop({ maxIterations: 1 })
 
-    expect(ghCalls).toHaveLength(2)
-    expect(ghCalls.every((args) => args.includes('--repo') && args.includes('AgentWorkforce/pear'))).toBe(true)
-    expect(closeInputs).toEqual([
-      { repo: 'AgentWorkforce/pear', prNumber: 856, expectedIssueKey: 'AR-355', requireTitleMarker: false },
-      { repo: 'AgentWorkforce/pear', prNumber: 857, expectedIssueKey: 'AR-356', requireTitleMarker: false },
-    ])
-    expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-357-impl-pear')
-    expect(factory.status().counters.probePrGhResolveHits).toBe(2)
+    expect(ghCalls).toEqual([])
+    expect(closeInputs).toEqual([])
+    expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-355'])
+    expect(factory.status().counters.completionSweepMissingPr).toBe(1)
+    expect(factory.status().counters.probePrGhResolveAttempts).toBeUndefined()
+    expect(factory.status().counters.probePrGhResolveHits).toBeUndefined()
   })
 
-  it('gh PR fallback rejects fuzzy over-matches and numeric-prefix collisions', async () => {
+  it('mount-only PR resolution never consults gh fuzzy over-matches or numeric-prefix collisions', async () => {
     const mount = new FakeMountClient({ [issuePath(229)]: issueFile(229) })
     const fleet = new FakeFleetClient()
     const closeInputs: unknown[] = []
+    const ghCalls: string[][] = []
     const factory = createFactory(config(), {
       mount,
       fleet,
       triage: new StaticTriage(),
-      probePrGhRunner: async () => ({
-        stdout: JSON.stringify([
-          ghPr(287, {
-            title: 'Add PR-state completion sweep',
-            body: 'This fix PR mentions AR-229 in tests but is not its issue PR.',
-            headRefName: 'factory-sdk-pr-state-completion-sb-impl3',
-            state: 'OPEN',
-          }),
-          ghPr(291, {
-            title: 'AR-22: wrong issue',
-            body: 'Linear: AR-22',
-            headRefName: 'ar-22-9-not-229',
-            state: 'OPEN',
-          }),
-          ghPr(292, {
-            title: 'AR-229-1: wrong child issue',
-            body: '',
-            headRefName: 'ar-229-1-is-positive',
-            state: 'OPEN',
-          }),
-          ghPr(293, {
-            title: 'AR-2290: wrong prefix',
-            body: '',
-            headRefName: 'ar-2290-is-positive',
-            state: 'OPEN',
-          }),
-        ]),
-      }),
+      probePrGhRunner: async (args) => {
+        ghCalls.push(args)
+        return {
+          stdout: JSON.stringify([
+            ghPr(287, {
+              title: 'Add PR-state completion sweep',
+              body: 'This fix PR mentions AR-229 in tests but is not its issue PR.',
+              headRefName: 'factory-sdk-pr-state-completion-sb-impl3',
+              state: 'OPEN',
+            }),
+            ghPr(291, {
+              title: 'AR-22: wrong issue',
+              body: 'Linear: AR-22',
+              headRefName: 'ar-22-9-not-229',
+              state: 'OPEN',
+            }),
+            ghPr(292, {
+              title: 'AR-229-1: wrong child issue',
+              body: '',
+              headRefName: 'ar-229-1-is-positive',
+              state: 'OPEN',
+            }),
+            ghPr(293, {
+              title: 'AR-2290: wrong prefix',
+              body: '',
+              headRefName: 'ar-2290-is-positive',
+              state: 'OPEN',
+            }),
+          ]),
+        }
+      },
       probeCloser: async (input) => {
         closeInputs.push(input)
         return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
@@ -21697,19 +21720,22 @@ describe('FactoryLoop', () => {
     await factory.runLoop({ maxIterations: 1 })
 
     expect(closeInputs).toEqual([])
+    expect(ghCalls).toEqual([])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-229'])
     expect(factory.status().counters.completionSweepMissingPr).toBe(1)
   })
 
-  it('gh PR fallback fails closed when gh is unavailable', async () => {
+  it('mount-only PR resolution does not invoke an unavailable gh binary', async () => {
     const mount = new FakeMountClient({ [issuePath(358)]: issueFile(358) })
     const fleet = new FakeFleetClient()
     const closeInputs: unknown[] = []
+    let ghCalls = 0
     const factory = createFactory(config(), {
       mount,
       fleet,
       triage: new StaticTriage(),
       probePrGhRunner: async () => {
+        ghCalls += 1
         throw new Error('gh auth missing')
       },
       probeCloser: async (input) => {
@@ -21722,12 +21748,13 @@ describe('FactoryLoop', () => {
     await factory.runLoop({ maxIterations: 1 })
 
     expect(closeInputs).toEqual([])
+    expect(ghCalls).toBe(0)
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-358'])
     expect(factory.status().counters.completionSweepMissingPr).toBe(1)
     expect(factory.status().counters.done).toBeUndefined()
   })
 
-  it('gh PR fallback backs off repeated not-found lookups', async () => {
+  it('mount-only PR resolution never starts or retries a local gh lookup after repeated misses', async () => {
     const clock = new ManualClock()
     const mount = new FakeMountClient({ [issuePath(361)]: issueFile(361) })
     const fleet = new FakeFleetClient()
@@ -21756,19 +21783,19 @@ describe('FactoryLoop', () => {
     await factory.runLoop({ maxIterations: 1 })
     await factory.runLoop({ maxIterations: 1 })
 
-    expect(ghCalls).toHaveLength(1)
-    expect(factory.status().counters.probePrGhBackoffSkips).toBe(1)
+    expect(ghCalls).toEqual([])
+    expect(factory.status().counters.probePrGhBackoffSkips).toBeUndefined()
     expect(factory.status().counters.completionSweepMissingPr).toBe(2)
 
     clock.advance(60_000)
     await factory.runLoop({ maxIterations: 1 })
 
-    expect(ghCalls).toHaveLength(2)
+    expect(ghCalls).toEqual([])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-361'])
     expect(factory.status().counters.done).toBeUndefined()
   })
 
-  it('gh PR fallback skips draft PRs and backs off repeated unresolved lookups', async () => {
+  it('mount-only PR resolution ignores a gh-only draft across repeated sweeps', async () => {
     const clock = new ManualClock()
     const mount = new FakeMountClient({ [issuePath(359)]: issueFile(359) })
     const fleet = new FakeFleetClient()
@@ -21797,34 +21824,33 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(359), issueFile(359))))
     await factory.runLoop({ maxIterations: 1 })
     await factory.runLoop({ maxIterations: 1 })
-    expect(ghCalls).toHaveLength(1)
-    expect(factory.status().counters.probePrGhBackoffSkips).toBe(1)
-    expect(factory.status().counters.completionSweepDraftPr).toBe(1)
+    expect(ghCalls).toEqual([])
+    expect(factory.status().counters.probePrGhBackoffSkips).toBeUndefined()
+    expect(factory.status().counters.completionSweepDraftPr).toBeUndefined()
+    expect(factory.status().counters.completionSweepMissingPr).toBe(2)
 
     clock.advance(60_000)
     await factory.runLoop({ maxIterations: 1 })
-    expect(ghCalls).toHaveLength(2)
+    expect(ghCalls).toEqual([])
     expect(factory.status().inFlight.map((issue) => issue.key)).toEqual(['AR-359'])
   })
 
-  it('treats already-closed gh-resolved probe PRs as completed instead of re-wedging', async () => {
-    const mount = new FakeMountClient({ [issuePath(360)]: issueFile(360) })
+  it('treats already-closed mount-resolved probe PRs as completed instead of re-wedging', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(360)]: issueFile(360),
+      '/github/repos/AgentWorkforce__pear/pulls/by-id/860.json': prFile(860, {
+        title: 'Add already closed probe work',
+        body: '',
+        head_ref: 'ar-360-closed-work',
+        state: 'CLOSED',
+      }),
+    })
     const fleet = new FakeFleetClient()
     const closeViewCalls: string[][] = []
     const factory = createFactory(config(), {
       mount,
       fleet,
       triage: new StaticTriage(),
-      probePrGhRunner: async () => ({
-        stdout: JSON.stringify([
-          ghPr(860, {
-            title: 'Add already closed probe work',
-            body: '',
-            headRefName: 'ar-360-closed-work',
-            state: 'CLOSED',
-          }),
-        ]),
-      }),
       probeCloser: (input) => closeProbePr({
         ...input,
         githubWrite: {
