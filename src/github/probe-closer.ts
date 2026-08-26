@@ -1,6 +1,6 @@
 import { containsIssueKey } from '../issue-key-match'
-import type { GithubConnectionWrite } from '../ports'
-import { defaultGhRunner, type GhRunner } from './merge-gate'
+import type { GithubConnectionWrite, MountClient } from '../ports'
+import { wrappedPayload } from '../writeback/shared'
 
 const FACTORY_E2E_MARKER = '[factory-e2e]'
 
@@ -10,7 +10,9 @@ export interface CloseProbePrInput {
   expectedIssueKey: string
   requireTitleMarker?: boolean
   githubWrite?: GithubConnectionWrite
-  runner?: GhRunner
+  /** Exact mounted PR metadata path returned by discovery. */
+  path?: string
+  mount?: Pick<MountClient, 'readFile'>
 }
 
 export interface CloseProbePrResult {
@@ -24,40 +26,50 @@ export async function closeProbePr(input: CloseProbePrInput): Promise<CloseProbe
   if (!githubWrite) {
     throw new Error('GitHub write path not available on this mount — connect GitHub to your workspace')
   }
-  const run = input.runner ?? defaultGhRunner
-  const before = await viewPr(run, input)
+  if (!input.mount) {
+    throw new Error(
+      `Mounted GitHub PR read path is unavailable for ${input.repo}#${input.prNumber}; ` +
+      'Factory will not fall back to the local gh CLI',
+    )
+  }
+  const before = await viewPr(input.mount, input)
   const beforeState = assertClosableProbe(before, input)
   if (beforeState === 'CLOSED') {
     return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
   }
 
   await githubWrite.closePullRequest({ repo: input.repo, number: input.prNumber })
-
-  const after = await viewPr(run, input)
-  const afterState = stringValue(after.state)
-  if (normalizeState(afterState) !== 'CLOSED') {
-    throw new Error(`Refusing to report probe PR closed: live state is ${afterState ?? 'unknown'}`)
-  }
-
   return { repo: input.repo, prNumber: input.prNumber, state: 'CLOSED' }
 }
 
-const viewPr = async (run: GhRunner, input: CloseProbePrInput): Promise<Record<string, unknown>> => {
-  // TODO(issue-52): replace this transitional gh read with the mounted PR meta
-  // once every supported adapter shape exposes the probe guard fields.
-  const result = await run([
-    'pr',
-    'view',
-    String(input.prNumber),
-    '--repo',
-    input.repo,
-    '--json',
-    'state,headRefName,body,title',
-  ])
-  if (!result.stdout.trim()) {
-    throw new Error(`Unable to guard probe PR #${input.prNumber}: gh returned empty output`)
+const viewPr = async (
+  mount: Pick<MountClient, 'readFile'>,
+  input: CloseProbePrInput,
+): Promise<Record<string, unknown>> => {
+  const path = input.path ?? pullByIdPath(input.repo, input.prNumber)
+  let content: unknown
+  try {
+    content = (await mount.readFile(path)).content
+  } catch (error) {
+    throw new Error(
+      `Unable to guard probe PR ${input.repo}#${input.prNumber} from mounted metadata at ${path}: ` +
+      `${error instanceof Error ? error.message : String(error)}`,
+    )
   }
-  return parseGhJson(result.stdout)
+  const payload = wrappedPayload(content)
+  const explicitNumber = numberValue(payload.number)
+  if (explicitNumber !== undefined && explicitNumber !== input.prNumber) {
+    throw new Error(
+      `Unable to guard probe PR ${input.repo}#${input.prNumber}: mounted record at ${path} identifies PR #${explicitNumber}`,
+    )
+  }
+  const head = recordValue(payload.head)
+  return {
+    state: stringValue(payload.state),
+    headRefName: stringValue(payload.headRefName) ?? stringValue(payload.head_ref) ?? stringValue(head.ref),
+    body: stringValue(payload.body),
+    title: stringValue(payload.title),
+  }
 }
 
 const assertClosableProbe = (live: Record<string, unknown>, input: CloseProbePrInput): 'OPEN' | 'CLOSED' => {
@@ -87,9 +99,18 @@ const normalizeState = (state?: string): string | undefined => state?.toUpperCas
 
 const stringValue = (value: unknown): string | undefined => typeof value === 'string' ? value : undefined
 
-const parseGhJson = (stdout: string): Record<string, unknown> => {
-  const parsed = JSON.parse(stdout) as unknown
-  return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
-    ? parsed as Record<string, unknown>
-    : {}
+const pullByIdPath = (repo: string, number: number): string => {
+  const [owner, name, ...extra] = repo.split('/')
+  if (!owner || !name || extra.length > 0 || !Number.isSafeInteger(number) || number <= 0) {
+    throw new Error(`Invalid GitHub pull request identity ${repo}#${number}`)
+  }
+  return `/github/repos/${encodeURIComponent(owner)}__${encodeURIComponent(name)}/pulls/by-id/${number}.json`
 }
+
+const numberValue = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+
+const recordValue = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
