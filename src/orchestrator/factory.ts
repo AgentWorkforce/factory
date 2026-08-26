@@ -9156,8 +9156,9 @@ export class FactoryLoop implements Factory {
       // used by point lookups and startup work, so only the enumeration call
       // issued by the currently leased pass may contribute to its diagnosis.
       const issuingPass = discoveryEnumerationPass.getStore()
-      const recordDiscovery = issuingPass !== undefined && issuingPass.epoch === this.#discoverySweepEpoch
-      if (recordDiscovery) {
+      const recordsCurrentDiscovery = (): boolean =>
+        issuingPass !== undefined && issuingPass.epoch === this.#discoverySweepEpoch
+      if (recordsCurrentDiscovery()) {
         for (const { owner, repo } of repos) this.#discoverySweepConfiguredRepoKeys.add(`${owner}/${repo}`)
         this.#discoverySweepReposConfigured = this.#discoverySweepConfiguredRepoKeys.size
       }
@@ -9186,7 +9187,7 @@ export class FactoryLoop implements Factory {
           // comment-replay call sites that share this cache.
           pathBatches = [indexedPaths]
           this.#increment('githubIssueIndexReposUsed')
-          if (recordDiscovery) {
+          if (recordsCurrentDiscovery()) {
             this.#discoverySweepIndexRepoKeys.add(repoKey)
             if (indexedPaths.length === 0) this.#discoverySweepIndexEmptyRepoKeys.add(repoKey)
             this.#discoverySweepIndexRepos = this.#discoverySweepIndexRepoKeys.size
@@ -9195,7 +9196,7 @@ export class FactoryLoop implements Factory {
         } else if (allRootsCached) {
           pathBatches = cachedBatches
           this.#increment('githubIssueDiscoveryCacheReposUsed')
-          if (recordDiscovery) {
+          if (recordsCurrentDiscovery()) {
             this.#discoverySweepCacheRepoKeys.add(repoKey)
             if (cachedBatches.every((paths) => paths.length === 0)) this.#discoverySweepCacheEmptyRepoKeys.add(repoKey)
             this.#discoverySweepCacheRepos = this.#discoverySweepCacheRepoKeys.size
@@ -9207,7 +9208,7 @@ export class FactoryLoop implements Factory {
             pathBatches.push(await this.#listRelayfileTree(root, 'GitHub issue ingestion', { cache: true, enumeration: true }))
           }
           this.#increment('githubIssueIndexFallbacks')
-          if (recordDiscovery) {
+          if (recordsCurrentDiscovery()) {
             this.#discoverySweepTreeRepoKeys.add(repoKey)
             if (pathBatches.every((paths) => paths.length === 0)) this.#discoverySweepTreeEmptyRepoKeys.add(repoKey)
             this.#discoverySweepTreeRepos = this.#discoverySweepTreeRepoKeys.size
