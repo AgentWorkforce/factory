@@ -301,6 +301,15 @@ const sweepOutcome = (
     dispatchFailureReasons?: unknown
     treeReads?: unknown
     emptyTreeReads?: unknown
+    discoveryReposConfigured?: unknown
+    discoveryIndexRepos?: unknown
+    discoveryIndexEmptyRepos?: unknown
+    discoveryCacheRepos?: unknown
+    discoveryCacheEmptyRepos?: unknown
+    discoveryTreeRepos?: unknown
+    discoveryTreeEmptyRepos?: unknown
+    consecutiveEmptySweeps?: unknown
+    emptySweepWarningThreshold?: unknown
     discoveryDeferred?: unknown
     lastEnumeratedAtMs?: unknown
     enumerationCountsInvalid?: unknown
@@ -315,6 +324,15 @@ const sweepOutcome = (
   | 'dispatchFailureReasons'
   | 'treeReads'
   | 'emptyTreeReads'
+  | 'discoveryReposConfigured'
+  | 'discoveryIndexRepos'
+  | 'discoveryIndexEmptyRepos'
+  | 'discoveryCacheRepos'
+  | 'discoveryCacheEmptyRepos'
+  | 'discoveryTreeRepos'
+  | 'discoveryTreeEmptyRepos'
+  | 'consecutiveEmptySweeps'
+  | 'emptySweepWarningThreshold'
   | 'discoveryDeferred'
   | 'lastEnumeratedAtMs'
   | 'enumerationCountsInvalid'
@@ -356,12 +374,24 @@ const sweepOutcome = (
   // apart, which is why this number exists next to the breakdown.
   const dispatchFailures = optionalCount('dispatchFailures', status.dispatchFailures)
   const dispatchFailureReasons = dispatchFailureReasonCounts(status.dispatchFailureReasons)
+  const discoveryCounts = {
+    ...optionalCount('discoveryReposConfigured', status.discoveryReposConfigured),
+    ...optionalCount('discoveryIndexRepos', status.discoveryIndexRepos),
+    ...optionalCount('discoveryIndexEmptyRepos', status.discoveryIndexEmptyRepos),
+    ...optionalCount('discoveryCacheRepos', status.discoveryCacheRepos),
+    ...optionalCount('discoveryCacheEmptyRepos', status.discoveryCacheEmptyRepos),
+    ...optionalCount('discoveryTreeRepos', status.discoveryTreeRepos),
+    ...optionalCount('discoveryTreeEmptyRepos', status.discoveryTreeEmptyRepos),
+    ...optionalCount('consecutiveEmptySweeps', status.consecutiveEmptySweeps),
+    ...optionalCount('emptySweepWarningThreshold', status.emptySweepWarningThreshold),
+  }
   return {
     ...candidates,
     ...dispatched,
     ...skipped,
     ...(skipReasons ? { skipReasons } : {}),
     ...dispatchFailures,
+    ...discoveryCounts,
     // A breakdown with no total is an orphan: a reader cannot check that the
     // parts sum, which is the one integrity check this surface offers.
     ...(dispatchFailures.dispatchFailures !== undefined && dispatchFailureReasons

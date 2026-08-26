@@ -5783,6 +5783,130 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('classifies an authoritative empty GitHub index without inventing tree reads', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-empty-index-signal-'))
+    const mount = new CountingListTreeMount({
+      '/github/repos/AgentWorkforce/pear/issues/_index.json': [],
+    })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') },
+    }), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 600_000 } })
+      expect(factory.status().readinessReconcile).toMatchObject({
+        candidates: 0,
+        treeReads: 0,
+        discoveryReposConfigured: 1,
+        discoveryIndexRepos: 1,
+        discoveryIndexEmptyRepos: 1,
+        discoveryCacheRepos: 0,
+        discoveryTreeRepos: 0,
+        consecutiveEmptySweeps: 1,
+        emptySweepWarningThreshold: 3,
+      })
+      expect(mount.listTreePrefixes).toEqual([])
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('warns once after three cache-backed empty sweeps with zero tree reads', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-empty-cache-signal-'))
+    const mount = new CountingListTreeMount()
+    mount.emit(changeEvent('/factory/observability/mount-health/current.json', 'event-empty-cache'))
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const make = (logger: { warn?: (message: string, details?: unknown) => void } = {}) => createFactory(config({
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') },
+    }), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      logger,
+    })
+    try {
+      const seed = make()
+      expect((await seed.runOnce()).pulled).toEqual([])
+      await seed.stop()
+      expect(mount.listTreePrefixes).toHaveLength(2)
+      mount.listTreePrefixes.length = 0
+
+      const warnings: Array<{ message: string; details?: unknown }> = []
+      const factory = make({ warn: (message, details) => warnings.push({ message, details }) })
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 100 } })
+      await vi.waitFor(() => expect(factory.status().readinessReconcile?.consecutiveEmptySweeps).toBe(3), {
+        timeout: 5_000,
+      })
+      await factory.stop()
+      expect(factory.status().readinessReconcile).toMatchObject({
+        candidates: 0,
+        treeReads: 0,
+        emptyTreeReads: 0,
+        discoveryReposConfigured: 1,
+        discoveryIndexRepos: 0,
+        discoveryCacheRepos: 1,
+        discoveryCacheEmptyRepos: 1,
+        discoveryTreeRepos: 0,
+        emptySweepWarningThreshold: 3,
+      })
+      expect(factory.status().counters).toMatchObject({
+        readinessZeroCandidateRepoSweeps: 3,
+        readinessZeroTreeReadRepoSweeps: 3,
+        readinessCacheEmptyRepoSweeps: 3,
+        readinessPersistentEmptyDiscoveryWarnings: 1,
+      })
+      expect(mount.listTreePrefixes).toEqual([])
+      expect(warnings.filter((entry) => entry.message.includes('persistently produced zero candidates'))).toEqual([
+        expect.objectContaining({ details: expect.objectContaining({ consecutiveEmptySweeps: 3, cacheEmptyRepos: 1, treeReads: 0 }) }),
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('classifies a genuinely empty uncached tree separately from zero reads', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-empty-tree-signal-'))
+    const mount = new CountingListTreeMount()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') },
+    }), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 600_000 } })
+      expect(factory.status().readinessReconcile).toMatchObject({
+        candidates: 0,
+        treeReads: 2,
+        emptyTreeReads: 2,
+        discoveryReposConfigured: 1,
+        discoveryIndexRepos: 0,
+        discoveryCacheRepos: 0,
+        discoveryTreeRepos: 1,
+        discoveryTreeEmptyRepos: 1,
+      })
+      expect(mount.listTreePrefixes).toHaveLength(2)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('retains the durable GitHub tree fallback when the issue index is malformed', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-github-index-cache-fallback-'))
     const indexPath = '/github/repos/AgentWorkforce/pear/issues/_index.json'

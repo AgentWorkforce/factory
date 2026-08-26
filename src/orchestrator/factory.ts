@@ -548,6 +548,9 @@ const RELAYFILE_OPERATION_BACKSTOP_RATIO = 1.25
 const DISCOVERY_SWEEP_LEASE_MS = 5 * 60_000
 const DISCOVERY_SWEEP_RENEW_MS = 30_000
 const READINESS_RECONCILE_FAILURE_THRESHOLD = 3
+// Three clean passes filters one-off empty indexes/checkpoints while making a
+// silent discovery outage loud within two normal intervals after first sight.
+const EMPTY_DISCOVERY_WARNING_THRESHOLD = 3
 
 /**
  * A relayfile fault a swallowing catch must not turn into "no result".
@@ -1006,6 +1009,7 @@ export class FactoryLoop implements Factory {
   #readinessReconcileAbandonedWait?: Promise<void>
   #readinessReconcileAbandonedSinceMs?: number
   #readinessReconcileConsecutiveFailures = 0
+  #readinessReconcileConsecutiveEmptySweeps = 0
   #readinessReconcileLastDurationMs?: number
   #readinessReconcileLastStartedAtMs?: number
   #readinessReconcileLastCompletedAtMs?: number
@@ -1029,6 +1033,13 @@ export class FactoryLoop implements Factory {
     /** Served tree reads, and how many were empty. Held even at zero. */
     treeReads: number
     emptyTreeReads: number
+    discoveryReposConfigured: number
+    discoveryIndexRepos: number
+    discoveryIndexEmptyRepos: number
+    discoveryCacheRepos: number
+    discoveryCacheEmptyRepos: number
+    discoveryTreeRepos: number
+    discoveryTreeEmptyRepos: number
     dispatched: number
     skipped: number
     skipReasons: Partial<Record<FactorySweepSkipReasonCode, number>>
@@ -1191,6 +1202,20 @@ export class FactoryLoop implements Factory {
   #discoverySweepTreeReads = 0
   /** How many of those were served with zero entries. */
   #discoverySweepEmptyTreeReads = 0
+  #discoverySweepReposConfigured = 0
+  #discoverySweepIndexRepos = 0
+  #discoverySweepIndexEmptyRepos = 0
+  #discoverySweepCacheRepos = 0
+  #discoverySweepCacheEmptyRepos = 0
+  #discoverySweepTreeRepos = 0
+  #discoverySweepTreeEmptyRepos = 0
+  readonly #discoverySweepConfiguredRepoKeys = new Set<string>()
+  readonly #discoverySweepIndexRepoKeys = new Set<string>()
+  readonly #discoverySweepIndexEmptyRepoKeys = new Set<string>()
+  readonly #discoverySweepCacheRepoKeys = new Set<string>()
+  readonly #discoverySweepCacheEmptyRepoKeys = new Set<string>()
+  readonly #discoverySweepTreeRepoKeys = new Set<string>()
+  readonly #discoverySweepTreeEmptyRepoKeys = new Set<string>()
   /**
    * The longest `Retry-After` any operation in this sweep advertised.
    *
@@ -2415,6 +2440,17 @@ export class FactoryLoop implements Factory {
         skipReasons: factorySweepSkipReasonCounts(report.skipped),
         dispatchFailures: report.skipped.filter((entry) => entry.code === 'dispatch-failed').length,
         dispatchFailureReasons: factoryDispatchFailureReasonCounts(report.skipped),
+        discoveryReposConfigured: report.discoveryReposConfigured ?? 0,
+        discoveryIndexRepos: report.discoveryIndexRepos ?? 0,
+        discoveryIndexEmptyRepos: report.discoveryIndexEmptyRepos ?? 0,
+        discoveryCacheRepos: report.discoveryCacheRepos ?? 0,
+        discoveryCacheEmptyRepos: report.discoveryCacheEmptyRepos ?? 0,
+        discoveryTreeRepos: report.discoveryTreeRepos ?? 0,
+        discoveryTreeEmptyRepos: report.discoveryTreeEmptyRepos ?? 0,
+        treeReads: report.treeReads ?? 0,
+        emptyTreeReads: report.emptyTreeReads ?? 0,
+        consecutiveEmptySweeps: this.#readinessReconcileConsecutiveEmptySweeps,
+        emptySweepWarningThreshold: EMPTY_DISCOVERY_WARNING_THRESHOLD,
         discoveryDeferred: report.discoveryDeferred,
       })
     } catch (error) {
@@ -3389,6 +3425,14 @@ export class FactoryLoop implements Factory {
     this.#discoverySweepOverloads = 0
     this.#discoverySweepTreeReads = 0
     this.#discoverySweepEmptyTreeReads = 0
+    this.#discoverySweepReposConfigured = 0
+    this.#discoverySweepIndexRepos = 0
+    this.#discoverySweepIndexEmptyRepos = 0
+    this.#discoverySweepCacheRepos = 0
+    this.#discoverySweepCacheEmptyRepos = 0
+    this.#discoverySweepTreeRepos = 0
+    this.#discoverySweepTreeEmptyRepos = 0
+    this.#clearDiscoveryRepoSignals()
     this.#discoverySweepRetryAfterSeconds = undefined
     this.#discoverySweepProgress = false
     this.#startDiscoverySweepRenewal(claim.lease.epoch)
@@ -3489,6 +3533,14 @@ export class FactoryLoop implements Factory {
       this.#discoverySweepOverloads = 0
       this.#discoverySweepTreeReads = 0
       this.#discoverySweepEmptyTreeReads = 0
+      this.#discoverySweepReposConfigured = 0
+      this.#discoverySweepIndexRepos = 0
+      this.#discoverySweepIndexEmptyRepos = 0
+      this.#discoverySweepCacheRepos = 0
+      this.#discoverySweepCacheEmptyRepos = 0
+      this.#discoverySweepTreeRepos = 0
+      this.#discoverySweepTreeEmptyRepos = 0
+      this.#clearDiscoveryRepoSignals()
       this.#discoverySweepRetryAfterSeconds = undefined
       this.#discoverySweepProgress = false
       // This sweep is over either way (committed, deferred, or lease lost) —
@@ -4013,6 +4065,13 @@ export class FactoryLoop implements Factory {
         // is still inside that try, so the counts are this sweep's own.
         treeReads: this.#discoverySweepTreeReads,
         emptyTreeReads: this.#discoverySweepEmptyTreeReads,
+        discoveryReposConfigured: this.#discoverySweepReposConfigured,
+        discoveryIndexRepos: this.#discoverySweepIndexRepos,
+        discoveryIndexEmptyRepos: this.#discoverySweepIndexEmptyRepos,
+        discoveryCacheRepos: this.#discoverySweepCacheRepos,
+        discoveryCacheEmptyRepos: this.#discoverySweepCacheEmptyRepos,
+        discoveryTreeRepos: this.#discoverySweepTreeRepos,
+        discoveryTreeEmptyRepos: this.#discoverySweepTreeEmptyRepos,
         slackDegraded: this.#slackDegraded,
         ...(orphanRecoveryDegraded ? { orphanRecoveryDegraded } : {}),
       }
@@ -6216,10 +6275,47 @@ export class FactoryLoop implements Factory {
       return
     }
     this.#readinessReconcileLastSweepDeferred = undefined
+    const configuredRepos = report.discoveryReposConfigured ?? 0
+    if (configuredRepos > 0 && report.pulled.length === 0) {
+      this.#readinessReconcileConsecutiveEmptySweeps += 1
+      this.#increment('readinessZeroCandidateRepoSweeps')
+      if ((report.treeReads ?? 0) === 0) this.#increment('readinessZeroTreeReadRepoSweeps')
+      if ((report.discoveryIndexEmptyRepos ?? 0) > 0) this.#increment('readinessIndexEmptyRepoSweeps')
+      if ((report.discoveryCacheEmptyRepos ?? 0) > 0) this.#increment('readinessCacheEmptyRepoSweeps')
+      if ((report.discoveryTreeEmptyRepos ?? 0) > 0) this.#increment('readinessTreeEmptyRepoSweeps')
+      // Warn only on the threshold crossing. A legitimately idle workspace
+      // remains observable through the streak, but does not emit once a minute
+      // forever. A later non-empty pass resets the edge and permits a new warn.
+      if (this.#readinessReconcileConsecutiveEmptySweeps === EMPTY_DISCOVERY_WARNING_THRESHOLD) {
+        this.#increment('readinessPersistentEmptyDiscoveryWarnings')
+        this.#logger.warn?.('[factory] discovery has persistently produced zero candidates for configured repositories', {
+          consecutiveEmptySweeps: this.#readinessReconcileConsecutiveEmptySweeps,
+          warningThreshold: EMPTY_DISCOVERY_WARNING_THRESHOLD,
+          configuredRepos,
+          indexRepos: report.discoveryIndexRepos ?? 0,
+          indexEmptyRepos: report.discoveryIndexEmptyRepos ?? 0,
+          cacheRepos: report.discoveryCacheRepos ?? 0,
+          cacheEmptyRepos: report.discoveryCacheEmptyRepos ?? 0,
+          treeRepos: report.discoveryTreeRepos ?? 0,
+          treeEmptyRepos: report.discoveryTreeEmptyRepos ?? 0,
+          treeReads: report.treeReads ?? 0,
+          emptyTreeReads: report.emptyTreeReads ?? 0,
+        })
+      }
+    } else {
+      this.#readinessReconcileConsecutiveEmptySweeps = 0
+    }
     this.#readinessReconcileLastSweep = {
       candidates: report.pulled.length,
       treeReads: report.treeReads ?? 0,
       emptyTreeReads: report.emptyTreeReads ?? 0,
+      discoveryReposConfigured: configuredRepos,
+      discoveryIndexRepos: report.discoveryIndexRepos ?? 0,
+      discoveryIndexEmptyRepos: report.discoveryIndexEmptyRepos ?? 0,
+      discoveryCacheRepos: report.discoveryCacheRepos ?? 0,
+      discoveryCacheEmptyRepos: report.discoveryCacheEmptyRepos ?? 0,
+      discoveryTreeRepos: report.discoveryTreeRepos ?? 0,
+      discoveryTreeEmptyRepos: report.discoveryTreeEmptyRepos ?? 0,
       dispatched: report.dispatched.length,
       skipped: report.skipped.length,
       skipReasons: factorySweepSkipReasonCounts(report.skipped),
@@ -6339,6 +6435,15 @@ export class FactoryLoop implements Factory {
             // an empty workspace, not a silent mount (#351 follow-up).
             treeReads: this.#readinessReconcileLastSweep.treeReads,
             emptyTreeReads: this.#readinessReconcileLastSweep.emptyTreeReads,
+            discoveryReposConfigured: this.#readinessReconcileLastSweep.discoveryReposConfigured,
+            discoveryIndexRepos: this.#readinessReconcileLastSweep.discoveryIndexRepos,
+            discoveryIndexEmptyRepos: this.#readinessReconcileLastSweep.discoveryIndexEmptyRepos,
+            discoveryCacheRepos: this.#readinessReconcileLastSweep.discoveryCacheRepos,
+            discoveryCacheEmptyRepos: this.#readinessReconcileLastSweep.discoveryCacheEmptyRepos,
+            discoveryTreeRepos: this.#readinessReconcileLastSweep.discoveryTreeRepos,
+            discoveryTreeEmptyRepos: this.#readinessReconcileLastSweep.discoveryTreeEmptyRepos,
+            consecutiveEmptySweeps: this.#readinessReconcileConsecutiveEmptySweeps,
+            emptySweepWarningThreshold: EMPTY_DISCOVERY_WARNING_THRESHOLD,
             dispatched: this.#readinessReconcileLastSweep.dispatched,
             skipped: this.#readinessReconcileLastSweep.skipped,
             ...(Object.keys(this.#readinessReconcileLastSweep.skipReasons).length > 0
@@ -9033,10 +9138,31 @@ export class FactoryLoop implements Factory {
     return candidates
   }
 
+  #clearDiscoveryRepoSignals(): void {
+    this.#discoverySweepConfiguredRepoKeys.clear()
+    this.#discoverySweepIndexRepoKeys.clear()
+    this.#discoverySweepIndexEmptyRepoKeys.clear()
+    this.#discoverySweepCacheRepoKeys.clear()
+    this.#discoverySweepCacheEmptyRepoKeys.clear()
+    this.#discoverySweepTreeRepoKeys.clear()
+    this.#discoverySweepTreeEmptyRepoKeys.clear()
+  }
+
   async #githubIssuePaths(): Promise<string[]> {
     try {
       const issuePaths = new Map<string, string>()
-      for (const { owner, repo } of configuredGithubRepoParts(this.#config)) {
+      const repos = configuredGithubRepoParts(this.#config)
+      // Match #listRelayfileTree's two load-bearing scopes: this method is also
+      // used by point lookups and startup work, so only the enumeration call
+      // issued by the currently leased pass may contribute to its diagnosis.
+      const issuingPass = discoveryEnumerationPass.getStore()
+      const recordDiscovery = issuingPass !== undefined && issuingPass.epoch === this.#discoverySweepEpoch
+      if (recordDiscovery) {
+        for (const { owner, repo } of repos) this.#discoverySweepConfiguredRepoKeys.add(`${owner}/${repo}`)
+        this.#discoverySweepReposConfigured = this.#discoverySweepConfiguredRepoKeys.size
+      }
+      for (const { owner, repo } of repos) {
+        const repoKey = `${owner}/${repo}`
         const roots = githubIssueRepoRoots(owner, repo)
         const cachedBatches = roots.map((root) => this.#cachedDiscoveryTree(root))
         const allRootsCached = cachedBatches.every((paths): paths is string[] => paths !== undefined)
@@ -9060,15 +9186,33 @@ export class FactoryLoop implements Factory {
           // comment-replay call sites that share this cache.
           pathBatches = [indexedPaths]
           this.#increment('githubIssueIndexReposUsed')
+          if (recordDiscovery) {
+            this.#discoverySweepIndexRepoKeys.add(repoKey)
+            if (indexedPaths.length === 0) this.#discoverySweepIndexEmptyRepoKeys.add(repoKey)
+            this.#discoverySweepIndexRepos = this.#discoverySweepIndexRepoKeys.size
+            this.#discoverySweepIndexEmptyRepos = this.#discoverySweepIndexEmptyRepoKeys.size
+          }
         } else if (allRootsCached) {
           pathBatches = cachedBatches
           this.#increment('githubIssueDiscoveryCacheReposUsed')
+          if (recordDiscovery) {
+            this.#discoverySweepCacheRepoKeys.add(repoKey)
+            if (cachedBatches.every((paths) => paths.length === 0)) this.#discoverySweepCacheEmptyRepoKeys.add(repoKey)
+            this.#discoverySweepCacheRepos = this.#discoverySweepCacheRepoKeys.size
+            this.#discoverySweepCacheEmptyRepos = this.#discoverySweepCacheEmptyRepoKeys.size
+          }
         } else {
           pathBatches = []
           for (const root of roots) {
             pathBatches.push(await this.#listRelayfileTree(root, 'GitHub issue ingestion', { cache: true, enumeration: true }))
           }
           this.#increment('githubIssueIndexFallbacks')
+          if (recordDiscovery) {
+            this.#discoverySweepTreeRepoKeys.add(repoKey)
+            if (pathBatches.every((paths) => paths.length === 0)) this.#discoverySweepTreeEmptyRepoKeys.add(repoKey)
+            this.#discoverySweepTreeRepos = this.#discoverySweepTreeRepoKeys.size
+            this.#discoverySweepTreeEmptyRepos = this.#discoverySweepTreeEmptyRepoKeys.size
+          }
         }
         for (const paths of pathBatches) {
           for (let index = 0; index < paths.length; index += 1) {

@@ -317,6 +317,18 @@ export interface FactoryReadinessReconcileStatus {
    */
   treeReads?: number
   emptyTreeReads?: number
+  /** GitHub repositories inspected by each discovery authority in this sweep. */
+  discoveryReposConfigured?: number
+  discoveryIndexRepos?: number
+  discoveryIndexEmptyRepos?: number
+  discoveryCacheRepos?: number
+  discoveryCacheEmptyRepos?: number
+  discoveryTreeRepos?: number
+  discoveryTreeEmptyRepos?: number
+  /** Successful enumerating sweeps in a row that found no candidates. */
+  consecutiveEmptySweeps?: number
+  /** The one-shot warning threshold for persistent empty discovery. */
+  emptySweepWarningThreshold?: number
   /** Work units the last enumerating sweep actually dispatched. */
   dispatched?: number
   /** Work units the last enumerating sweep saw and declined. */
@@ -439,6 +451,15 @@ export interface FactoryPublicReadinessReconcileHealth {
    */
   treeReads?: number
   emptyTreeReads?: number
+  discoveryReposConfigured?: number
+  discoveryIndexRepos?: number
+  discoveryIndexEmptyRepos?: number
+  discoveryCacheRepos?: number
+  discoveryCacheEmptyRepos?: number
+  discoveryTreeRepos?: number
+  discoveryTreeEmptyRepos?: number
+  consecutiveEmptySweeps?: number
+  emptySweepWarningThreshold?: number
   /**
    * When the pass the counts describe finished enumerating. Dates them —
    * `lastCompletedAtMs` does not, since it advances on deferred passes too.
@@ -806,6 +827,13 @@ export interface IterationReport {
    */
   treeReads?: number
   emptyTreeReads?: number
+  discoveryReposConfigured?: number
+  discoveryIndexRepos?: number
+  discoveryIndexEmptyRepos?: number
+  discoveryCacheRepos?: number
+  discoveryCacheEmptyRepos?: number
+  discoveryTreeRepos?: number
+  discoveryTreeEmptyRepos?: number
   /** A cross-process owner was already enumerating this workspace. */
   discoveryDeferred?: 'sweep-in-flight'
   error?: { message: string; stack?: string }
