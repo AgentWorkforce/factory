@@ -800,33 +800,29 @@ and therefore cannot be performed as the app today. Under `"app"` they refuse
 rather than writing as the operator, so an explicit app identity never produces
 a human-attributed write:
 
-| Write | Refuses under `"app"` | Missing connected capability |
+| Write | Built-in CLI identity gate | Missing connected capability |
 |---|---|---|
-| Guarded squash merge (`mergePolicy: "on-green-with-review"`) | the merge is declined and logged; nothing is merged | `mergePullRequest` |
-| Notion intake issue create | the run is blocked with the reason, before any durable claim is taken | `createIssue` |
-| Notion intake issue edit | the run is blocked with the reason, before any durable claim is taken | `updateIssue` |
+| Guarded squash merge (`mergePolicy: "on-green-with-review"`) | `"app"` declines and logs; nothing is merged | `mergePullRequest` |
+| Notion intake issue create | only exact `"user"`; `"auto"` and `"app"` block before any durable claim | `createIssue` |
+| Notion intake issue edit | only exact `"user"`; `"auto"` and `"app"` block before any CLI access | `updateIssue` |
 
-Both refusals name the missing capability and the recovery path: set
-`github.identity` to `"user"` or `"auto"` to deliberately accept local-user
-attribution for that operation. Under `"auto"` and `"user"` both paths behave
-exactly as they always have. Neither refusal is reachable in the default cloud
-deployment, which runs `mergePolicy: "never"` and does not run Notion intake.
+The merge refusal names `"user"` or `"auto"` as its local-user recovery path.
+The built-in Notion publisher is stricter: its local-host opt-in is exact
+`github.identity: "user"`, because the production Factory container contains
+no `gh` binary and the App surface has no issue-create or source-marker query.
 
 Notion intake is a separate surface from the Factory lifecycle writeback and
 still requires local `gh` authentication when enabled. Its CLI entry point
 resolves `github.identity` from the selected contract — including a split
-`workspaceConfig`/`nodeConfig` contract, where the node half wins — so `"app"`
-refuses while `"user"` and `"auto"` proceed. An absent contract resolves to
-`"auto"`, matching the schema's own synthesis of an unset `github` block; a
-contract that exists but cannot be parsed is an error rather than a silent
-downgrade to the permissive value.
+`workspaceConfig`/`nodeConfig` contract, where the node half wins. Only exact
+`"user"` enables the built-in CLI publisher. An absent contract resolves to
+`"auto"` and therefore blocks repository intake explicitly; a contract that
+exists but cannot be parsed is an error rather than a silent downgrade.
 
-Only the mutations refuse. Reconciliation of an already-dispatched task
-performs no GitHub write, so it continues to work under `"app"`: the refusal is
-raised immediately before the issue create or the issue edit, and in the create
-path before the durable delivery claim is taken, so a refused run never
-consumes the exactly-once claim and can be retried under a permitted
-identity.
+The gate covers the built-in publisher's visibility, label, reconciliation,
+create, and edit operations. `"auto"` and `"app"` fail before spawning `gh` and
+before reserving a durable claim. Project-only intake and injected custom
+publishers do not use this adapter and remain available.
 
 The standalone babysitter reads complete PR metadata from the authenticated
 mounted projection and reports `source: 'mount'`; it does not fall back to

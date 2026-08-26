@@ -12,10 +12,11 @@ import { FactoryConfigSchema } from '../config/schema'
  * `identity: "app"` they still attribute the write to whichever human is
  * logged in locally.
  *
- * Each case below is a must-fire / must-not-fire pair: `app` must refuse
- * WITHOUT spawning `gh`, and `auto`/`user` must behave exactly as they do
- * today. A test that only asserted the refusal would pass against a change
- * that broke every local run.
+ * Each case below is a must-fire / must-not-fire pair. Merge keeps its
+ * historical auto/user policy, while the Notion CLI adapter is a stricter
+ * explicit-user local-host capability because the production container has
+ * no `gh` binary. A test that only asserted refusal would pass against a
+ * change that broke every local run.
  */
 
 const mergeInput = { repo: 'AgentWorkforce/example', number: 7, expectedHeadSha: 'a'.repeat(40) }
@@ -172,20 +173,22 @@ describe('local gh mutations under github.identity', () => {
     expect(calls).toEqual([])
   })
 
-  it('MUST NOT FIRE: assertWritable permits user and auto', () => {
-    for (const identity of ['user', 'auto'] as const) {
-      const { gh } = fakeGh()
-      expect(() => new GhCliIssuePublisher(identity, gh).assertWritable()).not.toThrow()
-    }
+  it('requires exact user identity before the Notion gh adapter can write', () => {
+    const user = fakeGh()
+    expect(() => new GhCliIssuePublisher('user', user.gh).assertWritable()).not.toThrow()
+
+    const automatic = fakeGh()
+    expect(() => new GhCliIssuePublisher('auto', automatic.gh).assertWritable())
+      .toThrow(/GitHub identity "auto".*Notion intake.*local gh.*identity.*"user"/iu)
+    expect(automatic.calls).toEqual([])
   })
 
-  it('MUST NOT FIRE: identity "app" leaves Notion intake READS working', async () => {
-    // Reads carry no authorship, so gating them would break intake without
-    // removing any attribution.
+  it.each(['app', 'auto'] as const)('blocks Notion intake reads under %s before spawning gh', async (identity) => {
     const { gh, calls } = fakeGh()
-    const publisher = new GhCliIssuePublisher('app', gh)
+    const publisher = new GhCliIssuePublisher(identity, gh)
 
-    await publisher.missingLabels('AgentWorkforce/example', ['factory'])
-    expect(calls.map((args) => args[0])).toEqual(['api'])
+    await expect(publisher.missingLabels('AgentWorkforce/example', ['factory']))
+      .rejects.toThrow(new RegExp(`GitHub identity "${identity}".*Notion intake.*local gh`, 'iu'))
+    expect(calls).toEqual([])
   })
 })
