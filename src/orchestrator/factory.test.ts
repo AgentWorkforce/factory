@@ -1752,7 +1752,7 @@ class RefuseFirstClarificationParkStateStore extends InMemoryStateStore {
 }
 
 class ScriptedGithubMergeGate implements GithubMergeGatePort {
-  readonly checks: Array<{ repo: string; number: number; expectedHeadSha?: string }> = []
+  readonly checks: Array<{ repo: string; number: number; expectedHeadSha?: string; path?: string }> = []
   readonly merges: GithubMergeInput[] = []
   readonly #verdicts: GithubMergeGateVerdict[]
   #mergeResult: { merged: boolean; reason: string }
@@ -1762,7 +1762,7 @@ class ScriptedGithubMergeGate implements GithubMergeGatePort {
     this.#mergeResult = mergeResult
   }
 
-  async check(input: { repo: string; number: number; expectedHeadSha?: string }): Promise<GithubMergeGateVerdict> {
+  async check(input: { repo: string; number: number; expectedHeadSha?: string; path?: string }): Promise<GithubMergeGateVerdict> {
     this.checks.push(input)
     return this.#verdicts.shift() ?? this.#verdicts.at(-1) ?? refusedMergeVerdict('no scripted verdict')
   }
@@ -21523,6 +21523,11 @@ describe('FactoryLoop', () => {
     await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(242), realMergeIssueFile(242))))
     await factory.runLoop({ maxIterations: 1 })
 
+    expect(gate.checks).toEqual([{
+      repo: 'AgentWorkforce/pear',
+      number: 242,
+      path: '/github/repos/AgentWorkforce__pear/pulls/by-id/242.json',
+    }])
     expect(gate.merges).toEqual([{
       repo: 'AgentWorkforce/pear',
       number: 242,
@@ -32829,9 +32834,36 @@ describe('merge gate identity selection', () => {
       ...(identity ? { github: { identity } } : {}),
     })
 
+  it('MUST FIRE: the default gate reads readiness from the mount, never its local-gh mutation runner', async () => {
+    const path = '/github/repos/AgentWorkforce__example/pulls/by-id/7.json'
+    const mount = new FakeMountClient({
+      [path]: {
+        provider: 'github',
+        objectType: 'pull_request',
+        objectId: '7',
+        payload: {
+          number: 7,
+          mergeable: 'MERGEABLE',
+          mergeStateStatus: 'CLEAN',
+          headRefOid: mergeInput.expectedHeadSha,
+          reviewDecision: 'APPROVED',
+          statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        },
+      },
+    })
+    const gh: GhRunner = async () => { throw new Error('local gh must not be used for readiness reads') }
+
+    await expect(defaultMergeGate(configFor('app'), mount, gh).check({
+      repo: mergeInput.repo,
+      number: mergeInput.number,
+      expectedHeadSha: mergeInput.expectedHeadSha,
+      path,
+    })).resolves.toMatchObject({ verdict: 'READY', ready: true })
+  })
+
   it('MUST FIRE: identity "app" yields a merge gate that refuses without invoking gh', async () => {
     const { run, calls } = fakeGh()
-    const result = await defaultMergeGate(configFor('app'), run).merge(mergeInput)
+    const result = await defaultMergeGate(configFor('app'), new FakeMountClient(), run).merge(mergeInput)
 
     expect(result.merged).toBe(false)
     expect(calls).toEqual([])
@@ -32841,7 +32873,7 @@ describe('merge gate identity selection', () => {
 
   it('MUST NOT FIRE: identity "user" yields a gate that still performs the merge', async () => {
     const { run, calls } = fakeGh()
-    const result = await defaultMergeGate(configFor('user'), run).merge(mergeInput)
+    const result = await defaultMergeGate(configFor('user'), new FakeMountClient(), run).merge(mergeInput)
 
     expect(result.merged).toBe(true)
     expect(calls[0]?.slice(0, 2)).toEqual(['pr', 'merge'])
@@ -32852,7 +32884,7 @@ describe('merge gate identity selection', () => {
     expect(config.github.identity).toBe('auto')
 
     const { run, calls } = fakeGh()
-    const result = await defaultMergeGate(config, run).merge(mergeInput)
+    const result = await defaultMergeGate(config, new FakeMountClient(), run).merge(mergeInput)
     expect(result.merged).toBe(true)
     expect(calls).toHaveLength(1)
   })

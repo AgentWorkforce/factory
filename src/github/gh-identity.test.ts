@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { GhCliGithubMergeGate, type GhRunner } from './merge-gate'
+import { GhCliGithubMergeGate, MountedGithubMergeGate, type GhRunner } from './merge-gate'
 import { localGhMutationAllowed } from './gh-identity'
 import { GhCliIssuePublisher } from '../intake/notion'
 import { FactoryConfigSchema } from '../config/schema'
@@ -88,19 +88,21 @@ describe('local gh mutations under github.identity', () => {
   })
 
   it('MUST NOT FIRE: identity "app" leaves the merge-gate READ working', async () => {
-    // `check` reads `gh pr view`; a read carries no authorship, so gating it
-    // would break the gate without removing any attribution.
-    const gate = new GhCliGithubMergeGate(async () => ({
-      stdout: JSON.stringify({
+    const path = '/github/repos/AgentWorkforce__example/pulls/by-id/7.json'
+    const gate = new MountedGithubMergeGate({
+      readFile: async () => ({ content: {
+        number: 7,
         mergeable: 'MERGEABLE',
         mergeStateStatus: 'CLEAN',
         headRefOid: mergeInput.expectedHeadSha,
         reviewDecision: 'APPROVED',
         statusCheckRollup: [{ conclusion: 'SUCCESS' }],
-      }),
-    }), 'app')
+      } }),
+    }, new GhCliGithubMergeGate(async () => {
+      throw new Error('local gh must not be used for readiness reads')
+    }, 'app'))
 
-    await expect(gate.check(mergeInput)).resolves.toMatchObject({ verdict: 'READY', ready: true })
+    await expect(gate.check({ ...mergeInput, path })).resolves.toMatchObject({ verdict: 'READY', ready: true })
   })
 
   // The FactoryLoop selector's own must-fire/must-not-fire pair lives in
