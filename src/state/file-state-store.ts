@@ -410,6 +410,25 @@ export class DocumentStateStore extends InMemoryStateStore {
     }))
   }
 
+  override async clearClaimedDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    expectedLease: NonNullable<DispatchLifecycle['lease']>,
+  ): Promise<boolean> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId]
+      const lifecycle = workspace?.dispatchLifecycles[key]
+      if (!workspace || !lifecycle || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) {
+        return false
+      }
+      delete workspace.dispatchLifecycles[key]
+      if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
+      await this.#persist(document)
+      return true
+    }))
+  }
+
   override async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
     await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()

@@ -815,6 +815,35 @@ describe('RelayFleetClient', () => {
     expect(messaging.agentPresenceCalls).toBe(1)
   })
 
+  it('confirms registration only when presence and a live capable host agree', async () => {
+    const messaging = new FakeMessaging()
+    messaging.agentRows = [
+      { name: 'ar-1-impl', status: 'online', node: 'alpha' },
+      { name: 'ar-hostless-impl', status: 'online' },
+    ]
+    messaging.nodeRows = [
+      { name: 'alpha', status: 'online', capabilities: [{ name: 'spawn:codex' }] },
+      { name: 'beta', status: 'offline', capabilities: [{ name: 'spawn:codex' }] },
+    ]
+    const fleet = createClient(messaging)
+
+    await expect(fleet.isAgentRegistered({
+      name: 'ar-1-impl',
+      node: 'alpha',
+      capability: 'spawn:codex',
+    })).resolves.toBe(true)
+    await expect(fleet.isAgentRegistered({
+      name: 'ar-1-impl',
+      node: 'beta',
+      capability: 'spawn:codex',
+    })).resolves.toBe(false)
+    await expect(fleet.isAgentRegistered({
+      name: 'ar-hostless-impl',
+      node: 'alpha',
+      capability: 'spawn:codex',
+    })).resolves.toBe(false)
+  })
+
   it('sends DMs and channel messages through the agent-scoped surface', async () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging)

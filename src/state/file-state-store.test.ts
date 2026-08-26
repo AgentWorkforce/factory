@@ -1019,6 +1019,38 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('fences claimed lifecycle rollback against a concurrent lease takeover', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-claimed-clear-'))
+    try {
+      const stores = [
+        new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') }),
+        new InMemoryStateStore({ batchSize: 2 }),
+      ]
+      for (const [index, store] of stores.entries()) {
+        const workspace = `workspace-${index}`
+        const seed = dispatchLifecycle(895 + index)
+        const key = dispatchIssueIdentity(seed.issue)
+        const initial = await store.claimDispatchLifecycle(
+          workspace, key, seed, 'owner-a', 1_000, 5_000,
+        )
+        expect(initial.lease).toBeDefined()
+        const takeover = await store.claimDispatchLifecycle(
+          workspace, key, seed, 'owner-b', 6_001, 5_000,
+        )
+        expect(takeover).toMatchObject({ acquired: true, lease: { owner: 'owner-b', epoch: 2 } })
+
+        expect(await store.clearClaimedDispatchLifecycle(workspace, key, initial.lease!)).toBe(false)
+        expect(await store.getDispatchLifecycle(workspace, key)).toMatchObject({
+          lease: { owner: 'owner-b', epoch: 2 },
+        })
+        expect(await store.clearClaimedDispatchLifecycle(workspace, key, takeover.lease!)).toBe(true)
+        expect(await store.getDispatchLifecycle(workspace, key)).toBeUndefined()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('does not count a bare-repo lifecycle after its canonical PR is handed to a babysitter', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-lifecycle-bare-repo-handoff-'))
     try {

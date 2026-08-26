@@ -574,6 +574,19 @@ export class RelayFleetClient implements FleetClient {
     }
   }
 
+  async isAgentRegistered(input: {
+    name: string
+    node: string
+    capability: Capability
+  }): Promise<boolean> {
+    const roster = await this.roster()
+    const agent = roster.agents.find((candidate) =>
+      candidate.name === input.name && candidate.node === input.node)
+    if (!agent) return false
+    return roster.nodes.some((node) =>
+      node.name === input.node && node.live && node.capabilities.includes(input.capability))
+  }
+
   async discoverTeammates(query: TeammateQuery): Promise<TeammateAgent[]> {
     this.#teammateDirectory ??= this.#createTeammateDirectory()
     return await this.#teammateDirectory.discover(query)

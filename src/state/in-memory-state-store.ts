@@ -343,6 +343,18 @@ export class InMemoryStateStore implements StateStore {
     return true
   }
 
+  async clearClaimedDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    expectedLease: NonNullable<DispatchLifecycle['lease']>,
+  ): Promise<boolean> {
+    const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
+    const lifecycle = lifecycles.get(key)
+    if (!lifecycle || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) return false
+    lifecycles.delete(key)
+    return true
+  }
+
   async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
     this.#workspace(workspaceId).dispatchLifecycles.delete(key)
   }
