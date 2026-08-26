@@ -45,6 +45,7 @@ import type {
   MountClient,
   ProviderSyncStatus,
   PreviewReference,
+  RosterEntry,
   SlackWriteback,
   SpawnResult,
   Subscription,
@@ -456,6 +457,8 @@ const STOP_REJECTED_DISPATCH_DRAIN_TIMEOUT_MS = 2_500
 const DISPATCH_LIFECYCLE_LEASE_MS = 5 * 60_000
 const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
+const REMOTE_AGENT_REGISTRATION_TIMEOUT_MS = 30_000
+const REMOTE_AGENT_REGISTRATION_POLL_MS = 500
 /**
  * Ceiling on the durable capacity-wait re-arm (#303).
  *
@@ -651,6 +654,24 @@ class DispatchLifecycleCapacityError extends Error {}
 class DispatchLifecycleOwnedElsewhereError extends Error {
   constructor(readonly leaseUntilMs?: number) {
     super('durable dispatch is still owned by another publisher')
+  }
+}
+
+class FleetPlacementUnavailableError extends Error {
+  constructor(readonly capability: Capability) {
+    super(`Refusing remote dispatch: no live fleet node advertises ${capability}`)
+    this.name = 'FleetPlacementUnavailableError'
+  }
+}
+
+class RemoteAgentRegistrationTimeoutError extends Error {
+  constructor(
+    readonly agentName: string,
+    readonly cleanupConfirmed: boolean,
+    readonly cleanupError?: unknown,
+  ) {
+    super(`Remote agent ${agentName} did not register with the fleet before the startup deadline`)
+    this.name = 'RemoteAgentRegistrationTimeoutError'
   }
 }
 
@@ -3203,10 +3224,11 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  async #assertFleetControlPlaneAvailable(): Promise<void> {
+  async #assertFleetControlPlaneAvailable(): Promise<RosterEntry> {
     try {
-      await this.#fleet.roster()
+      const roster = await this.#fleet.roster()
       this.#increment('fleetControlPlaneProbeSuccesses')
+      return roster
     } catch (error) {
       const health = this.#fleetControlPlane.status()
       this.#increment('fleetControlPlaneProbeFailures')
@@ -5616,7 +5638,10 @@ export class FactoryLoop implements Factory {
     // consuming a dispatch attempt. The mutation proxy probes again at the
     // actual spawn/resume boundary so a later control-plane fault still fails
     // closed.
-    if (!dryRun) await this.#assertFleetControlPlaneAvailable()
+    const admissionRoster = !dryRun ? await this.#assertFleetControlPlaneAvailable() : undefined
+    if (admissionRoster && this.#fleet.placementLocality === 'remote') {
+      dispatchDecision = decisionWithVerifiedRemotePlacements(dispatchDecision, admissionRoster)
+    }
     const durableDispatch = !dryRun && this.#usesDurableDispatchLifecycle()
     // Local dispatches need the same deterministic branch identity as remote
     // ones. Without it, every worker starts in the configured shared checkout
@@ -6033,6 +6058,15 @@ export class FactoryLoop implements Factory {
         throw error
       }
       settlePostSpawnIssueObservation(!(error instanceof LiveDispatchStateChangedError))
+      if (
+        (error instanceof FleetPlacementUnavailableError ||
+          (error instanceof RemoteAgentRegistrationTimeoutError && error.cleanupConfirmed)) &&
+        await this.#rollbackUnregisteredRemoteDispatch(record, spawnedForReaperHandoff)
+      ) {
+        this.#increment('remoteDispatchAdmissionRollbacks')
+        this.#error(error, decision.issue)
+        throw error
+      }
       // A spawn can fail after the broker accepted it but before its ack
       // reached Factory. Include every planned worktree agent, not only the
       // acknowledged spawns, so cleanup never races a name-only survivor.
@@ -10616,14 +10650,6 @@ export class FactoryLoop implements Factory {
       return { name: spec.name }
     }
 
-    // Persist intent before the remote side effect. If the owner crashes after
-    // the spawn ack but before recording its result, takeover retries the same
-    // deterministic invocation id instead of inventing a second worker.
-    batch.recordPlanned(record, { ...spec, invocationId })
-    if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
-      throw new Error(`Dispatch lifecycle ownership lost before spawning ${spec.name}`)
-    }
-
     let roster
     try {
       roster = await retryOnTimeout(() => this.#fleet.roster(), { attempts: 3, delayMs: 2000 })
@@ -10632,6 +10658,16 @@ export class FactoryLoop implements Factory {
     }
     const rosterAgent = roster.agents.find((agent) => agent.name === spec.name)
     if (rosterAgent) {
+      if (this.#fleet.placementLocality === 'remote') {
+        const host = rosterAgent.node
+          ? roster.nodes.find((node) =>
+            node.name === rosterAgent.node && node.live && node.capabilities.includes(spec.capability))
+          : undefined
+        if (!host) {
+          throw new FleetPlacementUnavailableError(spec.capability)
+        }
+        spec = { ...spec, node: host.name }
+      }
       const trackedPlacement = this.#fleet.trackedAgents?.().get(spec.name)
       record.heldSinceAtMs ??= this.#clock.now()
       batch.recordSpawn(record, spec, invocationId, {
@@ -10647,6 +10683,22 @@ export class FactoryLoop implements Factory {
       const adopted = record.agents.get(spec.name)
       if (adopted) await this.#reportAgent(record, adopted, 'agent.adopted')
       return { name: spec.name }
+    }
+
+    if (this.#fleet.placementLocality === 'remote') {
+      const loads = new Map<string, number>()
+      for (const agent of roster.agents) {
+        if (agent.node) loads.set(agent.node, (loads.get(agent.node) ?? 0) + 1)
+      }
+      spec = { ...spec, node: liveFleetNodeForSpec(spec, roster, loads) }
+    }
+
+    // Persist intent before the remote side effect. If the owner crashes after
+    // the spawn ack but before recording its result, takeover retries the same
+    // deterministic invocation id instead of inventing a second worker.
+    batch.recordPlanned(record, { ...spec, invocationId })
+    if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
+      throw new Error(`Dispatch lifecycle ownership lost before spawning ${spec.name}`)
     }
 
     await this.#prepareAgentWorktree(record, spec)
@@ -10690,6 +10742,24 @@ export class FactoryLoop implements Factory {
       await this.#releaseOrphanedLatePlacement(record, spec, result)
       throw new LatePlacementReleasedError(record.issue.key, result.name ?? spec.name)
     }
+    if (this.#fleet.placementLocality === 'remote') {
+      const registered = await this.#awaitRemoteAgentRegistration(result.name, spec.capability, result.node)
+      if (!registered) {
+        try {
+          await this.#fleet.release(result.name, 'spawn-registration-timeout')
+          this.#fleet.markAgentTerminal?.(result.name, 'spawn-registration-timeout')
+          throw new RemoteAgentRegistrationTimeoutError(result.name, true)
+        } catch (error) {
+          if (error instanceof RemoteAgentRegistrationTimeoutError) throw error
+          // Cleanup is unconfirmed. Persist the placement so a successor can
+          // retry the release; forgetting it would be worse than retaining a
+          // nonterminal lifecycle for a worker that may still be alive.
+          batch.recordSpawn(record, spec, invocationId, result)
+          await this.#saveDispatchLifecycle(record, 'dispatching')
+          throw new RemoteAgentRegistrationTimeoutError(result.name, false, error)
+        }
+      }
+    }
     record.heldSinceAtMs ??= this.#clock.now()
     batch.recordSpawn(record, spec, invocationId, result)
     if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
@@ -10699,6 +10769,103 @@ export class FactoryLoop implements Factory {
     const spawned = record.agents.get(result.name)
     if (spawned) await this.#reportAgent(record, spawned, 'agent.spawned')
     return { name: result.name }
+  }
+
+  async #awaitRemoteAgentRegistration(
+    name: string,
+    capability: Capability,
+    expectedNode: string | undefined,
+  ): Promise<boolean> {
+    const deadlineAtMs = this.#clock.now() + REMOTE_AGENT_REGISTRATION_TIMEOUT_MS
+    do {
+      try {
+        if (expectedNode) {
+          if (this.#fleet.isAgentRegistered) {
+            if (await this.#fleet.isAgentRegistered({ name, node: expectedNode, capability })) return true
+          } else {
+            const roster = await this.#fleet.roster()
+            const agent = roster.agents.find((candidate) => candidate.name === name && candidate.node === expectedNode)
+            const node = agent
+              ? roster.nodes.find((candidate) =>
+                candidate.name === expectedNode && candidate.live && candidate.capabilities.includes(capability))
+              : undefined
+            if (agent && node) return true
+          }
+        }
+      } catch (error) {
+        this.#logger.warn?.('[factory] remote agent registration probe failed; retrying within startup bound', {
+          agent: name,
+          error: describeError(error).errorMessage,
+        })
+      }
+      const remainingMs = deadlineAtMs - this.#clock.now()
+      if (remainingMs <= 0) return false
+      await this.#clock.sleep(Math.min(REMOTE_AGENT_REGISTRATION_POLL_MS, remainingMs))
+    } while (this.#clock.now() <= deadlineAtMs)
+    return false
+  }
+
+  async #rollbackUnregisteredRemoteDispatch(
+    record: InFlightIssue,
+    acknowledged: RegistryHandoffAgent[],
+  ): Promise<boolean> {
+    const handoffs = this.#dispatchFailureHandoffs(record, acknowledged)
+    await this.#persistDispatchFailureReaperHandoff(record, handoffs)
+    const hasWorktrees = handoffs.some((handoff) => handoff.worktree)
+    if (hasWorktrees) {
+      if (!await this.#teardownFailedDispatchWorktrees(
+        handoffs,
+        'spawn-registration-timeout',
+        { skipNeverPlacedAgents: true },
+      )) return false
+    } else {
+      const failed = await this.#releaseAndTerminateAgents(
+        handoffs
+          .filter((handoff) => handoff.tracked.result !== undefined)
+          .map((handoff) => [handoff.name, handoff.tracked]),
+        'spawn-registration-timeout',
+        'completion',
+      )
+      if (failed.length > 0) return false
+      for (const handoff of handoffs) {
+        await this.#state.clearFailureHandoff(
+          this.#workspaceId,
+          registryHandoffKey(handoff.issue, handoff.name),
+        )
+      }
+    }
+    try {
+      await this.#teardownPreviews(record)
+    } catch (error) {
+      this.#logger.warn?.('[factory] retained unregistered spawn lifecycle after preview rollback failed', {
+        issue: record.issue.key,
+        error: describeError(error).errorMessage,
+      })
+      return false
+    }
+
+    const key = dispatchLifecycleKey(record.issue)
+    const epoch = this.#dispatchLifecycleEpochs.get(key)
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+    const lease = lifecycle?.lease
+    if (
+      epoch === undefined ||
+      !lease ||
+      lease.owner !== this.#dispatchLifecycleOwner ||
+      lease.epoch !== epoch ||
+      !await this.#state.clearClaimedDispatchLifecycle(this.#workspaceId, key, lease)
+    ) return false
+
+    const retryTimer = this.#dispatchLifecycleRetryTimers.get(key)
+    if (retryTimer) clearTimeout(retryTimer)
+    this.#dispatchLifecycleRetryTimers.delete(key)
+    this.#dispatchLifecycleEpochs.delete(key)
+    this.#abandonedDispatchReasons.delete(key)
+    const batch = await this.#batch()
+    batch.abandon(record.issue)
+    await this.#writeInFlightRegistry()
+    this.#resetDispatchCapacityBackoff()
+    return true
   }
 
   /**
@@ -20036,6 +20203,58 @@ function dispatchSpecs(decision: TriageDecision): AgentSpec[] {
   }
 
   return [...decision.implementers, decision.reviewer]
+}
+
+function liveFleetNodeForSpec(
+  spec: AgentSpec,
+  roster: RosterEntry,
+  assignedLoads: Map<string, number>,
+): string {
+  const eligible = roster.nodes.filter((node) => node.live && node.capabilities.includes(spec.capability))
+  if (eligible.length === 0) throw new FleetPlacementUnavailableError(spec.capability)
+
+  const explicitlyRequested = spec.node && spec.node !== 'self'
+    ? eligible.find((node) => node.name === spec.node)
+    : undefined
+  const selected = explicitlyRequested ?? [...eligible].sort((left, right) => {
+    const loadDifference = (assignedLoads.get(left.name) ?? 0) - (assignedLoads.get(right.name) ?? 0)
+    return loadDifference || left.name.localeCompare(right.name)
+  })[0]!
+  assignedLoads.set(selected.name, (assignedLoads.get(selected.name) ?? 0) + 1)
+  return selected.name
+}
+
+/**
+ * Resolve every remote dispatch spec against one canonical roster snapshot.
+ *
+ * A configured node is a preference, not an entitlement: if it is offline or
+ * no longer advertises the required capability, placement is re-selected from
+ * the live fleet. This runs before durable lifecycle creation, so an empty
+ * eligible set cannot leave a claim or consume a batch slot.
+ */
+function decisionWithVerifiedRemotePlacements(
+  decision: TriageDecision,
+  roster: RosterEntry,
+): TriageDecision {
+  const assignedLoads = new Map<string, number>()
+  for (const agent of roster.agents) {
+    if (agent.node) assignedLoads.set(agent.node, (assignedLoads.get(agent.node) ?? 0) + 1)
+  }
+  const place = (spec: AgentSpec): AgentSpec => ({
+    ...spec,
+    node: liveFleetNodeForSpec(spec, roster, assignedLoads),
+  })
+  if (decision.scope === 'workflow') {
+    return {
+      ...structuredClone(decision),
+      ...(decision.workflow ? { workflow: place(decision.workflow) } : {}),
+    }
+  }
+  return {
+    ...structuredClone(decision),
+    implementers: decision.implementers.map(place),
+    reviewer: place(decision.reviewer),
+  }
 }
 
 function dispatchSessionOwner(decision: TriageDecision): string | undefined {

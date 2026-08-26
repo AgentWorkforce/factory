@@ -230,6 +230,12 @@ export interface FleetClient {
   }): Promise<SpawnResult>
   release(name: string, reason?: string): Promise<void>
   roster(): Promise<RosterEntry>
+  /** One bounded-poll sample proving a spawned remote identity is broker-visible on its expected host. */
+  isAgentRegistered?(input: {
+    name: string
+    node: string
+    capability: Capability
+  }): Promise<boolean>
   /** Find addressable teammate agents by their published A2A cards. */
   discoverTeammates(query: TeammateQuery): Promise<TeammateAgent[]>
   /**

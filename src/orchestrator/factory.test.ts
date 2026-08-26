@@ -1073,7 +1073,18 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
 
   override async roster() {
     const roster = await super.roster()
-    return { ...roster, agents: roster.agents.map((agent) => ({ ...agent, node: 'sf-mini' })) }
+    return {
+      agents: roster.agents.map((agent) => ({ ...agent, node: 'sf-mini' })),
+      nodes: [{
+        name: 'sf-mini',
+        capabilities: ['spawn:codex' as const, 'spawn:claude' as const, 'workflow:run' as const],
+        live: true,
+      }],
+    }
+  }
+
+  async isAgentRegistered(): Promise<boolean> {
+    return true
   }
 
   override async reconcileTrackedAgents(): Promise<void> {
@@ -1081,6 +1092,49 @@ class RemoteLifecycleFleetClient extends FakeFleetClient {
     if (!this.exitImplementerOnReconcile) return
     const implementer = this.hydrated.find((agent) => agent.name.includes('-impl-'))
     if (implementer) this.emitAgentExit(implementer.name, 'exited')
+  }
+}
+
+class NodeDiscoveryRemoteFleetClient extends RemoteLifecycleFleetClient {
+  nodes: RosterEntry['nodes'] = [
+    { name: 'sf-mini', capabilities: ['spawn:codex', 'spawn:claude'], live: true },
+  ]
+  readonly unregistered = new Set<string>()
+
+  override async spawn(input: SpawnInput): Promise<SpawnResult> {
+    const result = await super.spawn(input)
+    return {
+      ...result,
+      node: input.node ?? result.node,
+      locality: 'remote',
+    }
+  }
+
+  override async roster(): Promise<RosterEntry> {
+    const roster = await super.roster()
+    return {
+      agents: roster.agents
+        .filter((agent) => !this.unregistered.has(agent.name))
+        .map((agent) => ({
+          ...agent,
+          node: this.spawns.findLast((spawn) => spawn.name === agent.name)?.node === 'self'
+            ? agent.node
+            : this.spawns.findLast((spawn) => spawn.name === agent.name)?.node ?? agent.node,
+        })),
+      nodes: structuredClone(this.nodes),
+    }
+  }
+
+  override async isAgentRegistered(input: {
+    name: string
+    node: string
+    capability: 'spawn:codex' | 'spawn:claude' | 'workflow:run'
+  }): Promise<boolean> {
+    if (this.unregistered.has(input.name)) return false
+    const roster = await this.roster()
+    return roster.agents.some((agent) => agent.name === input.name && agent.node === input.node) &&
+      roster.nodes.some((node) =>
+        node.name === input.node && node.live && node.capabilities.includes(input.capability))
   }
 }
 
@@ -3109,6 +3163,123 @@ describe('waitForDispatchTerminal', () => {
       )
 
       expect(phase).toBeUndefined()
+    } finally {
+      await factory.stop()
+    }
+  })
+})
+
+describe('remote fleet node discovery and registration admission', () => {
+  it('skips an offline capable node and pins every spawn to a live capable node', async () => {
+    const path = issuePath(390)
+    const issue = issueFile(390)
+    const fleet = new NodeDiscoveryRemoteFleetClient()
+    fleet.nodes = [
+      { name: 'chief-broker', capabilities: ['spawn:codex', 'spawn:claude'], live: false },
+      { name: 'sf-mini', capabilities: ['spawn:codex', 'spawn:claude'], live: true },
+    ]
+    const factory = createFactory(config(), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet,
+      stateStore: new InMemoryStateStore({ batchSize: 2 }),
+      triage: new StaticTriage(),
+    })
+
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+      await expect(factory.dispatch(decision)).resolves.toMatchObject({
+        agents: [
+          { name: 'ar-390-impl-pear', role: 'implementer' },
+          { name: 'ar-390-review', role: 'reviewer' },
+        ],
+      })
+
+      expect(fleet.spawns.map(({ name, node }) => ({ name, node }))).toEqual([
+        { name: 'ar-390-impl-pear', node: 'sf-mini' },
+        { name: 'ar-390-review', node: 'sf-mini' },
+      ])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('refuses when no live capable node exists before writing a durable lifecycle claim', async () => {
+    const path = issuePath(391)
+    const issue = issueFile(391)
+    const fleet = new NodeDiscoveryRemoteFleetClient()
+    fleet.nodes = [
+      { name: 'chief-broker', capabilities: ['spawn:codex', 'spawn:claude'], live: false },
+      { name: 'sf-mini', capabilities: ['spawn:codex'], live: false },
+    ]
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+      await expect(factory.dispatch(decision)).rejects.toThrow(
+        'no live fleet node advertises spawn:codex',
+      )
+
+      expect(fleet.spawns).toEqual([])
+      await expect(stateStore.listDispatchLifecycles('factory-test')).resolves.toEqual([])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('rolls back an unregistered remote spawn and frees the slot for the next issue', async () => {
+    const firstPath = issuePath(392)
+    const secondPath = issuePath(393)
+    const firstIssue = issueFile(392)
+    const secondIssue = issueFile(393)
+    const fleet = new NodeDiscoveryRemoteFleetClient()
+    fleet.unregistered.add('ar-392-review')
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const clock = new ManualClock()
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient({ [firstPath]: firstIssue, [secondPath]: secondIssue }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      clock,
+    })
+
+    try {
+      const first = await factory.triageIssue(parseLinearIssue(firstPath, firstIssue))
+      await expect(factory.dispatch(first)).rejects.toThrow(
+        'did not register with the fleet before the startup deadline',
+      )
+      expect(clock.value).toBe(30_000)
+
+      expect(fleet.releases).toContainEqual({
+        name: 'ar-392-review',
+        reason: 'spawn-registration-timeout',
+      })
+      expect(fleet.releases).toContainEqual({
+        name: 'ar-392-impl-pear',
+        reason: 'spawn-registration-timeout',
+      })
+      await expect(stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(first.issue),
+      )).resolves.toBeUndefined()
+
+      const second = await factory.triageIssue(parseLinearIssue(secondPath, secondIssue))
+      await expect(factory.dispatch(second)).resolves.toMatchObject({
+        agents: [
+          { name: 'ar-393-impl-pear', role: 'implementer' },
+          { name: 'ar-393-review', role: 'reviewer' },
+        ],
+      })
+      await expect(stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(second.issue),
+      )).resolves.toMatchObject({ phase: 'running' })
     } finally {
       await factory.stop()
     }
@@ -26966,6 +27137,17 @@ describe('FactoryLoop PR babysitter', () => {
 
   it('pins a remote babysitter to the preview node and gives it the live URL', async () => {
     class RemotePreviewFleetClient extends RemoteLifecycleFleetClient {
+      override async roster(): Promise<RosterEntry> {
+        const roster = await super.roster()
+        return {
+          ...roster,
+          nodes: [
+            ...roster.nodes,
+            { name: 'preview-node', capabilities: ['spawn:claude'], live: true },
+          ],
+        }
+      }
+
       override async createPreview(input: PreviewStartInput): Promise<PreviewReference> {
         return { ...await super.createPreview(input), node: 'preview-node' }
       }

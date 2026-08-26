@@ -529,6 +529,11 @@ export interface StateStore {
     key: string,
     expectedLease: DispatchLifecycleLease | undefined,
   ): Promise<boolean>
+  clearClaimedDispatchLifecycle(
+    workspaceId: string,
+    key: string,
+    expectedLease: DispatchLifecycleLease,
+  ): Promise<boolean>
   clearDispatchLifecycle(workspaceId: string, key: string): Promise<void>
 
   recordCritical(workspaceId: string, key: string, value: CriticalRecord): Promise<void>

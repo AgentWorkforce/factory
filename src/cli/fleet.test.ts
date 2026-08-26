@@ -127,8 +127,23 @@ const issueFile = {
  * flag would put the timer in scope for tests whose whole point is that no
  * timer decides the ordering (#346 review, cubic).
  */
-class ControlledCompletingRemoteFleetClient extends FakeFleetClient {
+class CompletingRemoteFleetBase extends FakeFleetClient {
   override readonly placementLocality = 'remote' as const
+
+  override async roster() {
+    const roster = await super.roster()
+    return {
+      agents: roster.agents.map((agent) => ({ ...agent, node: 'sf-mini' })),
+      nodes: [{
+        name: 'sf-mini',
+        capabilities: ['spawn:codex' as const, 'spawn:claude' as const, 'workflow:run' as const],
+        live: true,
+      }],
+    }
+  }
+}
+
+class ControlledCompletingRemoteFleetClient extends CompletingRemoteFleetBase {
   implementerName?: string
   exitEmitted = false
 
@@ -139,8 +154,7 @@ class ControlledCompletingRemoteFleetClient extends FakeFleetClient {
   }
 }
 
-class CompletingRemoteFleetClient extends FakeFleetClient {
-  override readonly placementLocality = 'remote' as const
+class CompletingRemoteFleetClient extends CompletingRemoteFleetBase {
   readonly lifecycleOrder: string[] = []
 
   override async spawn(input: SpawnInput): Promise<SpawnResult> {
