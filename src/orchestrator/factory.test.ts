@@ -10847,6 +10847,10 @@ describe('FactoryLoop', () => {
         }
       },
       closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      ensureRepositoryLabel: async () => undefined,
+      mutateIssueLabel: async () => undefined,
+      updateIssue: async () => undefined,
     }
     const mount = new ConfirmingMount({
       [issuePath(885)]: issueFile(885),
