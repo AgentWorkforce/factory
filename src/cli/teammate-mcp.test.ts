@@ -76,7 +76,10 @@ describe('Factory teammate MCP', () => {
       await client.close()
       await server.close()
     }
-  })
+  // The MCP handshake registers the whole tool surface, which is CPU-bound:
+  // ~400ms quiet, but measured at 3.5s under CPU oversubscription. Vitest's
+  // 5s default leaves no headroom on a loaded CI runner.
+  }, 15_000)
 })
 
 function toolJson(result: { content?: unknown }): unknown {

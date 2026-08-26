@@ -22917,7 +22917,9 @@ describe('FactoryLoop', () => {
     })
 
     await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-64-impl-pear', 'ar-64-review']))
-    expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1)
+    // The spawns land before #increment('githubTriageAnswersDispatched'), so the
+    // bare read could observe the key before it exists. Requirement unchanged.
+    await vi.waitFor(() => expect(factory.status().counters.githubTriageAnswersDispatched).toBe(1), { timeout: 4_000 })
   })
 
   it('keeps GitHub clarification durable on GitHub and mirrors one stakeholder escalation to Slack', async () => {
@@ -23573,10 +23575,12 @@ describe('FactoryLoop', () => {
       // cleared fence instead reaches #routeSlackConversationAnswerUnlocked and
       // rebinds the retired thread to the reopened work unit.
       await vi.waitFor(() => expect(factory.status().counters.slackAnswersUnroutableVisible).toBe(2))
+      // Deliberately a bare read: this asserts nothing was queued *at this
+      // point*, so retrying it would make it vacuous.
       expect(factory.status().counters.slackConversationRepliesQueued ?? 0).toBe(0)
       // ...and it must be the *drain* that fenced it, not the ordinary terminal
       // fence: this counter is what proves the route registered mid-drain.
-      expect(factory.status().counters.slackReplyRoutesFencedDuringDrain).toBe(1)
+      await vi.waitFor(() => expect(factory.status().counters.slackReplyRoutesFencedDuringDrain).toBe(1), { timeout: 4_000 })
       const conversation = await stateStore.getConversationSession(
         'factory-test', `slack:${retiredThreadTs}`,
       )
@@ -23751,7 +23755,11 @@ describe('FactoryLoop', () => {
       repo: 'AgentWorkforce/pear',
       clonePath: '/work/pear',
     })
-    expect(factory.status().counters.slackConversationRepliesCoalesced).toBe(1)
+    // `fleet.resume` is the observable this test synchronised on, but the
+    // orchestrator writes this counter two awaits later
+    // (#recordSlackConversationResume). Retry the read; the requirement is
+    // unchanged.
+    await vi.waitFor(() => expect(factory.status().counters.slackConversationRepliesCoalesced).toBe(1), { timeout: 4_000 })
     expect(slack.replies).toEqual([])
     expect(slackReplyWrites(mount).map((write) => write.content.text)).toEqual([
       slackImplementerReceipt,
@@ -30740,7 +30748,12 @@ describe('FactoryLoop PR babysitter', () => {
         'ar-413-impl-pear',
         'ar-413-review',
       ]))
-      expect(factory.status().counters.mergedPrAdvancedDone).toBe(1)
+      // Both observables above (the Done write, then the dependent spawns from
+      // #markDependencyTerminalAndReconcile) land before #increment runs, so a
+      // bare read here can observe the counters before they exist. `done` is
+      // incremented on the very next synchronous line, so gating on the first
+      // is enough. Requirements unchanged.
+      await vi.waitFor(() => expect(factory.status().counters.mergedPrAdvancedDone).toBe(1), { timeout: 4_000 })
       expect(factory.status().counters.done).toBe(1)
       expect(factory.status().parked).toEqual([])
       expect(mount.writes.some((write) => write.path === issuePath(412))).toBe(false)
