@@ -47,6 +47,22 @@ describe('closeProbePr', () => {
     expect(closes).toEqual([{ repo: 'AgentWorkforce/pear', number: 123 }])
   })
 
+  it('refuses a mounted record for a different PR before closing', async () => {
+    const reads: string[] = []
+    const closes: Array<{ repo: string; number: number }> = []
+
+    await expect(closeProbePr({
+      repo: 'AgentWorkforce/pear',
+      prNumber: 131,
+      expectedIssueKey: 'AR-42',
+      githubWrite: githubWrite(closes),
+      mount: prMount(131, { payload: { number: 999, ...openProbe } }, reads),
+    })).rejects.toThrow(/mounted record.*identifies PR #999/i)
+
+    expect(reads).toEqual([prPath(131)])
+    expect(closes).toEqual([])
+  })
+
   it('refuses a non-probe PR before closing', async () => {
     const reads: string[] = []
     const mount = prMount(124, { payload: {
