@@ -782,9 +782,10 @@ Factory GitHub write attribution is controlled explicitly with `github.identity`
 - `"user"` publishes pull requests and performs issue lifecycle writes with the
   account authenticated by the local `gh` CLI, even when the app path is
   available.
-- `"auto"` is the default and preserves compatibility: pull requests prefer the
-  App path and fall back to the local `gh` user, while issue comments, status
-  labels, and issue closure retain the local `gh` path.
+- `"auto"` is the default. Pull requests and issue lifecycle writes prefer the
+  connected App when their complete capability is available. A non-cloud host
+  can fall back to its local `gh` user; the gh-less cloud container instead
+  fails loudly when the connected lifecycle capability is incomplete.
 
 Each successful publication log includes `identity` (`app` or `user`) and the
 confirmed `author`. App writes are not reported complete until the connected

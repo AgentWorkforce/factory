@@ -19722,6 +19722,18 @@ export class FactoryLoop implements Factory {
 export const defaultMergeGate = (config: FactoryConfig, run?: GhRunner): GithubMergeGatePort =>
   new GithubMergeGate(run, config.github.identity)
 
+const hasAppGithubLifecycleWrite = (
+  write: GithubConnectionWrite | undefined,
+): write is GithubConnectionWrite & Required<Pick<
+  GithubConnectionWrite,
+  'postIssueComment' | 'ensureRepositoryLabel' | 'mutateIssueLabel' | 'updateIssue'
+>> => Boolean(
+  write?.postIssueComment &&
+  write.ensureRepositoryLabel &&
+  write.mutateIssueLabel &&
+  write.updateIssue,
+)
+
 const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): GithubWriteback => {
   const identity = config.github.identity
   const cloudContainer = mount.writebackTransport === 'relayfile-cloud'
@@ -19734,7 +19746,7 @@ const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): Gith
     }
     return new GhCliGithubWriteback()
   }
-  if (mount.githubWrite) {
+  if (hasAppGithubLifecycleWrite(mount.githubWrite)) {
     return new AppGithubWriteback(mount.githubWrite, mount.githubRead)
   }
   if (identity === 'app') {

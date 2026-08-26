@@ -19684,6 +19684,34 @@ describe('FactoryLoop', () => {
     })).toThrow(/identity "auto".*cloud container.*connected workspace GitHub App lifecycle write path.*does not contain gh/iu)
   })
 
+  it('retains local auto fallback when the non-cloud mount exposes only PR writes', () => {
+    const prOnlyWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+    }
+
+    expect(() => createFactory(config({ github: { identity: 'auto' } }), {
+      mount: new FakeMountClient({ [issuePath(57)]: issueFile(57) }, prOnlyWrite),
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })).not.toThrow()
+  })
+
+  it('reports the cloud auto capability refusal when the App writer exposes only PR writes', () => {
+    const prOnlyWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({ [issuePath(58)]: issueFile(58) }, prOnlyWrite)
+    Object.defineProperty(mount, 'writebackTransport', { value: 'relayfile-cloud' })
+
+    expect(() => createFactory(config({ github: { identity: 'auto' } }), {
+      mount,
+      fleet: new FakeFleetClient(),
+      triage: new StaticTriage(),
+    })).toThrow(/identity "auto".*cloud container.*connected workspace GitHub App lifecycle write path.*does not contain gh/iu)
+  })
+
   it('fails loudly when explicit local-user identity is selected in the gh-less cloud container', () => {
     const mount = new FakeMountClient({ [issuePath(55)]: issueFile(55) })
     Object.defineProperty(mount, 'writebackTransport', { value: 'relayfile-cloud' })
