@@ -428,8 +428,10 @@ export const githubIdentitySchema = z.enum(['app', 'user', 'auto']).default('aut
 const githubSchema = z.object({
   // Controls the credential identity used for GitHub writes. Exact `app`
   // selects the connected App for both PR publication and issue lifecycle
-  // writes. `auto` preserves compatibility: PRs prefer the App, while issue
-  // lifecycle writes retain the operator's local `gh` authentication.
+  // writes. `auto` prefers the App for both PRs and issue lifecycle writes
+  // when the complete connected capability is available. Outside the cloud
+  // container it falls back to the operator's local `gh`; inside the gh-less
+  // cloud container a missing App lifecycle capability fails loudly.
   identity: githubIdentitySchema,
 }).default({})
 

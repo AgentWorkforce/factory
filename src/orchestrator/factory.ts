@@ -19726,16 +19726,45 @@ export class FactoryLoop implements Factory {
 export const defaultMergeGate = (config: FactoryConfig, mount: MountClient, run?: GhRunner): GithubMergeGatePort =>
   new MountedGithubMergeGate(mount, new GhCliGithubMergeGate(run, config.github.identity))
 
+const hasAppGithubLifecycleWrite = (
+  write: GithubConnectionWrite | undefined,
+): write is GithubConnectionWrite & Required<Pick<
+  GithubConnectionWrite,
+  'postIssueComment' | 'ensureRepositoryLabel' | 'mutateIssueLabel' | 'updateIssue'
+>> => Boolean(
+  write?.postIssueComment &&
+  write.ensureRepositoryLabel &&
+  write.mutateIssueLabel &&
+  write.updateIssue,
+)
+
 const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): GithubWriteback => {
-  if (config.github.identity !== 'app') {
+  const identity = config.github.identity
+  const cloudContainer = mount.writebackTransport === 'relayfile-cloud'
+  if (identity === 'user') {
+    if (cloudContainer) {
+      throw new Error(
+        'GitHub identity "user" requires lifecycle writes through local gh, but the Factory cloud container does not contain gh. ' +
+        'Use identity "auto" or "app" with a connected workspace GitHub App lifecycle write path.',
+      )
+    }
     return new GhCliGithubWriteback()
   }
-  if (!mount.githubWrite) {
+  if (hasAppGithubLifecycleWrite(mount.githubWrite)) {
+    return new AppGithubWriteback(mount.githubWrite, mount.githubRead)
+  }
+  if (identity === 'app') {
     throw new Error(
       'GitHub identity "app" requires a connected workspace GitHub App lifecycle write path; refusing to fall back to the local gh user',
     )
   }
-  return new AppGithubWriteback(mount.githubWrite, mount.githubRead)
+  if (cloudContainer) {
+    throw new Error(
+      'GitHub identity "auto" cannot select lifecycle writeback in the Factory cloud container: no connected workspace GitHub App lifecycle write path is available, ' +
+      'and the container does not contain gh.',
+    )
+  }
+  return new GhCliGithubWriteback()
 }
 
 export function parseLinearIssue(path: string, content: unknown): LinearIssue {
