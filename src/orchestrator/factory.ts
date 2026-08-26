@@ -9040,17 +9040,18 @@ export class FactoryLoop implements Factory {
         const roots = githubIssueRepoRoots(owner, repo)
         const cachedBatches = roots.map((root) => this.#cachedDiscoveryTree(root))
         const allRootsCached = cachedBatches.every((paths): paths is string[] => paths !== undefined)
-        const indexedPaths = allRootsCached
-          ? undefined
-          : await this.#githubIssuePathsFromIndex(owner, repo)
+        // The issue index is the current eligibility authority, while the
+        // durable trees are only an incremental fallback for mounts whose
+        // index is absent or malformed. A checkpoint can legitimately retain
+        // stale membership (for example across an older cache format or a
+        // missed change window); letting two cached roots bypass a healthy
+        // index makes that stale snapshot self-validating forever.
+        const indexedPaths = await this.#githubIssuePathsFromIndex(owner, repo)
         // Keep the fallback roots as separate batches. Flattening a very large
         // provider result is synchronous work and can starve the durable loop
         // heartbeat before the bounded scan below gets a chance to yield.
         let pathBatches: string[][]
-        if (allRootsCached) {
-          pathBatches = cachedBatches
-          this.#increment('githubIssueDiscoveryCacheReposUsed')
-        } else if (indexedPaths) {
+        if (indexedPaths) {
           // Do not feed this into the discovery cache: the index only covers
           // open, labeled issues, so it is a filtered subset of the real
           // tree (and an empty result for whichever root form the index
@@ -9059,6 +9060,9 @@ export class FactoryLoop implements Factory {
           // comment-replay call sites that share this cache.
           pathBatches = [indexedPaths]
           this.#increment('githubIssueIndexReposUsed')
+        } else if (allRootsCached) {
+          pathBatches = cachedBatches
+          this.#increment('githubIssueDiscoveryCacheReposUsed')
         } else {
           pathBatches = []
           for (const root of roots) {
