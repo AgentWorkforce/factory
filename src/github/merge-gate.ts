@@ -245,7 +245,15 @@ const mountedMergeGateFields = (
   content: unknown,
   input: GithubMergeGateInput,
 ): Record<string, unknown> => {
-  const payload = wrappedPayload(content)
+  let payload: Record<string, unknown>
+  try {
+    payload = wrappedPayload(content)
+  } catch (error) {
+    throw mountedMergeGateCapabilityError(
+      input,
+      `could not parse mounted PR metadata: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
   const explicitNumber = numberValue(payload.number)
   if (explicitNumber !== undefined && explicitNumber !== input.number) {
     throw mountedMergeGateCapabilityError(

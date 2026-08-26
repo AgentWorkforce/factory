@@ -21,6 +21,7 @@ const live = (overrides: Record<string, unknown> = {}) => ({
 })
 
 const mountedPath = '/github/repos/AgentWorkforce/pear/pulls/123/metadata.json'
+const defaultMountedPath = '/github/repos/AgentWorkforce__pear/pulls/by-id/123.json'
 
 const mountedPull = (overrides: Record<string, unknown> = {}) => ({
   provider: 'github',
@@ -36,6 +37,13 @@ const mountedPull = (overrides: Record<string, unknown> = {}) => ({
 const pullMount = (content: unknown): Pick<MountClient, 'readFile'> => ({
   readFile: async (path) => {
     if (path !== mountedPath) throw new Error(`unexpected mounted PR path ${path}`)
+    return { content }
+  },
+})
+
+const defaultPathMount = (content: unknown): Pick<MountClient, 'readFile'> => ({
+  readFile: async (path) => {
+    if (path !== defaultMountedPath) throw new Error(`unexpected mounted PR path ${path}`)
     return { content }
   },
 })
@@ -56,6 +64,20 @@ describe('GithubMergeGate', () => {
       ready: true,
     })
     expect(ghInvoked).toBe(false)
+  })
+
+  it('derives the canonical by-id mounted path when the caller omits an exact path', async () => {
+    const gate = new MountedGithubMergeGate(defaultPathMount(mountedPull()))
+
+    await expect(gate.check(input)).resolves.toMatchObject({ verdict: 'READY', ready: true })
+  })
+
+  it('reports malformed mounted JSON as a merge-gate capability error', async () => {
+    const gate = new MountedGithubMergeGate(pullMount('{not-json'))
+
+    await expect(gate.check({ ...input, path: mountedPath })).rejects.toThrow(
+      /merge-gate capability unavailable.*could not parse mounted PR metadata.*does not fall back to local gh/i,
+    )
   })
 
   it('returns READY for MERGEABLE+CLEAN with neutral, skipped, or expected advisory checks', () => {
