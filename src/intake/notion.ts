@@ -7,6 +7,7 @@ import lockfile from 'proper-lockfile'
 import { z } from 'zod'
 
 import { dispatchNotionPageIdentity } from '../dispatch/work-unit-identity'
+import { assertLocalGhMutationAllowed, type GithubWriteIdentity } from '../github/gh-identity'
 
 const INTAKE_LOCK_STALE_MS = 60_000
 
@@ -90,6 +91,9 @@ export interface ExistingGithubIssue {
   url: string
   body: string
 }
+
+/** Invokes the `gh` CLI with shell-free arguments and optional stdin. */
+export type GhCommandRunner = (args: string[], input?: string) => Promise<string>
 
 export interface GithubIssuePublisher {
   repositoryVisibility(repo: string): Promise<'public' | 'private' | 'internal'>
@@ -378,8 +382,31 @@ export function parseChiefSpecHeader(content: string): {
 
 /** GitHub CLI publisher with shell-free arguments, bounded output, and source-marker reconciliation. */
 export class GhCliIssuePublisher implements GithubIssuePublisher {
+  readonly #identity: GithubWriteIdentity
+  readonly #gh: GhCommandRunner
+
+  /**
+   * @param identity the GitHub write identity this publisher may use. Notion
+   *   intake is a separate surface from the Factory lifecycle writeback and
+   *   still creates and edits issues through the local `gh` CLI, so its
+   *   issues are authored by the operator. That is a documented exception
+   *   (see README), not a silent fallback: the caller must state the identity
+   *   it is choosing, and exact `app` refuses rather than mislabelling the
+   *   write, because the connected App surface exposes no issue-create
+   *   operation to route it through.
+   * @param gh the `gh` invoker. Injectable because every method here mutates
+   *   or reads real GitHub: without a seam the only way to exercise this
+   *   class is against the live API, which during development of #221
+   *   created a junk issue and overwrote a merged PR's body. Tests must pass
+   *   a fake; production takes the default.
+   */
+  constructor(identity: GithubWriteIdentity, gh: GhCommandRunner = runGh) {
+    this.#identity = identity
+    this.#gh = gh
+  }
+
   async repositoryVisibility(repo: string): Promise<'public' | 'private' | 'internal'> {
-    const output = (await runGh(['repo', 'view', repo, '--json', 'visibility', '--jq', '.visibility'])).trim().toLowerCase()
+    const output = (await this.#gh(['repo', 'view', repo, '--json', 'visibility', '--jq', '.visibility'])).trim().toLowerCase()
     if (output !== 'public' && output !== 'private' && output !== 'internal') {
       throw new Error(`GitHub returned unknown visibility for ${repo}: ${output || '(empty)'}`)
     }
@@ -387,13 +414,13 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
   }
 
   async missingLabels(repo: string, labels: readonly string[]): Promise<string[]> {
-    const output = await runGh(['api', '--paginate', `repos/${repo}/labels?per_page=100`, '--jq', '.[].name'])
+    const output = await this.#gh(['api', '--paginate', `repos/${repo}/labels?per_page=100`, '--jq', '.[].name'])
     const available = new Set(output.split('\n').map((label) => label.trim()).filter(Boolean))
     return labels.filter((label) => !available.has(label))
   }
 
   async findBySource(repo: string, sourceKey: string): Promise<ExistingGithubIssue | undefined> {
-    const output = await runGh([
+    const output = await this.#gh([
       'issue', 'list', '--repo', repo, '--state', 'all', '--limit', '100',
       '--search', `"factory-source:${sourceKey}" in:body`,
       '--json', 'number,url,body',
@@ -404,16 +431,22 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
   }
 
   async createIssue(input: { repo: string; title: string; body: string; labels: readonly string[] }): Promise<{ number: number; url: string }> {
+    assertLocalGhMutationAllowed(this.#identity, `creating a GitHub issue in ${input.repo}`, 'createIssue')
     const args = ['issue', 'create', '--repo', input.repo, '--title', input.title, '--body-file', '-']
     for (const label of input.labels) args.push('--label', label)
-    const url = (await runGh(args, input.body)).trim()
+    const url = (await this.#gh(args, input.body)).trim()
     const number = Number(/\/issues\/(\d+)\/?$/u.exec(url)?.[1])
     if (!Number.isInteger(number) || number <= 0) throw new Error(`GitHub issue create returned an unexpected URL: ${url}`)
     return { number, url }
   }
 
   async updateIssue(input: { repo: string; number: number; body: string }): Promise<void> {
-    await runGh(['issue', 'edit', String(input.number), '--repo', input.repo, '--body-file', '-'], input.body)
+    assertLocalGhMutationAllowed(
+      this.#identity,
+      `editing the body of GitHub issue ${input.repo}#${input.number}`,
+      'updateIssue',
+    )
+    await this.#gh(['issue', 'edit', String(input.number), '--repo', input.repo, '--body-file', '-'], input.body)
   }
 }
 

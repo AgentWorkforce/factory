@@ -25,6 +25,23 @@ export interface StandalonePullRequest {
   crossRepository?: boolean
   maintainerCanModify?: boolean
   filesChanged?: string[]
+  /**
+   * Where this PR's metadata was read from — deliberately retained.
+   *
+   * `gh` here is READ provenance, not write provenance: the only `gh` call
+   * this module makes is `gh pr view --json` (see `readStandalonePullRequest`),
+   * and a read carries no authorship, so it cannot split Factory's audit
+   * trail the way a `gh`-authored comment or merge would. The member is kept
+   * because the mounted projection can be stale or incomplete, and callers
+   * need to know whether a field came from the mount, from live GitHub, or
+   * from both before they act on it.
+   *
+   * This module performs no GitHub writes. Factory's identity-bearing GitHub
+   * mutations live in `src/writeback/github.ts` (lifecycle, identity-selected)
+   * and `src/github/merge-gate.ts` (guarded merge, refuses under `app`); the
+   * babysitter's own review replies and pushes are performed by the dispatched
+   * agent under the agent's credential, not by this process.
+   */
   source: 'mount' | 'gh' | 'mount+gh'
 }
 

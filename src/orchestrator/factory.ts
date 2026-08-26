@@ -1222,7 +1222,7 @@ export class FactoryLoop implements Factory {
     this.#githubWriteback = ports.githubWriteback ?? defaultGithubWriteback(config, ports.mount)
     this.#slack = config.slack ? MountSlackWriteback(ports.mount, config.slack) : ports.slack
     this.#github = ports.github ?? MountGithubRead(ports.mount)
-    this.#mergeGate = ports.mergeGate ?? new GithubMergeGate()
+    this.#mergeGate = ports.mergeGate ?? defaultMergeGate(config)
     this.#verificationGate = ports.verificationGate ?? (config.verification.enabled
       ? new VerificationPipeline({
           descriptorPath: config.verification.descriptorPath,
@@ -19469,6 +19469,18 @@ export class FactoryLoop implements Factory {
     return hasTitlePrefix(issue.title, FACTORY_E2E_MARKER)
   }
 }
+
+/**
+ * The guarded merge is a GitHub mutation, so it answers to the same identity
+ * policy as the lifecycle writeback. Under exact `github.identity: "app"` the
+ * gate refuses the merge instead of squash-merging as the operator's local
+ * `gh` user; `auto` and `user` keep today's behavior.
+ *
+ * Exported so the selection itself is testable rather than buried in the
+ * constructor — the same shape as `defaultGithubWriteback` below.
+ */
+export const defaultMergeGate = (config: FactoryConfig): GithubMergeGatePort =>
+  new GithubMergeGate(undefined, config.github.identity)
 
 const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): GithubWriteback => {
   if (config.github.identity !== 'app') {

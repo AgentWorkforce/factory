@@ -364,7 +364,12 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
         manifest,
         dispatch: !globals.dryRun,
         ...(!globals.dryRun ? {
-          github: new GhCliIssuePublisher(),
+          // Notion intake is a separate surface from the Factory lifecycle
+          // writeback and has no app-authored issue-create route, so its
+          // issues are deliberately authored by the operator's gh account.
+          // Stated explicitly here so the attribution is a decision on the
+          // record rather than an unnoticed default.
+          github: new GhCliIssuePublisher('user'),
           workspace,
           ...(notionClaims ? { claims: notionClaims } : {}),
           ...(notionContracts ? { contracts: notionContracts } : {}),
