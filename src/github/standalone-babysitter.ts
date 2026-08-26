@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto'
 
-import type { GhRunner } from './merge-gate'
 import type { MountClient } from '../ports'
 
 export interface StandaloneBabysitTarget {
@@ -26,23 +25,11 @@ export interface StandalonePullRequest {
   maintainerCanModify?: boolean
   filesChanged?: string[]
   /**
-   * Where this PR's metadata was read from — deliberately retained.
-   *
-   * `gh` here is READ provenance, not write provenance: the only `gh` call
-   * this module makes is `gh pr view --json` (see `readStandalonePullRequest`),
-   * and a read carries no authorship, so it cannot split Factory's audit
-   * trail the way a `gh`-authored comment or merge would. The member is kept
-   * because the mounted projection can be stale or incomplete, and callers
-   * need to know whether a field came from the mount, from live GitHub, or
-   * from both before they act on it.
-   *
-   * This module performs no GitHub writes. Factory's identity-bearing GitHub
-   * mutations live in `src/writeback/github.ts` (lifecycle, identity-selected)
-   * and `src/github/merge-gate.ts` (guarded merge, refuses under `app`); the
-   * babysitter's own review replies and pushes are performed by the dispatched
-   * agent under the agent's credential, not by this process.
+   * Where this PR's metadata was read from. Standalone babysitting requires a
+   * complete authenticated mounted projection and never shells out to local
+   * gh in the production control-plane container.
    */
-  source: 'mount' | 'gh' | 'mount+gh'
+  source: 'mount'
 }
 
 export function parseStandaloneBabysitTarget(value: string | undefined): StandaloneBabysitTarget {
@@ -95,34 +82,14 @@ export function parseStandaloneBabysitTarget(value: string | undefined): Standal
 export async function readStandalonePullRequest(
   mount: MountClient,
   target: { repo: string; prNumber: number; url?: string },
-  ghRunner: GhRunner,
 ): Promise<StandalonePullRequest> {
   const mounted = await readPullRequestFromMount(mount, target)
-  let ghFailure: string | undefined
-  try {
-    const result = await ghRunner([
-      'pr',
-      'view',
-      String(target.prNumber),
-      '--repo',
-      target.repo,
-      '--json',
-      'number,title,body,state,isDraft,url,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,isCrossRepository,maintainerCanModify,files',
-    ])
-    const parsed = parsePullRequestPayload(JSON.parse(result.stdout), target)
-    if (parsed) {
-      const merged = mergePullMetadata(mounted, parsed)
-      if (hasRequiredPullMetadata(merged)) {
-        return { ...merged, source: mounted ? 'mount+gh' : 'gh' }
-      }
-    }
-  } catch (error) {
-    ghFailure = error instanceof Error ? error.message : String(error)
-  }
-
   if (mounted && hasRequiredPullMetadata(mounted)) return mounted
-  const suffix = ghFailure ? `: ${ghFailure}` : ''
-  throw new Error(`Unable to read complete metadata for ${target.repo} PR #${target.prNumber} from the connected GitHub mount or gh${suffix}`)
+  const missing = missingRequiredPullMetadata(mounted)
+  throw new Error(
+    `Unable to read complete metadata for ${target.repo} PR #${target.prNumber} from the connected GitHub mount: ` +
+    `missing ${missing.join(', ')}; Factory does not fall back to local gh`,
+  )
 }
 
 export function standaloneBabysitterAgentName(repo: string, prNumber: number): string {
@@ -247,29 +214,20 @@ const hasRequiredPullMetadata = (pr: Omit<StandalonePullRequest, 'source'>): boo
   Boolean(pr.baseRef?.trim()) &&
   pr.crossRepository !== undefined
 
-function mergePullMetadata(
-  mounted: Omit<StandalonePullRequest, 'source'> | undefined,
-  live: Omit<StandalonePullRequest, 'source'>,
-): Omit<StandalonePullRequest, 'source'> {
-  if (!mounted) return live
-  return {
-    repo: live.repo,
-    number: live.number,
-    title: live.title || mounted.title,
-    body: live.body || mounted.body,
-    state: live.state ?? mounted.state,
-    draft: live.draft ?? mounted.draft,
-    merged: live.merged ?? mounted.merged,
-    url: live.url || mounted.url,
-    headRef: live.headRef ?? mounted.headRef,
-    headSha: live.headSha ?? mounted.headSha,
-    baseRef: live.baseRef ?? mounted.baseRef,
-    headRepo: live.headRepo ?? mounted.headRepo,
-    crossRepository: live.crossRepository ?? mounted.crossRepository,
-    maintainerCanModify: live.maintainerCanModify ?? mounted.maintainerCanModify,
-    filesChanged: live.filesChanged ?? mounted.filesChanged,
-  }
-}
+const missingRequiredPullMetadata = (
+  pr: Omit<StandalonePullRequest, 'source'> | undefined,
+): string[] => !pr
+  ? ['PR record']
+  : [
+      ['title', pr.title.trim() || undefined],
+      ['state', pr.state?.trim()],
+      ['draft', pr.draft],
+      ['headRef', pr.headRef?.trim()],
+      ['headSha', pr.headSha?.trim()],
+      ['headRepo', pr.headRepo?.trim()],
+      ['baseRef', pr.baseRef?.trim()],
+      ['crossRepository', pr.crossRepository],
+    ].flatMap(([name, value]) => value === undefined ? [String(name)] : [])
 
 function changedFiles(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined

@@ -4441,7 +4441,6 @@ describe('fleet CLI runtime', () => {
           mountCalls.push(startDir)
           if (startDir === clonePath) throw new Error('mount unavailable')
         },
-        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: output,
         stderr: errors,
       })
@@ -4506,7 +4505,6 @@ describe('fleet CLI runtime', () => {
         fleet,
         mount,
         ensureLocalMount: async () => undefined,
-        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: buffer(),
         stderr: errors,
       })
@@ -4543,7 +4541,6 @@ describe('fleet CLI runtime', () => {
         fleet,
         mount,
         ensureLocalMount: async () => undefined,
-        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: buffer(),
         stderr: errors,
       })
@@ -4585,7 +4582,6 @@ describe('fleet CLI runtime', () => {
         fleet,
         mount,
         ensureLocalMount: async () => undefined,
-        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: output,
         stderr: buffer(),
       })
@@ -5915,7 +5911,6 @@ describe('fleet CLI exit-code contract', () => {
             missingScope: 'fs:read',
           })
         },
-        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: buffer(),
         stderr: deniedErrors,
       })
@@ -5930,7 +5925,6 @@ describe('fleet CLI exit-code contract', () => {
         fleet: grantedFleet,
         mount: openPr(),
         ensureLocalMount: async () => undefined,
-        babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
         stdout: buffer(),
         stderr: buffer(),
       })
@@ -5995,7 +5989,6 @@ describe('fleet CLI exit-code contract', () => {
               startMount: async () => {},
             })
           },
-          babysitPrGhRunner: async () => { throw new Error('gh unavailable') },
           stdout: buffer(),
           stderr: injected,
         })

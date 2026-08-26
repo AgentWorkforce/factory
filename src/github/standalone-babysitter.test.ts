@@ -32,7 +32,7 @@ describe('standalone PR babysitter helpers', () => {
     }
   })
 
-  it('uses a complete mounted snapshot when gh is unavailable', async () => {
+  it('uses a complete mounted snapshot without consulting local gh', async () => {
     const mount = new FakeMountClient({
       '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
         payload: {
@@ -51,7 +51,6 @@ describe('standalone PR babysitter helpers', () => {
     const pr = await readStandalonePullRequest(
       mount,
       { repo: 'AgentWorkforce/hoopsheet', prNumber: 10 },
-      async () => { throw new Error('gh unavailable') },
     )
 
     expect(pr).toMatchObject({
@@ -65,43 +64,19 @@ describe('standalone PR babysitter helpers', () => {
     })
   })
 
-  it('uses live gh metadata to hydrate and supersede an incomplete mounted snapshot', async () => {
+  it('fails explicitly when the mounted snapshot is incomplete', async () => {
     const mount = new FakeMountClient({
       '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
         payload: { number: 10, state: 'open', head_ref: 'stale-branch' },
       },
     })
-    const pr = await readStandalonePullRequest(
+    await expect(readStandalonePullRequest(
       mount,
       { repo: 'AgentWorkforce/hoopsheet', prNumber: 10 },
-      async () => ({
-        stdout: JSON.stringify({
-          number: 10,
-          title: 'Live title',
-          body: 'Live body',
-          state: 'OPEN',
-          isDraft: false,
-          url: 'https://github.com/AgentWorkforce/hoopsheet/pull/10',
-          headRefName: 'codex/league-public-sites',
-          headRefOid: 'live-sha',
-          baseRefName: 'main',
-          headRepository: { nameWithOwner: 'AgentWorkforce/hoopsheet' },
-          files: [{ path: 'src/routes/league.ts' }, { path: 'src/pages/league.tsx' }],
-        }),
-      }),
-    )
-
-    expect(pr).toMatchObject({
-      source: 'mount+gh',
-      title: 'Live title',
-      body: 'Live body',
-      headRef: 'codex/league-public-sites',
-      headSha: 'live-sha',
-      filesChanged: ['src/routes/league.ts', 'src/pages/league.tsx'],
-    })
+    )).rejects.toThrow(/connected GitHub mount.*missing.*title.*draft.*headSha.*headRepo.*baseRef.*crossRepository.*local gh/i)
   })
 
-  it('preserves mounted identity fields while live gh guard fields override stale mount state', async () => {
+  it('uses mounted guard fields as the sole production authority', async () => {
     const mount = new FakeMountClient({
       '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
         payload: {
@@ -118,14 +93,11 @@ describe('standalone PR babysitter helpers', () => {
     const pr = await readStandalonePullRequest(
       mount,
       { repo: 'AgentWorkforce/hoopsheet', prNumber: 10 },
-      async () => ({
-        stdout: JSON.stringify({ number: 10, state: 'CLOSED', isDraft: false }),
-      }),
     )
 
     expect(pr).toMatchObject({
-      source: 'mount+gh',
-      state: 'CLOSED',
+      source: 'mount',
+      state: 'open',
       headRef: 'feature',
       headSha: 'mounted-sha',
       headRepo: 'AgentWorkforce/hoopsheet',
@@ -151,19 +123,6 @@ describe('standalone PR babysitter helpers', () => {
     const pr = await readStandalonePullRequest(
       mount,
       { repo: 'AgentWorkforce/hoopsheet', prNumber: 10 },
-      async () => ({
-        stdout: JSON.stringify({
-          number: 10,
-          title: 'Live title',
-          body: '',
-          state: 'OPEN',
-          isDraft: false,
-          headRefName: 'feature',
-          headRefOid: 'live-sha',
-          baseRefName: 'main',
-          headRepository: { nameWithOwner: 'AgentWorkforce/hoopsheet' },
-        }),
-      }),
     )
 
     expect(pr.body).toBe('Mounted definition of done')
