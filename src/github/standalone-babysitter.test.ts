@@ -106,7 +106,7 @@ describe('standalone PR babysitter helpers', () => {
     })
   })
 
-  it('preserves the mounted PR body when live metadata has an empty body', async () => {
+  it('preserves the mounted PR body', async () => {
     const mount = new FakeMountClient({
       '/github/repos/AgentWorkforce__hoopsheet/pulls/by-id/10.json': {
         payload: {
