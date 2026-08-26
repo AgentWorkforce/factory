@@ -19477,10 +19477,13 @@ export class FactoryLoop implements Factory {
  * `gh` user; `auto` and `user` keep today's behavior.
  *
  * Exported so the selection itself is testable rather than buried in the
- * constructor — the same shape as `defaultGithubWriteback` below.
+ * constructor — the same shape as `defaultGithubWriteback` below. `run` is a
+ * test seam only: production passes nothing and gets `defaultGhRunner`. No
+ * test may reach the real `gh` binary here, because the operation it would
+ * perform is an irreversible merge.
  */
-export const defaultMergeGate = (config: FactoryConfig): GithubMergeGatePort =>
-  new GithubMergeGate(undefined, config.github.identity)
+export const defaultMergeGate = (config: FactoryConfig, run?: GhRunner): GithubMergeGatePort =>
+  new GithubMergeGate(run, config.github.identity)
 
 const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): GithubWriteback => {
   if (config.github.identity !== 'app') {

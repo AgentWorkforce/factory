@@ -3,7 +3,6 @@ import { describe, expect, it } from 'vitest'
 import { GhCliGithubMergeGate, type GhRunner } from './merge-gate'
 import { localGhMutationAllowed } from './gh-identity'
 import { GhCliIssuePublisher } from '../intake/notion'
-import { defaultMergeGate } from '../orchestrator/factory'
 import { FactoryConfigSchema } from '../config/schema'
 
 /**
@@ -104,13 +103,11 @@ describe('local gh mutations under github.identity', () => {
     await expect(gate.check(mergeInput)).resolves.toMatchObject({ verdict: 'READY', ready: true })
   })
 
-  it('MUST FIRE: the FactoryLoop selector propagates identity "app" to the merge gate', async () => {
-    // Without this the guard is a gate nobody invokes: the class would refuse
-    // correctly while FactoryLoop kept constructing it with the default.
-    const result = await defaultMergeGate(configWith('app')).merge(mergeInput)
-    expect(result.merged).toBe(false)
-    expect(result.reason).toContain('GitHub identity "app"')
-  })
+  // The FactoryLoop selector's own must-fire/must-not-fire pair lives in
+  // `src/orchestrator/factory.test.ts`. It belongs with the loop it selects
+  // for, and importing the 23k-line orchestrator module from a third test
+  // file measurably slowed the parallel CI workers enough to time out an
+  // unrelated 5s MCP test.
 
   it('MUST NOT FIRE: the selector leaves auto and an absent github key merging', async () => {
     // `github.identity` is synthesised to `auto` when the key is absent, so
