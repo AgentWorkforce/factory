@@ -25,8 +25,10 @@ export type GithubWriteIdentity = 'app' | 'user' | 'auto'
 /**
  * Whether the configured identity permits mutating GitHub through local `gh`.
  *
- * Reads are always permitted: `gh pr view` leaks no authorship, so read
- * provenance is not an identity concern (see `StandalonePullRequest.source`).
+ * This helper governs mutations only. Read provenance is not an authorship
+ * concern, although a capability-specific adapter may still reject reads when
+ * its runtime has no `gh` binary (for example Notion intake in the cloud
+ * container).
  */
 export function localGhMutationAllowed(identity: GithubWriteIdentity): boolean {
   return identity !== 'app'

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { CloudSession } from '@agent-relay/cloud'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -855,6 +855,68 @@ describe('fleet CLI runtime', () => {
     }
   })
 
+  it('blocks default-auto Notion repository intake before invoking local gh or reserving a claim', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-cli-notion-no-gh-'))
+    try {
+      const mountedPage = join(root, 'notion', 'pages', '3b36800c-1c90-801d-b1cf-c8f2e1cff7cf')
+      await mkdir(mountedPage, { recursive: true })
+      await writeFile(join(mountedPage, 'content.md'), [
+        '# Chief Spec',
+        'Status: ready',
+        'Title: Verify explicit local identity',
+        'Summary: Default auto must not reach the CLI adapter.',
+        'Recipe: single',
+        'Repos: AgentWorkforce/cloud',
+      ].join('\n'))
+      const manifestPath = join(root, 'notion.json')
+      await writeFile(manifestPath, JSON.stringify({
+        version: 1,
+        mountRoot: './notion',
+        statePath: './state.json',
+        tasks: [{ page: '3b36800c1c90801db1cfc8f2e1cff7cf' }],
+      }))
+      const ghLogPath = join(root, 'gh.log')
+      const ghPath = join(root, 'gh')
+      await writeFile(ghPath, [
+        '#!/bin/sh',
+        'printf \'%s\\n\' "$*" >> "$FACTORY_TEST_GH_LOG"',
+        'if [ "$1 $2" = "issue list" ]; then printf \'[]\'; fi',
+        'if [ "$1 $2" = "repo view" ]; then printf \'private\'; fi',
+      ].join('\n'))
+      await chmod(ghPath, 0o755)
+      vi.stubEnv('PATH', root)
+      vi.stubEnv('FACTORY_TEST_GH_LOG', ghLogPath)
+      const notionClaims = {
+        get: vi.fn(async () => undefined),
+        findBySourcePrefix: vi.fn(async () => []),
+        claim: vi.fn(async () => { throw new Error('claim must not be reserved') }),
+        dispose: vi.fn(async () => undefined),
+      }
+      const output = buffer()
+
+      const code = await runFleetCli(['intake', 'notion', manifestPath], {
+        fleet: new FakeFleetClient(),
+        notionClaims,
+        stdout: output,
+        stderr: buffer(),
+      })
+
+      expect(code).toBe(1)
+      expect(JSON.parse(output.text())).toMatchObject({
+        ok: false,
+        results: [{
+          status: 'blocked',
+          reason: expect.stringMatching(/GitHub identity "auto".*Notion intake.*local gh.*identity.*"user"/iu),
+        }],
+      })
+      await expect(readFile(ghLogPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(notionClaims.claim).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('honours github.identity "app" for Notion intake instead of writing as the local gh user', async () => {
     // The gate in GhCliIssuePublisher is worthless if this call site hardcodes
     // an identity: this is the only production caller of runNotionIntake, so
@@ -903,16 +965,16 @@ describe('fleet CLI runtime', () => {
       const resolved: string[] = []
       const notionGithub = (identity: string) => {
         resolved.push(identity)
-        const publisher = new GhCliIssuePublisher(
-          identity as 'app' | 'user' | 'auto',
-          async () => { throw new Error('gh must not be invoked in this test') },
-        )
-        return Object.assign(publisher, {
+        return {
+          assertWritable: () => {
+            if (identity === 'app') throw new Error('GitHub identity "app" refuses injected publisher writes')
+          },
           repositoryVisibility: async () => 'private' as const,
           missingLabels: async () => [],
           findBySource: async () => undefined,
           createIssue: async () => ({ number: 42, url: 'https://github.test/issues/42' }),
-        })
+          updateIssue: async () => undefined,
+        }
       }
 
       const code = await runFleetCli(

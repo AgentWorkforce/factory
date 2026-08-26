@@ -7,7 +7,7 @@ import lockfile from 'proper-lockfile'
 import { z } from 'zod'
 
 import { dispatchNotionPageIdentity } from '../dispatch/work-unit-identity'
-import { assertLocalGhMutationAllowed, type GithubWriteIdentity } from '../github/gh-identity'
+import type { GithubWriteIdentity } from '../github/gh-identity'
 
 const INTAKE_LOCK_STALE_MS = 60_000
 
@@ -398,11 +398,11 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
    * @param identity the GitHub write identity this publisher may use. Notion
    *   intake is a separate surface from the Factory lifecycle writeback and
    *   still creates and edits issues through the local `gh` CLI, so its
-   *   issues are authored by the operator. That is a documented exception
-   *   (see README), not a silent fallback: the caller must state the identity
-   *   it is choosing, and exact `app` refuses rather than mislabelling the
-   *   write, because the connected App surface exposes no issue-create
-   *   operation to route it through.
+   *   issues are authored by the operator. That is an explicit local-host
+   *   mode, not a production fallback: the caller must select exact `user`.
+   *   `auto` and `app` refuse every operation before spawning `gh`, because
+   *   the production container has no binary and the connected App surface
+   *   exposes neither issue creation nor source-marker reconciliation.
    * @param gh the `gh` invoker. Injectable because every method here mutates
    *   or reads real GitHub: without a seam the only way to exercise this
    *   class is against the live API, which during development of #221
@@ -415,14 +415,11 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
   }
 
   assertWritable(): void {
-    assertLocalGhMutationAllowed(
-      this.#identity,
-      'creating or editing Notion intake lifecycle issues',
-      'createIssue/updateIssue',
-    )
+    this.#assertExplicitLocalUser('createIssue/updateIssue')
   }
 
   async repositoryVisibility(repo: string): Promise<'public' | 'private' | 'internal'> {
+    this.#assertExplicitLocalUser('repositoryVisibility')
     const output = (await this.#gh(['repo', 'view', repo, '--json', 'visibility', '--jq', '.visibility'])).trim().toLowerCase()
     if (output !== 'public' && output !== 'private' && output !== 'internal') {
       throw new Error(`GitHub returned unknown visibility for ${repo}: ${output || '(empty)'}`)
@@ -431,12 +428,14 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
   }
 
   async missingLabels(repo: string, labels: readonly string[]): Promise<string[]> {
+    this.#assertExplicitLocalUser('missingLabels')
     const output = await this.#gh(['api', '--paginate', `repos/${repo}/labels?per_page=100`, '--jq', '.[].name'])
     const available = new Set(output.split('\n').map((label) => label.trim()).filter(Boolean))
     return labels.filter((label) => !available.has(label))
   }
 
   async findBySource(repo: string, sourceKey: string): Promise<ExistingGithubIssue | undefined> {
+    this.#assertExplicitLocalUser('findBySource')
     const output = await this.#gh([
       'issue', 'list', '--repo', repo, '--state', 'all', '--limit', '100',
       '--search', `"factory-source:${sourceKey}" in:body`,
@@ -448,7 +447,7 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
   }
 
   async createIssue(input: { repo: string; title: string; body: string; labels: readonly string[] }): Promise<{ number: number; url: string }> {
-    assertLocalGhMutationAllowed(this.#identity, `creating a GitHub issue in ${input.repo}`, 'createIssue')
+    this.#assertExplicitLocalUser('createIssue')
     const args = ['issue', 'create', '--repo', input.repo, '--title', input.title, '--body-file', '-']
     for (const label of input.labels) args.push('--label', label)
     const url = (await this.#gh(args, input.body)).trim()
@@ -458,12 +457,17 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
   }
 
   async updateIssue(input: { repo: string; number: number; body: string }): Promise<void> {
-    assertLocalGhMutationAllowed(
-      this.#identity,
-      `editing the body of GitHub issue ${input.repo}#${input.number}`,
-      'updateIssue',
-    )
+    this.#assertExplicitLocalUser('updateIssue')
     await this.#gh(['issue', 'edit', String(input.number), '--repo', input.repo, '--body-file', '-'], input.body)
+  }
+
+  #assertExplicitLocalUser(operation: string): void {
+    if (this.#identity === 'user') return
+    throw new Error(
+      `GitHub identity "${this.#identity}" refuses Notion intake ${operation} through local gh. ` +
+      'This adapter is local-only and requires explicit github.identity "user"; the production Factory container does not contain gh, ' +
+      'and the connected GitHub App surface does not expose issue creation or source-marker reconciliation.',
+    )
   }
 }
 
