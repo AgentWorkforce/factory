@@ -32213,6 +32213,32 @@ describe('probe PR resolution from the pull index', () => {
     expect(malformed.fast?.prNumber).toBe(805)
   })
 
+  it('uses a hydrated row that carries no id or updated field', async () => {
+    // The oldest index rows are `{ number, title, state, url }` — no `id`, no
+    // `updated`. The incremental writers replace one row at a time and pass the
+    // rest through verbatim, so a repaired row can carry `headRef` while still
+    // missing both. Neither field is scored or ranked on, so requiring them
+    // would refuse a perfectly usable index for no reason.
+    const files: Record<string, unknown> = {
+      [byIdPath(808)]: prFile(808, { title: 'The work', head_ref: 'factory/ar-800-legacyish', state: 'OPEN' }),
+      [PULL_INDEX_PATH]: [
+        {
+          number: 808,
+          title: 'The work',
+          state: 'open',
+          url: 'https://github.com/AgentWorkforce/pear/pull/808',
+          headRef: 'factory/ar-800-legacyish',
+        },
+      ],
+    }
+
+    const { fast, walked, reason, fastReads } = await bothWays(files, 800)
+    expect(reason).toBeUndefined()
+    expect(fast).toEqual(walked)
+    expect(fast?.prNumber).toBe(808)
+    expect(fastReads).toEqual([byIdPath(808)])
+  })
+
   it('reports the same mount path the walk would have reported for an aliased pull request', async () => {
     // One pull request under both spellings. The walk keeps the first one the
     // roots list, and callers persist that path as `ownedPullRequest.path`, so

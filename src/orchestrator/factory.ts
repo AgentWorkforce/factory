@@ -20961,11 +20961,14 @@ const linearIssueMirrorsGithubIssue = (issue: LinearIssue, ghIssue: GithubIssueS
  *
  * `index-absent`              — no index file at the canonical path.
  * `index-shape-unrecognised`  — an index exists but is not the documented bare
- *                               array of rows. The eager backfill writer
- *                               (relayfile-adapters `lazy.ts`) wraps it as
- *                               `{ pulls: [...] }`, while the incremental
- *                               index emitter writes the bare array, so the
- *                               shape depends on which writer last touched it.
+ *                               array of rows. relayfile-adapters' eager
+ *                               backfill used to wrap it as `{ pulls: [...] }`
+ *                               while the incremental emitter wrote the bare
+ *                               array; `@relayfile/adapter-github@0.5.7`
+ *                               converged both on the array
+ *                               (relayfile-adapters#271). A wrapper file is now
+ *                               only a residue on a mount last written by an
+ *                               older adapter, until its next write.
  * `index-without-head-ref`    — a readable index with at least one row that
  *                               carries no `headRef`. The primary match
  *                               (score 30) is a branch-name match, so a row
@@ -20982,6 +20985,16 @@ const linearIssueMirrorsGithubIssue = (issue: LinearIssue, ghIssue: GithubIssueS
  *                               the tree listing found. An unindexed PR could
  *                               hold a score-30 branch match, so the rows are
  *                               no longer a complete population to choose from.
+ *                               Unlike the issue index — which the adapter
+ *                               narrows by label at fetch time — the pull index
+ *                               is a full mirror under the default
+ *                               materialization policy (`state: 'all'`, no
+ *                               label filter), so this should be rare. It stops
+ *                               being rare if a connection configures a pull
+ *                               `filter`: the eager backfill overwrites the
+ *                               whole index from the filtered fetch while the
+ *                               excluded records stay on disk. Falling back is
+ *                               the correct answer to that, not a defect.
  * `index-no-match`            — a complete, usable index in which nothing
  *                               scored 20 or better. A body-only reference
  *                               (score 10) may still exist on disk and the
@@ -21059,14 +21072,26 @@ type PullIndexReading =
  *
  * All-or-nothing per repository, and the discipline is copied verbatim from
  * Factory's issue-side reader (`#githubIssuePathsFromIndex`): fall back for the
- * ENTIRE repository if any row is legacy or malformed. `headRef` was added to
- * the public GitHub pull index contract in `@relayfile/adapter-github@0.5.7`
- * and an already-written mount only converges on re-ingest, so mixed indexes
- * are the expected state, not a corruption. One legacy row is enough to poison
- * the whole conclusion: the primary match is a branch match worth 30, so a row
- * without `headRef` cannot be ruled out as the real winner, and ranking the
- * remaining rows against each other would answer a different question from the
- * one the walk answers.
+ * ENTIRE repository if any row is legacy or malformed. One legacy row is enough
+ * to poison the whole conclusion: the primary match is a branch match worth 30,
+ * so a row without `headRef` cannot be ruled out as the real winner, and ranking
+ * the remaining rows against each other would answer a different question from
+ * the one the walk answers.
+ *
+ * Mixed indexes are the expected state today, not a corruption. `headRef` landed
+ * in `@relayfile/adapter-github@0.5.7` and there is no pull-side backfill: the
+ * incremental writers replace exactly the row they touched and pass every other
+ * row through verbatim, so a webhook update hydrates one row and leaves the rest
+ * legacy. Only an eager re-ingest converges a repository, because it rebuilds
+ * the file from a list-pulls response in which every row carries `head.ref`.
+ *
+ * Row facts this relies on, from that contract: `state` is GitHub's lowercase
+ * `"open"`/`"closed"` and there is no `"merged"` state — `merged: true` (with
+ * `mergedAt`) is the only merged signal and `merged: false` is never written.
+ * `headRef` is the bare branch name (`head.ref`), matching what
+ * `readProbePrCandidate` reads off a record, NOT the `owner:branch` form of
+ * `head.label`. `id` and `updated` are deliberately not required here: the
+ * oldest legacy rows carry neither.
  */
 const readPullIndexForProbe = async (
   mount: MountClient,
