@@ -10066,7 +10066,27 @@ describe('FactoryLoop', () => {
     const registryPath = join(root, 'registry.json')
     const heartbeatPath = join(root, 'heartbeat.json')
     const issueNumbers = [610, 611, 612, 613, 614]
-    const mount = new FakeMountClient(Object.fromEntries(
+    let releaseProbes!: () => void
+    let signalLimitReached!: () => void
+    const probesReleased = new Promise<void>((resolve) => { releaseProbes = resolve })
+    const limitReached = new Promise<void>((resolve) => { signalLimitReached = resolve })
+    let activeProbes = 0
+    let maxActiveProbes = 0
+    let probeCalls = 0
+    class BlockingPullLookupMount extends FakeMountClient {
+      override async listTree(prefix: string): Promise<string[]> {
+        if (prefix === '/github/repos/AgentWorkforce/pear/pulls/') {
+          probeCalls += 1
+          activeProbes += 1
+          maxActiveProbes = Math.max(maxActiveProbes, activeProbes)
+          if (activeProbes === 4) signalLimitReached()
+          await probesReleased
+          activeProbes -= 1
+        }
+        return await super.listTree(prefix)
+      }
+    }
+    const mount = new BlockingPullLookupMount(Object.fromEntries(
       issueNumbers.map((number) => [issuePath(number), issueFile(number)]),
     ))
     const state = () => new FileStateStore({ batchSize: 5, watchStatePath })
@@ -10078,13 +10098,6 @@ describe('FactoryLoop', () => {
       triage: new StaticTriage(),
     })
     let restarted: ReturnType<typeof createFactory> | undefined
-    let releaseProbes!: () => void
-    let signalLimitReached!: () => void
-    const probesReleased = new Promise<void>((resolve) => { releaseProbes = resolve })
-    const limitReached = new Promise<void>((resolve) => { signalLimitReached = resolve })
-    let activeProbes = 0
-    let maxActiveProbes = 0
-    let probeCalls = 0
     try {
       for (const number of issueNumbers) {
         await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
@@ -10096,15 +10109,6 @@ describe('FactoryLoop', () => {
         fleet: new MissingHydratedRosterFleetClient('never'),
         stateStore: state(),
         triage: new StaticTriage(),
-        probePrGhRunner: async () => {
-          probeCalls += 1
-          activeProbes += 1
-          maxActiveProbes = Math.max(maxActiveProbes, activeProbes)
-          if (activeProbes === 4) signalLimitReached()
-          await probesReleased
-          activeProbes -= 1
-          return { stdout: '[]' }
-        },
       })
 
       const starting = restarted.start({ mode: 'dispatch-owner' })
@@ -10153,20 +10157,19 @@ describe('FactoryLoop', () => {
         state: 'OPEN',
         url: 'https://github.com/AgentWorkforce/pear/pull/1591',
       }),
-      probePrGhRunner: async () => ({
-        stdout: JSON.stringify([{
-          number: 1591,
-          url: 'https://github.com/AgentWorkforce/pear/pull/1591',
-          headRefName: branch,
-          isDraft: false,
-        }]),
-      }),
     })
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(591), issue))
 
     await factory.dispatch(decision)
     branch = (await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))!
       .decision.implementers[0]!.branch!
+    mount.files.set('/github/repos/AgentWorkforce/pear/pulls/1591/metadata.json', { content: {
+      number: 1591,
+      url: 'https://github.com/AgentWorkforce/pear/pull/1591',
+      head_ref: branch,
+      state: 'open',
+      draft: false,
+    } })
     fleet.emitAgentExit('ar-591-impl-pear', 'reconciled-missing')
 
     await vi.waitFor(async () => {
@@ -10188,7 +10191,7 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
-  it('probes the deterministic branch directly for a single implementer during babysitter recovery', async () => {
+  it('reads the deterministic branch from the mount during single-implementer babysitter recovery', async () => {
     const issue = issueFile(597)
     const publishPullRequest = vi.fn(async () => {
       throw new Error('must reconcile the exact existing branch')
@@ -10199,32 +10202,25 @@ describe('FactoryLoop', () => {
     })
     const fleet = new DurableRemoteLifecycleFleetClient()
     const stateStore = new InMemoryStateStore({ batchSize: 1 })
-    const ghCalls: string[][] = []
     let branch = ''
     const factory = createFactory(config({ babysitter: { enabled: true } }), {
       mount,
       fleet,
       stateStore,
       triage: new StaticTriage(),
-      probePrGhRunner: async (args) => {
-        ghCalls.push(args)
-        return {
-          stdout: args.includes('--head') && args.includes(branch)
-            ? JSON.stringify([{
-                number: 1597,
-                url: 'https://github.com/AgentWorkforce/pear/pull/1597',
-                headRefName: branch,
-                isDraft: false,
-              }])
-            : '[]',
-        }
-      },
     })
     const decision = await factory.triageIssue(parseLinearIssue(issuePath(597), issue))
 
     await factory.dispatch(decision)
     branch = (await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))!
       .decision.implementers[0]!.branch!
+    mount.files.set('/github/repos/AgentWorkforce/pear/pulls/1597/metadata.json', { content: {
+      number: 1597,
+      url: 'https://github.com/AgentWorkforce/pear/pull/1597',
+      head_ref: branch,
+      state: 'open',
+      draft: false,
+    } })
     fleet.emitAgentExit('ar-597-impl-pear', 'reconciled-missing')
 
     await vi.waitFor(async () => {
@@ -10236,8 +10232,7 @@ describe('FactoryLoop', () => {
         },
       })
     })
-    expect(ghCalls.length).toBeGreaterThan(0)
-    expect(ghCalls.every((args) => args.includes('--head') && args.includes(branch))).toBe(true)
+    expect(mount.reads).toContain('/github/repos/AgentWorkforce/pear/pulls/1597/metadata.json')
     expect(publishPullRequest).not.toHaveBeenCalled()
     await factory.stop()
   })
@@ -26631,14 +26626,6 @@ describe('FactoryLoop PR babysitter', () => {
             url: 'https://github.com/AgentWorkforce/pear/pull/1595',
           }
         : undefined,
-      probePrGhRunner: async () => ({
-        stdout: JSON.stringify([{
-          number: 1595,
-          url: 'https://github.com/AgentWorkforce/pear/pull/1595',
-          headRefName: branch,
-          isDraft: false,
-        }]),
-      }),
     })
     try {
       await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
@@ -26646,6 +26633,11 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.dispatch(decision)
       branch = (await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))!
         .decision.implementers[0]!.branch!
+      seedPrMeta(mount, 'AgentWorkforce/pear', 1595, {
+        state: 'open',
+        draft: false,
+        head_ref: branch,
+      })
 
       const stalePrPath = '/github/repos/AgentWorkforce/pear/pulls/1495/metadata.json'
       seedPrMeta(mount, 'AgentWorkforce/pear', 1495, {
