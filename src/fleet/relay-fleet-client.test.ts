@@ -1165,6 +1165,62 @@ describe('RelayFleetClient', () => {
     expect(fleet.trackedAgents().has('ar-2-review')).toBe(true)
   })
 
+  // Guards the downstream half of the unnamed-placement change. A review raised
+  // the concern that a worker tracked WITHOUT a node would be skipped by the
+  // registration probe and eventually torn down. It is not: the probe keys on
+  // AGENT NAME (`onlineAgentNames.has(name)`), so an unnamed worker is checked
+  // exactly like a named one. The `!entry.node` skip bypasses only the
+  // node-offline check, which is meaningless without a node name and is safer
+  // skipped than guessed.
+  it('keeps reconciling a tracked worker that has no node, by name', async () => {
+    const messaging = new FakeMessaging()
+    // Online under its own name, and there is a live node it is NOT attributed to.
+    messaging.agentRows = [{ name: 'ar-1-impl', status: 'online' }]
+    messaging.nodeRows = [{ name: 'mac-mini', status: 'online', capabilities: [] }]
+    let nowMs = 1_000_000
+    const fleet = createClient(messaging, { now: () => nowMs })
+    const exits: Array<{ name: string; reason?: string }> = []
+    fleet.onAgentExit((name, reason) => exits.push({ name, reason }))
+
+    // An accepted placement whose acknowledgement carried no node name.
+    messaging.placementAck = { placement: {} }
+    const result = await fleet.spawn({ name: 'ar-1-impl', capability: 'spawn:codex' })
+    expect(result.node).toBeUndefined()
+    expect(fleet.trackedAgents().get('ar-1-impl')?.node).toBeUndefined()
+
+    // Well past the registration grace AND past the node-offline grace.
+    nowMs += 600_000
+    await fleet.reconcileTrackedAgents()
+    await fleet.reconcileTrackedAgents()
+
+    // Still tracked, never exited, never released. Being unnamed is not death.
+    expect(exits).toEqual([])
+    expect(fleet.trackedAgents().has('ar-1-impl')).toBe(true)
+    expect(messaging.invokes).not.toContainEqual(
+      expect.objectContaining({ name: 'release' }),
+    )
+  })
+
+  it('still exits an unnamed tracked worker when it actually leaves the roster', async () => {
+    // The complement of the test above: skipping the node check must not make
+    // an unnamed worker immortal. Name-based liveness still applies.
+    const messaging = new FakeMessaging()
+    messaging.agentRows = []
+    messaging.nodeRows = [{ name: 'mac-mini', status: 'online', capabilities: [] }]
+    let nowMs = 1_000_000
+    const fleet = createClient(messaging, { now: () => nowMs })
+    const exits: Array<{ name: string; reason?: string }> = []
+    fleet.onAgentExit((name, reason) => exits.push({ name, reason }))
+
+    messaging.placementAck = { placement: {} }
+    await fleet.spawn({ name: 'ar-1-impl', capability: 'spawn:codex' })
+
+    nowMs += 600_000
+    await fleet.reconcileTrackedAgents()
+
+    expect(exits).toEqual([{ name: 'ar-1-impl', reason: 'exited' }])
+  })
+
   it('synthesizes exits for offline roster rows and dead nodes after their grace windows', async () => {
     const messaging = new FakeMessaging()
     messaging.agentRows = [
