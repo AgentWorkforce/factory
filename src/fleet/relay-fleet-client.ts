@@ -372,15 +372,19 @@ export class RelayFleetClient implements FleetClient {
       }
       throw error
     }
-    const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation, ack)
-    let acknowledgedNode: string
+    const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation)
+    let acknowledgedNode: string | undefined
     try {
-      acknowledgedNode = assertNamedRemotePlacement(result, ack.placement?.node)
+      acknowledgedNode = resolveAcknowledgedRemoteNode(
+        result,
+        ack.placement?.node,
+        ack.node?.name,
+      )
     } catch (error) {
-      // A completed placement invocation has already launched the worker. If
-      // Relay cannot prove that it ran on a named remote node, tear that worker
-      // down before refusing the result so a rejected spawn cannot keep acting
-      // outside Factory's lifecycle tracking.
+      // A completed placement invocation has already launched the worker. An
+      // explicit self acknowledgement proves that it violated the requested
+      // remote placement, so tear it down before refusing the result. Missing
+      // roster metadata is not a rejection and never reaches this path.
       try {
         await this.release(result.name, 'unverified-placement')
       } catch (releaseError) {
@@ -398,8 +402,11 @@ export class RelayFleetClient implements FleetClient {
       }
       throw error
     }
-    const trustedResult = { ...result, node: acknowledgedNode }
-    this.#track(trustedResult.name, { invocationId: ack.invocationId, node: acknowledgedNode })
+    const trustedResult = acknowledgedNode ? { ...result, node: acknowledgedNode } : result
+    this.#track(trustedResult.name, {
+      invocationId: ack.invocationId,
+      ...(acknowledgedNode ? { node: acknowledgedNode } : {}),
+    })
     return trustedResult
   }
 
@@ -469,7 +476,7 @@ export class RelayFleetClient implements FleetClient {
       log: this.#log,
     }))
     const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack, deadlineAtMs)
-    return previewReferenceFromInvocation(invocation, ack.placement?.node ?? ack.dispatchedNodeId)
+    return previewReferenceFromInvocation(invocation, ack.placement?.node ?? ack.dispatchedNodeId ?? undefined)
   }
 
   async removePreview(preview: PreviewReference): Promise<boolean> {
@@ -1669,7 +1676,6 @@ function spawnResultFromInvocation(
   fallbackName: string,
   fallbackSessionRef: string | undefined,
   invocation: RelayActionInvocation,
-  ack: RelayActionInvocationAck & { placement?: { node?: string } },
 ): SpawnResult {
   const output = asRecord(invocation.output)
   const agent = asRecord(output?.agent)
@@ -1679,29 +1685,38 @@ function spawnResultFromInvocation(
     ?? fallbackSessionRef
   const pid = readNumber(output, 'pid') ?? readNumber(agent, 'pid')
   const pids = readNumberArray(output, 'pids') ?? readNumberArray(agent, 'pids')
-  const node = readString(output, 'node') ?? readString(agent, 'node') ?? ack.placement?.node ?? ack.dispatchedNodeId ?? undefined
   return {
     name,
     ...(sessionRef ? { sessionRef } : {}),
     ...(pid !== undefined ? { pid } : {}),
     ...(pids ? { pids } : {}),
-    ...(node ? { node } : {}),
     locality: 'remote',
   }
 }
 
-function assertNamedRemotePlacement(result: SpawnResult, acknowledgedNode: string | undefined): string {
+function resolveAcknowledgedRemoteNode(
+  result: SpawnResult,
+  placementNode: string | undefined,
+  rosterNode: string | undefined,
+): string | undefined {
   // The placement acknowledgement is authoritative. Action output may name
   // the node executing the spawn handler even when Relay acknowledged `self`,
   // so accepting the synthesized SpawnResult would let self-placement pass.
-  const node = acknowledgedNode?.trim()
-  if (!node || node === 'self') {
+  const node = placementNode?.trim()
+  const resolvedRosterNode = rosterNode?.trim()
+  if (node === 'self' || resolvedRosterNode === 'self') {
     throw new Error(
       `Relay placement did not prove a named remote node for ${result.name}; ` +
       `refusing to accept the spawn result`,
     )
   }
-  return node
+  // The SDK deliberately permits both roster-derived names to be absent after
+  // Relay has accepted and confirmed the spawn. dispatchedNodeId and
+  // handlerNodeId are optional, nullable IDs rather than roster names, so they
+  // cannot close that metadata gap. Track by agent name so reconciliation can
+  // still observe worker liveness without inventing node metadata or converting
+  // an accepted spawn to failure.
+  return node || resolvedRosterNode || undefined
 }
 
 function lifecycleSignalFromInvocation(

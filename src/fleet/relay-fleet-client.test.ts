@@ -325,31 +325,100 @@ describe('RelayFleetClient', () => {
     })
   })
 
-  it.each([
-    ['self', { node: 'self' }],
-    ['an empty node', { node: '' }],
-    ['an absent node', {}],
-  ])('fails closed when placement resolves to %s', async (_label, placement) => {
-    const messaging = new FakeMessaging()
-    messaging.placementAck = { placement }
-    const fleet = createClient(messaging)
+  describe('remote placement acknowledgement metadata', () => {
+    it('accepts and tracks a confirmed spawn when the node name is absent', async () => {
+      const messaging = new FakeMessaging()
+      messaging.placementAck = {
+        invocationId: 'metadata-lag',
+        status: 'pending',
+        dispatchedNodeId: null,
+        handlerNodeId: null,
+        placement: {},
+      }
+      messaging.invocations.set('metadata-lag', [{
+        invocationId: 'metadata-lag',
+        actionName: 'spawn',
+        status: 'completed',
+        output: { name: 'ar-1-impl', node: 'untrusted-output-node' },
+      }])
+      const fleet = createClient(messaging)
 
-    await expect(fleet.spawn({
-      name: 'ar-1-impl',
-      capability: 'spawn:codex',
-      node: 'self',
-      repo: 'AgentWorkforce/factory',
-      task: 'do work',
-    })).rejects.toThrow('Relay placement did not prove a named remote node')
-
-    expect(fleet.trackedAgents().size).toBe(0)
-    expect(messaging.invokes).toContainEqual({
-      name: 'release',
-      input: {
+      expect(fleet.placementLocality).toBe('remote')
+      await expect(fleet.spawn({
         name: 'ar-1-impl',
-        agent: 'ar-1-impl',
-        reason: 'unverified-placement',
-      },
+        capability: 'spawn:codex',
+        node: 'self',
+        repo: 'AgentWorkforce/factory',
+        task: 'do work',
+      })).resolves.toEqual({ name: 'ar-1-impl', locality: 'remote' })
+
+      expect(fleet.trackedAgents().get('ar-1-impl')).toMatchObject({ invocationId: 'metadata-lag' })
+      expect(fleet.trackedAgents().get('ar-1-impl')).not.toHaveProperty('node')
+      expect(messaging.invokes).not.toContainEqual(expect.objectContaining({ name: 'release' }))
+    })
+
+    it('refuses and releases an explicitly self-placed spawn', async () => {
+      const messaging = new FakeMessaging()
+      messaging.placementAck = {
+        invocationId: 'self-placement',
+        status: 'pending',
+        placement: { node: 'self' },
+      }
+      messaging.invocations.set('self-placement', [{
+        invocationId: 'self-placement',
+        actionName: 'spawn',
+        status: 'completed',
+        output: { name: 'ar-1-impl', node: 'untrusted-output-node' },
+      }])
+      const fleet = createClient(messaging)
+
+      expect(fleet.placementLocality).toBe('remote')
+      await expect(fleet.spawn({
+        name: 'ar-1-impl',
+        capability: 'spawn:codex',
+        node: 'self',
+        repo: 'AgentWorkforce/factory',
+      })).rejects.toThrow('Relay placement did not prove a named remote node')
+
+      expect(fleet.trackedAgents().size).toBe(0)
+      expect(messaging.invokes).toContainEqual({
+        name: 'release',
+        input: {
+          name: 'ar-1-impl',
+          agent: 'ar-1-impl',
+          reason: 'unverified-placement',
+        },
+      })
+    })
+
+    it('returns and tracks a normal named remote placement unchanged', async () => {
+      const messaging = new FakeMessaging()
+      messaging.placementAck = {
+        invocationId: 'remote-placement',
+        status: 'pending',
+        placement: { node: ' mac-mini ' },
+      }
+      messaging.invocations.set('remote-placement', [{
+        invocationId: 'remote-placement',
+        actionName: 'spawn',
+        status: 'completed',
+        output: { name: 'ar-1-impl', node: 'wrong-node' },
+      }])
+      const fleet = createClient(messaging)
+
+      expect(fleet.placementLocality).toBe('remote')
+      await expect(fleet.spawn({
+        name: 'ar-1-impl',
+        capability: 'spawn:codex',
+        node: 'self',
+        repo: 'AgentWorkforce/factory',
+      })).resolves.toEqual({ name: 'ar-1-impl', node: 'mac-mini', locality: 'remote' })
+
+      expect(fleet.trackedAgents().get('ar-1-impl')).toMatchObject({
+        invocationId: 'remote-placement',
+        node: 'mac-mini',
+      })
+      expect(messaging.invokes).not.toContainEqual(expect.objectContaining({ name: 'release' }))
     })
   })
 
