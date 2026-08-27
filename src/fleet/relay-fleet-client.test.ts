@@ -325,13 +325,11 @@ describe('RelayFleetClient', () => {
     })
   })
 
-  it.each([
-    ['self', { node: 'self' }],
-    ['an empty node', { node: '' }],
-    ['an absent node', {}],
-  ])('fails closed when placement resolves to %s', async (_label, placement) => {
+  // `self` is a positive assertion that the work did NOT go remote, so it must
+  // still fail closed and tear the worker down.
+  it('fails closed when placement resolves to self', async () => {
     const messaging = new FakeMessaging()
-    messaging.placementAck = { placement }
+    messaging.placementAck = { placement: { node: 'self' } }
     const fleet = createClient(messaging)
 
     await expect(fleet.spawn({
@@ -351,6 +349,76 @@ describe('RelayFleetClient', () => {
         reason: 'unverified-placement',
       },
     })
+  })
+
+  // CONTRACT CHANGE, deliberate. These two cases previously shared the `self`
+  // assertion above and were expected to fail closed. That was correct while
+  // `placement.node` was REQUIRED: an absent name could only mean something had
+  // gone wrong. @agent-relay/sdk 11.8.5 (relay#1619) made it OPTIONAL and
+  // documents it as "absent when acknowledgment metadata is missing or not yet
+  // visible", so an unnamed placement is now an ordinary SUCCESSFUL spawn.
+  //
+  // Keeping the old expectation would make Factory release — i.e. kill — a
+  // worker it had just launched, every time the roster lagged. That is the
+  // production incident this change exists to prevent, so the guard must
+  // distinguish "no name yet" from "explicitly not remote".
+  it.each([
+    ['an empty node', { node: '' }],
+    ['an absent node', {}],
+  ])('accepts an unnamed placement (%s) without releasing the worker', async (_label, placement) => {
+    const messaging = new FakeMessaging()
+    messaging.placementAck = { placement }
+    const fleet = createClient(messaging)
+
+    const result = await fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+      repo: 'AgentWorkforce/factory',
+      task: 'do work',
+    })
+
+    expect(result.name).toBe('ar-1-impl')
+    // Accepted and tracked — the worker keeps running.
+    expect(fleet.trackedAgents().size).toBe(1)
+    // Never torn down.
+    expect(messaging.invokes).not.toContainEqual(
+      expect.objectContaining({ name: 'release' }),
+    )
+    // And no node name is invented for it: only the acknowledgement may name
+    // the node, and it did not.
+    expect(result.node).toBeUndefined()
+  })
+
+  it('does not inherit an action-output node when the acknowledgement is unnamed', async () => {
+    // The `self` guard exists because action output can name the node running
+    // the spawn handler. That output is equally untrustworthy when the
+    // acknowledgement is merely silent, so an unnamed placement must not quietly
+    // adopt it — otherwise "accepted but unidentified" would launder an
+    // unverified name into a trusted result.
+    const messaging = new FakeMessaging()
+    messaging.placementAck = { invocationId: 'unnamed-placement', status: 'pending', placement: {} }
+    messaging.invocations.set('unnamed-placement', [{
+      invocationId: 'unnamed-placement',
+      actionName: 'spawn',
+      status: 'completed',
+      output: { name: 'ar-1-impl', node: 'mac-mini' },
+    }])
+    const fleet = createClient(messaging)
+
+    const result = await fleet.spawn({
+      name: 'ar-1-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+      repo: 'AgentWorkforce/factory',
+      task: 'do work',
+    })
+
+    expect(result.node).toBeUndefined()
+    expect(fleet.trackedAgents().get('ar-1-impl')?.node).toBeUndefined()
+    expect(messaging.invokes).not.toContainEqual(
+      expect.objectContaining({ name: 'release' }),
+    )
   })
 
   it('rejects the acknowledgement node even when action output synthesizes a named node', async () => {

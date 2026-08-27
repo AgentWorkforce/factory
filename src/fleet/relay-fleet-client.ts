@@ -373,14 +373,16 @@ export class RelayFleetClient implements FleetClient {
       throw error
     }
     const result = spawnResultFromInvocation(input.name, input.sessionRef, invocation, ack)
-    let acknowledgedNode: string
+    let acknowledgedNode: string | undefined
     try {
-      acknowledgedNode = assertNamedRemotePlacement(result, ack.placement?.node)
+      acknowledgedNode = assertRemotePlacement(result, ack.placement?.node)
     } catch (error) {
       // A completed placement invocation has already launched the worker. If
-      // Relay cannot prove that it ran on a named remote node, tear that worker
-      // down before refusing the result so a rejected spawn cannot keep acting
-      // outside Factory's lifecycle tracking.
+      // Relay positively acknowledged `self`, tear that worker down before
+      // refusing the result so a rejected spawn cannot keep acting outside
+      // Factory's lifecycle tracking. Reached only for `self` — an accepted
+      // placement whose node name is merely absent is NOT a failure and must
+      // never land here, or Factory would kill workers it just started.
       try {
         await this.release(result.name, 'unverified-placement')
       } catch (releaseError) {
@@ -398,8 +400,20 @@ export class RelayFleetClient implements FleetClient {
       }
       throw error
     }
-    const trustedResult = { ...result, node: acknowledgedNode }
-    this.#track(trustedResult.name, { invocationId: ack.invocationId, node: acknowledgedNode })
+    // Only the acknowledgement may name the node. `spawnResultFromInvocation`
+    // derives a node from action output, which is exactly the untrusted source
+    // the `self` guard above exists to defeat — so when the acknowledgement
+    // carries no name, strip it rather than inheriting that guess. An accepted
+    // placement with an unknown node is tracked without one; the roster
+    // reconciliation loop is what later attributes it.
+    const { node: _untrustedNode, ...resultWithoutNode } = result
+    const trustedResult: SpawnResult = acknowledgedNode
+      ? { ...result, node: acknowledgedNode }
+      : resultWithoutNode
+    this.#track(trustedResult.name, {
+      invocationId: ack.invocationId,
+      ...(acknowledgedNode ? { node: acknowledgedNode } : {}),
+    })
     return trustedResult
   }
 
@@ -469,7 +483,12 @@ export class RelayFleetClient implements FleetClient {
       log: this.#log,
     }))
     const invocation = await this.#awaitInvocation(ack.actionName || 'preview:tailscale-serve', ack, deadlineAtMs)
-    return previewReferenceFromInvocation(invocation, ack.placement?.node ?? ack.dispatchedNodeId)
+    // `dispatchedNodeId` is `string | null`, and `placement.node` became
+    // optional in @agent-relay/sdk 11.8.5, so this chain can yield `null`.
+    // Collapse it to `undefined` explicitly — the callee distinguishes only
+    // "have a node" from "do not", and a `null` masquerading as a value here
+    // is how an absent node turns into a bad preview reference.
+    return previewReferenceFromInvocation(invocation, ack.placement?.node ?? ack.dispatchedNodeId ?? undefined)
   }
 
   async removePreview(preview: PreviewReference): Promise<boolean> {
@@ -1690,12 +1709,31 @@ function spawnResultFromInvocation(
   }
 }
 
-function assertNamedRemotePlacement(result: SpawnResult, acknowledgedNode: string | undefined): string {
-  // The placement acknowledgement is authoritative. Action output may name
-  // the node executing the spawn handler even when Relay acknowledged `self`,
-  // so accepting the synthesized SpawnResult would let self-placement pass.
+/**
+ * Decide whether an accepted placement may be trusted as remote.
+ *
+ * Two outcomes that used to be one. `@agent-relay/sdk` 11.8.5 (relay#1619) made
+ * `placement.node` OPTIONAL, documenting it as "absent when acknowledgment
+ * metadata is missing or not yet visible". That was deliberate: an accepted
+ * placement must not become a failure merely because the roster could not be
+ * read. Before that change `placement.node` was required, so `!node` could only
+ * mean something was wrong; now it is an ordinary outcome of a SUCCESSFUL spawn.
+ *
+ * `'self'`, by contrast, is a positive assertion that the work did NOT go
+ * remote, and it must still be refused. Action output may name the node running
+ * the spawn handler even when Relay acknowledged `self`, so the acknowledgement
+ * — not the synthesized SpawnResult — remains the authority here.
+ *
+ * Returns the proven remote node name, or `undefined` when the placement was
+ * accepted but no node name is available yet. Throws only for `'self'`.
+ */
+function assertRemotePlacement(result: SpawnResult, acknowledgedNode: string | undefined): string | undefined {
   const node = acknowledgedNode?.trim()
-  if (!node || node === 'self') {
+  if (!node) {
+    // Accepted, but unidentified. The caller must not invent a name for it.
+    return undefined
+  }
+  if (node === 'self') {
     throw new Error(
       `Relay placement did not prove a named remote node for ${result.name}; ` +
       `refusing to accept the spawn result`,
