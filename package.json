@@ -1,6 +1,6 @@
 {
   "name": "@agent-relay/factory",
-  "version": "0.1.81",
+  "version": "0.1.82",
   "description": "Agent factory — triage, dispatch, merge-gate for relayfile-driven workspaces",
   "license": "Apache-2.0",
   "repository": {
