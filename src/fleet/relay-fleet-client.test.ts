@@ -245,6 +245,110 @@ describe('RelayFleetClient', () => {
     expect(messaging.placements[0]?.repo).toBe('AgentWorkforce/factory')
   })
 
+  it('invokes provisionSandbox before placement and uses the returned node', async () => {
+    const messaging = new FakeMessaging()
+    const provisionSandbox = vi.fn(async () => ({ nodeName: 'jit-daytona-abc' }))
+    const fleet = createClient(messaging, { provisionSandbox })
+
+    await fleet.spawn({
+      name: 'ar-3-impl',
+      capability: 'spawn:codex',
+      // 'self' means the caller has no preference; the hook should win.
+      node: 'self',
+      repo: 'AgentWorkforce/factory',
+    })
+
+    expect(provisionSandbox).toHaveBeenCalledWith({
+      capability: 'spawn:codex',
+      repo: 'AgentWorkforce/factory',
+      name: 'ar-3-impl',
+    })
+    expect(messaging.placements[0]?.node).toBe('jit-daytona-abc')
+    expect(messaging.placements[0]?.repo).toBe('AgentWorkforce/factory')
+  })
+
+  it('lets provisionSandbox override an explicit input.node preference', async () => {
+    // Once a JIT sandbox is provisioned, factory-cloud MUST land the placement
+    // on that sandbox — otherwise the provisioned box orphans and the spawn
+    // lands somewhere without /srv/agent-workforce.
+    const messaging = new FakeMessaging()
+    const provisionSandbox = vi.fn(async () => ({ nodeName: 'jit-daytona-def' }))
+    const fleet = createClient(messaging, { provisionSandbox })
+
+    await fleet.spawn({
+      name: 'ar-4-impl',
+      capability: 'spawn:codex',
+      node: 'mac-mini',
+      repo: 'AgentWorkforce/factory',
+    })
+
+    expect(messaging.placements[0]?.node).toBe('jit-daytona-def')
+  })
+
+  it('does not invoke provisionSandbox for non-spawn capabilities', async () => {
+    // Workflow and preview placements don't need /srv/agent-workforce; forcing
+    // JIT sandbox provisioning there would waste sandboxes and rate-limit budget.
+    const messaging = new FakeMessaging()
+    const provisionSandbox = vi.fn(async () => ({ nodeName: 'jit-daytona-ghi' }))
+    const fleet = createClient(messaging, { provisionSandbox })
+
+    await fleet.spawn({
+      name: 'wf-1',
+      capability: 'workflow:run',
+      node: 'mac-mini',
+    })
+
+    expect(provisionSandbox).not.toHaveBeenCalled()
+    expect(messaging.placements[0]?.node).toBe('mac-mini')
+  })
+
+  it('refuses to place spawn:* when placementSandboxOnly is set but no hook is configured', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging, { placementSandboxOnly: true })
+
+    await expect(fleet.spawn({
+      name: 'ar-5-impl',
+      capability: 'spawn:codex',
+      node: 'self',
+      repo: 'AgentWorkforce/factory',
+    })).rejects.toThrow(/placementSandboxOnly is set but no provisionSandbox hook/)
+
+    expect(messaging.placements).toHaveLength(0)
+  })
+
+  it('refuses to place when provisionSandbox returns an empty nodeName', async () => {
+    // Empty string is the same failure mode as a hook that never came back:
+    // we would fall through and let the engine pick a laptop.
+    const messaging = new FakeMessaging()
+    const provisionSandbox = vi.fn(async () => ({ nodeName: '   ' }))
+    const fleet = createClient(messaging, { provisionSandbox })
+
+    await expect(fleet.spawn({
+      name: 'ar-6-impl',
+      capability: 'spawn:codex',
+      repo: 'AgentWorkforce/factory',
+    })).rejects.toThrow(/provisionSandbox returned no nodeName/)
+
+    expect(messaging.placements).toHaveLength(0)
+  })
+
+  it('propagates a hook rejection as the spawn failure', async () => {
+    const messaging = new FakeMessaging()
+    const provisionSandbox = vi.fn(async () => {
+      throw new Error('daytona 429 rate limited')
+    })
+    const fleet = createClient(messaging, { provisionSandbox })
+
+    await expect(fleet.spawn({
+      name: 'ar-7-impl',
+      capability: 'spawn:codex',
+      repo: 'AgentWorkforce/factory',
+    })).rejects.toThrow(/daytona 429 rate limited/)
+
+    // Never reached the placement — the caller can retry the whole spawn.
+    expect(messaging.placements).toHaveLength(0)
+  })
+
   it('creates and removes previews on the owning node', async () => {
     const messaging = new FakeMessaging()
     const preview = {

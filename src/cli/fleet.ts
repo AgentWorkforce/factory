@@ -173,6 +173,18 @@ export interface FleetCliDeps {
    * including that a read-only command never registers an agent.
    */
   createRelay?: (options: RelayClientFactoryOptions) => RelayClientLike
+  /**
+   * Bring a JIT sandbox online before each `spawn:*` placement. Injected by
+   * factory-cloud's container so the relay backend can call cloud's ensure
+   * route per dispatch (factory#412). Forwarded through `buildFleet` →
+   * `createFleet` to `RelayFleetClient`.
+   */
+  provisionSandbox?: import('../fleet/create-fleet').CreateFleetDeps['provisionSandbox']
+  /**
+   * Refuse to place `spawn:*` invocations that have no JIT sandbox behind
+   * them. Forwarded to `RelayFleetClient` alongside {@link provisionSandbox}.
+   */
+  placementSandboxOnly?: boolean
   isInteractive?: () => boolean
   confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
   openIntegrationUrl?: (url: string) => void | Promise<void>
@@ -1906,7 +1918,12 @@ async function buildFleet(
       relayAgentName: loaded?.config.relay.agentName,
       readOnly,
     },
-    { env: deps.env, createRelay: deps.createRelay },
+    {
+      env: deps.env,
+      createRelay: deps.createRelay,
+      ...(deps.provisionSandbox ? { provisionSandbox: deps.provisionSandbox } : {}),
+      ...(deps.placementSandboxOnly !== undefined ? { placementSandboxOnly: deps.placementSandboxOnly } : {}),
+    },
   )
 }
 
