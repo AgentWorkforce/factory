@@ -105,6 +105,39 @@ export interface RelayFleetClientOptions {
    * `ReadOnlyFleetIdentityError` rather than silently planting a row.
    */
   readOnly?: boolean
+  /**
+   * Bring a JIT sandbox online before placing a spawn.
+   *
+   * When set and this is a `spawn:*` invocation, `spawn()` calls this hook
+   * before `messaging.placement.spawn` and threads the returned `nodeName`
+   * into placement as the target node. That is how factory-cloud gets a
+   * fresh Daytona sandbox provisioned per dispatch — the caller wires this
+   * to `@agent-relay/cloud`'s `ensureCloudFleetSandbox` (see factory#412).
+   *
+   * A hook that throws aborts the spawn; the placement is never called.
+   * That is deliberate: a JIT sandbox that never came up has no working
+   * `worker_cwd`, so placing on any other node would silently degrade to
+   * the same failure this hook exists to prevent.
+   *
+   * Returning an empty `nodeName` behaves the same as throwing.
+   */
+  provisionSandbox?: (input: {
+    repo?: string
+    capability: Capability
+    name: string
+  }) => Promise<{ nodeName: string }>
+  /**
+   * Refuse to place a `spawn:*` invocation that has no JIT sandbox behind
+   * it. Requires {@link provisionSandbox}. Turns "landed on a laptop and
+   * spawn_failed on worker_cwd" into a clear placement refusal at the
+   * client boundary, so a factory sweep cannot silently fall back to a
+   * node whose disk layout will not accept the dispatch.
+   *
+   * Ignored for non-`spawn:*` capabilities (workflow runs and preview
+   * placements do not need /srv/agent-workforce and often want to land on
+   * whatever fleet node has the capability).
+   */
+  placementSandboxOnly?: boolean
 }
 
 const knownCapabilities = new Set<NodeCapability>(['spawn:claude', 'spawn:codex', 'workflow:run', 'preview:tailscale-serve'])
@@ -333,11 +366,45 @@ export class RelayFleetClient implements FleetClient {
       // the invocation cannot be accepted without a live Factory consumer.
       this.#ensureEventSubscription()
     }
+    // Ensure a JIT sandbox is up before placement. Only applies to `spawn:*`
+    // invocations (workflow/preview placements do not need /srv/agent-workforce)
+    // and only when the caller opted in via `provisionSandbox`. Fail-closed on
+    // `placementSandboxOnly` prevents a silent fall-back to a laptop node whose
+    // filesystem cannot honor factory-cloud's dispatch cloneRoot.
+    let sandboxTargetNode: string | undefined
+    if (input.capability.startsWith('spawn:')) {
+      if (this.#options.provisionSandbox) {
+        const provisioned = await this.#withinDeadline(
+          'sandbox provision',
+          deadlineAtMs,
+          () => this.#options.provisionSandbox!({
+            ...(input.repo ? { repo: input.repo } : {}),
+            capability: input.capability,
+            name: input.name,
+          }),
+        )
+        const proposedName = provisioned?.nodeName?.trim()
+        if (!proposedName) {
+          throw new Error(
+            'provisionSandbox returned no nodeName; refusing to place on an unbounded node',
+          )
+        }
+        sandboxTargetNode = proposedName
+      } else if (this.#options.placementSandboxOnly) {
+        throw new Error(
+          'placementSandboxOnly is set but no provisionSandbox hook is configured; ' +
+          'refusing to place a spawn without a JIT sandbox',
+        )
+      }
+    }
+    // Node resolution precedence: hook-provisioned name wins, then any explicit
+    // `input.node` (non-'self'), then engine-picked. 'self' from the orchestrator
+    // means "no placement preference".
+    const resolvedNode = sandboxTargetNode
+      ?? (input.node && input.node !== 'self' ? input.node : undefined)
     const ack = await this.#withinDeadline('placement.spawn', deadlineAtMs, () => messaging.placement.spawn({
       capability: input.capability,
-      // 'self' from the orchestrator means "no placement preference": let the
-      // engine pick the least-loaded eligible node.
-      ...(input.node && input.node !== 'self' ? { node: input.node } : {}),
+      ...(resolvedNode ? { node: resolvedNode } : {}),
       ...(input.repo ? { repo: input.repo } : {}),
       input: spawnActionInput(input),
       ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
