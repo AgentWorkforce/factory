@@ -207,6 +207,39 @@ describe('dispatch capacity health (#303)', () => {
     expect(health.dispatchCapacity?.agentHoldTimeoutMs).toBe(4 * 60 * 60_000)
   })
 
+  // #419 boundary: the reaper skips only while `nowMs < dueAtMs`, so it
+  // reaps AT the deadline. `pastOccupiedDeadline` uses `>=` for the same
+  // reason `pastReapDeadline` does — a diagnostic that regressed to `>`
+  // would disagree with the mechanism it reports on for exactly one
+  // millisecond, which is the failure mode this whole PR closes. The
+  // agentless shape pins this instant with its own test; the placed shape
+  // pins it here.
+  it('counts a placed-agent slot that reached agentHoldTimeoutMs exactly (#419)', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        batchSize: 2,
+        active: 2,
+        waiting: 0,
+        longestWaitMs: undefined,
+        waitingIssues: [],
+        occupants: [{
+          issue: 'AR-501',
+          phase: 'running',
+          agents: 1,
+          placedAgents: 1,
+          heldForMs: 4 * 60 * 60_000,
+          slotHeldForMs: 4 * 60 * 60_000,
+        }],
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.dispatchCapacity?.occupiedOccupants).toBe(1)
+    expect(health.dispatchCapacity?.occupants?.[0]?.pastOccupiedDeadline).toBe(true)
+    expect(health.dispatchCapacity?.state).toBe('stalled')
+    expect(health.degradedSubsystems).toContain('dispatchCapacity')
+  })
+
   // #419 must-not-fire: a placed-agent occupant INSIDE `agentHoldTimeoutMs`
   // is left alone. The reaper skips only while `nowMs < dueAtMs`, so a
   // diagnostic that fired one second earlier would disagree with the

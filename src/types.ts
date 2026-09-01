@@ -532,7 +532,11 @@ export interface FactoryPublicDispatchCapacityHealth {
    * this shape has always existed but was never surfaced next to
    * `agentlessHoldTimeoutMs`, so `dispatchCapacity` could read `healthy` for
    * an occupant that had held its slot 3× this bound. Published so a reader
-   * can check the two numbers against `slotHeldForMs` themselves.
+   * can check each deadline against its matching age: `slotHeldForMs` for
+   * agentless slots, `heldForMs` for placed-agent slots. The two clocks are
+   * distinct because a placement whose spawn took hours is not the same as
+   * a placement that outran its deadline, and only the second is the wedge
+   * the reaper reaps.
    */
   agentHoldTimeoutMs: number
   longestWaitMs?: number
