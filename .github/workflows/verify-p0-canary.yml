@@ -48,7 +48,8 @@
 #   - The PR must be opened by EXPECTED_PR_AUTHOR. Accepting a PR from any
 #     author means a credential regression - a human or a different app pushing
 #     the branch - still reports GREEN, which is the one outcome this workflow
-#     must never produce.
+#     must never produce. The expected author is PINNED below rather than being
+#     an input, so it cannot be relaxed at dispatch time.
 #   - A canary that times out is DISARMED before the job exits. The dispatch
 #     labels are what make it ingestible, so an abandoned canary left open with
 #     them is a live work item that consumes a real batch slot later. Slot
@@ -75,11 +76,6 @@ on:
         required: false
         type: boolean
         default: false
-      expected_pr_author:
-        description: Login that must have opened the canary PR. Only relax this if the dispatching app identity really changed.
-        required: false
-        type: string
-        default: app/agent-relay-code
 
 permissions:
   # Listing branches through the REST API.
@@ -106,7 +102,11 @@ jobs:
       TARGET_REPO: ${{ github.repository }}
       WAIT_MINUTES: ${{ github.event.inputs.wait_minutes || '45' }}
       CLOSE_AFTER: ${{ github.event.inputs.close_after || 'false' }}
-      EXPECTED_PR_AUTHOR: ${{ github.event.inputs.expected_pr_author || 'app/agent-relay-code' }}
+      # PINNED, deliberately not a workflow input. If a caller can choose the
+      # identity that counts as proof, the author check stops being a check --
+      # dispatching the canary yourself and naming yourself would go green. A
+      # real change of dispatching identity should be a reviewed edit here.
+      EXPECTED_PR_AUTHOR: app/agent-relay-code
     steps:
       - name: Verify this repo is a configured factory poll target
         run: |
@@ -124,6 +124,7 @@ jobs:
           echo "Filing canary into ${TARGET_REPO} (a configured poll target)."
 
       - name: Validate the wait window
+        id: window
         run: |
           set -euo pipefail
           # `WAIT_MINUTES` is fed straight into shell arithmetic below. A
@@ -138,14 +139,23 @@ jobs:
               exit 1
               ;;
           esac
-          if [ "${WAIT_MINUTES}" -lt 1 ] || [ "${WAIT_MINUTES}" -gt 55 ]; then
+          # Normalise with an explicit base. A leading zero ("08") passes the
+          # digit test above but is an INVALID OCTAL in `$(( ))`, so the
+          # deadline arithmetic would blow up in the wait step -- after the
+          # canary issue has already been filed, which is precisely the
+          # orphaned-issue state the disarm step exists to avoid.
+          NORMALISED=$(( 10#${WAIT_MINUTES} ))
+          if [ "${NORMALISED}" -lt 1 ] || [ "${NORMALISED}" -gt 55 ]; then
             echo "::error::wait_minutes must be between 1 and 55 (the job timeout is 60 min and the disarm step needs headroom); got '${WAIT_MINUTES}'"
             exit 1
           fi
-          echo "Wait window: ${WAIT_MINUTES} min. Expecting the canary PR from '${EXPECTED_PR_AUTHOR}'."
+          echo "wait_minutes=${NORMALISED}" >> "${GITHUB_OUTPUT}"
+          echo "Wait window: ${NORMALISED} min. Expecting the canary PR from '${EXPECTED_PR_AUTHOR}'."
 
       - name: File canary issue
         id: file
+        env:
+          WAIT_MINUTES: ${{ steps.window.outputs.wait_minutes }}
         run: |
           set -euo pipefail
           TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -186,6 +196,8 @@ jobs:
 
       - name: Wait for factory/<n>-* branch + PR
         id: wait
+        env:
+          WAIT_MINUTES: ${{ steps.window.outputs.wait_minutes }}
         run: |
           set -euo pipefail
           NUM="${{ steps.file.outputs.issue_number }}"
@@ -262,20 +274,57 @@ jobs:
         # unexpected PR author, cancellation, or an error in the wait step.
         # The dispatch labels are what make the issue ingestible, so leaving
         # them on an abandoned canary hands the sweep a real work item and
-        # burns a batch slot later. Stripping them (and closing) is what keeps
-        # a failed run from causing the slot exhaustion this workflow exists to
-        # detect. Best-effort: a cleanup failure must not mask the real result.
+        # burns a batch slot later. Slot exhaustion is part of the outage this
+        # workflow exists to detect; it must not cause it.
+        #
+        # This step VERIFIES the disarm instead of assuming it. A silent
+        # cleanup failure is worse than no cleanup at all: it reports the
+        # canary as disarmed while leaving a labelled, open, dispatchable issue
+        # behind. Nothing is masked by failing loudly here -- this step only
+        # runs on paths where the canary was already not proven, so the job is
+        # failing regardless.
         if: ${{ always() && steps.file.outputs.issue_number != '' && steps.wait.outputs.pr_number == '' }}
-        continue-on-error: true
         run: |
           set -uo pipefail
           NUM="${{ steps.file.outputs.issue_number }}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "Disarming unproven canary #${NUM}"
-          gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
-            --remove-label factory-ready --remove-label agent:single --remove-label factory || true
-          gh issue close "${NUM}" --repo "${TARGET_REPO}" --reason "not planned" \
-            --comment "P0 canary was not proven inside the wait window (run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}). Dispatch labels removed and issue closed so the sweep does not later ingest an abandoned canary and consume a batch slot. Re-run verify-p0-canary to retry." || true
-          echo "- disarmed canary #${NUM} (dispatch labels removed, issue closed)" >> "${GITHUB_STEP_SUMMARY}"
+
+          for attempt in 1 2 3; do
+            gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
+              --remove-label factory-ready --remove-label agent:single --remove-label factory >/dev/null 2>&1 || true
+            gh issue close "${NUM}" --repo "${TARGET_REPO}" --reason "not planned" \
+              --comment "P0 canary was not proven inside the wait window (${RUN_URL}). Dispatch labels removed and issue closed so the sweep does not later ingest an abandoned canary and consume a batch slot. Re-run verify-p0-canary to retry." >/dev/null 2>&1 || true
+
+            # Verify against the API rather than trusting the exit codes above.
+            STATE="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
+            LABELS="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo UNKNOWN)"
+            ARMED=0
+            case ",${LABELS}," in
+              *,factory-ready,*|*,agent:single,*|*,factory,*) ARMED=1 ;;
+            esac
+            if [ "${STATE}" = "CLOSED" ] && [ "${ARMED}" = "0" ]; then
+              echo "Disarmed on attempt ${attempt}: state=${STATE} labels=[${LABELS}]"
+              echo "- disarmed canary #${NUM} (dispatch labels removed, issue closed)" >> "${GITHUB_STEP_SUMMARY}"
+              exit 0
+            fi
+            echo "  attempt ${attempt} incomplete: state=${STATE} labels=[${LABELS}]"
+            sleep 5
+          done
+
+          # Still armed. Say so loudly and name the manual remedy -- an
+          # abandoned canary carrying dispatch labels WILL be picked up by the
+          # next sweep.
+          {
+            echo "## Canary disarm FAILED"
+            echo "- issue: ${{ steps.file.outputs.issue_url }}"
+            echo "- state: \`${STATE}\`  labels: \`${LABELS}\`"
+            echo ""
+            echo "This canary is still dispatchable and will consume a batch slot."
+            echo "Remove the \`factory\`, \`factory-ready\` and \`agent:single\` labels and close it by hand."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "::error::Could not disarm canary #${NUM} after 3 attempts (state=${STATE}, labels=[${LABELS}]); it remains dispatchable and needs manual cleanup"
+          exit 1
 
       - name: Close canary issue (optional)
         if: ${{ github.event.inputs.close_after == 'true' && steps.wait.outputs.pr_number != '' }}
