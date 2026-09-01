@@ -1068,6 +1068,8 @@ export class FactoryLoop implements Factory {
    * this whole change exists to provide.
    */
   #readinessReconcileLastSweepDeferred?: 'sweep-in-flight'
+  /** The most recent pass failed to enumerate GitHub issues (#406). */
+  #readinessReconcileLastSweepFailed?: 'issue-listing-failed'
   readonly #liveEventQueue: ChangeEvent[] = []
   #liveEventDrainScheduled = false
   #liveEventDrainActive = false
@@ -1194,6 +1196,14 @@ export class FactoryLoop implements Factory {
   #discoverySweepTreeReads = 0
   /** How many of those were served with zero entries. */
   #discoverySweepEmptyTreeReads = 0
+  /**
+   * This sweep's GitHub issue enumeration failed and was absorbed (#406).
+   *
+   * Set only from the enumerating pass that owns the current lease epoch, on
+   * the same terms as `#discoverySweepSources` below, so a stale continuation
+   * cannot mark the sweep that replaced it.
+   */
+  #discoverySweepDiscoveryFailed = false
   #discoverySweepSources: NonNullable<IterationReport['discoverySources']> = {
     configuredRepos: 0,
     indexBackedRepos: 0,
@@ -3402,6 +3412,7 @@ export class FactoryLoop implements Factory {
     this.#discoverySweepOverloads = 0
     this.#discoverySweepTreeReads = 0
     this.#discoverySweepEmptyTreeReads = 0
+    this.#discoverySweepDiscoveryFailed = false
     this.#discoverySweepSources = {
       configuredRepos: 0,
       indexBackedRepos: 0,
@@ -3512,6 +3523,7 @@ export class FactoryLoop implements Factory {
       this.#discoverySweepOverloads = 0
       this.#discoverySweepTreeReads = 0
       this.#discoverySweepEmptyTreeReads = 0
+      this.#discoverySweepDiscoveryFailed = false
       this.#discoverySweepSources = {
         configuredRepos: 0,
         indexBackedRepos: 0,
@@ -4047,6 +4059,9 @@ export class FactoryLoop implements Factory {
         treeReads: this.#discoverySweepTreeReads,
         emptyTreeReads: this.#discoverySweepEmptyTreeReads,
         discoverySources: { ...this.#discoverySweepSources },
+        ...(this.#discoverySweepDiscoveryFailed
+          ? { discoveryFailed: 'issue-listing-failed' as const }
+          : {}),
         slackDegraded: this.#slackDegraded,
         ...(orphanRecoveryDegraded ? { orphanRecoveryDegraded } : {}),
       }
@@ -6250,6 +6265,25 @@ export class FactoryLoop implements Factory {
       return
     }
     this.#readinessReconcileLastSweepDeferred = undefined
+    // A pass whose issue enumeration failed gets the deferred treatment, for
+    // the reason the doc comment above already gives: it never got to look.
+    //
+    // It reaches here at all because `#githubIssuePaths` absorbs an ordinary
+    // backend error and returns no paths -- it rethrows only a pass-wide
+    // relayfile fault -- so the sweep settles with `pulled: []` while
+    // `configuredRepos` was already incremented for each repo it was about to
+    // enumerate. That is exactly `configuredEmptySweep`, so without this the
+    // failure would be counted as a zero-candidate sweep and three of them
+    // would raise the persistent-empty-discovery alarm: an alarm about
+    // discovery finding nothing, fired by discovery never having looked.
+    //
+    // The failure is already counted (`githubIssueListFailures`) and logged.
+    // What must not happen is it being recorded as a measurement too.
+    if (report.discoveryFailed) {
+      this.#readinessReconcileLastSweepFailed = report.discoveryFailed
+      return
+    }
+    this.#readinessReconcileLastSweepFailed = undefined
     const previousEmptySweeps = this.#readinessReconcileZeroCandidateSweeps
     const configuredEmptySweep = report.pulled.length === 0 &&
       (report.discoverySources?.configuredRepos ?? 0) > 0
@@ -6446,6 +6480,12 @@ export class FactoryLoop implements Factory {
       // counts to publish and still needs to say why.
       ...(this.#readinessReconcileLastSweepDeferred
         ? { discoveryDeferred: this.#readinessReconcileLastSweepDeferred }
+        : {}),
+      // Same independence as the deferral marker: a daemon whose only pass
+      // failed to enumerate has no counts to publish and still needs to say
+      // why, rather than reading as a sweep that found nothing (#406).
+      ...(this.#readinessReconcileLastSweepFailed
+        ? { discoveryFailed: this.#readinessReconcileLastSweepFailed }
         : {}),
       ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
       ...(this.#readinessReconcileLastErrorClass
@@ -9222,6 +9262,16 @@ export class FactoryLoop implements Factory {
       return [...issuePaths.values()].sort()
     } catch (error) {
       if (isPassWideRelayfileFault(error)) throw error
+      // The failure is absorbed here so one bad repository cannot abort the
+      // sweep, but absorbing it must not erase it: the empty list below is
+      // "we could not finish looking", and #406 is what happened when the
+      // readiness accounting read it as "we looked and found nothing".
+      // Recorded under the same epoch guard the source counters use, so a
+      // stale continuation cannot mark the sweep that replaced it.
+      const failingPass = discoveryEnumerationPass.getStore()
+      if (failingPass !== undefined && failingPass.epoch === this.#discoverySweepEpoch) {
+        this.#discoverySweepDiscoveryFailed = true
+      }
       this.#githubIssuePathIndexReady = false
       this.#increment('githubIssueListFailures')
       this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)

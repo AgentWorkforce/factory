@@ -390,6 +390,18 @@ export interface FactoryReadinessReconcileStatus {
    * nothing has enumerated yet.
    */
   discoveryDeferred?: 'sweep-in-flight'
+  /**
+   * The MOST RECENT pass failed to enumerate GitHub issues, so it produced no
+   * candidates because it never finished looking (#406).
+   *
+   * The counterpart to `discoveryDeferred`, for the same reason: a failed pass
+   * publishes `candidates: 0` and is otherwise indistinguishable from a sweep
+   * that queried the provider and legitimately found no ready work. Its zeroes
+   * measure nothing, so they must not overwrite a real sweep's numbers, and
+   * they must not feed the persistent-zero-candidate alarm — which exists to
+   * report discovery finding nothing, not discovery failing.
+   */
+  discoveryFailed?: 'issue-listing-failed'
   /** Free text; authenticated surfaces only. */
   lastError?: string
   /** Allowlisted class name of `lastError`; publishable. */
@@ -837,6 +849,12 @@ export interface IterationReport {
   }
   /** A cross-process owner was already enumerating this workspace. */
   discoveryDeferred?: 'sweep-in-flight'
+  /**
+   * GitHub issue enumeration failed on this pass and was absorbed rather than
+   * thrown (#406), so `pulled` is empty because the sweep never finished
+   * looking — not because there was nothing to find.
+   */
+  discoveryFailed?: 'issue-listing-failed'
   error?: { message: string; stack?: string }
 }
 
