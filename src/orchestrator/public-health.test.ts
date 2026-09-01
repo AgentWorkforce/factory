@@ -40,6 +40,7 @@ describe('dispatch capacity health (#303)', () => {
       waiting: 3,
       waitWarnMs: 30 * 60_000,
       agentlessHoldTimeoutMs: 30 * 60_000,
+      agentHoldTimeoutMs: 4 * 60 * 60_000,
       longestWaitMs: 6 * 60 * 60_000,
       // `recordPlanned` wrote a spec and the spawn never returned, so the row
       // reports an agent and no placement — the shape the projection must not
@@ -66,6 +67,7 @@ describe('dispatch capacity health (#303)', () => {
       waiting: 3,
       waitWarnMs: 30 * 60_000,
       agentlessHoldTimeoutMs: 30 * 60_000,
+      agentHoldTimeoutMs: 4 * 60 * 60_000,
       longestWaitMs: 6 * 60 * 60_000,
       agentlessOccupants: 1,
       // #315: the count alone cannot separate one stuck occupant from
@@ -141,6 +143,175 @@ describe('dispatch capacity health (#303)', () => {
     }
   })
 
+
+  // #419 must-fire: an occupant with a placed agent held past
+  // `agentHoldTimeoutMs` degrades the subsystem and reaches the top-level
+  // status. Before #419 the state derivation only checked the agentless
+  // shape, so a slot whose placed agent had gone offline (or whose run
+  // exceeded any plausible duration) held its slot indefinitely while the
+  // subsystem still read `healthy`. The deployed daemon at 2026-08-31T11:03Z
+  // exhibited exactly this: two occupants with `placedAgents: 1` held their
+  // slots 13.5 hours (27× `agentlessHoldTimeoutMs`, 3.4× the default
+  // `agentHoldTimeoutMs`) while `dispatchCapacity.state` read `healthy` and
+  // no `degradedSubsystems` was published.
+  it('degrades when a placed-agent occupant is past agentHoldTimeoutMs (#419)', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        batchSize: 2,
+        active: 2,
+        waiting: 0,
+        longestWaitMs: undefined,
+        waitingIssues: [],
+        occupants: [
+          // The exact observed shape: agent placed, slot held 13.5h.
+          {
+            issue: 'AR-418',
+            phase: 'dispatching',
+            agents: 1,
+            placedAgents: 1,
+            heldForMs: 13 * 60 * 60_000 + 30 * 60_000,
+            slotHeldForMs: 13 * 60 * 60_000 + 30 * 60_000,
+          },
+          {
+            issue: 'AR-417',
+            phase: 'dispatching',
+            agents: 1,
+            placedAgents: 1,
+            heldForMs: 13 * 60 * 60_000 + 30 * 60_000,
+            slotHeldForMs: 13 * 60 * 60_000 + 30 * 60_000,
+          },
+        ],
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    // The wedge shape is a distinct count from the agentless shape: an
+    // operator reading /healthz has to know which reaper it points at.
+    expect(health.dispatchCapacity?.occupiedOccupants).toBe(2)
+    expect(health.dispatchCapacity?.agentlessOccupants).toBeUndefined()
+    // Per-occupant flag agrees with the aggregate count: a payload that
+    // contradicts itself here republishes the very defect this test covers.
+    expect(health.dispatchCapacity?.occupants?.every((occupant) => occupant.pastOccupiedDeadline)).toBe(true)
+    // The whole point: the state must not read healthy any more. `stalled`
+    // gates dispatch exactly as hard as a failing sweep.
+    expect(health.dispatchCapacity?.state).toBe('stalled')
+    expect(health.degradedSubsystems).toContain('dispatchCapacity')
+    expect(health.status).toBe('degraded')
+    // Liveness never moves: recycling the container destroys the evidence of
+    // the wedge and re-imports the durable lock into the replacement, which
+    // is what turned this bug into a 13.5-hour outage rather than a
+    // 30-minute one (the #303 doc-comment discipline).
+    expect(health.ok).toBe(true)
+    // The bound has to be visible next to `agentlessHoldTimeoutMs`, or the
+    // reader cannot tell which reaper is late.
+    expect(health.dispatchCapacity?.agentHoldTimeoutMs).toBe(4 * 60 * 60_000)
+  })
+
+  // #419 boundary: the reaper skips only while `nowMs < dueAtMs`, so it
+  // reaps AT the deadline. `pastOccupiedDeadline` uses `>=` for the same
+  // reason `pastReapDeadline` does — a diagnostic that regressed to `>`
+  // would disagree with the mechanism it reports on for exactly one
+  // millisecond, which is the failure mode this whole PR closes. The
+  // agentless shape pins this instant with its own test; the placed shape
+  // pins it here.
+  it('counts a placed-agent slot that reached agentHoldTimeoutMs exactly (#419)', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        batchSize: 2,
+        active: 2,
+        waiting: 0,
+        longestWaitMs: undefined,
+        waitingIssues: [],
+        occupants: [{
+          issue: 'AR-501',
+          phase: 'running',
+          agents: 1,
+          placedAgents: 1,
+          heldForMs: 4 * 60 * 60_000,
+          slotHeldForMs: 4 * 60 * 60_000,
+        }],
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.dispatchCapacity?.occupiedOccupants).toBe(1)
+    expect(health.dispatchCapacity?.occupants?.[0]?.pastOccupiedDeadline).toBe(true)
+    expect(health.dispatchCapacity?.state).toBe('stalled')
+    expect(health.degradedSubsystems).toContain('dispatchCapacity')
+  })
+
+  // #419 must-not-fire: a placed-agent occupant INSIDE `agentHoldTimeoutMs`
+  // is left alone. The reaper skips only while `nowMs < dueAtMs`, so a
+  // diagnostic that fired one second earlier would disagree with the
+  // mechanism it reports on for an entire second — the exact failure mode
+  // #303 review closed for the agentless side.
+  it('leaves a placed-agent occupant within agentHoldTimeoutMs untouched (#419)', () => {
+    const health = publicHealthFromHeartbeat(
+      capacity({
+        batchSize: 2,
+        active: 2,
+        waiting: 0,
+        longestWaitMs: undefined,
+        waitingIssues: [],
+        occupants: [{
+          issue: 'AR-500',
+          phase: 'running',
+          agents: 1,
+          placedAgents: 1,
+          // One millisecond before the deadline. `heldForMs` is the clock
+          // the reaper anchors on; `slotHeldForMs` is deliberately larger
+          // (a slow spawn) to prove the diagnostic reads the same clock.
+          heldForMs: 4 * 60 * 60_000 - 1,
+          slotHeldForMs: 5 * 60 * 60_000,
+        }],
+      }),
+      { nowMs: BOOT_MS + 1_000 },
+    )
+
+    expect(health.dispatchCapacity?.occupiedOccupants).toBeUndefined()
+    expect(health.dispatchCapacity?.occupants?.[0]?.pastOccupiedDeadline).toBeUndefined()
+    // A genuinely healthy run is not degraded: the whole point of this
+    // must-not-fire pair is that the new bound must not read fresh dispatch
+    // as a wedge.
+    expect(health.dispatchCapacity?.state).toBe('healthy')
+    expect(health.degradedSubsystems).not.toContain('dispatchCapacity')
+    expect(health.status).toBe('ok')
+  })
+
+  // #419: a producer that publishes occupants without the
+  // `occupiedOccupants` count still projects the wedge, mirroring the
+  // #318 discipline for the agentless shape. Without this, a rolled-back
+  // reader would let a 13.5-hour placed-agent occupant slip through with
+  // `state: 'stalled'` under `status: 'ok'`.
+  it('normalizes a placed-agent wedge over the wire without the aggregate count (#419)', () => {
+    const normalized = normalizePublicHealth({
+      ...publicHealthFromHeartbeat(
+        capacity({ waiting: 0, longestWaitMs: undefined }),
+        { nowMs: BOOT_MS + 1_000 },
+      ),
+      dispatchCapacity: {
+        state: 'healthy',
+        batchSize: 2,
+        active: 2,
+        waiting: 0,
+        waitWarnMs: 30 * 60_000,
+        agentlessHoldTimeoutMs: 30 * 60_000,
+        agentHoldTimeoutMs: 4 * 60 * 60_000,
+        occupants: [{
+          id: 'deadbeef1234',
+          placedAgents: 1,
+          heldForMs: 13 * 60 * 60_000,
+          slotHeldForMs: 13 * 60 * 60_000,
+        }],
+      },
+    })
+
+    expect(normalized?.dispatchCapacity?.state).toBe('stalled')
+    expect(normalized?.dispatchCapacity?.occupants?.[0]?.pastOccupiedDeadline).toBe(true)
+    expect(normalized?.dispatchCapacity?.occupiedOccupants).toBe(1)
+    expect(normalized?.degradedSubsystems).toContain('dispatchCapacity')
+    expect(normalized?.status).toBe('degraded')
+  })
 
   // #315: the monitor stayed green through the exact condition it exists to
   // catch. `agentlessOccupants` was computed and then dropped: with nothing
