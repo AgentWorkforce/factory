@@ -7647,6 +7647,13 @@ export class FactoryLoop implements Factory {
       waiting: waits.length,
       waitWarnMs: this.#config.dispatch.capacityWaitWarnMs,
       agentlessHoldTimeoutMs: this.#config.dispatch.agentlessHoldTimeoutMs,
+      // Published so `dispatchCapacity.state` and its readers can see BOTH
+      // hold bounds (#419). Before this the field was applied by the reaper
+      // but never surfaced, so an operator reading /healthz could not check
+      // an occupant's age against the deadline that should have reaped it —
+      // and the state derivation had no way to notice a placed slot past its
+      // own bound, so 13.5-hour ghosts read as `healthy`.
+      agentHoldTimeoutMs: this.#config.dispatch.agentHoldTimeoutMs,
       ...(longestWaitMs !== undefined ? { longestWaitMs } : {}),
       ...(occupants.length > 0 ? { occupants } : {}),
       ...(waits.length > 0

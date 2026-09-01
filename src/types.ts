@@ -505,6 +505,14 @@ export interface FactoryDispatchCapacityStatus {
   waitWarnMs: number
   /** Deadline after which a slot that never placed an agent should have been reaped. */
   agentlessHoldTimeoutMs: number
+  /**
+   * Deadline after which a slot that DID place an agent should have been
+   * reaped (#419). Distinct from `agentlessHoldTimeoutMs`: this bounds a team
+   * that plausibly ran, and until this field was published there was no
+   * maximum hold at all for that shape — one occupant survived 13.5 hours
+   * against a 4-hour reaper while the subsystem still read healthy.
+   */
+  agentHoldTimeoutMs: number
   longestWaitMs?: number
   occupants?: FactoryDispatchSlotOccupant[]
   /** Issue keys waiting on capacity, longest wait first. */
@@ -519,6 +527,14 @@ export interface FactoryPublicDispatchCapacityHealth {
   waiting: number
   waitWarnMs: number
   agentlessHoldTimeoutMs: number
+  /**
+   * Deadline for an occupied slot with a placed agent (#419). The reaper for
+   * this shape has always existed but was never surfaced next to
+   * `agentlessHoldTimeoutMs`, so `dispatchCapacity` could read `healthy` for
+   * an occupant that had held its slot 3× this bound. Published so a reader
+   * can check the two numbers against `slotHeldForMs` themselves.
+   */
+  agentHoldTimeoutMs: number
   longestWaitMs?: number
   /**
    * Occupied slots that never placed an agent **and** are already past the
@@ -532,6 +548,17 @@ export interface FactoryPublicDispatchCapacityHealth {
    * dispatch is still here.
    */
   agentlessOccupants?: number
+  /**
+   * Occupied slots with a placed agent that have exceeded `agentHoldTimeoutMs`
+   * (#419).
+   *
+   * The other wedge shape: a placed agent that went offline, or a run that
+   * exceeded any plausible duration. Distinct from `agentlessOccupants`
+   * because the *why* an operator should ask differs — an agentless wedge
+   * points at spawn machinery, an occupied wedge points at the placed worker
+   * itself. Past the deadline, no healthy dispatch is still here either.
+   */
+  occupiedOccupants?: number
   /**
    * Per-occupant age and identity, redacted (#315).
    *
@@ -563,8 +590,22 @@ export interface FactoryPublicDispatchSlotOccupant {
   placedAgents?: number
   /** Since the row took the batch slot, whether or not it ever placed an agent. */
   slotHeldForMs?: number
+  /**
+   * Milliseconds since the first successful placement (#419).
+   *
+   * Distinct from `slotHeldForMs` in exactly one case that matters: a row that
+   * took a slot and then placed an agent. `slotHeldForMs` measures against the
+   * slot; `heldForMs` measures against the placement. The occupied-hold
+   * reaper anchors on this one.
+   */
+  heldForMs?: number
   /** True once this occupant is past `agentlessHoldTimeoutMs` with no placement. */
   pastReapDeadline?: boolean
+  /**
+   * True once this occupant has a placed agent and is past
+   * `agentHoldTimeoutMs` (#419). The other wedge shape.
+   */
+  pastOccupiedDeadline?: boolean
 }
 
 export interface FactoryPublicEventListenerHealth {
