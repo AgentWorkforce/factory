@@ -2464,6 +2464,10 @@ export class FactoryLoop implements Factory {
       // an older pass would falsely describe this one as lease contention when
       // the timestamps/error below prove that it acquired the lease and failed.
       this.#readinessReconcileLastSweepDeferred = undefined
+      // Same reasoning for the enumeration-failure marker: this pass reached a
+      // hard failure with its own error recorded below, so an older pass's
+      // absorbed listing failure must not be published beside it.
+      this.#readinessReconcileLastSweepFailed = undefined
       // The class, unlike the message, is publishable: #295 puts it on the
       // unauthenticated health surface through the same allowlist.
       this.#readinessReconcileLastErrorClass = telemetryErrorClass(error)
@@ -6262,6 +6266,11 @@ export class FactoryLoop implements Factory {
   #recordReadinessSweepOutcome(report: IterationReport, completedAtMs: number): void {
     if (report.discoveryDeferred) {
       this.#readinessReconcileLastSweepDeferred = report.discoveryDeferred
+      // Symmetric with the reset below: both markers describe THE most recent
+      // pass, so a deferral must retire an older pass's enumeration failure
+      // exactly as an enumerating pass retires an older deferral. Publishing
+      // the pair together would say this sweep both deferred and failed.
+      this.#readinessReconcileLastSweepFailed = undefined
       return
     }
     this.#readinessReconcileLastSweepDeferred = undefined

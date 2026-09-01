@@ -483,6 +483,74 @@ describe('readiness sweep counters (#355)', () => {
     }
   }, 15_000)
 
+  it('retires the discovery-failure marker when the next pass defers (#406 review)', async () => {
+    // CodeRabbit, minor. Both markers describe THE most recent pass, so they
+    // must never be publishable together: a sweep cannot simultaneously have
+    // failed to enumerate and have deferred to another owner's lease.
+    class DeferrableStateStore extends InMemoryStateStore {
+      deferClaims = false
+
+      override async claimDiscoverySweep(
+        workspaceId: string,
+        owner: string,
+        nowMs: number,
+        leaseMs: number,
+      ): Promise<DiscoverySweepClaim> {
+        const claim = await super.claimDiscoverySweep(
+          workspaceId,
+          this.deferClaims ? 'another-process' : owner,
+          nowMs,
+          leaseMs,
+        )
+        return this.deferClaims ? { ...claim, acquired: false, lease: undefined } : claim
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-discovery-failure-then-defer-'))
+    const mount = new ToggleableGithubIssueMount()
+    mount.failing = true
+    const stateStore = new DeferrableStateStore({ batchSize: 2 })
+    let factory: ReturnType<typeof createFactory> | undefined
+    try {
+      factory = createFactory(config({
+        issueSource: 'github',
+        safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+        loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') },
+      }), {
+        mount,
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        logger: {},
+      })
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 25 },
+      })
+
+      // A failing enumeration first, so the marker is genuinely set.
+      await vi.waitFor(() => {
+        expect(factory!.status().readinessReconcile?.discoveryFailed).toBe('issue-listing-failed')
+      }, { timeout: 5_000 })
+
+      stateStore.deferClaims = true
+
+      await vi.waitFor(() => {
+        expect(factory!.status().readinessReconcile?.discoveryDeferred).toBe('sweep-in-flight')
+      }, { timeout: 5_000 })
+
+      const status = factory.status().readinessReconcile
+      expect(status?.discoveryDeferred).toBe('sweep-in-flight')
+      // The point of the test: the older pass's failure is retired, not
+      // published alongside the deferral it did not cause.
+      expect(status?.discoveryFailed).toBeUndefined()
+      await factory.stop()
+    } finally {
+      await factory?.stop().catch(() => {})
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
   it('publishes a non-zero candidate count for a sweep that found and dispatched ready work', async () => {
     const { status, spawns } = await sweepReadiness({
       [issuePath(901)]: issueFile(901),
