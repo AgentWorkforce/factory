@@ -294,6 +294,11 @@ describe('readiness sweep counters (#355)', () => {
 
     let seedFactory: ReturnType<typeof create> | undefined
     let factory: ReturnType<typeof create> | undefined
+    // `stop()` has no early-return guard, so an unconditional second call
+    // would make every passing run pay a full extra shutdown on both
+    // factories. These flags keep the guarded net for the failure path only.
+    let seedStopped = false
+    let stopped = false
     try {
       seedFactory = create()
       const seed = await seedFactory.runOnce()
@@ -306,6 +311,7 @@ describe('readiness sweep counters (#355)', () => {
       expect(seed.treeReads).toBe(2)
       expect(seed.emptyTreeReads).toBe(2)
       await seedFactory.stop()
+      seedStopped = true
       const readsAfterSeed = mount.listTreePrefixes.length
 
       const warn = vi.fn()
@@ -369,6 +375,7 @@ describe('readiness sweep counters (#355)', () => {
       expect(warn.mock.calls.filter(([message]) =>
         message === '[factory] discovery has persistently produced zero candidates')).toHaveLength(1)
       await factory.stop()
+      stopped = true
     } finally {
       // Guarded, and in the `finally`: every assertion above runs against a
       // started daemon holding a 25ms reconcile timer, so a failing one left
@@ -376,9 +383,10 @@ describe('readiness sweep counters (#355)', () => {
       // removed the temp dir out from under it. Swallowing is deliberate --
       // a throwing teardown replaces the real assertion failure in the report
       // with its own stack. The happy-path `stop()` above stays unguarded, so
-      // a genuine shutdown fault still fails this test.
-      await seedFactory?.stop().catch(() => {})
-      await factory?.stop().catch(() => {})
+      // a genuine shutdown fault still fails this test; this runs only when
+      // the try did not get that far.
+      if (!seedStopped) await seedFactory?.stop().catch(() => {})
+      if (!stopped) await factory?.stop().catch(() => {})
       await rm(root, { recursive: true, force: true })
     }
   }, 15_000)
@@ -419,6 +427,7 @@ describe('readiness sweep counters (#355)', () => {
     const { root, mount, create, alarms } = await discoveryFailureHarness()
     mount.failing = true
     let factory: ReturnType<typeof create> | undefined
+    let stopped = false
     try {
       factory = create()
       await factory.start({
@@ -446,8 +455,9 @@ describe('readiness sweep counters (#355)', () => {
       // Then the marker that preserves it as a failure.
       expect(snapshot.readinessReconcile?.discoveryFailed).toBe('issue-listing-failed')
       await factory.stop()
+      stopped = true
     } finally {
-      await factory?.stop().catch(() => {})
+      if (!stopped) await factory?.stop().catch(() => {})
       await rm(root, { recursive: true, force: true })
     }
   }, 15_000)
@@ -457,6 +467,7 @@ describe('readiness sweep counters (#355)', () => {
     // The single variable: discovery now succeeds and genuinely finds nothing.
     mount.failing = false
     let factory: ReturnType<typeof create> | undefined
+    let stopped = false
     try {
       factory = create()
       await factory.start({
@@ -477,8 +488,55 @@ describe('readiness sweep counters (#355)', () => {
       expect(snapshot.counters.readinessPersistentZeroCandidateSignals).toBe(1)
       expect(alarms()).toHaveLength(1)
       await factory.stop()
+      stopped = true
     } finally {
-      await factory?.stop().catch(() => {})
+      if (!stopped) await factory?.stop().catch(() => {})
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it('does not mark the sweep failed when only the GitHub mirror ingest failed (#406 review)', async () => {
+    // cubic, P2. `#githubIssuePaths` serves two roles. On a LINEAR-source
+    // workspace it is reached from `#ingestGithubIssues`, which only hydrates
+    // the GitHub mirror -- the sink enumeration is the Linear tree and can
+    // still return candidates. Marking the sweep failed from the mirror path
+    // stranded a sweep that DID find work: `#recordReadinessSweepOutcome`
+    // returned early, so its counts were never recorded and the
+    // zero-candidate streak was never reset.
+    const root = await mkdtemp(join(tmpdir(), 'factory-mirror-ingest-failure-'))
+    // Linear source (the config default), so the mirror ingest runs and fails
+    // while the Linear tree below still serves a ready issue.
+    const mount = new ToggleableGithubIssueMount({ [issuePath(971)]: issueFile(971) })
+    mount.failing = true
+    let factory: ReturnType<typeof createFactory> | undefined
+    let stopped = false
+    try {
+      factory = createFactory(
+        config({ loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') } }),
+        { mount, fleet: new FakeFleetClient(), stateStore: new InMemoryStateStore({ batchSize: 4 }), triage: new StaticTriage(), logger: {} },
+      )
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+      })
+
+      // The sweep found and dispatched real work, so it MUST be recorded.
+      await vi.waitFor(() => {
+        expect(factory!.status().readinessReconcile).toMatchObject({
+          candidates: 1,
+          dispatched: 1,
+        })
+      }, { timeout: 5_000 })
+
+      const status = factory.status().readinessReconcile
+      // The mirror failure is not this sweep's enumeration failing.
+      expect(status?.discoveryFailed).toBeUndefined()
+      expect(status?.zeroCandidateSweeps ?? 0).toBe(0)
+      expect(status?.zeroCandidateAlarmActive).toBeFalsy()
+      await factory.stop()
+      stopped = true
+    } finally {
+      if (!stopped) await factory?.stop().catch(() => {})
       await rm(root, { recursive: true, force: true })
     }
   }, 15_000)
@@ -511,6 +569,7 @@ describe('readiness sweep counters (#355)', () => {
     mount.failing = true
     const stateStore = new DeferrableStateStore({ batchSize: 2 })
     let factory: ReturnType<typeof createFactory> | undefined
+    let stopped = false
     try {
       factory = createFactory(config({
         issueSource: 'github',
@@ -545,8 +604,9 @@ describe('readiness sweep counters (#355)', () => {
       // published alongside the deferral it did not cause.
       expect(status?.discoveryFailed).toBeUndefined()
       await factory.stop()
+      stopped = true
     } finally {
-      await factory?.stop().catch(() => {})
+      if (!stopped) await factory?.stop().catch(() => {})
       await rm(root, { recursive: true, force: true })
     }
   }, 15_000)

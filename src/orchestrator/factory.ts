@@ -9170,7 +9170,22 @@ export class FactoryLoop implements Factory {
     return candidates
   }
 
-  async #githubIssuePaths(): Promise<string[]> {
+  /**
+   * `sinkEnumeration` marks the ONE call per sweep that is the sweep's own
+   * candidate enumeration (#406 review, cubic P2).
+   *
+   * This method serves two very different roles. For a github-source
+   * workspace `#readyIssuePaths` calls it as the sink enumeration, and an
+   * absorbed failure there means the sweep genuinely never finished looking.
+   * For a linear-source workspace it is also reached from
+   * `#ingestGithubIssues`, which only hydrates the GitHub mirror -- the sink
+   * enumeration is the Linear tree and can still return candidates. Marking
+   * the sweep failed from the mirror path would strand a sweep that DID find
+   * work: `#recordReadinessSweepOutcome` would return early, the
+   * zero-candidate streak would never be reset, and the alarm could fire for
+   * a workspace that is dispatching. So only the sink enumeration sets it.
+   */
+  async #githubIssuePaths(opts: { sinkEnumeration?: boolean } = {}): Promise<string[]> {
     try {
       const issuePaths = new Map<string, string>()
       for (const { owner, repo } of configuredGithubRepoParts(this.#config)) {
@@ -9278,7 +9293,8 @@ export class FactoryLoop implements Factory {
       // Recorded under the same epoch guard the source counters use, so a
       // stale continuation cannot mark the sweep that replaced it.
       const failingPass = discoveryEnumerationPass.getStore()
-      if (failingPass !== undefined && failingPass.epoch === this.#discoverySweepEpoch) {
+      if (opts.sinkEnumeration && failingPass !== undefined &&
+        failingPass.epoch === this.#discoverySweepEpoch) {
         this.#discoverySweepDiscoveryFailed = true
       }
       this.#githubIssuePathIndexReady = false
@@ -10328,7 +10344,9 @@ export class FactoryLoop implements Factory {
 
   async #readyIssuePaths(): Promise<string[]> {
     if (await this.#issueSource() === 'github') {
-      return this.#githubIssuePaths()
+      // The sweep's own candidate enumeration: an absorbed failure here is the
+      // sweep never finishing its look, and is the only one that may say so.
+      return this.#githubIssuePaths({ sinkEnumeration: true })
     }
     const pathsByKey = new Map<string, string>()
     const canonicalPathsByKey = new Map<string, string>()
