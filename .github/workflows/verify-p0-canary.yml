@@ -1,0 +1,206 @@
+# Prove the P0 end-to-end path still works after every live deploy:
+# file a fresh [factory]-labeled canary issue in THIS repo, wait up to 45 min
+# for the deployed container to dispatch it (JIT-provisioned sandbox, impl
+# agent, branch push, PR create), and fail if nothing appears.
+#
+# WHY THIS EXISTS
+#
+# The entire 2026-08-31/09-01 outage looked like "factory is running healthy"
+# to /healthz and /evidence right up until you tried to prove a dispatch could
+# actually complete end-to-end. Every green subsystem could pass with the
+# dispatch pipeline totally broken (mirror stale, rate-limited on ensure, slots
+# held forever, impl agents landing on repo-less sandboxes). The only signal
+# that actually catches this is a REAL issue turning into a REAL branch and
+# REAL PR. This is that signal, wired to fail loudly.
+#
+# WHY IT LIVES HERE AND NOT IN factory-cloud
+#
+# It was originally added to AgentWorkforce/factory-cloud, where it ran twice
+# (33500196999, 33513690229) and died at step one both times:
+#
+#   File canary issue -> GraphQL: Resource not accessible by integration (createIssue)
+#
+# `permissions: issues: write` scopes GITHUB_TOKEN to the repo the workflow
+# runs in. The canary must be filed in AgentWorkforce/factory, because that is
+# what the deployed sweep polls (factory-cloud's config/factory.config.template.json
+# `repos.names`) - and a repo-scoped token cannot create an issue in another
+# repo. Filing it anywhere the sweep does not poll is equally useless: the
+# issue would simply never be ingested.
+#
+# Moving the workflow into the polled repo resolves both halves at once. The
+# issue create, the branch listing and the PR listing are now all same-repo, so
+# the default GITHUB_TOKEN covers them with no PAT and no new secret.
+#
+# This also removes the old TARGET_REPO input and its 21-entry allowlist. That
+# allowlist could accept a repo the sweep does not poll - a canary that cannot
+# pass the gate it is meant to test - and it had already drifted from the live
+# config, which is narrowed to ["factory"]. The canary now files into the repo
+# it lives in, so the target cannot drift from the poll target by construction.
+#
+# Deliberately fails closed: if the canary issue file, the branch check, or
+# the PR check errors, the job fails. A green here means the P0 path really
+# worked; anything else demands operator attention.
+#
+# NOT triggered automatically on every deploy - the 45-min wait would clog CI
+# and the canary issues would accumulate. Run this after any deliberate
+# dispatch-path change (fresh cut of factory, new sandbox image, cloud ensure
+# quota bump) via workflow_dispatch.
+
+name: Verify P0 canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      wait_minutes:
+        description: How long to wait for the branch+PR to appear before failing
+        required: false
+        type: number
+        default: 45
+      close_after:
+        description: Close the canary issue after a successful check (leave open for triage otherwise)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  # Listing branches through the REST API.
+  contents: read
+  # Creating (and optionally closing) the canary issue. Same-repo, so the
+  # default GITHUB_TOKEN grants this; this is the permission the factory-cloud
+  # copy could never get, because its target was a different repo.
+  issues: write
+  # Finding the PR raised off the canary branch.
+  pull-requests: read
+
+concurrency:
+  # Two overlapping P0 verifications would race the same batch slot and both
+  # would time out. Serialize.
+  group: verify-p0-canary
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TARGET_REPO: ${{ github.repository }}
+      WAIT_MINUTES: ${{ github.event.inputs.wait_minutes || '45' }}
+      CLOSE_AFTER: ${{ github.event.inputs.close_after || 'false' }}
+    steps:
+      - name: Verify this repo is a configured factory poll target
+        run: |
+          set -euo pipefail
+          # The sweep only ingests repos named in factory-cloud's
+          # config/factory.config.template.json `repos.names`. That list is
+          # currently narrowed to ["factory"], and this repo is the one entry
+          # guaranteed to be on it however the list is later widened. Filing
+          # anywhere else produces an issue nothing will ever dispatch, so fail
+          # loudly rather than wait 45 minutes for a foregone timeout.
+          if [ "${TARGET_REPO}" != "AgentWorkforce/factory" ]; then
+            echo "::error::${TARGET_REPO} is not a configured factory poll target; the sweep will never ingest a canary here"
+            exit 1
+          fi
+          echo "Filing canary into ${TARGET_REPO} (a configured poll target)."
+
+      - name: File canary issue
+        id: file
+        run: |
+          set -euo pipefail
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          TITLE="[factory] Canary — P0 verify ${TS}"
+          BODY_FILE="$(mktemp)"
+          cat > "${BODY_FILE}" <<'EOF'
+          ## Canary probe
+
+          Filed by `verify-p0-canary.yml` to prove the factory dispatch pipeline
+          works end-to-end after the latest deploy. Deliberately trivial so the
+          impl agent's work is fast and unambiguous.
+
+          Expected pipeline:
+          1. Sweep ingests within ~5 min.
+          2. JIT provisions a Daytona sandbox with this repo cloned.
+          3. Implementer agent (`ar-<n>-impl-factory`) makes a trivial commit
+             appending one comment line to `README.md`.
+          4. `factory/<n>-*` branch appears on GitHub.
+          5. PR opens by `app/agent-relay-code`.
+
+          The verify job fails loudly if any step doesn't happen inside the
+          wait window. Any green here proves the P0 path is really working;
+          any red demands operator attention.
+          EOF
+          URL="$(gh issue create --repo "${TARGET_REPO}" --title "${TITLE}" --body-file "${BODY_FILE}" \
+            --label factory --label factory-ready --label agent:single)"
+          NUM="${URL##*/}"
+          echo "Filed canary ${URL}"
+          echo "issue_number=${NUM}" >> "${GITHUB_OUTPUT}"
+          echo "issue_url=${URL}" >> "${GITHUB_OUTPUT}"
+          # Emit a step summary line the operator can click straight to.
+          {
+            echo "## Canary filed"
+            echo "- ${URL}"
+            echo ""
+            echo "Waiting up to ${WAIT_MINUTES} min for branch \`factory/${NUM}-*\` + a matching PR."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Wait for factory/<n>-* branch + PR
+        id: wait
+        run: |
+          set -euo pipefail
+          NUM="${{ steps.file.outputs.issue_number }}"
+          DEADLINE=$(( $(date -u +%s) + WAIT_MINUTES * 60 ))
+          BRANCH=""
+          PR_NUM=""
+          PR_URL=""
+          while [ "$(date -u +%s)" -lt "${DEADLINE}" ]; do
+            REMAINING=$(( DEADLINE - $(date -u +%s) ))
+            # Branch first: it's the earlier signal in the pipeline.
+            if [ -z "${BRANCH}" ]; then
+              BRANCH="$(gh api "repos/${TARGET_REPO}/branches?per_page=100" \
+                --jq ".[] | select(.name | startswith(\"factory/${NUM}-\")) | .name" \
+                | head -1)"
+            fi
+            if [ -n "${BRANCH}" ]; then
+              # Branch exists; look for its PR.
+              PR_LINE="$(gh pr list --repo "${TARGET_REPO}" --state all --limit 20 \
+                --json number,headRefName,url \
+                --jq ".[] | select(.headRefName == \"${BRANCH}\") | \"\(.number) \(.url)\"" \
+                | head -1)"
+              if [ -n "${PR_LINE}" ]; then
+                PR_NUM="${PR_LINE%% *}"
+                PR_URL="${PR_LINE#* }"
+                break
+              fi
+            fi
+            echo "  waiting: branch=${BRANCH:-(none)} pr=${PR_NUM:-(none)} remaining=${REMAINING}s"
+            sleep 60
+          done
+          if [ -z "${BRANCH}" ] || [ -z "${PR_NUM}" ]; then
+            {
+              echo "## P0 canary FAILED"
+              echo "- issue: ${{ steps.file.outputs.issue_url }}"
+              echo "- branch after ${WAIT_MINUTES} min: \`${BRANCH:-(none)}\`"
+              echo "- PR after ${WAIT_MINUTES} min: \`${PR_NUM:-(none)}\`"
+              echo ""
+              echo "The dispatch pipeline did not complete inside the wait window."
+              echo "Check /evidence and the container's readinessReconcile.state."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            echo "::error::P0 canary did not produce a branch and PR inside ${WAIT_MINUTES} min"
+            exit 1
+          fi
+          echo "branch=${BRANCH}" >> "${GITHUB_OUTPUT}"
+          echo "pr_number=${PR_NUM}" >> "${GITHUB_OUTPUT}"
+          echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "## P0 canary PROVEN"
+            echo "- issue: ${{ steps.file.outputs.issue_url }}"
+            echo "- branch: \`${BRANCH}\`"
+            echo "- PR: ${PR_URL}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Close canary issue (optional)
+        if: ${{ github.event.inputs.close_after == 'true' && steps.wait.outputs.pr_number != '' }}
+        run: |
+          gh issue close "${{ steps.file.outputs.issue_number }}" --repo "${TARGET_REPO}" \
+            --reason completed \
+            --comment "P0 canary succeeded. Branch \`${{ steps.wait.outputs.branch }}\`, PR ${{ steps.wait.outputs.pr_url }}. Closed by verify-p0-canary."
