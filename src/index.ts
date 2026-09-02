@@ -361,7 +361,6 @@ export type {
   Clock,
   EventPage,
   GithubConnectionWrite,
-  GithubConnectionMutationReceipt,
   GithubConnectionIssue,
   GithubConnectionRead,
   GithubIssueLookup,
