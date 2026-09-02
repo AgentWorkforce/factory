@@ -885,6 +885,8 @@ export class FactoryLoop implements Factory {
   readonly #dispatchLifecycleReleaseAttempts = new Map<string, number>()
   readonly #dispatchLifecycleReleaseAbandoned = new Set<string>()
   readonly #abandonedDispatchReasons = new Map<string, string>()
+  /** Consecutive failed teardowns per abandoned work unit (#419). */
+  readonly #abandonmentTeardownAttempts = new Map<string, number>()
   /**
    * Live batch-capacity waits, keyed by issue (#303).
    *
@@ -7879,7 +7881,6 @@ export class FactoryLoop implements Factory {
   async #releaseDeadLetteredSlot(record: InFlightIssue, key: string): Promise<void> {
     let next: QueuedIssue | undefined
     try {
-      await this.#demoteDeadLetteredLifecycle(record, key)
       const batch = await this.#batch()
       next = batch.complete(record.issue)
       this.#uncompensatedDispatchClaims.delete(key)
@@ -7892,61 +7893,6 @@ export class FactoryLoop implements Factory {
     }
     // A freed slot that nothing is admitted into is only half the repair.
     if (next && !this.#stopping) await this.dispatch(next.decision, { dryRun: next.dryRun })
-  }
-
-  /**
-   * Move a dead-lettered row out of a slot-occupying phase, so the DURABLE
-   * half of its batch slot is handed back with the local one (#419).
-   *
-   * `#releaseDeadLetteredSlot` frees the process-local slot, and for #379 that
-   * was the whole repair: the only phase it could reach was `releasing`, which
-   * `dispatchPhaseOccupiesSlot` excludes, so both state stores' `batchSize`
-   * admission already ignored the row. The abandonment path retains
-   * `abandoning`, which that predicate does NOT exclude. Handing back only the
-   * local slot there frees a number this process keeps in memory while the
-   * store goes on counting the row against `batchSize` — so a durable dispatch
-   * stays refused for capacity with nothing in flight that explains it, which
-   * is a worse bug than the spin, not a better one.
-   *
-   * `releasing` and not a terminal phase, deliberately. The work unit is not
-   * clean: its agents may still exist, and this process has given up only on
-   * being the one to tear them down. `releasing` is exactly the phase a
-   * successor or a restart re-drives through `#finishDurableRelease` with a
-   * fresh budget, and it is the phase #379 already documents as "retain the
-   * work, hand back the slot". Terminalizing would free the slot by asserting
-   * a teardown that never happened.
-   *
-   * Best-effort on purpose. A refused or failed write leaves the row exactly as
-   * it was — the pre-existing behaviour — whereas throwing would skip the local
-   * handback below it and forfeit the half of the repair that did work. The
-   * next drive reaches this path again with the row unchanged.
-   */
-  async #demoteDeadLetteredLifecycle(record: InFlightIssue, key: string): Promise<void> {
-    if (record.dryRun || !this.#usesDurableDispatchLifecycle()) return
-    let lifecycle: DispatchLifecycle | undefined
-    try {
-      lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
-    } catch (error) {
-      this.#logger.warn?.('[factory] could not read a dead-lettered lifecycle to hand back its durable slot', {
-        issue: record.issue.key,
-        error: describeError(error).errorMessage,
-      })
-      return
-    }
-    if (!lifecycle || !dispatchLifecycleOccupiesSlot(lifecycle)) return
-    const from = lifecycle.phase
-    if (!await this.#saveDispatchLifecycle(record, 'releasing', undefined, lifecycle.releaseReason)) return
-    // The abandonment this process gave up on is no longer the reason to skip
-    // this key. Left behind, the entry fences `#sweepHeldAgentDeadlines` off a
-    // future record for the same work unit and sends `#driveDispatchLifecycle`
-    // straight back into `#abandonStuckDispatch` for a row we just demoted.
-    this.#abandonedDispatchReasons.delete(key)
-    this.#increment('deadLetteredDurableSlotsFreed')
-    this.#logger.warn?.('[factory] dead-lettered dispatch demoted to releasing so its batch slot is freed', {
-      issue: record.issue.key,
-      from,
-      releaseReason: lifecycle.releaseReason,
-    })
   }
 
   /** Clears a work unit's release budget once cleanup actually succeeds. */
@@ -12066,7 +12012,7 @@ export class FactoryLoop implements Factory {
         issue: record.issue.key,
         error: describeError(error).errorMessage,
       })
-      this.#scheduleAbandonedDispatchRetry(record, reason, { teardownFailed: true })
+      this.#scheduleAbandonedDispatchRetry(record, reason)
       return
     }
     // A never-placed record carries specs, not workers: `recordPlanned` writes
@@ -12109,9 +12055,14 @@ export class FactoryLoop implements Factory {
     }
     if (!cleanupComplete) {
       this.#increment('abandonedDispatchReleaseRetries')
-      this.#scheduleAbandonedDispatchRetry(record, reason, { teardownFailed: true })
-      await this.#writeInFlightRegistry()
-      return
+      if (this.#abandonmentTeardownMayRetry(record, key, reason)) {
+        this.#scheduleAbandonedDispatchRetry(record, reason)
+        await this.#writeInFlightRegistry()
+        return
+      }
+      // Budget spent: fall through to the terminal save below. The teardown is
+      // what this process gave up on, NOT the abandonment — see
+      // `#abandonmentTeardownMayRetry`.
     }
     // Batch completion alone only frees the process-local slot. Durable
     // capacity is computed from lifecycle phases, so commit the terminal phase
@@ -12133,6 +12084,7 @@ export class FactoryLoop implements Factory {
       return
     }
     this.#abandonedDispatchReasons.delete(key)
+    this.#abandonmentTeardownAttempts.delete(key)
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
     await this.#drainReadyClarificationWake()
@@ -12145,45 +12097,76 @@ export class FactoryLoop implements Factory {
   }
 
   /**
-   * Re-arm an abandonment whose cleanup did not complete — at most
-   * `DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS` times (#419).
+   * May this abandonment re-arm its failed teardown once more? (#419)
    *
-   * This is a RELEASE retry, and it was the only one in the file that never
-   * said so. #379 bounded every other one — `#scheduleDispatchLifecycleRetry`
-   * charges the budget under `releaseAttempt`, `#scheduleReleaseRetry`'s local
-   * arm charges it directly — while this path re-armed at
-   * `DISPATCH_LIFECYCLE_RETRY_MS` forever with the batch slot still held.
+   * `#scheduleAbandonedDispatchRetry` was the one release-retry path in this
+   * file that no budget bounded — `#scheduleDispatchLifecycleRetry` charges
+   * #379's under `releaseAttempt`, `#scheduleReleaseRetry`'s local arm charges
+   * it directly — so a teardown that cannot succeed re-armed at
+   * `DISPATCH_LIFECYCLE_RETRY_MS` forever. That is not hypothetical:
+   * `#abandonStuckDispatchFenced` releases EVERY tracked agent when the reason
+   * is `held-past-deadline`, and a placed agent whose host is gone answers
+   * `release` with a 503, not the 404 `isAgentAlreadyGoneOnRelease` forgives,
+   * so `cleanupComplete` stays false on every pass.
    *
-   * A teardown that cannot succeed is not hypothetical. `#abandonStuckDispatch`
-   * releases EVERY tracked agent when the reason is `held-past-deadline`, and a
-   * placed agent whose host is gone answers `release` with a 503, not the 404
-   * `isAgentAlreadyGoneOnRelease` forgives — so `cleanupComplete` stays false
-   * on every pass. The row then sits in `abandoning`, which
-   * `dispatchPhaseOccupiesSlot` does NOT exclude, so it keeps its slot; and
-   * `#sweepHeldAgentDeadlines` skips it from then on at its own
-   * `#abandonedDispatchReasons` fence, which means the held-agent reaper is
-   * fenced out by the cleanup the reaper itself started. That is a permanent
-   * dispatch outage assembled entirely out of correct-looking parts.
+   * The row then sits in `abandoning`, which `dispatchPhaseOccupiesSlot` does
+   * NOT exclude, so it holds its batch slot in both the local batch and the
+   * stores' `batchSize` admission; `#sweepHeldAgentDeadlines` skips it from
+   * then on at its own `#abandonedDispatchReasons` fence, so the held-agent
+   * reaper is fenced out by the cleanup the reaper itself started; and
+   * `#driveDispatchLifecycle`'s `abandoning` branch re-enters the same failing
+   * teardown after every restart. A permanent dispatch outage assembled
+   * entirely out of correct-looking parts.
    *
-   * Bounding it costs nothing the retry was buying: ten failures a second
-   * apart are enough to distinguish a transient broker fault from a teardown
-   * that will never land.
+   * What is dead-lettered here is the TEARDOWN, not the abandonment. The
+   * caller falls through to its normal terminal `abandoned` save, which is the
+   * truthful outcome — this dispatch really was abandoned past its deadline —
+   * and which keeps every piece of abandonment bookkeeping that follows it:
+   * `#recordDispatchTerminal`, the Slack and GitHub watchers, the batch
+   * completion and the promotion of the next queued unit.
+   *
+   * Deliberately NOT routed through #379's `#releaseDeadLetteredSlot`, which
+   * retains the row in `releasing` for a successor. A `releasing` row is
+   * re-driven by `#finishDurableRelease`, which terminalizes as `complete`,
+   * counts `done` and emits `issue-done` — so handing an abandonment to it
+   * would report a dispatch that timed out as a successful completion and skip
+   * the abandonment-specific bookkeeping entirely (#429 review, codex P1).
+   *
+   * A budget of its own rather than #379's maps: those carry a
+   * lease-relinquishing re-entry contract that assumes the caller stops
+   * driving the key, and this caller is about to finish it terminally.
+   *
+   * The cost, stated plainly: agents whose release never succeeded are left
+   * behind rather than retried forever. They have already been marked terminal
+   * with the fleet client, their names and the failure are logged at `error`,
+   * and ten consecutive failures against a host reported gone is evidence they
+   * are not running. Recovering one that IS running is an operator action —
+   * which is a bounded, visible cost against an unbounded, silent one.
    */
-  #scheduleAbandonedDispatchRetry(
-    record: InFlightIssue,
-    reason: string,
-    opts: { teardownFailed?: boolean } = {},
-  ): void {
+  #abandonmentTeardownMayRetry(record: InFlightIssue, key: string, reason: string): boolean {
+    const attempts = (this.#abandonmentTeardownAttempts.get(key) ?? 0) + 1
+    if (attempts <= DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS) {
+      this.#abandonmentTeardownAttempts.set(key, attempts)
+      return true
+    }
+    this.#abandonmentTeardownAttempts.delete(key)
+    this.#increment('abandonedDispatchTeardownDeadLettered')
+    // `error`, not `warn`, for the reason #379 gives at the same decision: a
+    // work unit whose cleanup this process has permanently given up on must
+    // not be inferable only from the absence of further log lines.
+    this.#logger.error?.('[factory] abandonment teardown retries exhausted; freeing the batch slot anyway', {
+      issue: record.issue.key,
+      reason,
+      attempts: attempts - 1,
+      maxAttempts: DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS,
+      unreleasedAgents: [...record.agents.keys()].sort(),
+    })
+    return false
+  }
+
+  #scheduleAbandonedDispatchRetry(record: InFlightIssue, reason: string): void {
     const key = dispatchLifecycleKey(record.issue)
     if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
-    // Only a failed TEARDOWN spends the budget, exactly as
-    // `#scheduleDispatchLifecycleRetry` spends it only for a `releaseAttempt`.
-    // Most re-arms on this path are legitimate waits for someone else to
-    // finish — a rejected dispatch claim settling, a blocked provider claim, a
-    // durable write refused by another owner's fence — and they are bounded by
-    // their rate, not their count. Charging those would dead-letter a work unit
-    // that was never failing, which is the hazard #379's own guard test pins.
-    if (opts.teardownFailed === true && !this.#chargeReleaseAttempt(record, key, 'abandoned-dispatch')) return
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
       void this.#abandonStuckDispatch(record, reason).catch((error) => {

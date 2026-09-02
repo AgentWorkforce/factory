@@ -32322,26 +32322,18 @@ describe('completion release retry budget (#379)', () => {
   it('charges the release budget from the release scheduler only', () => {
     const source = readFileSync(new URL('./factory.ts', import.meta.url), 'utf8')
 
-    // Three call sites. Two are inside `#scheduleReleaseRetry` — its durable
-    // branch and its local branch. Every caller of that method is a failed
-    // release: the three inside `#finishDurableRelease`, and `#completeIssue`'s
-    // catch once `releaseReasonForRetry` is set.
+    // Two call sites, both inside `#scheduleReleaseRetry` — its durable branch
+    // and its local branch. Every caller of that method is a failed release:
+    // the three inside `#finishDurableRelease`, and `#completeIssue`'s catch
+    // once `releaseReasonForRetry` is set.
     //
-    // The third is `#scheduleAbandonedDispatchRetry` (#419), and it is gated on
-    // an explicit `teardownFailed` for the same reason the generic lifecycle
-    // re-arm passes no charge at all. Most re-arms on the abandonment path are
-    // waits, not failures — a rejected dispatch claim settling, a blocked
-    // provider claim, a durable write refused by another owner's fence — and
-    // charging those would dead-letter a work unit that was never failing. Only
-    // the two sites where the TEARDOWN ITSELF did not land pass the flag:
-    // preview teardown, and the agent-release/worktree arm behind
-    // `cleanupComplete`.
+    // The abandonment path bounds its failed teardowns with a budget of its own
+    // (`#abandonmentTeardownMayRetry`, #419) rather than this one, because it
+    // finishes the work unit terminally instead of retaining it for a
+    // successor — so it must not inherit the lease-relinquishing re-entry
+    // contract these two call sites carry.
     const callSites = [...source.matchAll(/!this\.#chargeReleaseAttempt\(/gu)]
-    expect(callSites).toHaveLength(3)
-    const charged = [...source.matchAll(/#scheduleAbandonedDispatchRetry\(record, reason, \{ teardownFailed: true \}\)/gu)]
-    expect(charged).toHaveLength(2)
-    // The gate is opt-in, so an unflagged abandonment re-arm cannot spend it.
-    expect(source).toContain('opts.teardownFailed === true && !this.#chargeReleaseAttempt(')
+    expect(callSites).toHaveLength(2)
 
     // The generic lifecycle re-arm — dispatch, publishing, recovery — passes no
     // release charge, so it cannot dead-letter a unit that never released.
@@ -33241,12 +33233,13 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
     try {
       await factory.start({ mode: 'backfill-and-subscribe' })
 
-      // The durable row leaves the slot-occupying set. `releasing` and not a
-      // terminal phase on purpose: the agents were never torn down, so the row
-      // is retained for a successor to re-drive with a fresh budget.
+      // The abandonment finishes on its own terminal path. `abandoned`, not
+      // `releasing`: a `releasing` row is re-driven by `#finishDurableRelease`,
+      // which terminalizes as `complete` and emits `issue-done` — reporting a
+      // dispatch that timed out as a successful completion.
       await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
-        .toMatchObject({ phase: 'releasing', releaseReason: 'held-past-deadline' }), { timeout: 40_000 })
-      expect(dispatchPhaseOccupiesSlot('releasing')).toBe(false)
+        .toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 40_000 })
+      expect(dispatchPhaseOccupiesSlot('abandoned')).toBe(false)
 
       // Reporting the slot free is not reclaiming it. The queued issue actually
       // dispatching is.
@@ -33259,8 +33252,11 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
       await vi.waitFor(() => expect(factory.status().dispatchCapacity?.waiting).toBe(0), { timeout: 15_000 })
 
       // Fires once for the work unit, not once per retry.
-      expect(factory.status().counters.deadLetteredDurableSlotsFreed).toBe(1)
-      expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1)
+      expect(factory.status().counters.abandonedDispatchTeardownDeadLettered).toBe(1)
+      // #379's budget is NOT what bounded this — the abandonment carries its
+      // own, precisely so it does not inherit that one's retain-for-successor
+      // contract.
+      expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBeUndefined()
       // The reap must have gone through a release that genuinely FAILED —
       // otherwise this test would pass on the pre-existing 404 path and prove
       // nothing about the bound.
@@ -33269,9 +33265,18 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
         expect.objectContaining({ statusCode: 503 }),
       )
       expect(logger.error).toHaveBeenCalledWith(
-        '[factory] release retries exhausted; abandoning cleanup for this work unit',
-        expect.objectContaining({ issue: 'AR-419', context: 'abandoned-dispatch' }),
+        '[factory] abandonment teardown retries exhausted; freeing the batch slot anyway',
+        expect.objectContaining({
+          issue: 'AR-419',
+          reason: 'held-past-deadline',
+          maxAttempts: 10,
+          unreleasedAgents: ['ar-419-impl', 'ar-419-review'],
+        }),
       )
+      // The issue must NOT be reported as done. `issue-done` is what
+      // `#finishDurableRelease` would have emitted had the row been handed to
+      // the completion path instead (#429 review, codex P1).
+      expect(factory.status().counters.done).toBeUndefined()
     } finally {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
@@ -33309,7 +33314,7 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
       expect(fleet.releases).toEqual([])
       expect(fleet.spawns).toEqual([])
       expect(factory.status().dispatchCapacity?.occupants?.map((occupant) => occupant.issue)).toEqual(['AR-419'])
-      expect(factory.status().counters.deadLetteredDurableSlotsFreed).toBeUndefined()
+      expect(factory.status().counters.abandonedDispatchTeardownDeadLettered).toBeUndefined()
       expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBeUndefined()
       expect(factory.status().counters.abandonedDispatchReleaseRetries).toBeUndefined()
       expect(factory.status().counters.heldPastDeadlineReleases).toBeUndefined()
