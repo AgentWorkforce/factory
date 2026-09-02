@@ -32,10 +32,11 @@ import { LatePlacementReleasedError, changeEventPath, defaultMergeGate } from '.
 import type { GhRunner } from '../github'
 import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
 import { RelayfileOperationTimeoutError } from '../mount/relayfile-operation-timeout'
-import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubIssueCloseWriteResult, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { AgentSpec, AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubIssueCloseWriteResult, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
+import { dispatchPhaseOccupiesSlot } from '../state/dispatch-lifecycle-slot'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
@@ -32321,12 +32322,26 @@ describe('completion release retry budget (#379)', () => {
   it('charges the release budget from the release scheduler only', () => {
     const source = readFileSync(new URL('./factory.ts', import.meta.url), 'utf8')
 
-    // Two call sites, both inside `#scheduleReleaseRetry` — its durable branch
-    // and its local branch. Every caller of that method is a failed release:
-    // the three inside `#finishDurableRelease`, and `#completeIssue`'s catch
-    // once `releaseReasonForRetry` is set.
+    // Three call sites. Two are inside `#scheduleReleaseRetry` — its durable
+    // branch and its local branch. Every caller of that method is a failed
+    // release: the three inside `#finishDurableRelease`, and `#completeIssue`'s
+    // catch once `releaseReasonForRetry` is set.
+    //
+    // The third is `#scheduleAbandonedDispatchRetry` (#419), and it is gated on
+    // an explicit `teardownFailed` for the same reason the generic lifecycle
+    // re-arm passes no charge at all. Most re-arms on the abandonment path are
+    // waits, not failures — a rejected dispatch claim settling, a blocked
+    // provider claim, a durable write refused by another owner's fence — and
+    // charging those would dead-letter a work unit that was never failing. Only
+    // the two sites where the TEARDOWN ITSELF did not land pass the flag:
+    // preview teardown, and the agent-release/worktree arm behind
+    // `cleanupComplete`.
     const callSites = [...source.matchAll(/!this\.#chargeReleaseAttempt\(/gu)]
-    expect(callSites).toHaveLength(2)
+    expect(callSites).toHaveLength(3)
+    const charged = [...source.matchAll(/#scheduleAbandonedDispatchRetry\(record, reason, \{ teardownFailed: true \}\)/gu)]
+    expect(charged).toHaveLength(2)
+    // The gate is opt-in, so an unflagged abandonment re-arm cannot spend it.
+    expect(source).toContain('opts.teardownFailed === true && !this.#chargeReleaseAttempt(')
 
     // The generic lifecycle re-arm — dispatch, publishing, recovery — passes no
     // release charge, so it cannot dead-letter a unit that never released.
@@ -33119,4 +33134,188 @@ describe('merge gate identity selection', () => {
     expect(result.merged).toBe(true)
     expect(calls).toHaveLength(1)
   })
+})
+
+/**
+ * #419: an occupied batch slot whose placed agents no longer exist, past
+ * `agentHoldTimeoutMs`, must actually be reclaimed — not merely reported.
+ *
+ * The held-agent reaper was never the missing piece: it fires, classifies the
+ * row correctly and calls `#abandonStuckDispatch`. What it could not do was
+ * FINISH. `#abandonStuckDispatch` releases every tracked agent when the reason
+ * is `held-past-deadline`, a placed agent whose host is gone answers `release`
+ * with a 503 rather than the 404 `isAgentAlreadyGoneOnRelease` forgives, and
+ * the resulting `cleanupComplete: false` re-armed `#scheduleAbandonedDispatchRetry`
+ * at 1 Hz forever with the slot still held in `abandoning`. Every later sweep
+ * pass then skipped the row at `#abandonedDispatchReasons` — the reaper fenced
+ * out by the cleanup the reaper itself started.
+ *
+ * The fixture is the live measurement: one occupied slot, two agents each
+ * carrying a spawn result, `heldSinceAtMs` 12.66h back against a 4h bound,
+ * `slotHeldSinceAtMs` 14.39h back, seeded under an owner that is gone so the
+ * boot claim is a genuine restart, and one issue queued behind `batchSize: 1`.
+ */
+describe('reclaiming an occupied slot past its deadline (#419)', () => {
+  const HOUR = 60 * 60_000
+  // The shape a 503 from a node that is gone reaches `release` with. NOT the
+  // 404 `agent_not_found` shape — that one is already forgiven, and a fixture
+  // that used it would reap through the pre-existing path and prove nothing.
+  const agentHostUnavailable = () => Object.assign(new Error('agent host unavailable'), {
+    rawCode: 'agent_host_unavailable',
+    statusCode: 503,
+    code: 'unavailable',
+  })
+
+  const seedWedgedSlot = async (root: string, opts: { heldForMs: number }) => {
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const mounted = { [issuePath(419)]: issueFile(419), [issuePath(420)]: issueFile(420) }
+
+    const seed = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient(mounted),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    const decision = await seed.triageIssue(parseLinearIssue(issuePath(419), issueFile(419)))
+    await seed.stop()
+
+    const nowMs = Date.now()
+    const implementer = decision.implementers[0]!
+    const placed = (spec: AgentSpec) => ({
+      name: spec.name,
+      tracked: {
+        spec: { ...spec },
+        // A RESULT, not just a spec: this is the `kind: 'agents'` branch of
+        // `#holdDeadline`, not the never-placed one #303 covers.
+        result: {
+          name: spec.name,
+          sessionRef: `session-${spec.name}`,
+          node: 'sf-mini',
+          locality: 'remote' as const,
+        },
+      },
+    })
+    const wedged: DispatchLifecycle = {
+      runId: 'wedged-419',
+      issue: { ...decision.issue },
+      decision,
+      dryRun: false,
+      phase: 'running',
+      agents: [placed(implementer), placed(decision.reviewer!)],
+      invocationIds: [],
+      heldSinceAtMs: nowMs - opts.heldForMs,
+      slotHeldSinceAtMs: nowMs - 51_807_739,
+      updatedAtMs: nowMs,
+    }
+    const key = dispatchIssueIdentity(decision.issue)
+    // A lease left behind by an owner that is gone. The successor claims it on
+    // boot, which is what makes this a restart rather than a handover.
+    await state().claimDispatchLifecycle('factory-test', key, wedged, 'dead-owner', nowMs, 1)
+    return { state, key, mounted, agentNames: wedged.agents.map((agent) => agent.name) }
+  }
+
+  it('MUST FIRE: reclaims the slot and drains the queue when the ghosts cannot be released', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-419-reclaim-'))
+    // 12.66h held against a 4h bound — the live occupant's own number.
+    const { state, key, mounted, agentNames } = await seedWedgedSlot(root, { heldForMs: 45_578_546 })
+
+    class GhostFleetClient extends RemoteLifecycleFleetClient {
+      override async release(): Promise<void> {
+        throw agentHostUnavailable()
+      }
+    }
+    const fleet = new GhostFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 4 * HOUR, agentlessHoldTimeoutMs: 30 * 60_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      mount: new FakeMountClient(mounted),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+    })
+    try {
+      await factory.start({ mode: 'backfill-and-subscribe' })
+
+      // The durable row leaves the slot-occupying set. `releasing` and not a
+      // terminal phase on purpose: the agents were never torn down, so the row
+      // is retained for a successor to re-drive with a fresh budget.
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+        .toMatchObject({ phase: 'releasing', releaseReason: 'held-past-deadline' }), { timeout: 40_000 })
+      expect(dispatchPhaseOccupiesSlot('releasing')).toBe(false)
+
+      // Reporting the slot free is not reclaiming it. The queued issue actually
+      // dispatching is.
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name))
+        .toEqual(['ar-420-impl-pear', 'ar-420-review']), { timeout: 20_000 })
+      expect(factory.status().dispatchCapacity?.occupants?.map((occupant) => occupant.issue)).toEqual(['AR-420'])
+      // The capacity waiter clears on its own drive, one tick behind the
+      // direct dispatch above — `#saveDispatchLifecycle` wakes it on the
+      // occupancy transition `abandoning` -> `releasing`.
+      await vi.waitFor(() => expect(factory.status().dispatchCapacity?.waiting).toBe(0), { timeout: 15_000 })
+
+      // Fires once for the work unit, not once per retry.
+      expect(factory.status().counters.deadLetteredDurableSlotsFreed).toBe(1)
+      expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1)
+      // The reap must have gone through a release that genuinely FAILED —
+      // otherwise this test would pass on the pre-existing 404 path and prove
+      // nothing about the bound.
+      expect(logger.warn).toHaveBeenCalledWith(
+        `[factory] failed to release ${agentNames[0]} during completion`,
+        expect.objectContaining({ statusCode: 503 }),
+      )
+      expect(logger.error).toHaveBeenCalledWith(
+        '[factory] release retries exhausted; abandoning cleanup for this work unit',
+        expect.objectContaining({ issue: 'AR-419', context: 'abandoned-dispatch' }),
+      )
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 90_000)
+
+  // The same fixture, one field changed: the hold is INSIDE its bound. The
+  // must-fire case above is this test's control — it proves the fixture is
+  // capable of reaping at all, so a quiet pass here is a real must-not-fire
+  // and not a fixture that never armed anything.
+  it('MUST NOT FIRE: leaves a slot held by a live agent inside its deadline alone', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-419-inside-deadline-'))
+    const { state, key, mounted } = await seedWedgedSlot(root, { heldForMs: 60_000 })
+
+    const fleet = new RemoteLifecycleFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 4 * HOUR, agentlessHoldTimeoutMs: 30 * 60_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      mount: new FakeMountClient(mounted),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+    })
+    try {
+      await factory.start({ mode: 'backfill-and-subscribe' })
+      // Comfortably longer than the ten one-second attempts the bound allows,
+      // so "not yet" cannot pass for "never".
+      await new Promise((resolve) => setTimeout(resolve, 15_000))
+
+      expect(await state().getDispatchLifecycle('factory-test', key)).toMatchObject({ phase: 'running' })
+      expect(fleet.releases).toEqual([])
+      expect(fleet.spawns).toEqual([])
+      expect(factory.status().dispatchCapacity?.occupants?.map((occupant) => occupant.issue)).toEqual(['AR-419'])
+      expect(factory.status().counters.deadLetteredDurableSlotsFreed).toBeUndefined()
+      expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBeUndefined()
+      expect(factory.status().counters.abandonedDispatchReleaseRetries).toBeUndefined()
+      expect(factory.status().counters.heldPastDeadlineReleases).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 90_000)
 })
