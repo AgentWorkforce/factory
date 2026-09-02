@@ -211,10 +211,20 @@ jobs:
             # Branch first: it's the earlier signal in the pipeline.
             # --paginate, or this stops seeing new branches past the first 100
             # and reports a false 45-minute failure.
+            #
+            # Every lookup below ends `| sed -n '1p'`, deliberately, and must
+            # not become `| head -1` or regain a `|| true`. sed reads to EOF
+            # instead of closing the pipe on the first line, so it cannot
+            # SIGPIPE the producer -- which is what `|| true` was there to
+            # absorb -- while still letting a real gh failure travel out
+            # through pipefail. With the failure masked, a broken credential or
+            # a 5xx looks identical to "the branch isn't there yet": the canary
+            # then burns the whole window and pages someone for a dispatch
+            # outage that never happened.
             if [ -z "${BRANCH}" ]; then
               BRANCH="$(gh api --paginate "repos/${TARGET_REPO}/branches?per_page=100" \
                 --jq ".[] | select(.name | startswith(\"factory/${NUM}-\")) | .name" \
-                | head -1 || true)"
+                | sed -n '1p')"
             fi
             if [ -n "${BRANCH}" ]; then
               # Branch exists; look for its PR, from the expected author only.
@@ -224,7 +234,7 @@ jobs:
               PR_LINE="$(gh pr list --repo "${TARGET_REPO}" --state all --limit 100 \
                 --json number,headRefName,url,author \
                 --jq ".[] | select(.headRefName == \"${BRANCH}\") | select(.author.login == \"${EXPECTED_PR_AUTHOR}\") | \"\(.number) \(.url)\"" \
-                | head -1 || true)"
+                | sed -n '1p')"
               if [ -n "${PR_LINE}" ]; then
                 PR_NUM="${PR_LINE%% *}"
                 PR_URL="${PR_LINE#* }"
@@ -233,7 +243,7 @@ jobs:
               FOREIGN_PR="$(gh pr list --repo "${TARGET_REPO}" --state all --limit 100 \
                 --json number,headRefName,url,author \
                 --jq ".[] | select(.headRefName == \"${BRANCH}\") | \"\(.url) (author: \(.author.login))\"" \
-                | head -1 || true)"
+                | sed -n '1p')"
             fi
             echo "  waiting: branch=${BRANCH:-(none)} pr=${PR_NUM:-(none)} remaining=${REMAINING}s"
             sleep 60
