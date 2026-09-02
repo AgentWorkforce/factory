@@ -10010,6 +10010,12 @@ export class FactoryLoop implements Factory {
     const reopenedFromTerminal = previousRole === 'done' || previousRole === 'humanReview'
     if (reopenedFromTerminal && role === 'readyForAgent') {
       await this.#clearTerminalRefusals(ref)
+    } else if (role === 'readyForAgent') {
+      // The edge above only repairs a row that went terminal because the work
+      // FINISHED. A row can also go terminal because the DISPATCH gave up, and
+      // that path never touches the surface — so there is no edge to run and
+      // this branch is the only thing that can reach it (#410, #412).
+      await this.#reconcileStaleAbandonedLifecycle(ref)
     }
     // Never erase a remembered terminal role on an intermediate observation.
     // A reopened issue is routinely seen in a non-ready shape first — reopened
@@ -10022,6 +10028,158 @@ export class FactoryLoop implements Factory {
     // (cubic-dev-ai, #375 review).
     if (role === 'done' || role === 'humanReview' || role === 'readyForAgent') {
       await this.#state.recordCanonicalState(this.#workspaceId, canonicalKey, role)
+    }
+  }
+
+  /**
+   * Clear a durable row that says this work unit is finished when the surface
+   * says it is still open and ready (#410, #412).
+   *
+   * `#clearTerminalRefusals` above is armed on a TRANSITION — `done |
+   * humanReview -> readyForAgent` — so it can only ever repair a row that went
+   * terminal because the work COMPLETED and a human then reopened it. A row
+   * also goes terminal when the DISPATCH gives up: a transient live read after
+   * spawn throws `LiveDispatchStateChangedError`, `#dispatch` saves `abandoned`
+   * on that branch, and — deliberately, so the unit is not also retry-latched —
+   * skips `#recordDispatchTerminal`. Nothing on that path writes to GitHub, so
+   * the issue stays open and `factory-ready`, its canonical role never leaves
+   * `readyForAgent`, and the reopen edge can never arm. The attempt gate then
+   * passes (that row is not terminal) and the claim gate refuses instead, which
+   * is why the live signature is `dispatch-failed` / `lifecycle-terminal` and
+   * not `dispatch-terminal`. Refused forever, on an issue nobody closed.
+   *
+   * So reconcile on the DISAGREEMENT rather than on a transition. The surface
+   * is the system of record for whether the work is wanted; a durable row
+   * claiming otherwise, with no surface transition behind it, is stale.
+   *
+   * Six things keep this from trading a stall for a duplicate dispatch — the
+   * strictly worse bug, since a claim belongs to the work unit and a dispatch
+   * gate fails closed:
+   *
+   * 1. `abandoned` only, never `complete`. `complete` has exactly one writer,
+   *    `#finishDurableRelease`, which is reachable only after terminal issue
+   *    writeback was acknowledged. A `complete` row therefore means the work
+   *    really finished, and finished work is never resurrected here — that
+   *    case still belongs to the reopen edge and its human.
+   * 2. Never a rekey alias. `migrationAliasOf` rows are `abandoned` by
+   *    construction and are audit evidence of the #211 rekey, not abandoned
+   *    work; clearing one would delete the evidence and orphan its canonical
+   *    row.
+   * 3. Never a row this process still owns, and never an unconditional delete.
+   *    A live epoch means a dispatch is mid-flight under this key, but that
+   *    check is process-LOCAL and cannot see ownership held by another
+   *    instance. So the removal is a compare-and-delete against the lease this
+   *    method actually observed: if two reconcilers read the same `abandoned`
+   *    row and the first clears it and claims a fresh lifecycle, the second's
+   *    delete finds a different lease and is refused. An unconditional delete
+   *    would instead remove the new owner's dispatch fence and let a third
+   *    claimant take the emptied key — duplicate workers on one work unit,
+   *    which is the exact bug this whole guard list exists to avoid
+   *    (chatgpt-codex-connector P1, #435 review).
+   * 4. The attempt counters are deliberately LEFT ALONE. This is an automatic
+   *    repair with no human behind it, so resetting `attempts` — which is what
+   *    `#clearTerminalRefusals` does for a human reopen — would delete the only
+   *    brake and spin a permanently-failing unit forever. Leaving them means
+   *    `dispatch.maxAttempts` still latches, and the unit settles in
+   *    `dispatch-retry-limit`: a different, honest terminal state that names
+   *    the real problem and that a human reopen can still clear.
+   * 5. Only a SETTLED row. The abandon path makes `abandoned` durably visible
+   *    one write before it latches the attempt counters, so a row read inside
+   *    that window looks exactly like a stale one — guard (6) passes because
+   *    the latch has not landed yet — and another instance could clear and
+   *    reclaim it while the original's `#recordDispatchTerminal` is still in
+   *    flight, latching a unit that is now legitimately dispatching. Rather
+   *    than reorder that path (committing the latch before the terminal save
+   *    would strand a unit whose save then fails, which is the worse trade),
+   *    require the row to have been untouched for a full lease interval. Any
+   *    live cleanup renews its lease well inside that, so an older row is
+   *    settled by construction, and a genuinely stale row is old by definition
+   *    — the repair is delayed by at most one sweep, never lost
+   *    (cubic-dev-ai P1, #435 review).
+   * 6. And because the attempt counters are left alone, a row whose latch is
+   *    ALREADY terminal is left alone too. `#dispatchBlockReason` refuses it
+   *    ahead of the claim gate, so clearing its lifecycle cannot make it
+   *    dispatchable — it would only destroy the abandoned run's durable record
+   *    (its PR receipts, cost and release reason) and then count the deletion
+   *    as a repair, telling an operator something was fixed when nothing was.
+   *    `#abandonStuckDispatch`, `#abandonStaleDurableDispatch` and the
+   *    non-live-state branch of a terminal dispatch failure all produce that
+   *    pairing — terminal attempt latch, abandoned row, issue open and ready.
+   *    Clearing both records is the human reopen's job, because only a human
+   *    resetting `attempts` is safe (cubic-dev-ai P2, #435 review).
+   *
+   * The new failure mode this accepts, stated plainly: a work unit whose
+   * dispatch keeps dying gets `maxAttempts` attempts instead of one before it
+   * latches, so a genuinely broken unit costs one extra placement attempt. That
+   * is the bound being traded for recoverability, and it is finite.
+   *
+   * NEVER THROWS. This is opportunistic repair; enumeration is load-bearing.
+   * The sweep's call site (`#recordCanonicalIssueState` from the ready-issue
+   * loop) is not inside the per-issue try, so a durable read fault raised here
+   * would abort the ENTIRE readiness pass — a transient store blip zeroing out
+   * a whole dispatch cycle, on a DO-backed deployment already observed shedding
+   * with `workspace durable object is busy`. The guarantee lives in this
+   * function rather than at that one call site on purpose: there are already
+   * two callers guarded differently (the sweep is bare, `#handleChange` has an
+   * outer try), so a third would silently reintroduce the abort. A failed read
+   * is simply one more uncertainty, and this method already answers every
+   * uncertainty by leaving the row alone — the next sweep retries for free
+   * (lane-dispatch-e2e-0902 P1, #435 review).
+   */
+  async #reconcileStaleAbandonedLifecycle(ref: IssueRef): Promise<boolean> {
+    if (!this.#usesDurableDispatchLifecycle()) return false
+    const key = safeDispatchLifecycleKey(ref)
+    if (key === undefined) return false
+    // A live epoch is this process's own dispatch fence: see (3) above.
+    if (this.#dispatchLifecycleEpochs.has(key)) return false
+    // Everything below reads or writes durable state, so everything below is
+    // inside the never-throw boundary described above.
+    try {
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+      if (!lifecycle || lifecycle.phase !== 'abandoned') return false
+      if (lifecycle.migrationAliasOf !== undefined) return false
+      // See (5): a row still inside the abandon path's own write window is not
+      // settled, and its attempt latch has not landed yet.
+      if (this.#clock.now() - lifecycle.updatedAtMs < DISPATCH_LIFECYCLE_LEASE_MS) return false
+      // See (6): clearing a row the attempt gate already refuses repairs nothing
+      // and loses the record. Same key every other attempt reader/writer uses.
+      const attempts = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(ref))
+      if (attempts?.terminal) return false
+      // Every save carries the lease forward (`saveDispatchLifecycle` restamps
+      // `next.lease` from the row it fenced against), so an abandoned row always
+      // has one. A row without a lease cannot be compare-and-deleted at all, and
+      // a dispatch gate fails closed: leave it rather than delete it blind.
+      if (!lifecycle.lease) return false
+      if (!await this.#state.clearClaimedDispatchLifecycle(this.#workspaceId, key, lifecycle.lease)) {
+        // The row moved under this read — another reconciler cleared and
+        // reclaimed it. That new lifecycle is the live owner; leave it alone.
+        this.#increment('dispatchTerminalStaleReopenConflicts')
+        return false
+      }
+      this.#increment('dispatchTerminalStaleReopened')
+      this.#logger.info?.('[factory] cleared a terminal dispatch row whose issue is still open and ready', {
+        issue: ref.key,
+        releaseReason: lifecycle.releaseReason,
+      })
+      return true
+    } catch (error) {
+      // Counted, not silent: a store that is persistently too sick to repair
+      // is a real condition, and it must be visible without being fatal.
+      this.#increment('dispatchTerminalStaleReopenFailures')
+      // The diagnostics are themselves best-effort. `NEVER THROWS` has to hold
+      // against an injected logger that throws too, or the contract would be
+      // broken by the one line whose only job is to report that something
+      // broke — and the readiness sweep would abort on a logging fault
+      // (cubic-dev-ai P2, #435 review).
+      try {
+        this.#logger.warn?.('[factory] stale terminal reconcile failed; leaving the row alone', {
+          issue: ref.key,
+          error: describeError(error).errorMessage,
+        })
+      } catch {
+        // Nothing further to report it with.
+      }
+      return false
     }
   }
 
