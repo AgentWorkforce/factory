@@ -4836,6 +4836,25 @@ describe('fleet CLI runtime', () => {
         { labels: ['factory'], title: 'rewritten' },
         { guarded: true },
       )).resolves.toBe(false)
+      // A complete-set PATCH can drop labels too. The safety opt-in is what
+      // made this issue eligible, so a set that omits it must not be admitted
+      // — otherwise the guard would allow silently un-scoping the issue.
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: [] },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: ['bug', 'factory:in-progress'] },
+        { guarded: true },
+      )).resolves.toBe(false)
+      // Casing is the provider's for labels Factory did not author.
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: ['Factory', 'bug'] },
+        { guarded: true },
+      )).resolves.toBe(true)
       const commentBody = 'Factory dispatch'
       await expect(predicate(
         `/github/repos/AgentWorkforce/pear/issues/221/comments/${factoryGithubIssueCommentDraftName(commentBody)}`,
@@ -4861,17 +4880,16 @@ describe('fleet CLI runtime', () => {
         { operation: 'add', labels: ['factory:in-progress'] },
         { guarded: true },
       )).resolves.toBe(true)
-      // This case previously asserted `false`, to force label changes down the
-      // per-label draft path. That path is unroutable — Relayfile's GitHub
-      // adapter has no label resource — so the assertion was protecting a
-      // write that could never land. The guard now admits the complete-set
-      // PATCH, still bounded by: configured repo, open and in-scope issue,
-      // exact keys, non-empty string labels, and at most one Factory claim.
+      // Still rejected, but for a sharper reason than before: the guard now
+      // admits a complete-label-set PATCH (the per-label path it used to force
+      // is unroutable), and this set drops the `factory` safety opt-in that
+      // made the issue eligible. `setStatus` preserves every non-Factory
+      // label, so it never authors a set like this.
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221.json',
         { labels: ['factory:in-progress'] },
         { guarded: true },
-      )).resolves.toBe(true)
+      )).resolves.toBe(false)
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221/labels/factory-33333333-3333-4333-8333-333333333333.json',
         { operation: 'remove', label: 'bug' },

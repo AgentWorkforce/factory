@@ -22442,6 +22442,7 @@ const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =
 const isAllowedFactoryGithubIssueWriteContent = (
   kind: 'issue-update' | 'comment' | 'label-operation',
   content: unknown,
+  requireLabel: string,
 ): boolean => {
   const value = asRecord(content)
   if (!value) return false
@@ -22457,6 +22458,15 @@ const isAllowedFactoryGithubIssueWriteContent = (
       // One write must never assert two contradictory Factory claims.
       const lifecycle = value.labels.filter((label) => githubLifecycleLabelName(label))
       if (lifecycle.length > 1) return false
+      // A complete-set PATCH can drop labels as well as add them, and the
+      // safety opt-in is the label that made this issue eligible at all. A set
+      // that omits it would silently remove the issue from Factory's scope, so
+      // require it to survive. `setStatus` preserves every non-Factory label,
+      // so its own payloads always carry it; nothing legitimate is rejected.
+      const required = requireLabel.trim().toLowerCase()
+      if (required && !value.labels.some((label) => label.trim().toLowerCase() === required)) {
+        return false
+      }
       return value.state === undefined || value.state === 'closed'
     }
     return false
@@ -22501,7 +22511,7 @@ export const isAllowedFactoryGithubDraft = async (
 
   const target = factoryGithubIssueWriteTarget(path)
   if (!target) return false
-  if (!isAllowedFactoryGithubIssueWriteContent(target.kind, content)) return false
+  if (!isAllowedFactoryGithubIssueWriteContent(target.kind, content, config.safety.requireLabel)) return false
   if (target.kind === 'comment') {
     const body = asRecord(content)?.body
     const draftName = path.slice(path.lastIndexOf('/') + 1)
