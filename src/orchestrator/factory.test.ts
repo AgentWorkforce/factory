@@ -33441,6 +33441,12 @@ describe('a deterministic PR publication must not pin the batch slot forever (#4
       await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 10_000, interval: 5 })
 
       expect(factory.status().counters.dispatchPublishRetriesExhausted).toBe(1)
+      // The exact budget, not merely "some bound fired" (#440 review,
+      // CodeRabbit). One uncharged attempt from the agent-exit handler, then
+      // DISPATCH_PUBLISH_MAX_ATTEMPTS charged retries through the drive's
+      // `publishing` branch, then the attempt that tips it over: 1 + 10 + 1.
+      // A budget quietly changed to 5 or 20 fails here rather than passing.
+      expect(attempts).toBe(12)
       expect(errors.map(([message]) => message)).toContain(
         '[factory] pull request publication retries exhausted; abandoning the dispatch',
       )
