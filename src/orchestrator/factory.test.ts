@@ -32,10 +32,11 @@ import { LatePlacementReleasedError, changeEventPath, defaultMergeGate } from '.
 import type { GhRunner } from '../github'
 import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
 import { RelayfileOperationTimeoutError } from '../mount/relayfile-operation-timeout'
-import type { AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubIssueCloseWriteResult, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { AgentSpec, AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubIssueCloseWriteResult, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
+import { dispatchPhaseOccupiesSlot } from '../state/dispatch-lifecycle-slot'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import { FileStateStore } from '../state/file-state-store'
@@ -1665,6 +1666,35 @@ class LocalLifecycleFleetClient extends FakeFleetClient {
 class DurableSpawnFailingFleetClient extends SpawnFailingFleetClient {
   override readonly durableOwnership = true
 }
+
+/**
+ * A mount whose read of one path fails once, and only after that issue's own
+ * agents have spawned — so the failure lands on the post-spawn live read
+ * (`factory.ts:5793`) rather than on discovery or the pre-dispatch read.
+ *
+ * Keyed on THIS issue's spawns for the same reason `ShedPostSpawnReadMount`
+ * is: a global counter would make every later issue fail before it had spawned
+ * anything, which is a different bug wearing this one's costume.
+ */
+class PostSpawnReadFailureMount extends FakeMountClient {
+  readonly failed = new Set<string>()
+
+  constructor(files: Record<string, unknown>, readonly spawnedFor: (path: string) => number) {
+    super(files)
+  }
+
+  override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+    if (!this.failed.has(path) && this.spawnedFor(path) > 0) {
+      this.failed.add(path)
+      this.reads.push(path)
+      // A generic read fault, not an overload: `#readIssue` swallows this and
+      // returns `undefined`, which is what makes the live issue read as gone.
+      throw new Error(`Transient mount read failure for ${path}`)
+    }
+    return await super.readFile(path)
+  }
+}
+
 
 class TransientRemoteReleaseFleetClient extends RemoteLifecycleFleetClient {
   failReleaseFor?: string
@@ -3609,15 +3639,11 @@ describe('FactoryLoop', () => {
         author: 'app',
       }))
       const postIssueComment = vi.fn(async () => undefined)
-      const ensureRepositoryLabel = vi.fn(async () => undefined)
-      const mutateIssueLabel = vi.fn(async () => undefined)
       const updateIssue = vi.fn(async () => undefined)
       const githubWrite: GithubConnectionWrite = {
         publishPullRequest,
         closePullRequest: async () => undefined,
         postIssueComment,
-        ensureRepositoryLabel,
-        mutateIssueLabel,
         updateIssue,
       }
       const mount = new FakeMountClient({
@@ -3639,10 +3665,9 @@ describe('FactoryLoop', () => {
 
       await factory.runOnce()
 
-      // The claim rides the routed issue PATCH: Relayfile's GitHub adapter
-      // routes no label resource, so a per-label draft is unroutable.
-      expect(ensureRepositoryLabel).not.toHaveBeenCalled()
-      expect(mutateIssueLabel).not.toHaveBeenCalled()
+      // The claim rides the routed issue PATCH. Relayfile's GitHub adapter
+      // routes no label resource, so `GithubConnectionWrite` no longer has a
+      // per-label writer to call at all (#431).
       expect(updateIssue).toHaveBeenCalledWith({
         repo: 'AgentWorkforce/pear',
         number,
@@ -3691,16 +3716,12 @@ describe('FactoryLoop', () => {
       const path = githubIssuePath('AgentWorkforce', 'pear', number)
       const appPostIssueComment = vi.fn(async () => undefined)
       const appUpdateIssue = vi.fn(async () => undefined)
-      const appEnsureRepositoryLabel = vi.fn(async () => undefined)
-      const appMutateIssueLabel = vi.fn(async () => ({ receiptId: 'app-label-receipt' }))
       const mount = new FakeMountClient({
         [path]: githubIssueFile(number, { labels: ['factory'] }),
       }, {
         publishPullRequest: async () => { throw new Error('unexpected publish') },
         closePullRequest: async () => undefined,
         postIssueComment: appPostIssueComment,
-        ensureRepositoryLabel: appEnsureRepositoryLabel,
-        mutateIssueLabel: appMutateIssueLabel,
         updateIssue: appUpdateIssue,
       })
       mount.setSubRoot('/linear/issues', 'absent')
@@ -3714,8 +3735,6 @@ describe('FactoryLoop', () => {
 
       await expect(readFile(ghLogPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
       // The claim is one routed issue PATCH; the adapter routes no label path.
-      expect(appEnsureRepositoryLabel).not.toHaveBeenCalled()
-      expect(appMutateIssueLabel).not.toHaveBeenCalled()
       expect(appUpdateIssue).toHaveBeenCalledWith(expect.objectContaining({
         repo: 'AgentWorkforce/pear',
         number,
@@ -8281,6 +8300,359 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  // #410 / #412 MUST-FIRE. The reopen edge #334 added is armed on a TRANSITION
+  // (`done | humanReview -> readyForAgent`), so it only ever repairs a row that
+  // went terminal because the work FINISHED. A row also goes terminal when the
+  // DISPATCH gives up: the post-spawn live read throws
+  // `LiveDispatchStateChangedError`, `factory.ts` saves `abandoned` on that
+  // branch and deliberately skips `#recordDispatchTerminal`. Nothing there
+  // touches GitHub, so the issue stays open and ready, the canonical role never
+  // leaves `readyForAgent`, and the edge can never arm. The attempt gate then
+  // passes and the CLAIM gate refuses instead — `dispatch-failed` /
+  // `lifecycle-terminal`, the exact live signature — forever.
+  it('re-dispatches a GitHub-native issue whose durable row went terminal while its surface stayed open and ready', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 394)
+    const fleet = new RemoteLifecycleFleetClient()
+    const mount = new PostSpawnReadFailureMount(
+      { [path]: githubIssueFile(394, { labels: ['factory'] }) },
+      (readPath) => readPath === path ? fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-394-')).length : 0,
+    )
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const githubWriteback = new RecordingGithubWriteback()
+    const clock = new ManualClock()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      clock,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    const failed = await factory.runOnce()
+    expect(failed.dispatched).toEqual([])
+    // The durable row is terminal...
+    await vi.waitFor(async () => {
+      const lifecycles = await stateStore.listDispatchLifecycles('factory-test')
+      expect(lifecycles.map(([, lifecycle]) => lifecycle.phase)).toEqual(['abandoned'])
+    })
+    // ...and the attempt row is NOT, which is what makes the next refusal come
+    // from the claim gate rather than from `dispatch-terminal`.
+    await expect(stateStore.getDispatchAttempts('factory-test', issueKey({ uuid: 'AgentWorkforce/pear#394', key: '394', path })))
+      .resolves.toMatchObject({ terminal: false })
+    // The surface never moved: still open, still ready, no status writeback.
+    expect(githubWriteback.statuses).toEqual([])
+    expect((await mount.readFile(path)).content).toEqual(githubIssueFile(394, { labels: ['factory'] }))
+
+    // A freshly-abandoned row is NOT repaired: it may still be inside the
+    // abandon path's own write window, where the attempt latch has not landed
+    // yet (guard 5). Same sweep, same surface, and it is still refused.
+    const tooSoon = await factory.runOnce()
+    expect(tooSoon.dispatched).toEqual([])
+    expect(tooSoon.skipped).toContainEqual(
+      expect.objectContaining({ code: 'dispatch-failed', failureCode: 'lifecycle-terminal' }),
+    )
+    expect(factory.status().counters.dispatchTerminalStaleReopened).toBeUndefined()
+
+    // Once the row has been untouched for a full lease interval it is settled
+    // by construction — any live cleanup would have renewed well inside that.
+    // `DISPATCH_LIFECYCLE_LEASE_MS`, factory.ts:456.
+    clock.advance(5 * 60_000)
+
+    // The repair: the surface says this work is open and ready, so the stale
+    // row must stop refusing it.
+    const recovered = await factory.runOnce()
+    expect(recovered.skipped).toEqual([])
+    expect(recovered.dispatched.map((result) => result.issue.key)).toEqual(['394'])
+    expect(factory.status().counters.dispatchTerminalStaleReopened).toBe(1)
+    await factory.stop()
+  })
+
+  // #410 / #412 MUST-NOT-FIRE, and the one that matters: a fix that
+  // re-dispatches finished work is worse than the stall it cures. This unit
+  // genuinely completed — terminal writeback applied, `complete` row written —
+  // and the GitHub issue is open and ready again ONLY because a merged PR has
+  // not closed it yet. `complete` has one writer and it is reachable only after
+  // acknowledged writeback, so the surface disagreement here is not evidence of
+  // a stale row and must not clear one.
+  //
+  // Honest note on what this isolates. Completion sets BOTH the `complete`
+  // lifecycle phase and, via `#recordDispatchTerminal`, the terminal attempt
+  // latch — so guards (1) and (5) each independently refuse this unit, and
+  // ablating (1) alone no longer flips this test. It is an end-to-end
+  // must-not-fire, not an isolation of (1); (5) has its own test above. Guard
+  // (1) is kept because it states the semantic invariant — finished work is
+  // never resurrected — and would still hold if the attempt latch were ever
+  // cleared independently of the lifecycle row.
+  it('does not resurrect a completed GitHub-native unit whose issue is still open and ready', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 395)
+    const mount = new FakeMountClient({ [path]: githubIssueFile(395, { labels: ['factory'] }) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.runOnce()
+    fleet.emitAgentExit('ar-395-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.humanReview).toBe(1))
+    await vi.waitFor(async () => {
+      const lifecycles = await stateStore.listDispatchLifecycles('factory-test')
+      expect(lifecycles.map(([, lifecycle]) => lifecycle.phase)).toEqual(['complete'])
+    })
+
+    // The issue is left exactly as it started — open, `factory`, ready — so the
+    // surface and the durable row disagree in precisely the shape the must-fire
+    // case repairs. The phase is the discriminator, and it says finished.
+    const afterCompletion = await factory.runOnce()
+
+    // The load-bearing assertion: the completion record SURVIVES. It carries
+    // the run's cost, its PR receipts and its release reason, and the naive fix
+    // — clear any terminal row the surface disagrees with — deletes it.
+    await expect(stateStore.listDispatchLifecycles('factory-test'))
+      .resolves.toMatchObject([[
+        expect.any(String),
+        expect.objectContaining({ phase: 'complete', releaseReason: 'issue-human-review' }),
+      ]])
+    // And the attempt latch a completion sets (`#recordDispatchTerminal`, on
+    // the writeback path) is untouched too. It is a second, independent guard
+    // on finished work, which is why clearing only the lifecycle row is the
+    // narrow change: for a COMPLETED unit this reconciler has nothing to clear,
+    // and even if it did the attempt gate still refuses ahead of the claim gate.
+    await expect(stateStore.getDispatchAttempts(
+      'factory-test',
+      issueKey({ uuid: 'AgentWorkforce/pear#395', key: '395', path }),
+    )).resolves.toMatchObject({ terminal: true })
+
+    expect(afterCompletion.dispatched).toEqual([])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-395-impl-pear', 'ar-395-review-pear'])
+    expect(factory.status().counters.dispatchTerminalStaleReopened).toBeUndefined()
+    await factory.stop()
+  })
+
+  // #435 review, cubic-dev-ai P2. An abandoned row whose ATTEMPT latch is also
+  // terminal is refused by `#dispatchBlockReason` ahead of the claim gate, so
+  // clearing its lifecycle cannot make it dispatchable. Doing it anyway would
+  // destroy the abandoned run's durable record and then count the deletion as a
+  // repair — telling an operator something was fixed when nothing was. This is
+  // a real pairing: `maxAttempts: 1` makes the FIRST spawn failure latch the
+  // attempt row and abandon the lifecycle in one pass, with the issue still
+  // open and ready throughout.
+  it('leaves an abandoned row alone when the attempt latch already refuses the issue', async () => {
+    const path = issuePath(397)
+    const mount = new FakeMountClient({ [path]: issueFile(397) })
+    const fleet = new DurableSpawnFailingFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(
+      config({ dispatch: { errorCooldownMs: 0, maxAttempts: 1 } }),
+      { mount, fleet, stateStore, triage: new StaticTriage() },
+    )
+
+    await factory.runOnce()
+    const attemptKey = 'AR-397'
+    await vi.waitFor(async () => {
+      const lifecycles = await stateStore.listDispatchLifecycles('factory-test')
+      expect(lifecycles.map(([, lifecycle]) => lifecycle.phase)).toEqual(['abandoned'])
+      await expect(stateStore.getDispatchAttempts('factory-test', attemptKey))
+        .resolves.toMatchObject({ terminal: true })
+    })
+
+    // The issue is open and ready, so the reconciler is reached — and declines.
+    const next = await factory.runOnce()
+
+    // The abandoned row survives: deleting it would repair nothing.
+    await expect(stateStore.listDispatchLifecycles('factory-test'))
+      .resolves.toMatchObject([[expect.any(String), expect.objectContaining({ phase: 'abandoned' })]])
+    // And no repair is claimed, so the counter does not lie to an operator.
+    expect(factory.status().counters.dispatchTerminalStaleReopened).toBeUndefined()
+    // The unit is refused by the ATTEMPT gate, which is the honest terminal
+    // state a human reopen still clears — not by the claim gate.
+    expect(next.skipped).toContainEqual(
+      expect.objectContaining({ code: 'dispatch-terminal', reason: 'dispatch already terminal' }),
+    )
+    await factory.stop()
+  })
+
+  // #435 review, lane-dispatch-e2e-0902 P1. The reconcile is opportunistic
+  // repair; enumeration is load-bearing. The sweep calls
+  // `#recordCanonicalIssueState` from the ready-issue loop OUTSIDE that loop's
+  // per-issue try, so a durable read fault raised inside the reconcile would
+  // abort the ENTIRE readiness pass — one transient store blip zeroing a whole
+  // dispatch cycle. The error shape is the one observed on the live DO-backed
+  // deployment, which is already shedding, so this is not hypothetical.
+  it('completes the readiness sweep when the stale-row reconcile hits a busy durable store', async () => {
+    const busy = 'workspace durable object is busy; retry after the advertised delay'
+
+    // Scoped to the RECONCILIATION read only. `#dispatchUnlocked` also calls
+    // `getDispatchLifecycle` before it claims (`factory.ts:5497`), so a store
+    // that throws on every read blocks ordinary dispatch too — and then
+    // `report.pulled` passing would prove enumeration survived while saying
+    // nothing about whether dispatch still worked (coderabbitai and
+    // cubic-dev-ai, independently, #435 review).
+    //
+    // The hook is causal rather than a call count: `#recordCanonicalIssueState`
+    // reads `getCanonicalState` and then, for a ready issue, the reconcile
+    // reads `getDispatchLifecycle`. The sweep awaits one issue at a time, so
+    // the first lifecycle read after a canonical read is exactly the reconcile's.
+    class BusyReconcileReadStore extends InMemoryStateStore {
+      throws = 0
+      #reconcileNext = false
+
+      override async getCanonicalState(workspaceId: string, key: string) {
+        const role = await super.getCanonicalState(workspaceId, key)
+        this.#reconcileNext = true
+        return role
+      }
+
+      override async getDispatchLifecycle(workspaceId: string, key: string) {
+        if (this.#reconcileNext) {
+          this.#reconcileNext = false
+          this.throws += 1
+          throw new Error(busy)
+        }
+        return await super.getDispatchLifecycle(workspaceId, key)
+      }
+    }
+
+    const paths = {
+      [githubIssuePath('AgentWorkforce', 'pear', 398)]: githubIssueFile(398, { labels: ['factory'] }),
+      [githubIssuePath('AgentWorkforce', 'pear', 399)]: githubIssueFile(399, { labels: ['factory'] }),
+    }
+    const mount = new FakeMountClient(paths)
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new BusyReconcileReadStore({ batchSize: 2 })
+    const warnings: Array<{ message: string }> = []
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      logger: { warn: (message: string) => warnings.push({ message }) },
+    })
+
+    // The sweep must COMPLETE, enumerate, AND still dispatch. Asserting
+    // `dispatched` is the point: enumeration surviving is worth little if the
+    // repair fault silently cost the work the sweep exists to do.
+    const report = await factory.runOnce()
+    expect(stateStore.throws).toBeGreaterThan(0)
+    expect(report.pulled.map((issue) => issue.key).sort()).toEqual(['398', '399'])
+    expect(report.dispatched.map((result) => result.issue.key).sort()).toEqual(['398', '399'])
+
+    // The repair failure is counted, not silent — a store too sick to repair is
+    // a real condition that must be visible without being fatal.
+    expect(factory.status().counters.dispatchTerminalStaleReopenFailures).toBeGreaterThan(0)
+    expect(warnings.some((warning) => warning.message.includes('stale terminal reconcile failed'))).toBe(true)
+    // And nothing was repaired on a read that never succeeded.
+    expect(factory.status().counters.dispatchTerminalStaleReopened).toBeUndefined()
+    await factory.stop()
+  })
+
+  // #435 review, chatgpt-codex-connector P1. The stale-row clear must be a
+  // compare-and-delete, not an unconditional one. The epoch guard in
+  // `#reconcileStaleAbandonedLifecycle` is process-LOCAL and cannot see a
+  // lifecycle another Factory instance owns, so two reconcilers can read the
+  // same `abandoned` row: the first clears it and claims a fresh lifecycle, and
+  // the second's delete — acting on its stale read — would remove the NEW
+  // owner's dispatch fence. A third claimant then takes the emptied key and two
+  // agent sets run one work unit. This store injects exactly that interleaving:
+  // the row is reclaimed under a new lease between the read and the delete.
+  it('refuses to clear a stale terminal row that was reclaimed under a new lease', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 396)
+    class ReclaimBetweenReadAndDeleteStore extends InMemoryStateStore {
+      reclaimed = false
+      refusedClears = 0
+      racedKey?: string
+      reclaimedLease: DispatchLifecycle['lease']
+
+      override async getDispatchLifecycle(workspaceId: string, lifecycleKey: string) {
+        const lifecycle = await super.getDispatchLifecycle(workspaceId, lifecycleKey)
+        // The other instance wins the race *after* this read: it cleared the
+        // abandoned row and claimed a live one. Driven through the real claim
+        // path rather than hand-seeded, so the lease is a lease the store
+        // actually issued to a different owner.
+        if (lifecycle?.phase === 'abandoned' && !this.reclaimed) {
+          this.racedKey = lifecycleKey
+          this.reclaimed = true
+          await super.clearDispatchLifecycle(workspaceId, lifecycleKey)
+          // A fresh claim seeds without the abandoned row's lease; carrying it
+          // would make the store read the seed as owned by someone else.
+          const { lease: _abandonedLease, ...seed } = lifecycle
+          const claim = await super.claimDispatchLifecycle(
+            workspaceId,
+            lifecycleKey,
+            { ...seed, phase: 'dispatching' },
+            'another-factory-instance',
+            Date.now(),
+            600_000,
+          )
+          this.reclaimedLease = claim.lease
+        }
+        return lifecycle
+      }
+
+      override async clearClaimedDispatchLifecycle(
+        workspaceId: string,
+        lifecycleKey: string,
+        expectedLease: NonNullable<DispatchLifecycle['lease']>,
+      ) {
+        const cleared = await super.clearClaimedDispatchLifecycle(workspaceId, lifecycleKey, expectedLease)
+        if (!cleared) this.refusedClears += 1
+        return cleared
+      }
+    }
+
+    const fleet = new RemoteLifecycleFleetClient()
+    const mount = new PostSpawnReadFailureMount(
+      { [path]: githubIssueFile(396, { labels: ['factory'] }) },
+      (readPath) => readPath === path ? fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-396-')).length : 0,
+    )
+    const stateStore = new ReclaimBetweenReadAndDeleteStore({ batchSize: 2 })
+    const clock = new ManualClock()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      clock,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    // Drive the real construction path to a genuinely abandoned row first.
+    await factory.runOnce()
+    await vi.waitFor(async () => {
+      const lifecycles = await stateStore.listDispatchLifecycles('factory-test')
+      expect(lifecycles.map(([, lifecycle]) => lifecycle.phase)).toEqual(['abandoned'])
+    })
+
+    // Past the settle window (guard 5), so the reconciler reaches the clear.
+    clock.advance(5 * 60_000)
+
+    // The next sweep reads that row and races the other instance's reclaim.
+    await factory.runOnce()
+
+    expect(stateStore.reclaimed).toBe(true)
+    expect(stateStore.racedKey).toBeDefined()
+    expect(stateStore.reclaimedLease).toBeDefined()
+    // The load-bearing assertion: the OTHER owner's live lifecycle survives.
+    // An unconditional delete removes it, leaving the key empty while that
+    // owner's agents are mid-spawn — which is what lets a third claimant take
+    // the key and run a second agent set on one work unit.
+    await expect(stateStore.getDispatchLifecycle('factory-test', stateStore.racedKey!))
+      .resolves.toMatchObject({ lease: { owner: 'another-factory-instance' } })
+    // And it survived because the compare-and-delete was attempted and refused,
+    // not because the clear was never reached.
+    expect(stateStore.refusedClears).toBeGreaterThan(0)
+    expect(factory.status().counters.dispatchTerminalStaleReopened).toBeUndefined()
+    expect(factory.status().counters.dispatchTerminalStaleReopenConflicts).toBe(1)
+    await factory.stop()
+  })
+
   // #334 deliverable 2: the canonical-state key is the work unit, so a role
   // observed through one surface is visible to the other. `issueStateKey` is
   // surface scoped — `AR-448` for the Linear mirror, `448:<uuid>:<path>` for
@@ -11045,8 +11417,6 @@ describe('FactoryLoop', () => {
       },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => undefined,
       updateIssue: async () => undefined,
     }
     const mount = new ConfirmingMount({
@@ -13414,8 +13784,6 @@ describe('FactoryLoop', () => {
         commentWriteStarted.resolve()
         await commentWriteGate.promise
       },
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => { throw new Error('the adapter routes no label path') },
       // The status claim is a replace PATCH of the whole label set, so the
       // fake provider derives its status from the set it is handed.
       updateIssue: async ({ labels }) => {
@@ -20164,8 +20532,6 @@ describe('FactoryLoop', () => {
       publishPullRequest: async () => { throw new Error('unexpected publish') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => undefined,
       updateIssue: async () => undefined,
     })
 
@@ -32564,6 +32930,12 @@ describe('completion release retry budget (#379)', () => {
     // and its local branch. Every caller of that method is a failed release:
     // the three inside `#finishDurableRelease`, and `#completeIssue`'s catch
     // once `releaseReasonForRetry` is set.
+    //
+    // The abandonment path bounds its failed teardowns with a budget of its own
+    // (`#abandonmentTeardownMayRetry`, #419) rather than this one, because it
+    // finishes the work unit terminally instead of retaining it for a
+    // successor — so it must not inherit the lease-relinquishing re-entry
+    // contract these two call sites carry.
     const callSites = [...source.matchAll(/!this\.#chargeReleaseAttempt\(/gu)]
     expect(callSites).toHaveLength(2)
 
@@ -33358,6 +33730,237 @@ describe('merge gate identity selection', () => {
     expect(result.merged).toBe(true)
     expect(calls).toHaveLength(1)
   })
+})
+
+/**
+ * #419: an occupied batch slot whose placed agents no longer exist, past
+ * `agentHoldTimeoutMs`, must actually be reclaimed — not merely reported.
+ *
+ * The held-agent reaper was never the missing piece: it fires, classifies the
+ * row correctly and calls `#abandonStuckDispatch`. What it could not do was
+ * FINISH. `#abandonStuckDispatch` releases every tracked agent when the reason
+ * is `held-past-deadline`, a placed agent whose host is gone answers `release`
+ * with a 503 rather than the 404 `isAgentAlreadyGoneOnRelease` forgives, and
+ * the resulting `cleanupComplete: false` re-armed `#scheduleAbandonedDispatchRetry`
+ * at 1 Hz forever with the slot still held in `abandoning`. Every later sweep
+ * pass then skipped the row at `#abandonedDispatchReasons` — the reaper fenced
+ * out by the cleanup the reaper itself started.
+ *
+ * The fixture is the live measurement: one occupied slot, two agents each
+ * carrying a spawn result, `heldSinceAtMs` 12.66h back against a 4h bound,
+ * `slotHeldSinceAtMs` 14.39h back, seeded under an owner that is gone so the
+ * boot claim is a genuine restart, and one issue queued behind `batchSize: 1`.
+ */
+describe('reclaiming an occupied slot past its deadline (#419)', () => {
+  const HOUR = 60 * 60_000
+  // Test-only retry cadence, as the #379 suite uses. The BOUND is under test,
+  // not the wall clock it takes to reach.
+  const RETRY_MS = 25
+  // The shape a 503 from a node that is gone reaches `release` with. NOT the
+  // 404 `agent_not_found` shape — that one is already forgiven, and a fixture
+  // that used it would reap through the pre-existing path and prove nothing.
+  const agentHostUnavailable = () => Object.assign(new Error('agent host unavailable'), {
+    rawCode: 'agent_host_unavailable',
+    statusCode: 503,
+    code: 'unavailable',
+  })
+
+  const seedWedgedSlot = async (root: string, opts: { heldForMs: number }) => {
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const mounted = { [issuePath(419)]: issueFile(419), [issuePath(420)]: issueFile(420) }
+
+    const seed = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient(mounted),
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore: state(),
+      triage: new StaticTriage(),
+    })
+    const decision = await seed.triageIssue(parseLinearIssue(issuePath(419), issueFile(419)))
+    await seed.stop()
+
+    const nowMs = Date.now()
+    const implementer = decision.implementers[0]!
+    const placed = (spec: AgentSpec) => ({
+      name: spec.name,
+      tracked: {
+        spec: { ...spec },
+        // A RESULT, not just a spec: this is the `kind: 'agents'` branch of
+        // `#holdDeadline`, not the never-placed one #303 covers.
+        result: {
+          name: spec.name,
+          sessionRef: `session-${spec.name}`,
+          node: 'sf-mini',
+          locality: 'remote' as const,
+        },
+      },
+    })
+    const wedged: DispatchLifecycle = {
+      runId: 'wedged-419',
+      issue: { ...decision.issue },
+      decision,
+      dryRun: false,
+      phase: 'running',
+      agents: [placed(implementer), placed(decision.reviewer!)],
+      invocationIds: [],
+      heldSinceAtMs: nowMs - opts.heldForMs,
+      slotHeldSinceAtMs: nowMs - 51_807_739,
+      updatedAtMs: nowMs,
+    }
+    const key = dispatchIssueIdentity(decision.issue)
+    // A lease left behind by an owner that is gone. The successor claims it on
+    // boot, which is what makes this a restart rather than a handover.
+    await state().claimDispatchLifecycle('factory-test', key, wedged, 'dead-owner', nowMs, 1)
+    return { state, key, mounted, agentNames: wedged.agents.map((agent) => agent.name) }
+  }
+
+  it('MUST FIRE: reclaims the slot and drains the queue when the ghosts cannot be released', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-419-reclaim-'))
+    // 12.66h held against a 4h bound — the live occupant's own number.
+    const { state, key, mounted } = await seedWedgedSlot(root, { heldForMs: 45_578_546 })
+
+    // Deliberately PARTIAL: the implementer's release succeeds and the
+    // reviewer's does not. `cleanupComplete` is false either way, but only
+    // this shape can tell a correct `unreleasedAgents` list from one that
+    // names every tracked agent.
+    class GhostFleetClient extends RemoteLifecycleFleetClient {
+      // The failed calls are invisible in `releases`, which only records the
+      // ones that succeeded — so count them here, or a regression that
+      // dead-letters after a single attempt still passes (#429 review, cubic).
+      readonly releaseFailures: string[] = []
+
+      override async release(name: string, reason?: string): Promise<void> {
+        if (name.endsWith('-review')) {
+          this.releaseFailures.push(name)
+          throw agentHostUnavailable()
+        }
+        await super.release(name, reason)
+      }
+    }
+    const fleet = new GhostFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 4 * HOUR, agentlessHoldTimeoutMs: 30 * 60_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      mount: new FakeMountClient(mounted),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+      // The ten-attempt bound is what is under test, not how long ten
+      // attempts take. At the production 1 Hz this test spent twelve seconds
+      // sleeping, and wall clock in this suite is not free — the 5s default
+      // `testTimeout` makes unrelated files flake under load.
+      dispatchLifecycleRetryMs: RETRY_MS,
+    })
+    try {
+      await factory.start({ mode: 'backfill-and-subscribe' })
+
+      // The abandonment finishes on its own terminal path. `abandoned`, not
+      // `releasing`: a `releasing` row is re-driven by `#finishDurableRelease`,
+      // which terminalizes as `complete` and emits `issue-done` — reporting a
+      // dispatch that timed out as a successful completion.
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
+        .toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 20_000 })
+      expect(dispatchPhaseOccupiesSlot('abandoned')).toBe(false)
+
+      // Reporting the slot free is not reclaiming it. The queued issue actually
+      // dispatching is.
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name))
+        .toEqual(['ar-420-impl-pear', 'ar-420-review']), { timeout: 15_000 })
+      expect(factory.status().dispatchCapacity?.occupants?.map((occupant) => occupant.issue)).toEqual(['AR-420'])
+      // The capacity waiter clears on its own drive, one tick behind the
+      // direct dispatch above — `#saveDispatchLifecycle` wakes it on the
+      // occupancy transition `abandoning` -> `abandoned`.
+      await vi.waitFor(() => expect(factory.status().dispatchCapacity?.waiting).toBe(0), { timeout: 15_000 })
+
+      // Fires once for the work unit, not once per retry.
+      expect(factory.status().counters.abandonedDispatchTeardownDeadLettered).toBe(1)
+      // #379's budget is NOT what bounded this — the abandonment carries its
+      // own, precisely so it does not inherit that one's retain-for-successor
+      // contract.
+      expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBeUndefined()
+      // The reap must have gone through a release that genuinely FAILED —
+      // otherwise this test would pass on the pre-existing 404 path and prove
+      // nothing about the bound.
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[factory] failed to release ar-419-review during completion',
+        expect.objectContaining({ statusCode: 503 }),
+      )
+      expect(fleet.releases).toContainEqual({ name: 'ar-419-impl', reason: 'held-past-deadline' })
+      // The budget was really spent, and spent exactly once: ten teardown
+      // passes the bound allows, plus the eleventh that exhausts it. Without
+      // this a regression that dead-lettered after a single attempt would
+      // still satisfy every assertion above (#429 review, cubic P2), and one
+      // that kept retrying past the bound would overshoot it.
+      expect(fleet.releaseFailures).toHaveLength(11)
+      expect(logger.error).toHaveBeenCalledWith(
+        '[factory] abandonment teardown retries exhausted; freeing the batch slot anyway',
+        expect.objectContaining({
+          issue: 'AR-419',
+          reason: 'held-past-deadline',
+          attempts: 10,
+          maxAttempts: 10,
+          // ONLY the agent that failed. The implementer released, and naming
+          // it here would send an operator after a worker that already
+          // terminated cleanly.
+          unreleasedAgents: ['ar-419-review'],
+        }),
+      )
+      // The issue must NOT be reported as done. `issue-done` is what
+      // `#finishDurableRelease` would have emitted had the row been handed to
+      // the completion path instead (#429 review, codex P1).
+      expect(factory.status().counters.done).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 90_000)
+
+  // The same fixture, one field changed: the hold is INSIDE its bound. The
+  // must-fire case above is this test's control — it proves the fixture is
+  // capable of reaping at all, so a quiet pass here is a real must-not-fire
+  // and not a fixture that never armed anything.
+  it('MUST NOT FIRE: leaves a slot held by a live agent inside its deadline alone', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-419-inside-deadline-'))
+    const { state, key, mounted } = await seedWedgedSlot(root, { heldForMs: 60_000 })
+
+    const fleet = new RemoteLifecycleFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 4 * HOUR, agentlessHoldTimeoutMs: 30 * 60_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      mount: new FakeMountClient(mounted),
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      logger,
+      dispatchLifecycleRetryMs: RETRY_MS,
+    })
+    try {
+      await factory.start({ mode: 'backfill-and-subscribe' })
+      // Several sweep ticks (the held-deadline sweep re-arms at 1 Hz) and far
+      // more than the ten retry intervals the bound allows, so "not yet"
+      // cannot pass for "never".
+      await new Promise((resolve) => setTimeout(resolve, 4_000))
+
+      expect(await state().getDispatchLifecycle('factory-test', key)).toMatchObject({ phase: 'running' })
+      expect(fleet.releases).toEqual([])
+      expect(fleet.spawns).toEqual([])
+      expect(factory.status().dispatchCapacity?.occupants?.map((occupant) => occupant.issue)).toEqual(['AR-419'])
+      expect(factory.status().counters.abandonedDispatchTeardownDeadLettered).toBeUndefined()
+      expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBeUndefined()
+      expect(factory.status().counters.abandonedDispatchReleaseRetries).toBeUndefined()
+      expect(factory.status().counters.heldPastDeadlineReleases).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 90_000)
 })
 
 /**
