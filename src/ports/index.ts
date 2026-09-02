@@ -7,7 +7,6 @@ export type {
   FactoryIntegrationProvider,
   GithubConnectionIssue,
   GithubConnectionIssueUpdateInput,
-  GithubConnectionMutationReceipt,
   GithubConnectionRead,
   GithubConnectionWrite,
   GithubIssueLookup,

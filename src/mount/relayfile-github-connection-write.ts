@@ -1,15 +1,11 @@
 import { execFile } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
 import { promisify } from 'node:util'
 
-import {
-  factoryGithubIssueCommentDraftName,
-  factoryGithubOperationDraftName,
-} from '../github/writeback-paths'
+import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
+import { assertRoutedGithubWritebackPath } from '../github/writeback-routes'
 import type {
   GithubConnectionIssueUpdateInput,
   GithubIssueLookup,
-  GithubConnectionMutationReceipt,
   GithubConnectionWrite,
   GithubPublishPullRequestInput,
   GithubPublishPullRequestResult,
@@ -28,7 +24,6 @@ export interface RelayfileGithubConnectionWriteConfig {
   gitRunner?: GitCommandRunner
   receiptReadAttempts?: number
   receiptReadDelayMs?: number
-  operationIdFactory?: () => string
 }
 
 /**
@@ -41,7 +36,6 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
   readonly #git: GitCommandRunner
   readonly #receiptReadAttempts: number
   readonly #receiptReadDelayMs: number
-  readonly #operationIdFactory: () => string
   readonly #writesByPath = new Map<string, Promise<string | undefined>>()
 
   constructor(config: RelayfileGithubConnectionWriteConfig) {
@@ -49,7 +43,6 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     this.#git = config.gitRunner ?? defaultGitRunner
     this.#receiptReadAttempts = positiveInteger(config.receiptReadAttempts) ?? RECEIPT_READ_ATTEMPTS
     this.#receiptReadDelayMs = nonNegativeInteger(config.receiptReadDelayMs) ?? RECEIPT_READ_DELAY_MS
-    this.#operationIdFactory = config.operationIdFactory ?? randomUUID
   }
 
   async getIssue(repo: string, number: number): Promise<GithubIssueLookup> {
@@ -191,50 +184,19 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
     )
   }
 
-  async ensureRepositoryLabel(input: {
-    repo: string
-    name: string
-    color: string
-    description: string
-    author: 'app'
-  }): Promise<void> {
-    const repoRoot = githubRepoRoot(input.repo)
-    assertAppAuthor(input.author, 'repository labels')
-    const name = normalizedGithubLabel(input.name)
-    const color = input.color.trim().replace(/^#/u, '')
-    if (!/^[a-f0-9]{6}$/iu.test(color)) {
-      throw new Error(`GitHub label color must be a six-digit hex value: ${input.color}`)
-    }
-    const description = input.description.trim()
-    if (!description) throw new Error('GitHub label description must be a non-empty string')
-    await this.#writeAndConfirm(
-      `${repoRoot}/labels/${this.#nextOperationDraftName()}`,
-      { name, color: color.toLowerCase(), description },
-    )
-  }
-
-  async mutateIssueLabel(input: {
-    repo: string
-    number: number
-    operation: 'add' | 'remove'
-    label: string
-    author: 'app'
-  }): Promise<GithubConnectionMutationReceipt> {
-    const repoRoot = githubRepoRoot(input.repo)
-    assertPositiveGithubNumber(input.number, 'issue')
-    assertAppAuthor(input.author, 'issue label mutations')
-    const label = normalizedGithubLabel(input.label)
-    await this.#writeAndConfirm(
-      `${repoRoot}/issues/${input.number}/labels/${this.#nextOperationDraftName()}`,
-      input.operation === 'add'
-        ? { operation: 'add', labels: [label] }
-        : { operation: 'remove', label },
-    )
-    // The durable operation proves App authorship and provider success, but
-    // the current adapter receipt does not distinguish a created mutation from
-    // an idempotent no-op. Callers must not infer ownership from it.
-    return 'acknowledged'
-  }
+  // `ensureRepositoryLabel` and `mutateIssueLabel` used to live here, authoring
+  // `${repoRoot}/labels/<draft>.json` and
+  // `${repoRoot}/issues/{n}/labels/<draft>.json`. Relayfile's GitHub adapter
+  // routes no label resource at all, so both were refused with `Unsupported
+  // GitHub writeback path` and no request ever reached GitHub (#431, #411).
+  //
+  // They are gone rather than rerouted because neither has a routed
+  // equivalent at this layer. The only expression of a label change the
+  // adapter accepts is a complete-label-set PATCH on the issue itself —
+  // `updateIssue` below — and computing that set needs the issue's current
+  // labels, which is `AppGithubWriteback.setStatus`'s job (#434). Repository
+  // label provisioning is unnecessary on top of it: GitHub auto-creates an
+  // unknown label named in that PATCH.
 
   async updateIssue(input: GithubConnectionIssueUpdateInput): Promise<void> {
     const repoRoot = githubRepoRoot(input.repo)
@@ -265,10 +227,6 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       throw new Error(`Unable to resolve ${description} for GitHub PR publication: ${errorMessage(error)}`)
     }
     throw new Error(`Unable to resolve ${description} for GitHub PR publication`)
-  }
-
-  #nextOperationDraftName(): string {
-    return factoryGithubOperationDraftName(this.#operationIdFactory())
   }
 
   async #readPullRequestReceipt(
@@ -317,6 +275,12 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
   }
 
   async #writeAndConfirmUnlocked(path: string, content: unknown): Promise<string | undefined> {
+    // Fail on the authoring stack, not 90s later in the confirm. A path the
+    // adapter does not route is a Factory bug, never a transient one, but the
+    // remote rejection arrives as an ordinary confirmation failure that the
+    // durable lifecycle retries indefinitely — which is how #431 stayed
+    // invisible while every dispatch silently lost its lifecycle label.
+    assertRoutedGithubWritebackPath(path)
     await this.#mount.writeFile(path, content, { guarded: true })
     const status = await this.#mount.confirmWrite(path, { timeoutMs: WRITE_CONFIRM_TIMEOUT_MS })
     if (status !== 'acked') {
@@ -359,18 +323,6 @@ const normalizedGithubLabels = (labels: string[]): string[] => {
     throw new Error('GitHub issue labels must be non-empty strings')
   }
   return [...new Set(normalized)]
-}
-
-const normalizedGithubLabel = (label: string): string => {
-  const normalized = normalizedGithubLabels([label])[0]
-  if (!normalized) throw new Error('GitHub label must be a non-empty string')
-  return normalized
-}
-
-const assertAppAuthor = (author: string, operation: string): void => {
-  if (author !== 'app') {
-    throw new Error(`Relayfile GitHub ${operation} require author "app": ${author}`)
-  }
 }
 
 const githubDraftName = (headRef: string, headSha?: string): string => {

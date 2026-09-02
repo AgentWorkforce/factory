@@ -3609,15 +3609,11 @@ describe('FactoryLoop', () => {
         author: 'app',
       }))
       const postIssueComment = vi.fn(async () => undefined)
-      const ensureRepositoryLabel = vi.fn(async () => undefined)
-      const mutateIssueLabel = vi.fn(async () => undefined)
       const updateIssue = vi.fn(async () => undefined)
       const githubWrite: GithubConnectionWrite = {
         publishPullRequest,
         closePullRequest: async () => undefined,
         postIssueComment,
-        ensureRepositoryLabel,
-        mutateIssueLabel,
         updateIssue,
       }
       const mount = new FakeMountClient({
@@ -3639,10 +3635,9 @@ describe('FactoryLoop', () => {
 
       await factory.runOnce()
 
-      // The claim rides the routed issue PATCH: Relayfile's GitHub adapter
-      // routes no label resource, so a per-label draft is unroutable.
-      expect(ensureRepositoryLabel).not.toHaveBeenCalled()
-      expect(mutateIssueLabel).not.toHaveBeenCalled()
+      // The claim rides the routed issue PATCH. Relayfile's GitHub adapter
+      // routes no label resource, so `GithubConnectionWrite` no longer has a
+      // per-label writer to call at all (#431).
       expect(updateIssue).toHaveBeenCalledWith({
         repo: 'AgentWorkforce/pear',
         number,
@@ -3691,16 +3686,12 @@ describe('FactoryLoop', () => {
       const path = githubIssuePath('AgentWorkforce', 'pear', number)
       const appPostIssueComment = vi.fn(async () => undefined)
       const appUpdateIssue = vi.fn(async () => undefined)
-      const appEnsureRepositoryLabel = vi.fn(async () => undefined)
-      const appMutateIssueLabel = vi.fn(async () => ({ receiptId: 'app-label-receipt' }))
       const mount = new FakeMountClient({
         [path]: githubIssueFile(number, { labels: ['factory'] }),
       }, {
         publishPullRequest: async () => { throw new Error('unexpected publish') },
         closePullRequest: async () => undefined,
         postIssueComment: appPostIssueComment,
-        ensureRepositoryLabel: appEnsureRepositoryLabel,
-        mutateIssueLabel: appMutateIssueLabel,
         updateIssue: appUpdateIssue,
       })
       mount.setSubRoot('/linear/issues', 'absent')
@@ -3714,8 +3705,6 @@ describe('FactoryLoop', () => {
 
       await expect(readFile(ghLogPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
       // The claim is one routed issue PATCH; the adapter routes no label path.
-      expect(appEnsureRepositoryLabel).not.toHaveBeenCalled()
-      expect(appMutateIssueLabel).not.toHaveBeenCalled()
       expect(appUpdateIssue).toHaveBeenCalledWith(expect.objectContaining({
         repo: 'AgentWorkforce/pear',
         number,
@@ -11045,8 +11034,6 @@ describe('FactoryLoop', () => {
       },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => undefined,
       updateIssue: async () => undefined,
     }
     const mount = new ConfirmingMount({
@@ -13414,8 +13401,6 @@ describe('FactoryLoop', () => {
         commentWriteStarted.resolve()
         await commentWriteGate.promise
       },
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => { throw new Error('the adapter routes no label path') },
       // The status claim is a replace PATCH of the whole label set, so the
       // fake provider derives its status from the set it is handed.
       updateIssue: async ({ labels }) => {
@@ -20164,8 +20149,6 @@ describe('FactoryLoop', () => {
       publishPullRequest: async () => { throw new Error('unexpected publish') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => undefined,
       updateIssue: async () => undefined,
     })
 
