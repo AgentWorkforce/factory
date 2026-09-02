@@ -19704,15 +19704,16 @@ export class FactoryLoop implements Factory {
 export const defaultMergeGate = (config: FactoryConfig, mount: MountClient, run?: GhRunner): GithubMergeGatePort =>
   new MountedGithubMergeGate(mount, new GhCliGithubMergeGate(run, config.github.identity))
 
+// Label transitions ride the connected issue PATCH, not a per-label draft:
+// Relayfile's GitHub adapter routes no label resource. Gating on label
+// capabilities here would reject a write path that is in fact complete.
 const hasAppGithubLifecycleWrite = (
   write: GithubConnectionWrite | undefined,
 ): write is GithubConnectionWrite & Required<Pick<
   GithubConnectionWrite,
-  'postIssueComment' | 'ensureRepositoryLabel' | 'mutateIssueLabel' | 'updateIssue'
+  'postIssueComment' | 'updateIssue'
 >> => Boolean(
   write?.postIssueComment &&
-  write.ensureRepositoryLabel &&
-  write.mutateIssueLabel &&
   write.updateIssue,
 )
 
@@ -22421,6 +22422,17 @@ const factoryGithubRepositoryLabelWriteTarget = (
 const githubLifecycleLabel = (name: unknown) =>
   Object.values(FACTORY_GITHUB_STATUS_LABELS).find((label) => label.name === name)
 
+/**
+ * Case-insensitive lifecycle-label match. A complete-label-set PATCH carries
+ * the provider's own casing for labels Factory did not author, so an
+ * exact-name test would let a cased variant slip past the one-claim bound.
+ */
+const githubLifecycleLabelName = (name: unknown) =>
+  typeof name === 'string'
+    ? Object.values(FACTORY_GITHUB_STATUS_LABELS)
+      .find((label) => label.name.toLowerCase() === name.trim().toLowerCase())
+    : undefined
+
 const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean => {
   const actual = Object.keys(value).sort()
   const expected = [...keys].sort()
@@ -22430,11 +22442,51 @@ const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =
 const isAllowedFactoryGithubIssueWriteContent = (
   kind: 'issue-update' | 'comment' | 'label-operation',
   content: unknown,
+  requireLabel: string,
 ): boolean => {
   const value = asRecord(content)
   if (!value) return false
   if (kind === 'issue-update') {
-    return hasExactKeys(value, ['state']) && value.state === 'closed'
+    if (hasExactKeys(value, ['state'])) return value.state === 'closed'
+    // A status claim is a complete-label-set PATCH. Relayfile's GitHub adapter
+    // routes no label resource, so replacing the set on the issue itself is
+    // the only expression of a label change that reaches the provider at all —
+    // this guard has to admit it or the claim dies here instead.
+    if (hasExactKeys(value, ['labels']) || hasExactKeys(value, ['labels', 'state'])) {
+      if (!Array.isArray(value.labels)) return false
+      if (!value.labels.every((label) => typeof label === 'string' && label.trim().length > 0)) return false
+      // One write must never assert two contradictory Factory claims.
+      const lifecycle = value.labels.filter((label) => githubLifecycleLabelName(label))
+      if (lifecycle.length > 1) return false
+      // A complete-set PATCH can drop labels as well as add them, and the
+      // safety opt-in is the label that made this issue eligible at all. A set
+      // that omits it would silently remove the issue from Factory's scope, so
+      // require it to survive. `setStatus` preserves every non-Factory label,
+      // so its own payloads always carry it; nothing legitimate is rejected.
+      //
+      // Unless the opt-in IS a lifecycle label, which a status transition is
+      // supposed to change. That configuration is already self-contradictory
+      // (`#isIssueReady` refuses an issue carrying `factory:in-progress`, so
+      // such an issue could never be dispatched to begin with) and this guard
+      // is not the place to litigate it — skip the survival check rather than
+      // add a second, more confusing way for the same config to fail.
+      //
+      // The empty set is refused unconditionally, before the exemption below
+      // can apply to it: stripping every label from an in-scope open issue is
+      // never a status transition, whatever `requireLabel` is configured to
+      // be. `factoryStatusLabelSet` preserves every non-Factory label and an
+      // in-scope issue always carries at least the opt-in, so `setStatus`
+      // cannot author an empty set.
+      if (value.labels.length === 0) return false
+      const required = requireLabel.trim().toLowerCase()
+      const requiredIsLifecycle = Boolean(githubLifecycleLabelName(required))
+      if (required && !requiredIsLifecycle &&
+        !value.labels.some((label) => label.trim().toLowerCase() === required)) {
+        return false
+      }
+      return value.state === undefined || value.state === 'closed'
+    }
+    return false
   }
   if (kind === 'comment') {
     return hasExactKeys(value, ['body']) && typeof value.body === 'string' && value.body.trim().length > 0
@@ -22476,7 +22528,7 @@ export const isAllowedFactoryGithubDraft = async (
 
   const target = factoryGithubIssueWriteTarget(path)
   if (!target) return false
-  if (!isAllowedFactoryGithubIssueWriteContent(target.kind, content)) return false
+  if (!isAllowedFactoryGithubIssueWriteContent(target.kind, content, config.safety.requireLabel)) return false
   if (target.kind === 'comment') {
     const body = asRecord(content)?.body
     const draftName = path.slice(path.lastIndexOf('/') + 1)
