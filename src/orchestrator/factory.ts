@@ -9886,7 +9886,7 @@ export class FactoryLoop implements Factory {
    * is the system of record for whether the work is wanted; a durable row
    * claiming otherwise, with no surface transition behind it, is stale.
    *
-   * Four things keep this from trading a stall for a duplicate dispatch — the
+   * Six things keep this from trading a stall for a duplicate dispatch — the
    * strictly worse bug, since a claim belongs to the work unit and a dispatch
    * gate fails closed:
    *
@@ -9917,8 +9917,21 @@ export class FactoryLoop implements Factory {
    *    `dispatch.maxAttempts` still latches, and the unit settles in
    *    `dispatch-retry-limit`: a different, honest terminal state that names
    *    the real problem and that a human reopen can still clear.
-   * 5. And because they are left alone, a row whose attempt latch is ALREADY
-   *    terminal is left alone too. `#dispatchBlockReason` refuses such a unit
+   * 5. Only a SETTLED row. The abandon path makes `abandoned` durably visible
+   *    one write before it latches the attempt counters, so a row read inside
+   *    that window looks exactly like a stale one — guard (6) passes because
+   *    the latch has not landed yet — and another instance could clear and
+   *    reclaim it while the original's `#recordDispatchTerminal` is still in
+   *    flight, latching a unit that is now legitimately dispatching. Rather
+   *    than reorder that path (committing the latch before the terminal save
+   *    would strand a unit whose save then fails, which is the worse trade),
+   *    require the row to have been untouched for a full lease interval. Any
+   *    live cleanup renews its lease well inside that, so an older row is
+   *    settled by construction, and a genuinely stale row is old by definition
+   *    — the repair is delayed by at most one sweep, never lost
+   *    (cubic-dev-ai P1, #435 review).
+   * 6. And because the attempt counters are left alone, a row whose latch is
+   *    ALREADY terminal is left alone too. `#dispatchBlockReason` refuses it
    *    ahead of the claim gate, so clearing its lifecycle cannot make it
    *    dispatchable — it would only destroy the abandoned run's durable record
    *    (its PR receipts, cost and release reason) and then count the deletion
@@ -9943,7 +9956,10 @@ export class FactoryLoop implements Factory {
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     if (!lifecycle || lifecycle.phase !== 'abandoned') return false
     if (lifecycle.migrationAliasOf !== undefined) return false
-    // See (5): clearing a row the attempt gate already refuses repairs nothing
+    // See (5): a row still inside the abandon path's own write window is not
+    // settled, and its attempt latch has not landed yet.
+    if (this.#clock.now() - lifecycle.updatedAtMs < DISPATCH_LIFECYCLE_LEASE_MS) return false
+    // See (6): clearing a row the attempt gate already refuses repairs nothing
     // and loses the record. Same key every other attempt reader/writer uses.
     const attempts = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(ref))
     if (attempts?.terminal) return false

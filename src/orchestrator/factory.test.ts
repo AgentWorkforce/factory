@@ -8298,10 +8298,12 @@ describe('FactoryLoop', () => {
     )
     const stateStore = new InMemoryStateStore({ batchSize: 2 })
     const githubWriteback = new RecordingGithubWriteback()
+    const clock = new ManualClock()
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount,
       fleet,
       stateStore,
+      clock,
       triage: new StaticTriage(),
       githubWriteback,
     })
@@ -8320,6 +8322,21 @@ describe('FactoryLoop', () => {
     // The surface never moved: still open, still ready, no status writeback.
     expect(githubWriteback.statuses).toEqual([])
     expect((await mount.readFile(path)).content).toEqual(githubIssueFile(394, { labels: ['factory'] }))
+
+    // A freshly-abandoned row is NOT repaired: it may still be inside the
+    // abandon path's own write window, where the attempt latch has not landed
+    // yet (guard 5). Same sweep, same surface, and it is still refused.
+    const tooSoon = await factory.runOnce()
+    expect(tooSoon.dispatched).toEqual([])
+    expect(tooSoon.skipped).toContainEqual(
+      expect.objectContaining({ code: 'dispatch-failed', failureCode: 'lifecycle-terminal' }),
+    )
+    expect(factory.status().counters.dispatchTerminalStaleReopened).toBeUndefined()
+
+    // Once the row has been untouched for a full lease interval it is settled
+    // by construction — any live cleanup would have renewed well inside that.
+    // `DISPATCH_LIFECYCLE_LEASE_MS`, factory.ts:456.
+    clock.advance(5 * 60_000)
 
     // The repair: the surface says this work is open and ready, so the stale
     // row must stop refusing it.
@@ -8500,10 +8517,12 @@ describe('FactoryLoop', () => {
       (readPath) => readPath === path ? fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-396-')).length : 0,
     )
     const stateStore = new ReclaimBetweenReadAndDeleteStore({ batchSize: 2 })
+    const clock = new ManualClock()
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount,
       fleet,
       stateStore,
+      clock,
       triage: new StaticTriage(),
       githubWriteback: new RecordingGithubWriteback(),
     })
@@ -8514,6 +8533,9 @@ describe('FactoryLoop', () => {
       const lifecycles = await stateStore.listDispatchLifecycles('factory-test')
       expect(lifecycles.map(([, lifecycle]) => lifecycle.phase)).toEqual(['abandoned'])
     })
+
+    // Past the settle window (guard 5), so the reconciler reaches the clear.
+    clock.advance(5 * 60_000)
 
     // The next sweep reads that row and races the other instance's reclaim.
     await factory.runOnce()
