@@ -885,6 +885,10 @@ export class FactoryLoop implements Factory {
   readonly #dispatchLifecycleReleaseAttempts = new Map<string, number>()
   readonly #dispatchLifecycleReleaseAbandoned = new Set<string>()
   readonly #abandonedDispatchReasons = new Map<string, string>()
+  /** Consecutive failed teardowns per abandoned work unit (#419). */
+  readonly #abandonmentTeardownAttempts = new Map<string, number>()
+  /** Work units whose teardown this process has permanently given up on (#419). */
+  readonly #abandonmentTeardownDeadLettered = new Set<string>()
   /**
    * Live batch-capacity waits, keyed by issue (#303).
    *
@@ -12359,8 +12363,15 @@ export class FactoryLoop implements Factory {
       )
     }
     const worktreeHandoffs = this.#dispatchFailureHandoffs(record, [])
+    // A teardown this process has already dead-lettered is not retried, only
+    // finished. Re-running it here would re-attempt releases that have failed
+    // ten times, and — because the terminal save below can itself be refused
+    // and re-arm this method — would do so on every one of those retries
+    // (#429 review, cubic P1).
     let cleanupComplete = true
-    if (worktreeHandoffs.length > 0) {
+    if (this.#abandonmentTeardownDeadLettered.has(key)) {
+      // Nothing further to attempt; fall through to the terminal save.
+    } else if (worktreeHandoffs.length > 0) {
       // A terminal no-PR dispatch no longer owns useful work. Fence and release
       // every agent sharing the checkout before removing it. If release or
       // cleanup fails, the durable handoff reaper retains responsibility rather
@@ -12383,9 +12394,14 @@ export class FactoryLoop implements Factory {
     }
     if (!cleanupComplete) {
       this.#increment('abandonedDispatchReleaseRetries')
-      this.#scheduleAbandonedDispatchRetry(record, reason)
-      await this.#writeInFlightRegistry()
-      return
+      if (this.#abandonmentTeardownMayRetry(record, key, reason)) {
+        this.#scheduleAbandonedDispatchRetry(record, reason)
+        await this.#writeInFlightRegistry()
+        return
+      }
+      // Budget spent: fall through to the terminal save below. The teardown is
+      // what this process gave up on, NOT the abandonment — see
+      // `#abandonmentTeardownMayRetry`.
     }
     // Batch completion alone only frees the process-local slot. Durable
     // capacity is computed from lifecycle phases, so commit the terminal phase
@@ -12407,6 +12423,8 @@ export class FactoryLoop implements Factory {
       return
     }
     this.#abandonedDispatchReasons.delete(key)
+    this.#abandonmentTeardownAttempts.delete(key)
+    this.#abandonmentTeardownDeadLettered.delete(key)
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
     await this.#drainReadyClarificationWake()
@@ -12416,6 +12434,88 @@ export class FactoryLoop implements Factory {
     if (next) {
       await this.dispatch(next.decision, { dryRun: next.dryRun })
     }
+  }
+
+  /**
+   * May this abandonment re-arm its failed teardown once more? (#419)
+   *
+   * `#scheduleAbandonedDispatchRetry` was the one release-retry path in this
+   * file that no budget bounded — `#scheduleDispatchLifecycleRetry` charges
+   * #379's under `releaseAttempt`, `#scheduleReleaseRetry`'s local arm charges
+   * it directly — so a teardown that cannot succeed re-armed at
+   * `DISPATCH_LIFECYCLE_RETRY_MS` forever. That is not hypothetical:
+   * `#abandonStuckDispatchFenced` releases EVERY tracked agent when the reason
+   * is `held-past-deadline`, and a placed agent whose host is gone answers
+   * `release` with a 503, not the 404 `isAgentAlreadyGoneOnRelease` forgives,
+   * so `cleanupComplete` stays false on every pass.
+   *
+   * The row then sits in `abandoning`, which `dispatchPhaseOccupiesSlot` does
+   * NOT exclude, so it holds its batch slot in both the local batch and the
+   * stores' `batchSize` admission; `#sweepHeldAgentDeadlines` skips it from
+   * then on at its own `#abandonedDispatchReasons` fence, so the held-agent
+   * reaper is fenced out by the cleanup the reaper itself started; and
+   * `#driveDispatchLifecycle`'s `abandoning` branch re-enters the same failing
+   * teardown after every restart. A permanent dispatch outage assembled
+   * entirely out of correct-looking parts.
+   *
+   * What is dead-lettered here is the TEARDOWN, not the abandonment. The
+   * caller falls through to its normal terminal `abandoned` save, which is the
+   * truthful outcome — this dispatch really was abandoned past its deadline —
+   * and which keeps every piece of abandonment bookkeeping that follows it:
+   * `#recordDispatchTerminal`, the Slack and GitHub watchers, the batch
+   * completion and the promotion of the next queued unit.
+   *
+   * Deliberately NOT routed through #379's `#releaseDeadLetteredSlot`, which
+   * retains the row in `releasing` for a successor. A `releasing` row is
+   * re-driven by `#finishDurableRelease`, which terminalizes as `complete`,
+   * counts `done` and emits `issue-done` — so handing an abandonment to it
+   * would report a dispatch that timed out as a successful completion and skip
+   * the abandonment-specific bookkeeping entirely (#429 review, codex P1).
+   *
+   * A budget of its own rather than #379's maps: those carry a
+   * lease-relinquishing re-entry contract that assumes the caller stops
+   * driving the key, and this caller is about to finish it terminally.
+   *
+   * The cost, stated plainly: agents whose release never succeeded are left
+   * behind rather than retried forever. They have already been marked terminal
+   * with the fleet client, their names and the failure are logged at `error`,
+   * and ten consecutive failures against a host reported gone is evidence they
+   * are not running. Recovering one that IS running is an operator action —
+   * which is a bounded, visible cost against an unbounded, silent one.
+   */
+  #abandonmentTeardownMayRetry(record: InFlightIssue, key: string, reason: string): boolean {
+    // Already given up on. Deleting the counter on exhaustion instead would
+    // reset the budget, so a refused terminal save below would re-run the
+    // dead-lettered teardown and spend a fresh ten attempts on every retry
+    // (#429 review, cubic P1).
+    if (this.#abandonmentTeardownDeadLettered.has(key)) return false
+    const attempts = (this.#abandonmentTeardownAttempts.get(key) ?? 0) + 1
+    if (attempts <= DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS) {
+      this.#abandonmentTeardownAttempts.set(key, attempts)
+      return true
+    }
+    this.#abandonmentTeardownDeadLettered.add(key)
+    this.#abandonmentTeardownAttempts.delete(key)
+    this.#increment('abandonedDispatchTeardownDeadLettered')
+    // `error`, not `warn`, for the reason #379 gives at the same decision: a
+    // work unit whose cleanup this process has permanently given up on must
+    // not be inferable only from the absence of further log lines.
+    this.#logger.error?.('[factory] abandonment teardown retries exhausted; freeing the batch slot anyway', {
+      issue: record.issue.key,
+      reason,
+      attempts: attempts - 1,
+      maxAttempts: DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS,
+      // Only the agents that did NOT release. `record.agents` keeps a released
+      // agent's entry and marks it with `releasedAtMs`, so listing every key
+      // would send an operator after workers that already terminated cleanly —
+      // and this log is the only artifact they get (#429 review, CodeRabbit
+      // and cubic).
+      unreleasedAgents: [...record.agents]
+        .filter(([, tracked]) => tracked.releasedAtMs === undefined)
+        .map(([name]) => name)
+        .sort(),
+    })
+    return false
   }
 
   #scheduleAbandonedDispatchRetry(record: InFlightIssue, reason: string): void {
@@ -12430,7 +12530,11 @@ export class FactoryLoop implements Factory {
         })
         this.#scheduleAbandonedDispatchRetry(record, reason)
       })
-    }, DISPATCH_LIFECYCLE_RETRY_MS)
+      // The injectable cadence its sibling retry schedulers already use. It
+      // defaults to `DISPATCH_LIFECYCLE_RETRY_MS`, so production is unchanged;
+      // hardcoding the constant only made this the one retry path a test could
+      // not run at speed.
+    }, this.#dispatchLifecycleRetryMs)
     timer.unref?.()
     this.#dispatchLifecycleRetryTimers.set(key, timer)
   }
