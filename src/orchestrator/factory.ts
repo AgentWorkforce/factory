@@ -22470,6 +22470,14 @@ const isAllowedFactoryGithubIssueWriteContent = (
       // such an issue could never be dispatched to begin with) and this guard
       // is not the place to litigate it — skip the survival check rather than
       // add a second, more confusing way for the same config to fail.
+      //
+      // The empty set is refused unconditionally, before the exemption below
+      // can apply to it: stripping every label from an in-scope open issue is
+      // never a status transition, whatever `requireLabel` is configured to
+      // be. `factoryStatusLabelSet` preserves every non-Factory label and an
+      // in-scope issue always carries at least the opt-in, so `setStatus`
+      // cannot author an empty set.
+      if (value.labels.length === 0) return false
       const required = requireLabel.trim().toLowerCase()
       const requiredIsLifecycle = Boolean(githubLifecycleLabelName(required))
       if (required && !requiredIsLifecycle &&

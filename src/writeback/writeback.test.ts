@@ -2415,6 +2415,13 @@ describe('isAllowedFactoryGithubDraft complete-label-set PATCH', () => {
     await expect(allows({ labels: ['factory'], state: 'closed' })).resolves.toBe(true)
   })
 
+  it('refuses the empty set even when the opt-in is exempt', async () => {
+    // The exemption below must not reopen the hole the survival check closed:
+    // stripping every label off an in-scope open issue is never a transition.
+    await expect(allows({ labels: [] }, 'factory:in-progress')).resolves.toBe(false)
+    await expect(allows({ labels: [] }, 'factory:human-review')).resolves.toBe(false)
+  })
+
   it('exempts a lifecycle opt-in from the survival check', async () => {
     // A self-contradictory configuration, but the survival rule must not add a
     // second way for it to fail: a status transition is supposed to change a
