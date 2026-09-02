@@ -33220,8 +33220,16 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
     // this shape can tell a correct `unreleasedAgents` list from one that
     // names every tracked agent.
     class GhostFleetClient extends RemoteLifecycleFleetClient {
+      // The failed calls are invisible in `releases`, which only records the
+      // ones that succeeded — so count them here, or a regression that
+      // dead-letters after a single attempt still passes (#429 review, cubic).
+      readonly releaseFailures: string[] = []
+
       override async release(name: string, reason?: string): Promise<void> {
-        if (name.endsWith('-review')) throw agentHostUnavailable()
+        if (name.endsWith('-review')) {
+          this.releaseFailures.push(name)
+          throw agentHostUnavailable()
+        }
         await super.release(name, reason)
       }
     }
@@ -33278,11 +33286,18 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
         expect.objectContaining({ statusCode: 503 }),
       )
       expect(fleet.releases).toContainEqual({ name: 'ar-419-impl', reason: 'held-past-deadline' })
+      // The budget was really spent, and spent exactly once: ten teardown
+      // passes the bound allows, plus the eleventh that exhausts it. Without
+      // this a regression that dead-lettered after a single attempt would
+      // still satisfy every assertion above (#429 review, cubic P2), and one
+      // that kept retrying past the bound would overshoot it.
+      expect(fleet.releaseFailures).toHaveLength(11)
       expect(logger.error).toHaveBeenCalledWith(
         '[factory] abandonment teardown retries exhausted; freeing the batch slot anyway',
         expect.objectContaining({
           issue: 'AR-419',
           reason: 'held-past-deadline',
+          attempts: 10,
           maxAttempts: 10,
           // ONLY the agent that failed. The implementer released, and naming
           // it here would send an operator after a worker that already
