@@ -8388,6 +8388,101 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  // #435 review, chatgpt-codex-connector P1. The stale-row clear must be a
+  // compare-and-delete, not an unconditional one. The epoch guard in
+  // `#reconcileStaleAbandonedLifecycle` is process-LOCAL and cannot see a
+  // lifecycle another Factory instance owns, so two reconcilers can read the
+  // same `abandoned` row: the first clears it and claims a fresh lifecycle, and
+  // the second's delete — acting on its stale read — would remove the NEW
+  // owner's dispatch fence. A third claimant then takes the emptied key and two
+  // agent sets run one work unit. This store injects exactly that interleaving:
+  // the row is reclaimed under a new lease between the read and the delete.
+  it('refuses to clear a stale terminal row that was reclaimed under a new lease', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 396)
+    class ReclaimBetweenReadAndDeleteStore extends InMemoryStateStore {
+      reclaimed = false
+      refusedClears = 0
+      racedKey?: string
+      reclaimedLease: DispatchLifecycle['lease']
+
+      override async getDispatchLifecycle(workspaceId: string, lifecycleKey: string) {
+        const lifecycle = await super.getDispatchLifecycle(workspaceId, lifecycleKey)
+        // The other instance wins the race *after* this read: it cleared the
+        // abandoned row and claimed a live one. Driven through the real claim
+        // path rather than hand-seeded, so the lease is a lease the store
+        // actually issued to a different owner.
+        if (lifecycle?.phase === 'abandoned' && !this.reclaimed) {
+          this.racedKey = lifecycleKey
+          this.reclaimed = true
+          await super.clearDispatchLifecycle(workspaceId, lifecycleKey)
+          // A fresh claim seeds without the abandoned row's lease; carrying it
+          // would make the store read the seed as owned by someone else.
+          const { lease: _abandonedLease, ...seed } = lifecycle
+          const claim = await super.claimDispatchLifecycle(
+            workspaceId,
+            lifecycleKey,
+            { ...seed, phase: 'dispatching' },
+            'another-factory-instance',
+            Date.now(),
+            600_000,
+          )
+          this.reclaimedLease = claim.lease
+        }
+        return lifecycle
+      }
+
+      override async clearClaimedDispatchLifecycle(
+        workspaceId: string,
+        lifecycleKey: string,
+        expectedLease: NonNullable<DispatchLifecycle['lease']>,
+      ) {
+        const cleared = await super.clearClaimedDispatchLifecycle(workspaceId, lifecycleKey, expectedLease)
+        if (!cleared) this.refusedClears += 1
+        return cleared
+      }
+    }
+
+    const fleet = new RemoteLifecycleFleetClient()
+    const mount = new PostSpawnReadFailureMount(
+      { [path]: githubIssueFile(396, { labels: ['factory'] }) },
+      (readPath) => readPath === path ? fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-396-')).length : 0,
+    )
+    const stateStore = new ReclaimBetweenReadAndDeleteStore({ batchSize: 2 })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    // Drive the real construction path to a genuinely abandoned row first.
+    await factory.runOnce()
+    await vi.waitFor(async () => {
+      const lifecycles = await stateStore.listDispatchLifecycles('factory-test')
+      expect(lifecycles.map(([, lifecycle]) => lifecycle.phase)).toEqual(['abandoned'])
+    })
+
+    // The next sweep reads that row and races the other instance's reclaim.
+    await factory.runOnce()
+
+    expect(stateStore.reclaimed).toBe(true)
+    expect(stateStore.racedKey).toBeDefined()
+    expect(stateStore.reclaimedLease).toBeDefined()
+    // The load-bearing assertion: the OTHER owner's live lifecycle survives.
+    // An unconditional delete removes it, leaving the key empty while that
+    // owner's agents are mid-spawn — which is what lets a third claimant take
+    // the key and run a second agent set on one work unit.
+    await expect(stateStore.getDispatchLifecycle('factory-test', stateStore.racedKey!))
+      .resolves.toMatchObject({ lease: { owner: 'another-factory-instance' } })
+    // And it survived because the compare-and-delete was attempted and refused,
+    // not because the clear was never reached.
+    expect(stateStore.refusedClears).toBeGreaterThan(0)
+    expect(factory.status().counters.dispatchTerminalStaleReopened).toBeUndefined()
+    expect(factory.status().counters.dispatchTerminalStaleReopenConflicts).toBe(1)
+    await factory.stop()
+  })
+
   // #334 deliverable 2: the canonical-state key is the work unit, so a role
   // observed through one surface is visible to the other. `issueStateKey` is
   // surface scoped — `AR-448` for the Linear mirror, `448:<uuid>:<path>` for

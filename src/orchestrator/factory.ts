@@ -9899,9 +9899,17 @@ export class FactoryLoop implements Factory {
    *    construction and are audit evidence of the #211 rekey, not abandoned
    *    work; clearing one would delete the evidence and orphan its canonical
    *    row.
-   * 3. Never a row this process still owns. A live epoch means a dispatch is
-   *    mid-flight under this key; terminal saves drop the epoch, so a row that
-   *    is both terminal and epoch-held is a race, not a stale record.
+   * 3. Never a row this process still owns, and never an unconditional delete.
+   *    A live epoch means a dispatch is mid-flight under this key, but that
+   *    check is process-LOCAL and cannot see ownership held by another
+   *    instance. So the removal is a compare-and-delete against the lease this
+   *    method actually observed: if two reconcilers read the same `abandoned`
+   *    row and the first clears it and claims a fresh lifecycle, the second's
+   *    delete finds a different lease and is refused. An unconditional delete
+   *    would instead remove the new owner's dispatch fence and let a third
+   *    claimant take the emptied key — duplicate workers on one work unit,
+   *    which is the exact bug this whole guard list exists to avoid
+   *    (chatgpt-codex-connector P1, #435 review).
    * 4. The attempt counters are deliberately LEFT ALONE. This is an automatic
    *    repair with no human behind it, so resetting `attempts` — which is what
    *    `#clearTerminalRefusals` does for a human reopen — would delete the only
@@ -9924,7 +9932,17 @@ export class FactoryLoop implements Factory {
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     if (!lifecycle || lifecycle.phase !== 'abandoned') return false
     if (lifecycle.migrationAliasOf !== undefined) return false
-    await this.#state.clearDispatchLifecycle(this.#workspaceId, key)
+    // Every save carries the lease forward (`saveDispatchLifecycle` restamps
+    // `next.lease` from the row it fenced against), so an abandoned row always
+    // has one. A row without a lease cannot be compare-and-deleted at all, and
+    // a dispatch gate fails closed: leave it rather than delete it blind.
+    if (!lifecycle.lease) return false
+    if (!await this.#state.clearClaimedDispatchLifecycle(this.#workspaceId, key, lifecycle.lease)) {
+      // The row moved under this read — another reconciler cleared and
+      // reclaimed it. That new lifecycle is the live owner; leave it alone.
+      this.#increment('dispatchTerminalStaleReopenConflicts')
+      return false
+    }
     this.#increment('dispatchTerminalStaleReopened')
     this.#logger.info?.('[factory] cleared a terminal dispatch row whose issue is still open and ready', {
       issue: ref.key,
