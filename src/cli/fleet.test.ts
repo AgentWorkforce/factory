@@ -4807,6 +4807,35 @@ describe('fleet CLI runtime', () => {
         { state: 'closed' },
         { guarded: true },
       )).resolves.toBe(true)
+      // The status claim is a complete-label-set PATCH on the issue itself:
+      // Relayfile's GitHub adapter routes no label resource, so if this guard
+      // rejects the shape the claim never reaches the provider.
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: ['factory', 'bug', 'factory:in-progress'] },
+        { guarded: true },
+      )).resolves.toBe(true)
+      // One write must not assert two contradictory Factory claims, in any casing.
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: ['factory', 'factory:in-progress', 'Factory:Human-Review'] },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: ['factory', '  '] },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: 'factory:in-progress' },
+        { guarded: true },
+      )).resolves.toBe(false)
+      await expect(predicate(
+        '/github/repos/AgentWorkforce/pear/issues/221.json',
+        { labels: ['factory'], title: 'rewritten' },
+        { guarded: true },
+      )).resolves.toBe(false)
       const commentBody = 'Factory dispatch'
       await expect(predicate(
         `/github/repos/AgentWorkforce/pear/issues/221/comments/${factoryGithubIssueCommentDraftName(commentBody)}`,
@@ -4832,11 +4861,17 @@ describe('fleet CLI runtime', () => {
         { operation: 'add', labels: ['factory:in-progress'] },
         { guarded: true },
       )).resolves.toBe(true)
+      // This case previously asserted `false`, to force label changes down the
+      // per-label draft path. That path is unroutable — Relayfile's GitHub
+      // adapter has no label resource — so the assertion was protecting a
+      // write that could never land. The guard now admits the complete-set
+      // PATCH, still bounded by: configured repo, open and in-scope issue,
+      // exact keys, non-empty string labels, and at most one Factory claim.
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221.json',
         { labels: ['factory:in-progress'] },
         { guarded: true },
-      )).resolves.toBe(false)
+      )).resolves.toBe(true)
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221/labels/factory-33333333-3333-4333-8333-333333333333.json',
         { operation: 'remove', label: 'bug' },

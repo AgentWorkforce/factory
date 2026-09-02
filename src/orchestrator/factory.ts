@@ -22422,6 +22422,17 @@ const factoryGithubRepositoryLabelWriteTarget = (
 const githubLifecycleLabel = (name: unknown) =>
   Object.values(FACTORY_GITHUB_STATUS_LABELS).find((label) => label.name === name)
 
+/**
+ * Case-insensitive lifecycle-label match. A complete-label-set PATCH carries
+ * the provider's own casing for labels Factory did not author, so an
+ * exact-name test would let a cased variant slip past the one-claim bound.
+ */
+const githubLifecycleLabelName = (name: unknown) =>
+  typeof name === 'string'
+    ? Object.values(FACTORY_GITHUB_STATUS_LABELS)
+      .find((label) => label.name.toLowerCase() === name.trim().toLowerCase())
+    : undefined
+
 const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean => {
   const actual = Object.keys(value).sort()
   const expected = [...keys].sort()
@@ -22435,7 +22446,20 @@ const isAllowedFactoryGithubIssueWriteContent = (
   const value = asRecord(content)
   if (!value) return false
   if (kind === 'issue-update') {
-    return hasExactKeys(value, ['state']) && value.state === 'closed'
+    if (hasExactKeys(value, ['state'])) return value.state === 'closed'
+    // A status claim is a complete-label-set PATCH. Relayfile's GitHub adapter
+    // routes no label resource, so replacing the set on the issue itself is
+    // the only expression of a label change that reaches the provider at all —
+    // this guard has to admit it or the claim dies here instead.
+    if (hasExactKeys(value, ['labels']) || hasExactKeys(value, ['labels', 'state'])) {
+      if (!Array.isArray(value.labels)) return false
+      if (!value.labels.every((label) => typeof label === 'string' && label.trim().length > 0)) return false
+      // One write must never assert two contradictory Factory claims.
+      const lifecycle = value.labels.filter((label) => githubLifecycleLabelName(label))
+      if (lifecycle.length > 1) return false
+      return value.state === undefined || value.state === 'closed'
+    }
+    return false
   }
   if (kind === 'comment') {
     return hasExactKeys(value, ['body']) && typeof value.body === 'string' && value.body.trim().length > 0
