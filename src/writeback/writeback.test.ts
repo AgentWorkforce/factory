@@ -1179,6 +1179,59 @@ describe('AppGithubWriteback', () => {
     expect(updateIssue).not.toHaveBeenCalled()
   })
 
+  it('falls back to the dispatched labels when a found projection carries none', async () => {
+    // A `found` projection with no usable labels is an incomplete read, not a
+    // bare issue: nothing reaches setStatus without the safety opt-in that made
+    // it dispatchable. Trusting the empty set would compute the whole replace
+    // PATCH from nothing — dropping `factory` (which the mount guard then
+    // rejects, stalling the claim) and clobbering every other label with it.
+    for (const content of [{}, { labels: [] }, { labels: [{ name: '  ' }] }]) {
+      const updateIssue = vi.fn(async () => undefined)
+      const app = new AppGithubWriteback({
+        publishPullRequest: async () => { throw new Error('not used') },
+        closePullRequest: async () => undefined,
+        postIssueComment: async () => undefined,
+        updateIssue,
+        getIssue: async () => ({ outcome: 'found' as const, issue: { content } }),
+      })
+
+      await expect(app.setStatus(appIssue, 'human-review')).resolves.toBe('acknowledged')
+      expect(updateIssue).toHaveBeenCalledWith({
+        repo: 'AgentWorkforce/factory',
+        number: 221,
+        // The dispatched set, transitioned — not the bare ['factory:human-review'].
+        labels: ['factory', 'bug', 'factory:human-review'],
+        author: 'app',
+      })
+    }
+  })
+
+  it('keeps a non-empty connected projection authoritative over the dispatched one', async () => {
+    // The must-not-fire direction of the fallback above: a projection that does
+    // answer still wins, including when it contradicts the dispatched snapshot
+    // by having dropped a label. Only the empty read falls back.
+    const updateIssue = vi.fn(async () => undefined)
+    const app = new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      updateIssue,
+      // `bug` was removed on GitHub after dispatch; the connected read sees it.
+      getIssue: async () => ({
+        outcome: 'found' as const,
+        issue: { content: { labels: [{ name: 'factory' }, { name: 'factory:in-progress' }] } },
+      }),
+    })
+
+    await expect(app.setStatus(appIssue, 'human-review')).resolves.toBe('acknowledged')
+    expect(updateIssue).toHaveBeenCalledWith({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      labels: ['factory', 'factory:human-review'],
+      author: 'app',
+    })
+  })
+
   it('falls back to the dispatched projection when the connected read cannot answer', async () => {
     const updateIssue = vi.fn(async () => undefined)
     const app = new AppGithubWriteback({
@@ -2420,6 +2473,50 @@ describe('isAllowedFactoryGithubDraft complete-label-set PATCH', () => {
     // stripping every label off an in-scope open issue is never a transition.
     await expect(allows({ labels: [] }, 'factory:in-progress')).resolves.toBe(false)
     await expect(allows({ labels: [] }, 'factory:human-review')).resolves.toBe(false)
+  })
+
+  it('admits the payload setStatus authors from an empty connected projection', async () => {
+    // Closes the loop the two halves leave open: the guard is what turns an
+    // empty read into a stalled claim, so the red check has to run the real
+    // construction path into the real guard rather than assert on an array.
+    const pearIssue: LinearIssue = {
+      ...issue,
+      uuid: 'github-pear-221',
+      key: '221',
+      title: '[factory] complete-label-set claim',
+      stateId: '',
+      labels: ['factory', 'bug'],
+      path: issuePath,
+      raw: {
+        payload: {
+          source: {
+            provider: 'github',
+            id: 'github-pear-221',
+            owner: 'AgentWorkforce',
+            repo: 'pear',
+            number: 221,
+            url: 'https://github.com/AgentWorkforce/pear/issues/221',
+          },
+        },
+      },
+    }
+    const authored: unknown[] = []
+    const app = new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      updateIssue: async ({ labels }) => { authored.push({ labels }) },
+      // `found`, but with nothing this reader can extract a label from.
+      getIssue: async () => ({ outcome: 'found' as const, issue: { content: {} } }),
+    })
+
+    await app.setStatus(pearIssue, 'in-progress')
+
+    expect(authored).toEqual([{ labels: ['factory', 'bug', 'factory:in-progress'] }])
+    await expect(allows(authored[0])).resolves.toBe(true)
+    // And the set the unfixed read would have authored is exactly what the
+    // guard refuses — the stall this fallback removes.
+    await expect(allows({ labels: ['factory:in-progress'] })).resolves.toBe(false)
   })
 
   it('exempts a lifecycle opt-in from the survival check', async () => {

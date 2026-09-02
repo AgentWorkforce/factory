@@ -249,6 +249,19 @@ export class AppGithubWriteback implements GithubWriteback {
    * available on this surface, and a replace PATCH computed from a stale set
    * would drop labels added since. Fall back to the projection the caller
    * dispatched from when the connected read cannot answer.
+   *
+   * A `found` projection carrying no labels does not count as an answer. Only
+   * a labelled issue reaches this method at all — `#isIssueReady` requires the
+   * safety opt-in before anything is dispatched — so an empty extraction means
+   * the projection is incomplete (a record written without its `labels` array,
+   * or a shape this reader cannot parse), not that the issue is bare. Treating
+   * it as authoritative would compute the whole replace set from nothing, and
+   * that fails twice over: `factoryStatusLabelSet([], status)` yields only the
+   * target Factory label, so the PATCH both drops the configured safety label
+   * — which `isAllowedFactoryGithubIssueWriteContent` then rejects, stalling
+   * the claim through the same door #434 exists to close — and clobbers every
+   * other label on the issue, including the `factory`/`factory-ready`/`agent:*`
+   * set the dispatch protocol itself runs on (#434 review, CodeRabbit).
    */
   async #currentIssueLabels(
     ref: { repo: string; number: number },
@@ -258,7 +271,8 @@ export class AppGithubWriteback implements GithubWriteback {
       try {
         const connected = await this.#connectedRead.getIssue(ref.repo, ref.number)
         if (connected.outcome === 'found') {
-          return githubLabelNamesFromContent(connected.issue.content)
+          const projected = githubLabelNamesFromContent(connected.issue.content)
+          if (projected.length > 0) return projected
         }
       } catch {
         // Fall through to the dispatched projection below.
