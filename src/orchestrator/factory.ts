@@ -9946,6 +9946,19 @@ export class FactoryLoop implements Factory {
    * dispatch keeps dying gets `maxAttempts` attempts instead of one before it
    * latches, so a genuinely broken unit costs one extra placement attempt. That
    * is the bound being traded for recoverability, and it is finite.
+   *
+   * NEVER THROWS. This is opportunistic repair; enumeration is load-bearing.
+   * The sweep's call site (`#recordCanonicalIssueState` from the ready-issue
+   * loop) is not inside the per-issue try, so a durable read fault raised here
+   * would abort the ENTIRE readiness pass — a transient store blip zeroing out
+   * a whole dispatch cycle, on a DO-backed deployment already observed shedding
+   * with `workspace durable object is busy`. The guarantee lives in this
+   * function rather than at that one call site on purpose: there are already
+   * two callers guarded differently (the sweep is bare, `#handleChange` has an
+   * outer try), so a third would silently reintroduce the abort. A failed read
+   * is simply one more uncertainty, and this method already answers every
+   * uncertainty by leaving the row alone — the next sweep retries for free
+   * (lane-dispatch-e2e-0902 P1, #435 review).
    */
   async #reconcileStaleAbandonedLifecycle(ref: IssueRef): Promise<boolean> {
     if (!this.#usesDurableDispatchLifecycle()) return false
@@ -9953,33 +9966,46 @@ export class FactoryLoop implements Factory {
     if (key === undefined) return false
     // A live epoch is this process's own dispatch fence: see (3) above.
     if (this.#dispatchLifecycleEpochs.has(key)) return false
-    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
-    if (!lifecycle || lifecycle.phase !== 'abandoned') return false
-    if (lifecycle.migrationAliasOf !== undefined) return false
-    // See (5): a row still inside the abandon path's own write window is not
-    // settled, and its attempt latch has not landed yet.
-    if (this.#clock.now() - lifecycle.updatedAtMs < DISPATCH_LIFECYCLE_LEASE_MS) return false
-    // See (6): clearing a row the attempt gate already refuses repairs nothing
-    // and loses the record. Same key every other attempt reader/writer uses.
-    const attempts = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(ref))
-    if (attempts?.terminal) return false
-    // Every save carries the lease forward (`saveDispatchLifecycle` restamps
-    // `next.lease` from the row it fenced against), so an abandoned row always
-    // has one. A row without a lease cannot be compare-and-deleted at all, and
-    // a dispatch gate fails closed: leave it rather than delete it blind.
-    if (!lifecycle.lease) return false
-    if (!await this.#state.clearClaimedDispatchLifecycle(this.#workspaceId, key, lifecycle.lease)) {
-      // The row moved under this read — another reconciler cleared and
-      // reclaimed it. That new lifecycle is the live owner; leave it alone.
-      this.#increment('dispatchTerminalStaleReopenConflicts')
+    // Everything below reads or writes durable state, so everything below is
+    // inside the never-throw boundary described above.
+    try {
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+      if (!lifecycle || lifecycle.phase !== 'abandoned') return false
+      if (lifecycle.migrationAliasOf !== undefined) return false
+      // See (5): a row still inside the abandon path's own write window is not
+      // settled, and its attempt latch has not landed yet.
+      if (this.#clock.now() - lifecycle.updatedAtMs < DISPATCH_LIFECYCLE_LEASE_MS) return false
+      // See (6): clearing a row the attempt gate already refuses repairs nothing
+      // and loses the record. Same key every other attempt reader/writer uses.
+      const attempts = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(ref))
+      if (attempts?.terminal) return false
+      // Every save carries the lease forward (`saveDispatchLifecycle` restamps
+      // `next.lease` from the row it fenced against), so an abandoned row always
+      // has one. A row without a lease cannot be compare-and-deleted at all, and
+      // a dispatch gate fails closed: leave it rather than delete it blind.
+      if (!lifecycle.lease) return false
+      if (!await this.#state.clearClaimedDispatchLifecycle(this.#workspaceId, key, lifecycle.lease)) {
+        // The row moved under this read — another reconciler cleared and
+        // reclaimed it. That new lifecycle is the live owner; leave it alone.
+        this.#increment('dispatchTerminalStaleReopenConflicts')
+        return false
+      }
+      this.#increment('dispatchTerminalStaleReopened')
+      this.#logger.info?.('[factory] cleared a terminal dispatch row whose issue is still open and ready', {
+        issue: ref.key,
+        releaseReason: lifecycle.releaseReason,
+      })
+      return true
+    } catch (error) {
+      // Counted, not silent: a store that is persistently too sick to repair
+      // is a real condition, and it must be visible without being fatal.
+      this.#increment('dispatchTerminalStaleReopenFailures')
+      this.#logger.warn?.('[factory] stale terminal reconcile failed; leaving the row alone', {
+        issue: ref.key,
+        error: describeError(error).errorMessage,
+      })
       return false
     }
-    this.#increment('dispatchTerminalStaleReopened')
-    this.#logger.info?.('[factory] cleared a terminal dispatch row whose issue is still open and ready', {
-      issue: ref.key,
-      releaseReason: lifecycle.releaseReason,
-    })
-    return true
   }
 
   /**

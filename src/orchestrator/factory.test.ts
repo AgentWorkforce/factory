@@ -8457,6 +8457,55 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  // #435 review, lane-dispatch-e2e-0902 P1. The reconcile is opportunistic
+  // repair; enumeration is load-bearing. The sweep calls
+  // `#recordCanonicalIssueState` from the ready-issue loop OUTSIDE that loop's
+  // per-issue try, so a durable read fault raised inside the reconcile would
+  // abort the ENTIRE readiness pass — one transient store blip zeroing a whole
+  // dispatch cycle. The error shape is the one observed on the live DO-backed
+  // deployment, which is already shedding, so this is not hypothetical.
+  it('completes the readiness sweep when the stale-row reconcile hits a busy durable store', async () => {
+    const busy = 'workspace durable object is busy; retry after the advertised delay'
+
+    class BusyLifecycleReadStore extends InMemoryStateStore {
+      reads = 0
+      override async getDispatchLifecycle(workspaceId: string, key: string) {
+        this.reads += 1
+        throw new Error(busy)
+      }
+    }
+
+    const paths = {
+      [githubIssuePath('AgentWorkforce', 'pear', 398)]: githubIssueFile(398, { labels: ['factory'] }),
+      [githubIssuePath('AgentWorkforce', 'pear', 399)]: githubIssueFile(399, { labels: ['factory'] }),
+    }
+    const mount = new FakeMountClient(paths)
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new BusyLifecycleReadStore({ batchSize: 2 })
+    const warnings: Array<{ message: string }> = []
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      logger: { warn: (message: string) => warnings.push({ message }) },
+    })
+
+    // The sweep must COMPLETE and enumerate, not abort on the first bad read.
+    const report = await factory.runOnce()
+    expect(stateStore.reads).toBeGreaterThan(0)
+    expect(report.pulled.map((issue) => issue.key).sort()).toEqual(['398', '399'])
+
+    // The repair failure is counted, not silent — a store too sick to repair is
+    // a real condition that must be visible without being fatal.
+    expect(factory.status().counters.dispatchTerminalStaleReopenFailures).toBeGreaterThan(0)
+    expect(warnings.some((warning) => warning.message.includes('stale terminal reconcile failed'))).toBe(true)
+    // And nothing was repaired on a read that never succeeded.
+    expect(factory.status().counters.dispatchTerminalStaleReopened).toBeUndefined()
+    await factory.stop()
+  })
+
   // #435 review, chatgpt-codex-connector P1. The stale-row clear must be a
   // compare-and-delete, not an unconditional one. The epoch guard in
   // `#reconcileStaleAbandonedLifecycle` is process-LOCAL and cannot see a
