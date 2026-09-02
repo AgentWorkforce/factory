@@ -8467,11 +8467,34 @@ describe('FactoryLoop', () => {
   it('completes the readiness sweep when the stale-row reconcile hits a busy durable store', async () => {
     const busy = 'workspace durable object is busy; retry after the advertised delay'
 
-    class BusyLifecycleReadStore extends InMemoryStateStore {
-      reads = 0
+    // Scoped to the RECONCILIATION read only. `#dispatchUnlocked` also calls
+    // `getDispatchLifecycle` before it claims (`factory.ts:5497`), so a store
+    // that throws on every read blocks ordinary dispatch too — and then
+    // `report.pulled` passing would prove enumeration survived while saying
+    // nothing about whether dispatch still worked (coderabbitai and
+    // cubic-dev-ai, independently, #435 review).
+    //
+    // The hook is causal rather than a call count: `#recordCanonicalIssueState`
+    // reads `getCanonicalState` and then, for a ready issue, the reconcile
+    // reads `getDispatchLifecycle`. The sweep awaits one issue at a time, so
+    // the first lifecycle read after a canonical read is exactly the reconcile's.
+    class BusyReconcileReadStore extends InMemoryStateStore {
+      throws = 0
+      #reconcileNext = false
+
+      override async getCanonicalState(workspaceId: string, key: string) {
+        const role = await super.getCanonicalState(workspaceId, key)
+        this.#reconcileNext = true
+        return role
+      }
+
       override async getDispatchLifecycle(workspaceId: string, key: string) {
-        this.reads += 1
-        throw new Error(busy)
+        if (this.#reconcileNext) {
+          this.#reconcileNext = false
+          this.throws += 1
+          throw new Error(busy)
+        }
+        return await super.getDispatchLifecycle(workspaceId, key)
       }
     }
 
@@ -8481,7 +8504,7 @@ describe('FactoryLoop', () => {
     }
     const mount = new FakeMountClient(paths)
     const fleet = new RemoteLifecycleFleetClient()
-    const stateStore = new BusyLifecycleReadStore({ batchSize: 2 })
+    const stateStore = new BusyReconcileReadStore({ batchSize: 2 })
     const warnings: Array<{ message: string }> = []
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount,
@@ -8492,10 +8515,13 @@ describe('FactoryLoop', () => {
       logger: { warn: (message: string) => warnings.push({ message }) },
     })
 
-    // The sweep must COMPLETE and enumerate, not abort on the first bad read.
+    // The sweep must COMPLETE, enumerate, AND still dispatch. Asserting
+    // `dispatched` is the point: enumeration surviving is worth little if the
+    // repair fault silently cost the work the sweep exists to do.
     const report = await factory.runOnce()
-    expect(stateStore.reads).toBeGreaterThan(0)
+    expect(stateStore.throws).toBeGreaterThan(0)
     expect(report.pulled.map((issue) => issue.key).sort()).toEqual(['398', '399'])
+    expect(report.dispatched.map((result) => result.issue.key).sort()).toEqual(['398', '399'])
 
     // The repair failure is counted, not silent — a store too sick to repair is
     // a real condition that must be visible without being fatal.

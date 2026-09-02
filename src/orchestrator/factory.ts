@@ -10000,10 +10000,19 @@ export class FactoryLoop implements Factory {
       // Counted, not silent: a store that is persistently too sick to repair
       // is a real condition, and it must be visible without being fatal.
       this.#increment('dispatchTerminalStaleReopenFailures')
-      this.#logger.warn?.('[factory] stale terminal reconcile failed; leaving the row alone', {
-        issue: ref.key,
-        error: describeError(error).errorMessage,
-      })
+      // The diagnostics are themselves best-effort. `NEVER THROWS` has to hold
+      // against an injected logger that throws too, or the contract would be
+      // broken by the one line whose only job is to report that something
+      // broke — and the readiness sweep would abort on a logging fault
+      // (cubic-dev-ai P2, #435 review).
+      try {
+        this.#logger.warn?.('[factory] stale terminal reconcile failed; leaving the row alone', {
+          issue: ref.key,
+          error: describeError(error).errorMessage,
+        })
+      } catch {
+        // Nothing further to report it with.
+      }
       return false
     }
   }
