@@ -12781,6 +12781,155 @@ describe('FactoryLoop', () => {
     }
   }, 30_000)
 
+/**
+ * A broker that refuses every `release`, the shape an unreachable fleet control
+ * plane leaves behind. `isAgentAlreadyGoneOnRelease` is deliberately false for
+ * it: a transport failure is not evidence the worker is gone, so the cleanup
+ * must treat it as a failure rather than absorbing it.
+ */
+class UnreachableBrokerFleetClient extends RemoteLifecycleFleetClient {
+  /** Refusals left to serve. Zero until the test takes the broker down. */
+  releaseFailuresRemaining = 0
+
+  override async release(name: string, reason?: string): Promise<void> {
+    if (this.releaseFailuresRemaining > 0) {
+      this.releaseFailuresRemaining -= 1
+      throw new Error('fleet control plane is unavailable: connect ECONNREFUSED')
+    }
+    await super.release(name, reason)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The abandonment retry is a release retry, and it has to spend the same budget
+// (#303/#391 follow-up; the 2026-09-02 single-slot production wedge).
+//
+// `#abandonStuckDispatch` fences the periodic held-agent sweep on
+// `#abandonedDispatchReasons` before its first await. From that instant the
+// keyed abandon timer is the ONLY thing that can still free the batch slot, and
+// it was the one release re-arm in the class that never charged
+// `#chargeReleaseAttempt`. A teardown step that fails for a durable reason
+// therefore retried once a second forever, with the row parked in `abandoning`
+// — a phase that still occupies a slot.
+// ---------------------------------------------------------------------------
+describe('abandoned dispatch cleanup budget', () => {
+  const dispatchWithBroker = async (
+    root: string,
+    fleet: UnreachableBrokerFleetClient,
+    logger: { debug: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> },
+    number: number,
+  ) => {
+    const watchStatePath = join(root, 'state.json')
+    const factory = createFactory(config({
+      batchSize: 1,
+      dispatch: { agentHoldTimeoutMs: 5_000, agentlessHoldTimeoutMs: 5_000 },
+      loop: { heartbeatPath: join(root, 'heartbeat.json'), registryPath: join(root, 'registry.json') },
+    }), {
+      mount: new FakeMountClient({ [issuePath(number)]: issueFile(number) }),
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 1, watchStatePath }),
+      triage: new StaticTriage(),
+      logger,
+    })
+    const decision = await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number)))
+    await factory.dispatch(decision)
+    expect(factory.status().dispatchCapacity?.active).toBe(1)
+    return { factory, decision, watchStatePath }
+  }
+
+  // MUST-FIRE. Against origin/main this hangs at `active: 1` with
+  // `abandonedDispatchReleaseRetries` climbing and no error ever logged,
+  // because the budget is never charged.
+  it('dead-letters a cleanup that can never complete so the batch slot comes back', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-abandon-budget-'))
+    const fleet = new UnreachableBrokerFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const { factory, decision, watchStatePath } = await dispatchWithBroker(root, fleet, logger, 453)
+    try {
+      // The broker goes down AFTER the team is placed -- the production
+      // ordering, where the workers were spawned hours before the control
+      // plane started failing. Every release from here on refuses.
+      fleet.releaseFailuresRemaining = Number.POSITIVE_INFINITY
+
+      // Past the 5s hold deadline and past the ten-attempt budget at one
+      // attempt per second. Nothing here can ever succeed.
+      await vi.waitFor(
+        () => expect(factory.status().dispatchCapacity?.active ?? 0).toBe(0),
+        { timeout: 40_000, interval: 250 },
+      )
+
+      expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1)
+      expect(logger.error).toHaveBeenCalledWith(
+        '[factory] release retries exhausted; abandoning cleanup for this work unit',
+        expect.objectContaining({ issue: 'AR-453' }),
+      )
+      // Capacity came back WITHOUT the row being falsely terminalized: the
+      // cleanup is still owed, it just stopped costing everyone else a slot.
+      const lifecycle = await new FileStateStore({ batchSize: 1, watchStatePath })
+        .getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
+      expect(lifecycle?.phase).toBe('abandoning')
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 90_000)
+
+  // MUST-NOT-FIRE, and the arm that matters. A cleanup that merely needs a few
+  // retries must run to completion. An implementation that frees the slot on
+  // the first failed release also reaches `active: 0`, so this arm asserts the
+  // real teardown happened: both agents released, the row terminal, the budget
+  // never spent.
+  it('lets a cleanup that recovers finish normally instead of dead-lettering it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-abandon-budget-ok-'))
+    const fleet = new UnreachableBrokerFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const { factory, decision, watchStatePath } = await dispatchWithBroker(root, fleet, logger, 454)
+    try {
+      // Two agents, eight refusals: four cleanup passes fail and the fifth
+      // succeeds. Four charges, well inside the ten-attempt budget.
+      fleet.releaseFailuresRemaining = 8
+
+      // Wait until two whole cleanup passes have failed and re-armed. Anchored
+      // on the counter the `!cleanupComplete` branch bumps, not on a refusal:
+      // a refusal fires mid-pass, before any re-arm has been decided, which is
+      // too early to tell the two implementations apart.
+      await vi.waitFor(
+        () => expect(factory.status().counters.abandonedDispatchReleaseRetries ?? 0)
+          .toBeGreaterThanOrEqual(2),
+        { timeout: 40_000, interval: 50 },
+      )
+      // THE ARM. A cleanup that is merely retrying still owns its workers, so
+      // the slot must STILL be held. Handing this slot to the next dispatch
+      // while the previous team is being torn down is the duplicate dispatch
+      // of AR-448 -- and it is exactly what an implementation that frees the
+      // slot on the first failed pass, instead of after a spent budget, does.
+      expect(factory.status().dispatchCapacity?.active).toBe(1)
+
+      await vi.waitFor(async () => expect(
+        (await new FileStateStore({ batchSize: 1, watchStatePath })
+          .getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))?.phase,
+      ).toBe('abandoned'), { timeout: 40_000, interval: 250 })
+
+      expect(factory.status().dispatchCapacity?.active ?? 0).toBe(0)
+      // The teardown really ran: every placement was released by the broker.
+      // A retried pass re-releases an agent that already succeeded, so compare
+      // the SET of names rather than the call log.
+      expect([...new Set(fleet.releases.map((release) => release.name))].sort())
+        .toEqual(['ar-454-impl-pear', 'ar-454-review'])
+      // The budget was never exhausted, so nothing was dead-lettered.
+      expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBeUndefined()
+      expect(logger.error).not.toHaveBeenCalledWith(
+        '[factory] release retries exhausted; abandoning cleanup for this work unit',
+        expect.anything(),
+      )
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 90_000)
+})
+
+
   it('settles post-spawn completion waits when a later spawn reaches the held-agent deadline', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-deadline-'))
     const number = 1252

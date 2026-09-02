@@ -12249,6 +12249,10 @@ export class FactoryLoop implements Factory {
       return
     }
     this.#abandonedDispatchReasons.delete(key)
+    // Cleanup succeeded, so the retries it took are refunded. Without this a
+    // reopened work unit reusing this key would inherit a spent budget and
+    // dead-letter its first release (mirrors `#finishDurableRelease`).
+    this.#clearReleaseAttempts(key)
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
     await this.#drainReadyClarificationWake()
@@ -12260,9 +12264,36 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  /**
+   * Re-arm the abandonment cleanup, on the SAME release budget as every other
+   * release retry.
+   *
+   * This loop is the reaper's own recovery path, and it used to be the only
+   * release re-arm in the class that never charged `#chargeReleaseAttempt`.
+   * That made it the one retry that could run forever. The shape it produced
+   * is the wedge this exists to close:
+   *
+   *   `#abandonStuckDispatch` fences the periodic held-agent sweep on
+   *   `#abandonedDispatchReasons` BEFORE its first await, deliberately, so the
+   *   sweep cannot release the same placements twice. From that moment this
+   *   timer is the only thing that can still free the batch slot. If any step
+   *   of `#abandonStuckDispatchFenced` fails for a durable reason — an
+   *   unreachable broker failing every `release`, a provider teardown that
+   *   keeps rejecting — it re-arms here, at one attempt per second, forever.
+   *   The row stays in `abandoning`, which still occupies a slot, so on a
+   *   `batchSize: 1` deployment the factory dispatches nothing ever again.
+   *   `abandoning` is non-terminal, so a restart re-adopts the row and the
+   *   loop resumes: the hold outlives every reboot.
+   *
+   * Charging the budget routes exhaustion into `#releaseDeadLetteredSlot`,
+   * which frees the slot and hands back the lease while deliberately leaving
+   * the lifecycle non-terminal — the cleanup is still owed, it just stops
+   * costing everyone else their dispatch capacity.
+   */
   #scheduleAbandonedDispatchRetry(record: InFlightIssue, reason: string): void {
     const key = dispatchLifecycleKey(record.issue)
     if (this.#stopping || this.#dispatchLifecycleRetryTimers.has(key)) return
+    if (!this.#chargeReleaseAttempt(record, key, 'abandoned-dispatch')) return
     const timer = setTimeout(() => {
       this.#dispatchLifecycleRetryTimers.delete(key)
       void this.#abandonStuckDispatch(record, reason).catch((error) => {
