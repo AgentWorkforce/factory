@@ -3602,18 +3602,16 @@ describe('FactoryLoop', () => {
 
       await factory.runOnce()
 
-      expect(ensureRepositoryLabel).toHaveBeenCalledWith({
+      // The claim rides the routed issue PATCH: Relayfile's GitHub adapter
+      // routes no label resource, so a per-label draft is unroutable.
+      expect(ensureRepositoryLabel).not.toHaveBeenCalled()
+      expect(mutateIssueLabel).not.toHaveBeenCalled()
+      expect(updateIssue).toHaveBeenCalledWith({
         repo: 'AgentWorkforce/pear',
-        name: 'factory:in-progress',
-        color: '1d76db',
-        description: 'Factory agents are working on this issue.',
+        number,
+        labels: ['factory', 'bug', 'factory:in-progress'],
         author: 'app',
       })
-      expect(mutateIssueLabel.mock.calls).toEqual([
-        [{ repo: 'AgentWorkforce/pear', number, operation: 'add', label: 'factory:in-progress', author: 'app' }],
-        [{ repo: 'AgentWorkforce/pear', number, operation: 'remove', label: 'factory:human-review', author: 'app' }],
-      ])
-      expect(updateIssue).not.toHaveBeenCalled()
       expect(postIssueComment).toHaveBeenCalledWith(expect.objectContaining({
         repo: 'AgentWorkforce/pear',
         number,
@@ -3678,16 +3676,13 @@ describe('FactoryLoop', () => {
       await factory.runOnce()
 
       await expect(readFile(ghLogPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
-      expect(appEnsureRepositoryLabel).toHaveBeenCalledWith(expect.objectContaining({
-        repo: 'AgentWorkforce/pear',
-        name: 'factory:in-progress',
-        author: 'app',
-      }))
-      expect(appMutateIssueLabel).toHaveBeenCalledWith(expect.objectContaining({
+      // The claim is one routed issue PATCH; the adapter routes no label path.
+      expect(appEnsureRepositoryLabel).not.toHaveBeenCalled()
+      expect(appMutateIssueLabel).not.toHaveBeenCalled()
+      expect(appUpdateIssue).toHaveBeenCalledWith(expect.objectContaining({
         repo: 'AgentWorkforce/pear',
         number,
-        operation: 'add',
-        label: 'factory:in-progress',
+        labels: expect.arrayContaining(['factory:in-progress']),
         author: 'app',
       }))
       expect(appPostIssueComment).toHaveBeenCalledWith(expect.objectContaining({
@@ -3695,7 +3690,6 @@ describe('FactoryLoop', () => {
         number,
         author: 'app',
       }))
-      expect(appUpdateIssue).not.toHaveBeenCalled()
     } finally {
       vi.unstubAllEnvs()
       await rm(root, { recursive: true, force: true })
@@ -13182,12 +13176,18 @@ describe('FactoryLoop', () => {
         await commentWriteGate.promise
       },
       ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async ({ operation, label }) => {
-        if (operation === 'add' && label === 'factory:in-progress') providerStatus = 'in-progress'
-        if (operation === 'add' && label === 'factory:human-review') providerStatus = 'human-review'
-        return operation === 'add' ? 'applied' : 'already-matched'
+      mutateIssueLabel: async () => { throw new Error('the adapter routes no label path') },
+      // The status claim is a replace PATCH of the whole label set, so the
+      // fake provider derives its status from the set it is handed.
+      updateIssue: async ({ labels }) => {
+        if (!labels) return
+        const names = new Set(labels.map((label) => label.toLowerCase()))
+        providerStatus = names.has('factory:human-review')
+          ? 'human-review'
+          : names.has('factory:in-progress')
+            ? 'in-progress'
+            : 'ready'
       },
-      updateIssue: async () => undefined,
     }
     const githubRead: GithubConnectionRead = {
       getIssue: async () => ({

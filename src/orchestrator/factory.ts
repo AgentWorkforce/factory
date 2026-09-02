@@ -19704,15 +19704,16 @@ export class FactoryLoop implements Factory {
 export const defaultMergeGate = (config: FactoryConfig, mount: MountClient, run?: GhRunner): GithubMergeGatePort =>
   new MountedGithubMergeGate(mount, new GhCliGithubMergeGate(run, config.github.identity))
 
+// Label transitions ride the connected issue PATCH, not a per-label draft:
+// Relayfile's GitHub adapter routes no label resource. Gating on label
+// capabilities here would reject a write path that is in fact complete.
 const hasAppGithubLifecycleWrite = (
   write: GithubConnectionWrite | undefined,
 ): write is GithubConnectionWrite & Required<Pick<
   GithubConnectionWrite,
-  'postIssueComment' | 'ensureRepositoryLabel' | 'mutateIssueLabel' | 'updateIssue'
+  'postIssueComment' | 'updateIssue'
 >> => Boolean(
   write?.postIssueComment &&
-  write.ensureRepositoryLabel &&
-  write.mutateIssueLabel &&
   write.updateIssue,
 )
 
