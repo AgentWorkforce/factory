@@ -12176,7 +12176,11 @@ export class FactoryLoop implements Factory {
         })
         this.#scheduleAbandonedDispatchRetry(record, reason)
       })
-    }, DISPATCH_LIFECYCLE_RETRY_MS)
+      // The injectable cadence its sibling retry schedulers already use. It
+      // defaults to `DISPATCH_LIFECYCLE_RETRY_MS`, so production is unchanged;
+      // hardcoding the constant only made this the one retry path a test could
+      // not run at speed.
+    }, this.#dispatchLifecycleRetryMs)
     timer.unref?.()
     this.#dispatchLifecycleRetryTimers.set(key, timer)
   }

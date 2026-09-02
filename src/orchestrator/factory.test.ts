@@ -33149,6 +33149,9 @@ describe('merge gate identity selection', () => {
  */
 describe('reclaiming an occupied slot past its deadline (#419)', () => {
   const HOUR = 60 * 60_000
+  // Test-only retry cadence, as the #379 suite uses. The BOUND is under test,
+  // not the wall clock it takes to reach.
+  const RETRY_MS = 25
   // The shape a 503 from a node that is gone reaches `release` with. NOT the
   // 404 `agent_not_found` shape — that one is already forgiven, and a fixture
   // that used it would reap through the pre-existing path and prove nothing.
@@ -33229,6 +33232,11 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
       stateStore: state(),
       triage: new StaticTriage(),
       logger,
+      // The ten-attempt bound is what is under test, not how long ten
+      // attempts take. At the production 1 Hz this test spent twelve seconds
+      // sleeping, and wall clock in this suite is not free — the 5s default
+      // `testTimeout` makes unrelated files flake under load.
+      dispatchLifecycleRetryMs: RETRY_MS,
     })
     try {
       await factory.start({ mode: 'backfill-and-subscribe' })
@@ -33238,13 +33246,13 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
       // which terminalizes as `complete` and emits `issue-done` — reporting a
       // dispatch that timed out as a successful completion.
       await vi.waitFor(async () => expect(await state().getDispatchLifecycle('factory-test', key))
-        .toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 40_000 })
+        .toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 20_000 })
       expect(dispatchPhaseOccupiesSlot('abandoned')).toBe(false)
 
       // Reporting the slot free is not reclaiming it. The queued issue actually
       // dispatching is.
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name))
-        .toEqual(['ar-420-impl-pear', 'ar-420-review']), { timeout: 20_000 })
+        .toEqual(['ar-420-impl-pear', 'ar-420-review']), { timeout: 15_000 })
       expect(factory.status().dispatchCapacity?.occupants?.map((occupant) => occupant.issue)).toEqual(['AR-420'])
       // The capacity waiter clears on its own drive, one tick behind the
       // direct dispatch above — `#saveDispatchLifecycle` wakes it on the
@@ -33303,12 +33311,14 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
       stateStore: state(),
       triage: new StaticTriage(),
       logger,
+      dispatchLifecycleRetryMs: RETRY_MS,
     })
     try {
       await factory.start({ mode: 'backfill-and-subscribe' })
-      // Comfortably longer than the ten one-second attempts the bound allows,
-      // so "not yet" cannot pass for "never".
-      await new Promise((resolve) => setTimeout(resolve, 15_000))
+      // Several sweep ticks (the held-deadline sweep re-arms at 1 Hz) and far
+      // more than the ten retry intervals the bound allows, so "not yet"
+      // cannot pass for "never".
+      await new Promise((resolve) => setTimeout(resolve, 4_000))
 
       expect(await state().getDispatchLifecycle('factory-test', key)).toMatchObject({ phase: 'running' })
       expect(fleet.releases).toEqual([])
