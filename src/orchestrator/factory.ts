@@ -22463,8 +22463,17 @@ const isAllowedFactoryGithubIssueWriteContent = (
       // that omits it would silently remove the issue from Factory's scope, so
       // require it to survive. `setStatus` preserves every non-Factory label,
       // so its own payloads always carry it; nothing legitimate is rejected.
+      //
+      // Unless the opt-in IS a lifecycle label, which a status transition is
+      // supposed to change. That configuration is already self-contradictory
+      // (`#isIssueReady` refuses an issue carrying `factory:in-progress`, so
+      // such an issue could never be dispatched to begin with) and this guard
+      // is not the place to litigate it — skip the survival check rather than
+      // add a second, more confusing way for the same config to fail.
       const required = requireLabel.trim().toLowerCase()
-      if (required && !value.labels.some((label) => label.trim().toLowerCase() === required)) {
+      const requiredIsLifecycle = Boolean(githubLifecycleLabelName(required))
+      if (required && !requiredIsLifecycle &&
+        !value.labels.some((label) => label.trim().toLowerCase() === required)) {
         return false
       }
       return value.state === undefined || value.state === 'closed'

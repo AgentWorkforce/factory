@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FactoryConfigSchema } from '../config/schema'
 import { linearByIdPath, linearCommentPath } from '../constants/linear'
 import { slackReplyPath } from '../constants/slack'
-import { AppGithubWriteback, createFactory, GhCliGithubWriteback, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
+import { AppGithubWriteback, createFactory, GhCliGithubWriteback, isAllowedFactoryGithubDraft, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubWriteback, MountClient } from '../ports'
 import type { LinearIssue } from '../types'
 import { RelayfileGithubConnectionWrite } from '../mount/relayfile-github-connection-write'
@@ -2349,5 +2349,76 @@ describe('createFactory writeback defaults', () => {
       { body, issueId: issue.uuid },
       { guarded: true },
     )).resolves.toBeUndefined()
+  })
+})
+
+describe('isAllowedFactoryGithubDraft complete-label-set PATCH', () => {
+  // This guard had no coverage from the writeback side, which is how a status
+  // claim that the adapter routes but the guard rejects reached CI green.
+  const issuePath = '/github/repos/AgentWorkforce/pear/issues/by-id/221.json'
+  const draftPath = '/github/repos/AgentWorkforce/pear/issues/221.json'
+  const issueFile = {
+    provider: 'github',
+    objectType: 'issue',
+    objectId: 'pear-221',
+    payload: {
+      number: 221,
+      title: '[factory] complete-label-set claim',
+      body: 'body',
+      state: 'open',
+      labels: [{ name: 'factory' }, { name: 'bug' }],
+      url: 'https://github.com/AgentWorkforce/pear/issues/221',
+      repository: { name: 'pear', owner: { login: 'AgentWorkforce' } },
+    },
+  }
+  const guardConfig = (requireLabel: string) => FactoryConfigSchema.parse({
+    workspaceId: 'rw_test',
+    issueSource: 'github',
+    repos: { byLabel: { factory: 'AgentWorkforce/pear' } },
+    safety: { requireLabel, requireTitlePrefix: '[factory]' },
+    slack: { channel: 'C0AD7UU0J1G__proj-cloud' },
+  })
+  const allows = async (content: unknown, requireLabel = 'factory'): Promise<boolean> =>
+    await isAllowedFactoryGithubDraft(
+      draftPath,
+      content,
+      { guarded: true },
+      new FakeMountClient({ [issuePath]: issueFile }),
+      guardConfig(requireLabel),
+    )
+
+  it('admits the exact payload setStatus authors', async () => {
+    await expect(allows({ labels: ['factory', 'bug', 'factory:in-progress'] })).resolves.toBe(true)
+    await expect(allows({ labels: ['factory', 'bug'] })).resolves.toBe(true)
+  })
+
+  it('refuses a set that drops the safety opt-in, including the empty set', async () => {
+    await expect(allows({ labels: [] })).resolves.toBe(false)
+    await expect(allows({ labels: ['bug', 'factory:in-progress'] })).resolves.toBe(false)
+  })
+
+  it('refuses two contradictory Factory claims in one write, in any casing', async () => {
+    await expect(allows({
+      labels: ['factory', 'factory:in-progress', 'Factory:Human-Review'],
+    })).resolves.toBe(false)
+  })
+
+  it('still refuses shapes outside the status claim', async () => {
+    await expect(allows({ labels: ['factory'], title: 'rewritten' })).resolves.toBe(false)
+    await expect(allows({ labels: 'factory' })).resolves.toBe(false)
+    await expect(allows({ labels: ['factory', '   '] })).resolves.toBe(false)
+    await expect(allows({ state: 'open' })).resolves.toBe(false)
+  })
+
+  it('keeps admitting the close write and the opt-in survival check together', async () => {
+    await expect(allows({ state: 'closed' })).resolves.toBe(true)
+    await expect(allows({ labels: ['factory'], state: 'closed' })).resolves.toBe(true)
+  })
+
+  it('exempts a lifecycle opt-in from the survival check', async () => {
+    // A self-contradictory configuration, but the survival rule must not add a
+    // second way for it to fail: a status transition is supposed to change a
+    // lifecycle label, so requiring it to survive would reject every claim.
+    await expect(allows({ labels: ['factory', 'bug'] }, 'factory:in-progress')).resolves.toBe(true)
   })
 })
