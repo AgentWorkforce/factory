@@ -4955,6 +4955,8 @@ export class FactoryLoop implements Factory {
       }
       if (adopted.length > 0) {
         this.#fleet.hydrateTracked?.(adopted)
+        // Observed at the hydration, not after it: see `#placementLiveness`.
+        this.#observeTrackedAgents()
         await this.#saveDispatchLifecycle(record, 'published', publishedPr)
         for (const agent of adopted) {
           this.#increment('legacyLocalWorkersAdopted')
@@ -6910,36 +6912,42 @@ export class FactoryLoop implements Factory {
   }
 
   /**
-   * Has the backend positively determined this placement is gone?
+   * Which of the three states is this placement in?
    *
-   * Absence from the tracked map is evidence ONLY for a name this process has
-   * seen in that map. `#adoptInFlightAgents` restores records into the batch
-   * BEFORE it calls `hydrateTracked`, so after a partial adoption failure every
-   * restored placement is missing from a set nobody populated -- and reading
-   * that as death evicts live work, at startup, while the factory is already
-   * recovering. That is AR-448 arriving through the one door this change opens
-   * (#433 review, codex and cubic, independently).
+   * The whole correctness of the hold gate is that these are THREE states and
+   * not two. Collapsing them either way is a real outage we have already had:
    *
-   * So an unhydrated name is UNKNOWN, and unknown keeps the hold. Only a
-   * positive determination releases it.
+   * - `gone`       a positive determination that no worker is there. Decided
+   *                by our own bookkeeping (a spec `recordPlanned` wrote that no
+   *                spawn ever answered, or a placement this factory released),
+   *                or by watching a name enter the backend's tracked map and
+   *                then leave it. Only this state shortens the hold.
+   * - `live`       the name is in the backend's tracked map right now.
+   * - `unmeasured` we have no reading. The backend keeps no tracked set, or the
+   *                name has never been seen in it -- which is what a partial
+   *                `#adoptInFlightAgents` failure leaves behind, since adoption
+   *                restores records into the batch BEFORE it hydrates. Treated
+   *                as live for the hold, because evicting a worker we merely
+   *                failed to measure is AR-448 (#433 review, codex and cubic).
+   *
+   * `unmeasured` is not a resting state. Every hydration site records its names
+   * the moment they land and before any reconcile can remove them, so a
+   * genuinely dead agent resolves to `gone` rather than sitting unmeasured and
+   * keeping a four-hour hold it does not deserve (#433 review, cubic).
    */
-  #placementConfirmedGone(name: string): boolean {
+  #placementLiveness(name: string, tracked: TrackedAgent): 'gone' | 'live' | 'unmeasured' {
+    if (tracked.result === undefined) return 'gone'
+    if (tracked.releasedAtMs !== undefined) return 'gone'
     const fleetTracked = this.#fleet.trackedAgents?.()
-    if (fleetTracked === undefined) return false
-    if (!this.#trackedAgentsObserved.has(name)) return false
-    return !fleetTracked.has(name)
+    if (fleetTracked === undefined) return 'unmeasured'
+    if (fleetTracked.has(name)) return 'live'
+    return this.#trackedAgentsObserved.has(name) ? 'gone' : 'unmeasured'
   }
 
   #hasLivePlacement(record: InFlightIssue): boolean {
     this.#observeTrackedAgents()
     for (const [name, tracked] of record.agents) {
-      // A spec `recordPlanned` wrote before the spawn returned is a name, not a
-      // worker, and a placement this factory released is not one either. Both
-      // are positive determinations of our own (#303).
-      if (tracked.result === undefined) continue
-      if (tracked.releasedAtMs !== undefined) continue
-      if (this.#placementConfirmedGone(name)) continue
-      return true
+      if (this.#placementLiveness(name, tracked) !== 'gone') return true
     }
     return false
   }
@@ -7031,6 +7039,36 @@ export class FactoryLoop implements Factory {
   #rescheduleHeldAgentDeadlineSweep(): void {
     if (this.#stopping) return
     for (const record of this.#batchView?.inFlight ?? []) this.#scheduleHeldAgentDeadline(record)
+    this.#pruneTrackedAgentsObserved()
+  }
+
+  /**
+   * Drops observations no hold decision can still consult.
+   *
+   * Why this cannot turn a `live` answer back into `unmeasured`: the ONLY
+   * caller of `#placementLiveness` is `#hasLivePlacement`, and it only ever
+   * asks about names taken from `record.agents` of a record in
+   * `#batchView.inFlight`. Every such name is retained here, so a pruned name
+   * is by construction one the gate cannot ask about. Names still in the
+   * backend's tracked map and names with an exit still being handled are
+   * retained too, since either can be adopted into a record before the next
+   * prune.
+   *
+   * A record that leaves the batch and later comes back does so through a
+   * takeover or startup adoption, and both hydrate before the gate runs --
+   * hydration re-records the names, so the observation is rebuilt rather than
+   * remembered (#433 review, cubic).
+   */
+  #pruneTrackedAgentsObserved(): void {
+    if (this.#trackedAgentsObserved.size === 0) return
+    const retained = new Set<string>(this.#fleet.trackedAgents?.().keys() ?? [])
+    for (const name of this.#agentExitsInFlight.keys()) retained.add(name)
+    for (const record of this.#batchView?.inFlight ?? []) {
+      for (const name of record.agents.keys()) retained.add(name)
+    }
+    for (const name of this.#trackedAgentsObserved) {
+      if (!retained.has(name)) this.#trackedAgentsObserved.delete(name)
+    }
   }
 
   async #sweepHeldAgentDeadlines(): Promise<void> {
@@ -8240,6 +8278,12 @@ export class FactoryLoop implements Factory {
           node: agent.tracked.result?.node,
         }))
         this.#fleet.hydrateTracked(hydrated)
+        // BEFORE the reconcile below, which is what removes the dead ones. A
+        // takeover that hydrated without recording the names would leave a
+        // genuinely dead agent reading as `unmeasured` forever, and unmeasured
+        // keeps the four-hour hold -- the mirror of the P1, and just as wrong
+        // (#433 review, cubic).
+        this.#observeTrackedAgents()
         try {
           await this.#fleet.reconcileTrackedAgents?.()
           const online = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
