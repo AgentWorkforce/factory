@@ -649,3 +649,6 @@ export type {
   ResolvedLoadTarget,
 } from './environments/k6-job'
 export * from './intake'
+
+// CI baseline control for #433. No behaviour change; this branch is origin/main
+// plus this comment, used to tell a load flake from a regression. Delete after.
