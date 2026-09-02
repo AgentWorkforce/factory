@@ -9917,6 +9917,17 @@ export class FactoryLoop implements Factory {
    *    `dispatch.maxAttempts` still latches, and the unit settles in
    *    `dispatch-retry-limit`: a different, honest terminal state that names
    *    the real problem and that a human reopen can still clear.
+   * 5. And because they are left alone, a row whose attempt latch is ALREADY
+   *    terminal is left alone too. `#dispatchBlockReason` refuses such a unit
+   *    ahead of the claim gate, so clearing its lifecycle cannot make it
+   *    dispatchable — it would only destroy the abandoned run's durable record
+   *    (its PR receipts, cost and release reason) and then count the deletion
+   *    as a repair, telling an operator something was fixed when nothing was.
+   *    `#abandonStuckDispatch`, `#abandonStaleDurableDispatch` and the
+   *    non-live-state branch of a terminal dispatch failure all produce that
+   *    pairing — terminal attempt latch, abandoned row, issue open and ready.
+   *    Clearing both records is the human reopen's job, because only a human
+   *    resetting `attempts` is safe (cubic-dev-ai P2, #435 review).
    *
    * The new failure mode this accepts, stated plainly: a work unit whose
    * dispatch keeps dying gets `maxAttempts` attempts instead of one before it
@@ -9932,6 +9943,10 @@ export class FactoryLoop implements Factory {
     const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
     if (!lifecycle || lifecycle.phase !== 'abandoned') return false
     if (lifecycle.migrationAliasOf !== undefined) return false
+    // See (5): clearing a row the attempt gate already refuses repairs nothing
+    // and loses the record. Same key every other attempt reader/writer uses.
+    const attempts = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(ref))
+    if (attempts?.terminal) return false
     // Every save carries the lease forward (`saveDispatchLifecycle` restamps
     // `next.lease` from the row it fenced against), so an abandoned row always
     // has one. A row without a lease cannot be compare-and-deleted at all, and

@@ -8337,6 +8337,15 @@ describe('FactoryLoop', () => {
   // not closed it yet. `complete` has one writer and it is reachable only after
   // acknowledged writeback, so the surface disagreement here is not evidence of
   // a stale row and must not clear one.
+  //
+  // Honest note on what this isolates. Completion sets BOTH the `complete`
+  // lifecycle phase and, via `#recordDispatchTerminal`, the terminal attempt
+  // latch — so guards (1) and (5) each independently refuse this unit, and
+  // ablating (1) alone no longer flips this test. It is an end-to-end
+  // must-not-fire, not an isolation of (1); (5) has its own test above. Guard
+  // (1) is kept because it states the semantic invariant — finished work is
+  // never resurrected — and would still hold if the attempt latch were ever
+  // cleared independently of the lifecycle row.
   it('does not resurrect a completed GitHub-native unit whose issue is still open and ready', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 395)
     const mount = new FakeMountClient({ [path]: githubIssueFile(395, { labels: ['factory'] }) })
@@ -8385,6 +8394,49 @@ describe('FactoryLoop', () => {
     expect(afterCompletion.dispatched).toEqual([])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-395-impl-pear', 'ar-395-review-pear'])
     expect(factory.status().counters.dispatchTerminalStaleReopened).toBeUndefined()
+    await factory.stop()
+  })
+
+  // #435 review, cubic-dev-ai P2. An abandoned row whose ATTEMPT latch is also
+  // terminal is refused by `#dispatchBlockReason` ahead of the claim gate, so
+  // clearing its lifecycle cannot make it dispatchable. Doing it anyway would
+  // destroy the abandoned run's durable record and then count the deletion as a
+  // repair — telling an operator something was fixed when nothing was. This is
+  // a real pairing: `maxAttempts: 1` makes the FIRST spawn failure latch the
+  // attempt row and abandon the lifecycle in one pass, with the issue still
+  // open and ready throughout.
+  it('leaves an abandoned row alone when the attempt latch already refuses the issue', async () => {
+    const path = issuePath(397)
+    const mount = new FakeMountClient({ [path]: issueFile(397) })
+    const fleet = new DurableSpawnFailingFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(
+      config({ dispatch: { errorCooldownMs: 0, maxAttempts: 1 } }),
+      { mount, fleet, stateStore, triage: new StaticTriage() },
+    )
+
+    await factory.runOnce()
+    const attemptKey = 'AR-397'
+    await vi.waitFor(async () => {
+      const lifecycles = await stateStore.listDispatchLifecycles('factory-test')
+      expect(lifecycles.map(([, lifecycle]) => lifecycle.phase)).toEqual(['abandoned'])
+      await expect(stateStore.getDispatchAttempts('factory-test', attemptKey))
+        .resolves.toMatchObject({ terminal: true })
+    })
+
+    // The issue is open and ready, so the reconciler is reached — and declines.
+    const next = await factory.runOnce()
+
+    // The abandoned row survives: deleting it would repair nothing.
+    await expect(stateStore.listDispatchLifecycles('factory-test'))
+      .resolves.toMatchObject([[expect.any(String), expect.objectContaining({ phase: 'abandoned' })]])
+    // And no repair is claimed, so the counter does not lie to an operator.
+    expect(factory.status().counters.dispatchTerminalStaleReopened).toBeUndefined()
+    // The unit is refused by the ATTEMPT gate, which is the honest terminal
+    // state a human reopen still clears — not by the claim gate.
+    expect(next.skipped).toContainEqual(
+      expect.objectContaining({ code: 'dispatch-terminal', reason: 'dispatch already terminal' }),
+    )
     await factory.stop()
   })
 
