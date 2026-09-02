@@ -6164,10 +6164,14 @@ export class FactoryLoop implements Factory {
       eventListener: this.#eventListenerStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
       dispatchCapacity: this.#dispatchCapacityStatus(),
+      // The gate's own timeout, not the configured one: a record whose
+      // placements are all gone is held under the shorter fallback, and an
+      // operator surface that reported the four-hour deadline anyway would be
+      // the second clock this area already learned not to keep.
       heldAgents: batch?.inFlight.flatMap((record) => heldAgentsForRecord(
         record,
         nowMs,
-        this.#config.dispatch.agentHoldTimeoutMs,
+        this.#holdDeadline(record)?.timeoutMs ?? this.#config.dispatch.agentHoldTimeoutMs,
         this.#config.terminalState,
       )) ?? [],
     }
@@ -6443,6 +6447,12 @@ export class FactoryLoop implements Factory {
         if (this.#agentExitsInFlight.get(name) === handling) {
           this.#agentExitsInFlight.delete(name)
         }
+        // An exit that did not terminalize its record has just changed what
+        // `#holdDeadline` answers for it. The armed timer is only ever moved
+        // EARLIER, so re-arming here cannot extend a hold -- and without it
+        // the four-hour timer armed at placement is the only thing left, which
+        // is precisely how a record outlives every worker it placed.
+        this.#rescheduleHeldAgentDeadlineSweep()
       })
     this.#agentExitsInFlight.set(name, handling)
   }
@@ -6849,20 +6859,71 @@ export class FactoryLoop implements Factory {
     )
   }
 
+  /**
+   * Does this record still have a placement that could plausibly be running?
+   *
+   * `heldSinceAtMs` is a latch: the first successful placement stamps it and
+   * nothing ever clears it. So a record whose workers have all since gone kept
+   * the four-hour `agentHoldTimeoutMs` -- eight times the agent-less deadline
+   * -- purely because it once placed someone, which made a DEAD placement
+   * strictly worse than no placement at all. On a `batchSize: 1` factory that
+   * one occupant is the whole dispatch capacity.
+   *
+   * Fails CLOSED, deliberately. Only evidence already in hand may retire the
+   * agent hold: a placement this factory released, or one the backend's own
+   * tracked set has dropped -- the relay client's exit watcher reconciles that
+   * set against presence, so an agent missing from it is one the backend has
+   * already concluded is gone. A backend that keeps no tracked set (the
+   * internal fleet) contributes no evidence and every placement stays live to
+   * this predicate. Freeing a slot from a worker that is still running is the
+   * duplicate dispatch of AR-448, so "cannot tell" must read as live.
+   *
+   * A spec with no `result` is not counted: `recordPlanned` writes it before
+   * the spawn returns, so it is a name, not a worker (#303). A record holding
+   * only those is exactly what the agent-less deadline already bounds.
+   */
+  #hasLivePlacement(record: InFlightIssue): boolean {
+    const fleetTracked = this.#fleet.trackedAgents?.()
+    for (const [name, tracked] of record.agents) {
+      if (tracked.result === undefined) continue
+      if (tracked.releasedAtMs !== undefined) continue
+      if (fleetTracked !== undefined && !fleetTracked.has(name)) continue
+      return true
+    }
+    return false
+  }
+
   #holdDeadline(record: InFlightIssue): {
     kind: 'agents' | 'agentless'
     sinceAtMs: number
     timeoutMs: number
     dueAtMs: number
+    /** True when the agent hold ran under the shorter dead-placement fallback. */
+    deadPlacementFallback: boolean
   } | undefined {
     if (record.dryRun) return undefined
     if (record.heldSinceAtMs !== undefined) {
-      const timeoutMs = this.#config.dispatch.agentHoldTimeoutMs
+      // Gated on still holding a slot, and not on dead placements alone. A
+      // record handed off to babysitters has released its implementers and is
+      // blocking nobody; shortening ITS deadline would abandon a dispatch that
+      // is progressing perfectly well. What this bounds is the occupant that
+      // costs everyone else their capacity.
+      const deadPlacementFallback = !this.#hasLivePlacement(record) && this.#recordOccupiesSlot(record)
+      // `Math.min`, not the agent-less timeout outright: the two are
+      // independently configurable, and a fallback that LENGTHENED a hold
+      // would be a worse bug than the one it fixes.
+      const timeoutMs = deadPlacementFallback
+        ? Math.min(
+          this.#config.dispatch.agentHoldTimeoutMs,
+          this.#config.dispatch.agentlessHoldTimeoutMs,
+        )
+        : this.#config.dispatch.agentHoldTimeoutMs
       return {
         kind: 'agents',
         sinceAtMs: record.heldSinceAtMs,
         timeoutMs,
         dueAtMs: record.heldSinceAtMs + timeoutMs,
+        deadPlacementFallback,
       }
     }
     // Only a row that is actually holding a slot is worth reaping; a `queued`
@@ -6876,6 +6937,7 @@ export class FactoryLoop implements Factory {
       sinceAtMs: record.slotHeldSinceAtMs,
       timeoutMs,
       dueAtMs: record.slotHeldSinceAtMs + timeoutMs,
+      deadPlacementFallback: false,
     }
   }
 
@@ -6964,12 +7026,18 @@ export class FactoryLoop implements Factory {
         waitingForTerminalState: this.#config.terminalState,
         reason: agentless ? AGENTLESS_SLOT_PAST_DEADLINE_RELEASE_REASON : HELD_PAST_DEADLINE_RELEASE_REASON,
         agents: [...record.agents.keys()].sort(),
+        // Which of the two agent-hold durations this release ran under. An
+        // operator reading `holdTimeoutMs` alone cannot tell a four-hour team
+        // that overran from a team that died and kept the slot anyway.
+        ...(agentless ? {} : { deadPlacementFallback: effective.deadPlacementFallback }),
         ...(agentless ? { phase: record.lifecyclePhase } : {}),
       }
       this.#logger.warn?.(
         agentless
           ? '[factory] releasing a dispatch lifecycle that never placed an agent'
-          : '[factory] releasing agents held past deadline',
+          : effective.deadPlacementFallback
+            ? '[factory] releasing a dispatch lifecycle whose placements are all gone'
+            : '[factory] releasing agents held past deadline',
         details,
       )
       await this.#abandonStuckDispatch(record, details.reason)
@@ -6978,10 +7046,13 @@ export class FactoryLoop implements Factory {
         : undefined
       if (!lifecycle || isTerminalDispatchLifecycle(lifecycle)) {
         this.#increment(agentless ? 'agentlessSlotPastDeadlineReleases' : 'heldPastDeadlineReleases')
+        if (effective.deadPlacementFallback) this.#increment('deadPlacementHoldReleases')
         this.#logger.warn?.(
           agentless
             ? '[factory] released a dispatch lifecycle that never placed an agent'
-            : '[factory] released agents held past deadline',
+            : effective.deadPlacementFallback
+              ? '[factory] released a dispatch lifecycle whose placements are all gone'
+              : '[factory] released agents held past deadline',
           details,
         )
       }

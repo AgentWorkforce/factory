@@ -1171,6 +1171,24 @@ class LocalReleaseHookFleetClient extends FakeFleetClient {
   }
 }
 
+/**
+ * A backend that has silently lost a placement.
+ *
+ * The named agent disappears from the tracked set with no exit event ever
+ * delivered -- the shape a dead factory worker actually leaves behind, where
+ * an attach to the node answers `agent_not_found` while nothing ever told the
+ * orchestrator the worker was gone.
+ */
+class SilentlyLostPlacementFleetClient extends RemoteLifecycleFleetClient {
+  readonly lost = new Set<string>()
+
+  override trackedAgents(): ReadonlyMap<string, { invocationId?: string; node?: string }> {
+    const tracked = new Map(super.trackedAgents())
+    for (const name of this.lost) tracked.delete(name)
+    return tracked
+  }
+}
+
 class LaterSpawnHangingFleetClient extends RemoteLifecycleFleetClient {
   readonly laterSpawnGate = Promise.withResolvers<void>()
   terminalExitEmitted = false
@@ -12547,6 +12565,115 @@ describe('FactoryLoop', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  // A dead placement used to be strictly WORSE than no placement at all.
+  // `heldSinceAtMs` is a latch stamped by the first successful spawn and never
+  // cleared, so the gate picked the four-hour `agentHoldTimeoutMs` for a record
+  // whose workers were all gone -- eight times the agent-less deadline that
+  // bounds a record which never placed anyone. On a `batchSize: 1` factory that
+  // one occupant is the entire dispatch capacity.
+  it('falls back to the agent-less deadline once every placement is gone from the backend', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dead-placement-hold-'))
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const mount = new FakeMountClient({ [issuePath(431)]: issueFile(431) })
+    const fleet = new SilentlyLostPlacementFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      // The four-hour hold is the one under test; the fallback is a second so
+      // the assertion does not have to wait one out.
+      dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 1_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), { mount, fleet, stateStore, triage: new StaticTriage(), logger })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(431), issueFile(431)))
+      await factory.dispatch(decision)
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-431-impl-pear', 'ar-431-review'])
+
+      // Control, in the same test: while the placements are live the gate is
+      // still on the four-hour clock, well over a second in.
+      await new Promise((resolve) => setTimeout(resolve, 1_500))
+      expect(fleet.releases).toEqual([])
+      expect(factory.status().heldAgents.map((held) => held.pastDeadline)).toEqual([false, false])
+
+      // Both workers vanish from the backend with no exit for either. Some
+      // other agent's exit is what re-derives the deadline -- without that the
+      // only timer left is the one armed for four hours at placement.
+      fleet.lost.add('ar-431-impl-pear')
+      fleet.lost.add('ar-431-review')
+      fleet.emitAgentExit('unrelated-agent-431', 'exited')
+
+      await vi.waitFor(() => expect(fleet.releases).toEqual([
+        { name: 'ar-431-impl-pear', reason: 'held-past-deadline' },
+        { name: 'ar-431-review', reason: 'held-past-deadline' },
+      ]), { timeout: 8_000 })
+      await vi.waitFor(async () => expect(
+        await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)),
+      ).toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 8_000 })
+      expect(factory.status().counters.deadPlacementHoldReleases).toBe(1)
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[factory] released a dispatch lifecycle whose placements are all gone',
+        expect.objectContaining({
+          issue: 'AR-431',
+          holdTimeoutMs: 1_000,
+          deadPlacementFallback: true,
+          reason: 'held-past-deadline',
+        }),
+      )
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  // The other arm, and the one that matters more: freeing a slot from a worker
+  // that is still running is the duplicate dispatch of AR-448. The fallback is
+  // allowed to fire only on evidence, so a tracked placement keeps its slot for
+  // the full four hours no matter how many unrelated exits re-derive the gate.
+  it('keeps the four-hour hold while a placement is still tracked by the backend', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-live-placement-hold-'))
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const mount = new FakeMountClient({ [issuePath(434)]: issueFile(434) })
+    const fleet = new SilentlyLostPlacementFleetClient()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 1_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), { mount, fleet, stateStore, triage: new StaticTriage(), logger })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(434), issueFile(434)))
+      await factory.dispatch(decision)
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-434-impl-pear', 'ar-434-review'])
+
+      // The implementer is gone; the reviewer is still tracked and still
+      // working. ONE live placement is enough to hold the slot honestly, and
+      // the lost one is deliberately the FIRST entry in the record's agent map
+      // -- a gate that gives up on the first placement it cannot find would
+      // pass if the survivor came first, and this arm exists to catch exactly
+      // that over-tightening.
+      fleet.lost.add('ar-434-impl-pear')
+      fleet.emitAgentExit('unrelated-agent-434', 'exited')
+      await new Promise((resolve) => setTimeout(resolve, 3_000))
+
+      expect(fleet.releases).toEqual([])
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
+        .toMatchObject({ phase: 'running' })
+      expect(factory.status().counters.deadPlacementHoldReleases).toBeUndefined()
+      expect(factory.status().counters.heldPastDeadlineReleases).toBeUndefined()
+      const held = factory.status().heldAgents
+      expect(held.map((agent) => agent.name)).toEqual(['ar-434-impl-pear', 'ar-434-review'])
+      expect(held.every((agent) => !agent.pastDeadline)).toBe(true)
+      expect(held[0]!.holdDeadlineAtMs - held[0]!.heldSinceAtMs).toBe(4 * 60 * 60_000)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
 
   it('settles post-spawn completion waits when a later spawn reaches the held-agent deadline', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-post-spawn-deadline-'))
