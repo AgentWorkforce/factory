@@ -96,7 +96,7 @@ interface GithubIssueCloseReceiptBaseline {
 
 type AppIssueConnectionWrite = GithubConnectionWrite & Required<Pick<
   GithubConnectionWrite,
-  'postIssueComment' | 'ensureRepositoryLabel' | 'mutateIssueLabel' | 'updateIssue'
+  'postIssueComment' | 'updateIssue'
 >>
 
 /**
@@ -117,9 +117,9 @@ export class AppGithubWriteback implements GithubWriteback {
   readonly #claimProjections = new Map<string, number>()
 
   constructor(write: GithubConnectionWrite, read?: GithubConnectionRead) {
-    if (!write.postIssueComment || !write.ensureRepositoryLabel || !write.mutateIssueLabel || !write.updateIssue) {
+    if (!write.postIssueComment || !write.updateIssue) {
       throw new Error(
-        'GitHub App lifecycle writeback requires connected comment, label, and issue-update capabilities',
+        'GitHub App lifecycle writeback requires connected comment and issue-update capabilities',
       )
     }
     this.#write = write as AppIssueConnectionWrite
@@ -212,42 +212,73 @@ export class AppGithubWriteback implements GithubWriteback {
 
   async setStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusWriteResult> {
     const ref = githubIssueRef(issue)
-    if (status === 'ready') {
-      for (const label of Object.values(FACTORY_GITHUB_STATUS_LABELS)) {
-        await this.#write.mutateIssueLabel({
-          repo: ref.repo,
-          number: ref.number,
-          operation: 'remove',
-          label: label.name,
-          author: 'app',
-        })
-      }
-      return 'acknowledged'
+    // Relayfile's GitHub adapter routes eight writeback resources — issues,
+    // issue-comments, reviews, pull-requests, refs, close-pull-request, merge
+    // and replies. There is no label resource at all, so the per-label drafts
+    // this used to author (`/repos/{o}/{r}/labels/...` and
+    // `/repos/{o}/{r}/issues/{n}/labels/...`) were rejected by the adapter
+    // before any request reached GitHub. That rejection failed the dispatch
+    // claim, so the lifecycle never reached `running`, the batch slot was
+    // never released, and at batchSize 1 the whole pipeline starved.
+    //
+    // The routed expression is a single issue PATCH carrying the complete
+    // label set, which GitHub also auto-creates unknown labels for — the
+    // reason no separate repository-label provisioning step is needed.
+    const current = await this.#currentIssueLabels(ref, issue)
+    const next = factoryStatusLabelSet(current, status)
+    if (next) {
+      await this.#write.updateIssue({
+        repo: ref.repo,
+        number: ref.number,
+        labels: next,
+        author: 'app',
+      })
     }
-    const target = FACTORY_GITHUB_STATUS_LABELS[status]
-    const previous = FACTORY_GITHUB_STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
-    await this.#write.ensureRepositoryLabel({
-      repo: ref.repo,
-      ...target,
-      author: 'app',
-    })
-    const addReceipt = await this.#write.mutateIssueLabel({
-      repo: ref.repo,
-      number: ref.number,
-      operation: 'add',
-      label: target.name,
-      author: 'app',
-    })
-    await this.#write.mutateIssueLabel({
-      repo: ref.repo,
-      number: ref.number,
-      operation: 'remove',
-      label: previous.name,
-      author: 'app',
-    })
-    // Only the target-label add can prove ownership of the claim that rollback
-    // may later remove. Mutating the obsolete label is not such a receipt.
-    return addReceipt ?? 'acknowledged'
+    // A replace-with-computed-set PATCH acknowledges provider success but
+    // cannot distinguish our transition from an identical concurrent one, and
+    // a set that already matched is not evidence we created it either. Keep
+    // the fail-closed receipt so no caller infers claim ownership from it.
+    return 'acknowledged'
+  }
+
+  /**
+   * The label set to PATCH, in the provider's own casing, or `undefined` when
+   * the issue already carries exactly the wanted set.
+   *
+   * Prefer the connected App projection: it is the freshest authoritative read
+   * available on this surface, and a replace PATCH computed from a stale set
+   * would drop labels added since. Fall back to the projection the caller
+   * dispatched from when the connected read cannot answer.
+   *
+   * A `found` projection carrying no labels does not count as an answer. Only
+   * a labelled issue reaches this method at all — `#isIssueReady` requires the
+   * safety opt-in before anything is dispatched — so an empty extraction means
+   * the projection is incomplete (a record written without its `labels` array,
+   * or a shape this reader cannot parse), not that the issue is bare. Treating
+   * it as authoritative would compute the whole replace set from nothing, and
+   * that fails twice over: `factoryStatusLabelSet([], status)` yields only the
+   * target Factory label, so the PATCH both drops the configured safety label
+   * — which `isAllowedFactoryGithubIssueWriteContent` then rejects, stalling
+   * the claim through the same door #434 exists to close — and clobbers every
+   * other label on the issue, including the `factory`/`factory-ready`/`agent:*`
+   * set the dispatch protocol itself runs on (#434 review, CodeRabbit).
+   */
+  async #currentIssueLabels(
+    ref: { repo: string; number: number },
+    issue: LinearIssue,
+  ): Promise<string[]> {
+    if (this.#connectedRead) {
+      try {
+        const connected = await this.#connectedRead.getIssue(ref.repo, ref.number)
+        if (connected.outcome === 'found') {
+          const projected = githubLabelNamesFromContent(connected.issue.content)
+          if (projected.length > 0) return projected
+        }
+      } catch {
+        // Fall through to the dispatched projection below.
+      }
+    }
+    return issue.labels.map((label) => label.trim()).filter(Boolean)
   }
 
   async claimStatus(issue: LinearIssue, status: GithubIssueStatus): Promise<GithubStatusClaimReceipt> {
@@ -732,6 +763,47 @@ const githubStatusFromLabels = (labels: Set<string>): GithubIssueStatus => {
   if (labels.has(FACTORY_GITHUB_STATUS_LABELS['human-review'].name.toLowerCase())) return 'human-review'
   if (labels.has(FACTORY_GITHUB_STATUS_LABELS['in-progress'].name.toLowerCase())) return 'in-progress'
   return 'ready'
+}
+
+const githubLabelNamesFromContent = (content: unknown): string[] => {
+  const payload = wrappedPayload(content)
+  const labels = Array.isArray(payload.labels) ? payload.labels : []
+  return labels.flatMap((label) => {
+    if (typeof label === 'string' && label.trim()) return [label.trim()]
+    const name = stringValue(asRecord(label)?.name)?.trim()
+    return name ? [name] : []
+  })
+}
+
+/**
+ * The complete label set the issue should carry for `status`, or `undefined`
+ * when `current` already matches it. Every Factory status label is dropped
+ * first so a transition can never leave both on the issue, and non-Factory
+ * labels are preserved in their original order and casing.
+ */
+const factoryStatusLabelSet = (
+  current: string[],
+  status: GithubIssueStatus,
+): string[] | undefined => {
+  const factoryNames = new Set(
+    Object.values(FACTORY_GITHUB_STATUS_LABELS).map((label) => label.name.toLowerCase()),
+  )
+  const seen = new Set<string>()
+  const next: string[] = []
+  for (const label of current) {
+    const key = label.toLowerCase()
+    if (factoryNames.has(key) || seen.has(key)) continue
+    seen.add(key)
+    next.push(label)
+  }
+  if (status !== 'ready') {
+    const target = FACTORY_GITHUB_STATUS_LABELS[status].name
+    if (!seen.has(target.toLowerCase())) next.push(target)
+  }
+  const before = current.map((label) => label.toLowerCase())
+  const after = next.map((label) => label.toLowerCase())
+  const unchanged = before.length === after.length && before.every((label, index) => label === after[index])
+  return unchanged ? undefined : next
 }
 
 const githubLabelsFromContent = (content: unknown): Set<string> => {

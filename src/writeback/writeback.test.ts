@@ -3,9 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FactoryConfigSchema } from '../config/schema'
 import { linearByIdPath, linearCommentPath } from '../constants/linear'
 import { slackReplyPath } from '../constants/slack'
-import { AppGithubWriteback, createFactory, GhCliGithubWriteback, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
+import { AppGithubWriteback, createFactory, GhCliGithubWriteback, isAllowedFactoryGithubDraft, linearCommentName, MountGithubRead, MountLinearWriteback, MountSlackWriteback } from '../index'
 import type { GithubConnectionRead, GithubConnectionWrite, GithubWriteback, MountClient } from '../ports'
 import type { LinearIssue } from '../types'
+import { RelayfileGithubConnectionWrite } from '../mount/relayfile-github-connection-write'
 import { FakeFleetClient, FakeMountClient } from '../testing'
 
 const issuePath = '/linear/issues/AR-99__04ef067e-35b6-4ec4-81e7-66acc1f2e31f.json'
@@ -1067,32 +1068,40 @@ describe('AppGithubWriteback', () => {
       body: 'Factory dispatch for 221',
       author: 'app',
     })
-    expect(ensureRepositoryLabel).toHaveBeenCalledWith({
-      repo: 'AgentWorkforce/factory',
-      name: 'factory:human-review',
-      color: 'fbca04',
-      description: 'Factory work is ready for human review.',
-      author: 'app',
-    })
-    expect(mutateIssueLabel.mock.calls).toEqual([
-      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'add', label: 'factory:human-review', author: 'app' }],
-      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:in-progress', author: 'app' }],
-      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:in-progress', author: 'app' }],
-      [{ repo: 'AgentWorkforce/factory', number: 221, operation: 'remove', label: 'factory:human-review', author: 'app' }],
-    ])
+    // Relayfile's GitHub adapter routes no label resource, so a status
+    // transition must never reach for one.
+    expect(ensureRepositoryLabel).not.toHaveBeenCalled()
+    expect(mutateIssueLabel).not.toHaveBeenCalled()
     expect(postIssueComment).toHaveBeenNthCalledWith(2, {
       repo: 'AgentWorkforce/factory',
       number: 221,
       body: 'Factory observed the linked PR merge.',
       author: 'app',
     })
-    expect(updateIssue).toHaveBeenCalledTimes(1)
-    expect(updateIssue).toHaveBeenCalledWith({
-      repo: 'AgentWorkforce/factory',
-      number: 221,
-      state: 'closed',
-      author: 'app',
-    })
+    // Two status transitions plus the close, all on the routed issue PATCH.
+    expect(updateIssue.mock.calls).toEqual([
+      // human-review: the obsolete in-progress label goes, the rest survive.
+      [{
+        repo: 'AgentWorkforce/factory',
+        number: 221,
+        labels: ['factory', 'bug', 'factory:human-review'],
+        author: 'app',
+      }],
+      // ready: both Factory status labels go. The dispatched projection still
+      // reads `factory:in-progress`, so this is computed from that set.
+      [{
+        repo: 'AgentWorkforce/factory',
+        number: 221,
+        labels: ['factory', 'bug'],
+        author: 'app',
+      }],
+      [{
+        repo: 'AgentWorkforce/factory',
+        number: 221,
+        state: 'closed',
+        author: 'app',
+      }],
+    ])
     const writeback: GithubWriteback = app
     expect(writeback.getIssueAuthor).toBeUndefined()
     await expect(writeback.getIssueStatus?.(appIssue)).resolves.toBeUndefined()
@@ -1103,10 +1112,14 @@ describe('AppGithubWriteback', () => {
     expect(() => new AppGithubWriteback({
       publishPullRequest: async () => { throw new Error('unexpected publish') },
       closePullRequest: async () => undefined,
-    })).toThrow('requires connected comment, label, and issue-update capabilities')
+    })).toThrow('requires connected comment and issue-update capabilities')
   })
 
-  it('propagates an actor-qualified App label receipt to the status claim', async () => {
+  it('fails closed on the status claim: a replace PATCH is not proof of authorship', async () => {
+    // The old per-label path could in principle report `applied`. The routed
+    // issue PATCH cannot: it replaces the label set, so an identical
+    // concurrent transition is indistinguishable from ours. Keep the receipt
+    // fail-closed rather than let a caller infer claim ownership from it.
     const mutateIssueLabel: NonNullable<GithubConnectionWrite['mutateIssueLabel']> = vi.fn(async (input) =>
       input.operation === 'add' ? 'applied' : 'already-matched')
     const app = new AppGithubWriteback({
@@ -1118,7 +1131,159 @@ describe('AppGithubWriteback', () => {
       updateIssue: async () => undefined,
     })
 
-    await expect(app.setStatus(appIssue, 'in-progress')).resolves.toBe('applied')
+    await expect(app.setStatus(appIssue, 'in-progress')).resolves.toBe('acknowledged')
+    expect(mutateIssueLabel).not.toHaveBeenCalled()
+  })
+
+  it('computes the status label set from the connected App projection, not the dispatched one', async () => {
+    // A replace PATCH built from a stale set silently drops labels added
+    // since. The connected read is the freshest authority this surface has.
+    const updateIssue = vi.fn(async () => undefined)
+    const app = new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      updateIssue,
+      getIssue: async () => ({
+        outcome: 'found' as const,
+        issue: {
+          content: {
+            // `triage` landed after the dispatched projection was read, and
+            // the casing here is the provider's, not ours.
+            labels: [{ name: 'Factory' }, { name: 'triage' }, { name: 'factory:in-progress' }],
+          },
+        },
+      }),
+    })
+
+    await expect(app.setStatus(appIssue, 'human-review')).resolves.toBe('acknowledged')
+    expect(updateIssue).toHaveBeenCalledWith({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      labels: ['Factory', 'triage', 'factory:human-review'],
+      author: 'app',
+    })
+  })
+
+  it('writes nothing when the issue already carries exactly the wanted label set', async () => {
+    const updateIssue = vi.fn(async () => undefined)
+    const app = new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      updateIssue,
+    })
+
+    // appIssue.labels is ['factory', 'bug', 'factory:in-progress'].
+    await expect(app.setStatus(appIssue, 'in-progress')).resolves.toBe('acknowledged')
+    expect(updateIssue).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the dispatched labels when a found projection carries none', async () => {
+    // A `found` projection with no usable labels is an incomplete read, not a
+    // bare issue: nothing reaches setStatus without the safety opt-in that made
+    // it dispatchable. Trusting the empty set would compute the whole replace
+    // PATCH from nothing — dropping `factory` (which the mount guard then
+    // rejects, stalling the claim) and clobbering every other label with it.
+    for (const content of [{}, { labels: [] }, { labels: [{ name: '  ' }] }]) {
+      const updateIssue = vi.fn(async () => undefined)
+      const app = new AppGithubWriteback({
+        publishPullRequest: async () => { throw new Error('not used') },
+        closePullRequest: async () => undefined,
+        postIssueComment: async () => undefined,
+        updateIssue,
+        getIssue: async () => ({ outcome: 'found' as const, issue: { content } }),
+      })
+
+      await expect(app.setStatus(appIssue, 'human-review')).resolves.toBe('acknowledged')
+      expect(updateIssue).toHaveBeenCalledWith({
+        repo: 'AgentWorkforce/factory',
+        number: 221,
+        // The dispatched set, transitioned — not the bare ['factory:human-review'].
+        labels: ['factory', 'bug', 'factory:human-review'],
+        author: 'app',
+      })
+    }
+  })
+
+  it('keeps a non-empty connected projection authoritative over the dispatched one', async () => {
+    // The must-not-fire direction of the fallback above: a projection that does
+    // answer still wins, including when it contradicts the dispatched snapshot
+    // by having dropped a label. Only the empty read falls back.
+    const updateIssue = vi.fn(async () => undefined)
+    const app = new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      updateIssue,
+      // `bug` was removed on GitHub after dispatch; the connected read sees it.
+      getIssue: async () => ({
+        outcome: 'found' as const,
+        issue: { content: { labels: [{ name: 'factory' }, { name: 'factory:in-progress' }] } },
+      }),
+    })
+
+    await expect(app.setStatus(appIssue, 'human-review')).resolves.toBe('acknowledged')
+    expect(updateIssue).toHaveBeenCalledWith({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      labels: ['factory', 'factory:human-review'],
+      author: 'app',
+    })
+  })
+
+  it('falls back to the dispatched projection when the connected read cannot answer', async () => {
+    const updateIssue = vi.fn(async () => undefined)
+    const app = new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      updateIssue,
+      getIssue: async () => { throw new Error('connected read unavailable') },
+    })
+
+    await expect(app.setStatus(appIssue, 'ready')).resolves.toBe('acknowledged')
+    expect(updateIssue).toHaveBeenCalledWith({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      labels: ['factory', 'bug'],
+      author: 'app',
+    })
+  })
+
+  it('authors only writeback paths the Relayfile GitHub adapter routes', async () => {
+    // The regression this pins: `setStatus` used to author
+    // `/github/repos/{o}/{r}/labels/<draft>.json` and
+    // `/github/repos/{o}/{r}/issues/{n}/labels/<draft>.json`. The adapter
+    // routes neither, so it rejected the draft before any request reached
+    // GitHub, the dispatch claim failed, and the lifecycle never reached
+    // `running` — starving the whole batch at batchSize 1.
+    //
+    // These patterns are transcribed from the adapter's own route table
+    // (relayfile-adapters `packages/github/src/resources.ts`), which factory
+    // does not depend on. A path that matches none of them is unroutable.
+    const adapterRoutes = [
+      /^\/github\/repos\/[^/]+\/[^/]+\/issues(?:\/[^/]+(?:\.json)?)?$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/issues\/[^/]+\/comments(?:\/[^/]+(?:\.json|\/meta\.json)?)?$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/reviews(?:\/[^/]+(?:\.json)?)?$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/pull-requests(?:\/[^/]+(?:\.json)?)?$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/refs(?:\/[^/]+(?:\.json)?)?$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/pulls\/[1-9]\d*(?:__[^/]+)?\/close\.json$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/pulls\/[1-9]\d*(?:__[^/]+)?\/merge\.json$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/review-comments\/[^/]+\/replies(?:\/[^/]+(?:\.json)?)?$/u,
+    ]
+
+    const mount = new FakeMountClient()
+    const app = new AppGithubWriteback(new RelayfileGithubConnectionWrite({ mount }))
+
+    await app.setStatus(appIssue, 'human-review')
+    await app.setStatus(appIssue, 'ready')
+    await app.postComment(appIssue, 'Factory dispatch for 221')
+
+    const paths = mount.writes.map((write) => write.path)
+    expect(paths.length).toBeGreaterThan(0)
+    const unroutable = paths.filter((path) => !adapterRoutes.some((route) => route.test(path)))
+    expect(unroutable).toEqual([])
   })
 
   it('prefers the connected App issue reader over an unauthenticated fallback', async () => {
@@ -2237,5 +2402,127 @@ describe('createFactory writeback defaults', () => {
       { body, issueId: issue.uuid },
       { guarded: true },
     )).resolves.toBeUndefined()
+  })
+})
+
+describe('isAllowedFactoryGithubDraft complete-label-set PATCH', () => {
+  // This guard had no coverage from the writeback side, which is how a status
+  // claim that the adapter routes but the guard rejects reached CI green.
+  const issuePath = '/github/repos/AgentWorkforce/pear/issues/by-id/221.json'
+  const draftPath = '/github/repos/AgentWorkforce/pear/issues/221.json'
+  const issueFile = {
+    provider: 'github',
+    objectType: 'issue',
+    objectId: 'pear-221',
+    payload: {
+      number: 221,
+      title: '[factory] complete-label-set claim',
+      body: 'body',
+      state: 'open',
+      labels: [{ name: 'factory' }, { name: 'bug' }],
+      url: 'https://github.com/AgentWorkforce/pear/issues/221',
+      repository: { name: 'pear', owner: { login: 'AgentWorkforce' } },
+    },
+  }
+  const guardConfig = (requireLabel: string) => FactoryConfigSchema.parse({
+    workspaceId: 'rw_test',
+    issueSource: 'github',
+    repos: { byLabel: { factory: 'AgentWorkforce/pear' } },
+    safety: { requireLabel, requireTitlePrefix: '[factory]' },
+    slack: { channel: 'C0AD7UU0J1G__proj-cloud' },
+  })
+  const allows = async (content: unknown, requireLabel = 'factory'): Promise<boolean> =>
+    await isAllowedFactoryGithubDraft(
+      draftPath,
+      content,
+      { guarded: true },
+      new FakeMountClient({ [issuePath]: issueFile }),
+      guardConfig(requireLabel),
+    )
+
+  it('admits the exact payload setStatus authors', async () => {
+    await expect(allows({ labels: ['factory', 'bug', 'factory:in-progress'] })).resolves.toBe(true)
+    await expect(allows({ labels: ['factory', 'bug'] })).resolves.toBe(true)
+  })
+
+  it('refuses a set that drops the safety opt-in, including the empty set', async () => {
+    await expect(allows({ labels: [] })).resolves.toBe(false)
+    await expect(allows({ labels: ['bug', 'factory:in-progress'] })).resolves.toBe(false)
+  })
+
+  it('refuses two contradictory Factory claims in one write, in any casing', async () => {
+    await expect(allows({
+      labels: ['factory', 'factory:in-progress', 'Factory:Human-Review'],
+    })).resolves.toBe(false)
+  })
+
+  it('still refuses shapes outside the status claim', async () => {
+    await expect(allows({ labels: ['factory'], title: 'rewritten' })).resolves.toBe(false)
+    await expect(allows({ labels: 'factory' })).resolves.toBe(false)
+    await expect(allows({ labels: ['factory', '   '] })).resolves.toBe(false)
+    await expect(allows({ state: 'open' })).resolves.toBe(false)
+  })
+
+  it('keeps admitting the close write and the opt-in survival check together', async () => {
+    await expect(allows({ state: 'closed' })).resolves.toBe(true)
+    await expect(allows({ labels: ['factory'], state: 'closed' })).resolves.toBe(true)
+  })
+
+  it('refuses the empty set even when the opt-in is exempt', async () => {
+    // The exemption below must not reopen the hole the survival check closed:
+    // stripping every label off an in-scope open issue is never a transition.
+    await expect(allows({ labels: [] }, 'factory:in-progress')).resolves.toBe(false)
+    await expect(allows({ labels: [] }, 'factory:human-review')).resolves.toBe(false)
+  })
+
+  it('admits the payload setStatus authors from an empty connected projection', async () => {
+    // Closes the loop the two halves leave open: the guard is what turns an
+    // empty read into a stalled claim, so the red check has to run the real
+    // construction path into the real guard rather than assert on an array.
+    const pearIssue: LinearIssue = {
+      ...issue,
+      uuid: 'github-pear-221',
+      key: '221',
+      title: '[factory] complete-label-set claim',
+      stateId: '',
+      labels: ['factory', 'bug'],
+      path: issuePath,
+      raw: {
+        payload: {
+          source: {
+            provider: 'github',
+            id: 'github-pear-221',
+            owner: 'AgentWorkforce',
+            repo: 'pear',
+            number: 221,
+            url: 'https://github.com/AgentWorkforce/pear/issues/221',
+          },
+        },
+      },
+    }
+    const authored: unknown[] = []
+    const app = new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      updateIssue: async ({ labels }) => { authored.push({ labels }) },
+      // `found`, but with nothing this reader can extract a label from.
+      getIssue: async () => ({ outcome: 'found' as const, issue: { content: {} } }),
+    })
+
+    await app.setStatus(pearIssue, 'in-progress')
+
+    expect(authored).toEqual([{ labels: ['factory', 'bug', 'factory:in-progress'] }])
+    await expect(allows(authored[0])).resolves.toBe(true)
+    // And the set the unfixed read would have authored is exactly what the
+    // guard refuses — the stall this fallback removes.
+    await expect(allows({ labels: ['factory:in-progress'] })).resolves.toBe(false)
+  })
+
+  it('exempts a lifecycle opt-in from the survival check', async () => {
+    // A self-contradictory configuration, but the survival rule must not add a
+    // second way for it to fail: a status transition is supposed to change a
+    // lifecycle label, so requiring it to survive would reject every claim.
+    await expect(allows({ labels: ['factory', 'bug'] }, 'factory:in-progress')).resolves.toBe(true)
   })
 })
