@@ -33213,11 +33213,16 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
   it('MUST FIRE: reclaims the slot and drains the queue when the ghosts cannot be released', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-419-reclaim-'))
     // 12.66h held against a 4h bound — the live occupant's own number.
-    const { state, key, mounted, agentNames } = await seedWedgedSlot(root, { heldForMs: 45_578_546 })
+    const { state, key, mounted } = await seedWedgedSlot(root, { heldForMs: 45_578_546 })
 
+    // Deliberately PARTIAL: the implementer's release succeeds and the
+    // reviewer's does not. `cleanupComplete` is false either way, but only
+    // this shape can tell a correct `unreleasedAgents` list from one that
+    // names every tracked agent.
     class GhostFleetClient extends RemoteLifecycleFleetClient {
-      override async release(): Promise<void> {
-        throw agentHostUnavailable()
+      override async release(name: string, reason?: string): Promise<void> {
+        if (name.endsWith('-review')) throw agentHostUnavailable()
+        await super.release(name, reason)
       }
     }
     const fleet = new GhostFleetClient()
@@ -33256,7 +33261,7 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
       expect(factory.status().dispatchCapacity?.occupants?.map((occupant) => occupant.issue)).toEqual(['AR-420'])
       // The capacity waiter clears on its own drive, one tick behind the
       // direct dispatch above — `#saveDispatchLifecycle` wakes it on the
-      // occupancy transition `abandoning` -> `releasing`.
+      // occupancy transition `abandoning` -> `abandoned`.
       await vi.waitFor(() => expect(factory.status().dispatchCapacity?.waiting).toBe(0), { timeout: 15_000 })
 
       // Fires once for the work unit, not once per retry.
@@ -33269,16 +33274,20 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
       // otherwise this test would pass on the pre-existing 404 path and prove
       // nothing about the bound.
       expect(logger.warn).toHaveBeenCalledWith(
-        `[factory] failed to release ${agentNames[0]} during completion`,
+        '[factory] failed to release ar-419-review during completion',
         expect.objectContaining({ statusCode: 503 }),
       )
+      expect(fleet.releases).toContainEqual({ name: 'ar-419-impl', reason: 'held-past-deadline' })
       expect(logger.error).toHaveBeenCalledWith(
         '[factory] abandonment teardown retries exhausted; freeing the batch slot anyway',
         expect.objectContaining({
           issue: 'AR-419',
           reason: 'held-past-deadline',
           maxAttempts: 10,
-          unreleasedAgents: ['ar-419-impl', 'ar-419-review'],
+          // ONLY the agent that failed. The implementer released, and naming
+          // it here would send an operator after a worker that already
+          // terminated cleanly.
+          unreleasedAgents: ['ar-419-review'],
         }),
       )
       // The issue must NOT be reported as done. `issue-done` is what

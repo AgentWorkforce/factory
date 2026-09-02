@@ -887,6 +887,8 @@ export class FactoryLoop implements Factory {
   readonly #abandonedDispatchReasons = new Map<string, string>()
   /** Consecutive failed teardowns per abandoned work unit (#419). */
   readonly #abandonmentTeardownAttempts = new Map<string, number>()
+  /** Work units whose teardown this process has permanently given up on (#419). */
+  readonly #abandonmentTeardownDeadLettered = new Set<string>()
   /**
    * Live batch-capacity waits, keyed by issue (#303).
    *
@@ -12031,8 +12033,15 @@ export class FactoryLoop implements Factory {
       )
     }
     const worktreeHandoffs = this.#dispatchFailureHandoffs(record, [])
+    // A teardown this process has already dead-lettered is not retried, only
+    // finished. Re-running it here would re-attempt releases that have failed
+    // ten times, and — because the terminal save below can itself be refused
+    // and re-arm this method — would do so on every one of those retries
+    // (#429 review, cubic P1).
     let cleanupComplete = true
-    if (worktreeHandoffs.length > 0) {
+    if (this.#abandonmentTeardownDeadLettered.has(key)) {
+      // Nothing further to attempt; fall through to the terminal save.
+    } else if (worktreeHandoffs.length > 0) {
       // A terminal no-PR dispatch no longer owns useful work. Fence and release
       // every agent sharing the checkout before removing it. If release or
       // cleanup fails, the durable handoff reaper retains responsibility rather
@@ -12085,6 +12094,7 @@ export class FactoryLoop implements Factory {
     }
     this.#abandonedDispatchReasons.delete(key)
     this.#abandonmentTeardownAttempts.delete(key)
+    this.#abandonmentTeardownDeadLettered.delete(key)
     await this.#recordDispatchTerminal(record.issue)
     const next = (await this.#batch()).complete(record.issue)
     await this.#drainReadyClarificationWake()
@@ -12144,11 +12154,17 @@ export class FactoryLoop implements Factory {
    * which is a bounded, visible cost against an unbounded, silent one.
    */
   #abandonmentTeardownMayRetry(record: InFlightIssue, key: string, reason: string): boolean {
+    // Already given up on. Deleting the counter on exhaustion instead would
+    // reset the budget, so a refused terminal save below would re-run the
+    // dead-lettered teardown and spend a fresh ten attempts on every retry
+    // (#429 review, cubic P1).
+    if (this.#abandonmentTeardownDeadLettered.has(key)) return false
     const attempts = (this.#abandonmentTeardownAttempts.get(key) ?? 0) + 1
     if (attempts <= DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS) {
       this.#abandonmentTeardownAttempts.set(key, attempts)
       return true
     }
+    this.#abandonmentTeardownDeadLettered.add(key)
     this.#abandonmentTeardownAttempts.delete(key)
     this.#increment('abandonedDispatchTeardownDeadLettered')
     // `error`, not `warn`, for the reason #379 gives at the same decision: a
@@ -12159,7 +12175,15 @@ export class FactoryLoop implements Factory {
       reason,
       attempts: attempts - 1,
       maxAttempts: DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS,
-      unreleasedAgents: [...record.agents.keys()].sort(),
+      // Only the agents that did NOT release. `record.agents` keeps a released
+      // agent's entry and marks it with `releasedAtMs`, so listing every key
+      // would send an operator after workers that already terminated cleanly —
+      // and this log is the only artifact they get (#429 review, CodeRabbit
+      // and cubic).
+      unreleasedAgents: [...record.agents]
+        .filter(([, tracked]) => tracked.releasedAtMs === undefined)
+        .map(([name]) => name)
+        .sort(),
     })
     return false
   }
