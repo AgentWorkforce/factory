@@ -228,61 +228,112 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(mount.writes[2]?.path).toBe(mount.writes[0]?.path)
   })
 
-  it('provisions and mutates lifecycle labels through unique confirmed operation drafts', async () => {
-    const mount = new FakeMountClient()
-    const operationIds = [
-      '11111111-1111-4111-8111-111111111111',
-      '22222222-2222-4222-8222-222222222222',
-      '33333333-3333-4333-8333-333333333333',
+  it('authors no writeback path Relayfile\'s GitHub adapter refuses', async () => {
+    // #431's red-check, and it asserts on the RENDERED PATH rather than on the
+    // absence of an exception. The paths this surface used to author for
+    // labels — `/labels/<draft>.json` and `/issues/{n}/labels/<draft>.json` —
+    // threw nothing locally: `writeFile` accepted them, the mount guard
+    // vouched for them, and only the server-side adapter refused, with
+    // `Unsupported GitHub writeback path`. A test that watched for a thrown
+    // error would have stayed green through the entire outage.
+    //
+    // Patterns transcribed from the adapter's own route table
+    // (relayfile-adapters `packages/github/src/resources.ts`) rather than
+    // imported from `GITHUB_WRITEBACK_ROUTES`, so a produced path has to
+    // satisfy the adapter's shapes independently of the copy in src. If the
+    // two disagree, one of them drifted and this fails.
+    const adapterRoutes = [
+      /^\/github\/repos\/[^/]+\/[^/]+\/issues(?:\/[^/]+(?:\.json)?)?$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/issues\/[^/]+\/comments(?:\/[^/]+(?:\.json|\/meta\.json)?)?$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/reviews(?:\/[^/]+(?:\.json)?)?$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/pull-requests(?:\/[^/]+(?:\.json)?)?$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/refs(?:\/[^/]+(?:\.json)?)?$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/pulls\/[1-9]\d*(?:__[^/]+)?\/close\.json$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/pulls\/[1-9]\d*(?:__[^/]+)?\/merge\.json$/u,
+      /^\/github\/repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/review-comments\/[^/]+\/replies(?:\/[^/]+(?:\.json)?)?$/u,
     ]
-    const write = new RelayfileGithubConnectionWrite({
-      mount,
-      operationIdFactory: () => operationIds.shift()!,
-    })
 
-    await write.ensureRepositoryLabel({
+    class ReceiptMount extends FakeMountClient {
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        await super.writeFile(path, content, opts)
+        if (path.includes('/pull-requests/')) {
+          this.files.set(path, { content: { created: 85, url: 'https://github.com/AgentWorkforce/factory/pull/85' } })
+        }
+      }
+    }
+    const mount = new ReceiptMount()
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: gitRunner() })
+
+    // Every mutation this surface exposes, driven through one instance.
+    await write.publishPullRequest({
       repo: 'AgentWorkforce/factory',
-      name: 'factory:in-progress',
-      color: '#1D76DB',
-      description: 'Factory agents are working on this issue.',
-      author: 'app',
+      clonePath: '/tmp/factory-clone',
+      baseRef: 'main',
+      title: 'Issue 52',
+      body: 'Fixes #52',
     })
-    const addReceipt = await write.mutateIssueLabel({
+    await write.closePullRequest({ repo: 'AgentWorkforce/factory', number: 85 })
+    await write.postIssueComment({
       repo: 'AgentWorkforce/factory',
       number: 221,
-      operation: 'add',
-      label: 'factory:in-progress',
+      body: 'Factory dispatch for 221',
       author: 'app',
     })
-    const removeReceipt = await write.mutateIssueLabel({
+    await write.updateIssue({
       repo: 'AgentWorkforce/factory',
       number: 221,
-      operation: 'remove',
-      label: 'factory:human-review',
+      labels: ['factory', 'factory:in-progress'],
+      author: 'app',
+    })
+    await write.updateIssue({
+      repo: 'AgentWorkforce/factory',
+      number: 221,
+      state: 'closed',
       author: 'app',
     })
 
-    expect(addReceipt).toBe('acknowledged')
-    expect(removeReceipt).toBe('acknowledged')
+    const paths = mount.writes.map((entry) => entry.path)
+    expect(paths.length).toBeGreaterThan(0)
+    expect(paths.filter((path) => !adapterRoutes.some((route) => route.test(path)))).toEqual([])
 
-    expect(mount.writes).toEqual([
-      {
-        path: '/github/repos/AgentWorkforce/factory/labels/factory-11111111-1111-4111-8111-111111111111.json',
-        content: {
-          name: 'factory:in-progress',
-          color: '1d76db',
-          description: 'Factory agents are working on this issue.',
-        },
+    // The two writers that authored the unroutable paths are gone, not merely
+    // uncalled. Keeping them would leave the next caller one method call away
+    // from the same silent failure.
+    expect('ensureRepositoryLabel' in write).toBe(false)
+    expect('mutateIssueLabel' in write).toBe(false)
+  })
+
+  it('refuses an unroutable draft before the mount ever sees it', async () => {
+    // The wiring half of the must-not-fire. `assertRoutedGithubWritebackPath`
+    // owns the route table and is red-checked against #431's own path in
+    // writeback-routes.test.ts; what has to be true HERE is that the producer
+    // consults it before `writeFile`, so an unroutable draft is never created
+    // and never enters the durable retry that reissued it every 30s.
+    //
+    // No public method can render an unroutable path any more — that is the
+    // fix — so the refusal is provoked by standing in for the route table.
+    vi.resetModules()
+    vi.doMock('../github/writeback-routes', () => ({
+      assertRoutedGithubWritebackPath: (path: string) => {
+        throw new Error(`Refusing to author an unroutable GitHub writeback path: ${path}.`)
       },
-      {
-        path: '/github/repos/AgentWorkforce/factory/issues/221/labels/factory-22222222-2222-4222-8222-222222222222.json',
-        content: { operation: 'add', labels: ['factory:in-progress'] },
-      },
-      {
-        path: '/github/repos/AgentWorkforce/factory/issues/221/labels/factory-33333333-3333-4333-8333-333333333333.json',
-        content: { operation: 'remove', label: 'factory:human-review' },
-      },
-    ])
+    }))
+    try {
+      const { RelayfileGithubConnectionWrite: Isolated } = await import('./relayfile-github-connection-write')
+      const mount = new FakeMountClient()
+      const write = new Isolated({ mount })
+
+      await expect(write.postIssueComment({
+        repo: 'AgentWorkforce/factory',
+        number: 221,
+        body: 'Factory dispatch for 221',
+        author: 'app',
+      })).rejects.toThrow(/Refusing to author an unroutable GitHub writeback path/u)
+      expect(mount.writes).toEqual([])
+    } finally {
+      vi.doUnmock('../github/writeback-routes')
+      vi.resetModules()
+    }
   })
 
   it('does not report an app issue comment when provider confirmation remains pending', async () => {
@@ -302,23 +353,22 @@ describe('RelayfileGithubConnectionWrite', () => {
     })).rejects.toThrow(/GitHub writeback did not complete .*: pending/u)
   })
 
-  it('does not report a lifecycle-label operation when provider confirmation remains pending', async () => {
-    class PendingLabelMount extends FakeMountClient {
+  it('does not report an issue update when provider confirmation remains pending', async () => {
+    // Was written against `mutateIssueLabel`, whose `/labels/` draft the
+    // adapter never routed. The routed expression of a label change is the
+    // issue PATCH, so the pending-confirmation contract is pinned there.
+    class PendingIssueMount extends FakeMountClient {
       override async confirmWrite(path: string): Promise<'acked' | 'pending'> {
-        return path.includes('/labels/') ? 'pending' : 'acked'
+        return path.endsWith('/issues/221.json') ? 'pending' : 'acked'
       }
     }
-    const mount = new PendingLabelMount()
-    const write = new RelayfileGithubConnectionWrite({
-      mount,
-      operationIdFactory: () => '11111111-1111-4111-8111-111111111111',
-    })
+    const mount = new PendingIssueMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
 
-    await expect(write.mutateIssueLabel({
+    await expect(write.updateIssue({
       repo: 'AgentWorkforce/factory',
       number: 221,
-      operation: 'add',
-      label: 'factory:in-progress',
+      labels: ['factory', 'factory:in-progress'],
       author: 'app',
     })).rejects.toThrow(/GitHub writeback did not complete .*: pending/u)
   })

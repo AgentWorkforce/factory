@@ -4866,6 +4866,19 @@ describe('fleet CLI runtime', () => {
         { body: commentBody },
         { guarded: true },
       )).resolves.toBe(false)
+      // Both of these used to be admitted, and that is #431. Relayfile's
+      // GitHub adapter routes no label resource, so neither path could ever
+      // reach GitHub — it refused them with `Unsupported GitHub writeback
+      // path`. Vouching for them here made every local layer report a healthy
+      // write while the lifecycle label was silently never applied, and
+      // several lanes read the resulting label-less issues as "dispatch never
+      // started". Nothing authors either path since #434; the guard now fails
+      // closed on them like any other unroutable shape.
+      //
+      // This assertion is inverted from allow to deny on purpose. It is the
+      // safe direction — the routed expression of a label change is the
+      // complete-set `/issues/{n}.json` PATCH asserted above, which is
+      // unaffected.
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/labels/factory-11111111-1111-4111-8111-111111111111.json',
         {
@@ -4874,12 +4887,12 @@ describe('fleet CLI runtime', () => {
           description: 'Factory agents are working on this issue.',
         },
         { guarded: true },
-      )).resolves.toBe(true)
+      )).resolves.toBe(false)
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221/labels/factory-22222222-2222-4222-8222-222222222222.json',
         { operation: 'add', labels: ['factory:in-progress'] },
         { guarded: true },
-      )).resolves.toBe(true)
+      )).resolves.toBe(false)
       // Still rejected, but for a sharper reason than before: the guard now
       // admits a complete-label-set PATCH (the per-label path it used to force
       // is unroutable), and this set drops the `factory` safety opt-in that

@@ -23,7 +23,6 @@ import { GhCliGithubMergeGate, MountedGithubMergeGate, closeProbePr, type GhRunn
 import {
   factoryGithubIssueCommentDraftName,
   isFactoryGithubIssueCommentDraftName,
-  isFactoryGithubOperationDraftName,
 } from '../github/writeback-paths'
 import { VerificationPipeline, type VerificationGate } from '../environments/verification-pipeline'
 import type {
@@ -22820,41 +22819,37 @@ export const isAllowedFactoryGithubArtifactDraft = (
   opts: { guarded?: boolean } | undefined,
 ): boolean => opts?.guarded === true && isFactoryGithubAuthoredArtifactPath(path)
 
+/**
+ * This guard used to admit two more shapes: `/issues/{n}/labels/<draft>` and
+ * `/labels/<draft>`. Relayfile's GitHub adapter routes no label resource, so
+ * both were refused remotely with `Unsupported GitHub writeback path` (#431,
+ * #411) — and pre-authorizing them here is part of why that took so long to
+ * see. Every local layer said the write was fine, so a dispatch that had in
+ * fact lost its lifecycle label looked healthy from inside Factory.
+ *
+ * They are not listed any more. Nothing authors them since #434, and a guard
+ * that vouches for an unroutable path is worse than one that fails closed on
+ * it.
+ */
 const factoryGithubIssueWriteTarget = (
   path: string,
-): { owner: string; repo: string; number: number; kind: 'issue-update' | 'comment' | 'label-operation' } | undefined => {
-  const match = /^\/github\/repos\/([^/]+)\/([^/]+)\/issues\/([1-9]\d*)(?:\.json|\/(comments|labels)\/([^/]+))$/iu.exec(path)
+): { owner: string; repo: string; number: number; kind: 'issue-update' | 'comment' } | undefined => {
+  const match = /^\/github\/repos\/([^/]+)\/([^/]+)\/issues\/([1-9]\d*)(?:\.json|\/(comments)\/([^/]+))$/iu.exec(path)
   if (!match?.[1] || !match[2] || !match[3]) return undefined
   const child = match[4]
   const filename = match[5]
   if (child === 'comments' && (!filename || !isFactoryGithubIssueCommentDraftName(filename))) return undefined
-  if (child === 'labels' && (!filename || !isFactoryGithubOperationDraftName(filename))) return undefined
   try {
     return {
       owner: decodeURIComponent(match[1]),
       repo: decodeURIComponent(match[2]),
       number: Number(match[3]),
-      kind: child === 'comments' ? 'comment' : child === 'labels' ? 'label-operation' : 'issue-update',
+      kind: child === 'comments' ? 'comment' : 'issue-update',
     }
   } catch {
     return undefined
   }
 }
-
-const factoryGithubRepositoryLabelWriteTarget = (
-  path: string,
-): { owner: string; repo: string } | undefined => {
-  const match = /^\/github\/repos\/([^/]+)\/([^/]+)\/labels\/([^/]+)$/iu.exec(path)
-  if (!match?.[1] || !match[2] || !match[3] || !isFactoryGithubOperationDraftName(match[3])) return undefined
-  try {
-    return { owner: decodeURIComponent(match[1]), repo: decodeURIComponent(match[2]) }
-  } catch {
-    return undefined
-  }
-}
-
-const githubLifecycleLabel = (name: unknown) =>
-  Object.values(FACTORY_GITHUB_STATUS_LABELS).find((label) => label.name === name)
 
 /**
  * Case-insensitive lifecycle-label match. A complete-label-set PATCH carries
@@ -22874,7 +22869,7 @@ const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =
 }
 
 const isAllowedFactoryGithubIssueWriteContent = (
-  kind: 'issue-update' | 'comment' | 'label-operation',
+  kind: 'issue-update' | 'comment',
   content: unknown,
   requireLabel: string,
 ): boolean => {
@@ -22922,21 +22917,8 @@ const isAllowedFactoryGithubIssueWriteContent = (
     }
     return false
   }
-  if (kind === 'comment') {
-    return hasExactKeys(value, ['body']) && typeof value.body === 'string' && value.body.trim().length > 0
-  }
-  if (value.operation === 'add') {
-    return hasExactKeys(value, ['labels', 'operation']) &&
-      Array.isArray(value.labels) && value.labels.length === 1 && Boolean(githubLifecycleLabel(value.labels[0]))
-  }
-  return value.operation === 'remove' && hasExactKeys(value, ['label', 'operation']) && Boolean(githubLifecycleLabel(value.label))
-}
-
-const isAllowedFactoryGithubRepositoryLabelContent = (content: unknown): boolean => {
-  const value = asRecord(content)
-  if (!value || !hasExactKeys(value, ['color', 'description', 'name'])) return false
-  const expected = githubLifecycleLabel(value.name)
-  return Boolean(expected && expected.color === value.color && expected.description === value.description)
+  // kind === 'comment'
+  return hasExactKeys(value, ['body']) && typeof value.body === 'string' && value.body.trim().length > 0
 }
 
 /**
@@ -22953,12 +22935,6 @@ export const isAllowedFactoryGithubDraft = async (
 ): Promise<boolean> => {
   if (!opts?.guarded) return false
   if (isAllowedFactoryGithubArtifactDraft(path, opts)) return true
-
-  const repositoryLabelTarget = factoryGithubRepositoryLabelWriteTarget(path)
-  if (repositoryLabelTarget) {
-    const repoPath = `/github/repos/${encodeURIComponent(repositoryLabelTarget.owner)}/${encodeURIComponent(repositoryLabelTarget.repo)}/`
-    return isConfiguredGithubRepoPath(repoPath, config) && isAllowedFactoryGithubRepositoryLabelContent(content)
-  }
 
   const target = factoryGithubIssueWriteTarget(path)
   if (!target) return false

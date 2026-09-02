@@ -1037,15 +1037,11 @@ describe('AppGithubWriteback', () => {
       author: 'app',
     }))
     const postIssueComment = vi.fn(async () => undefined)
-    const ensureRepositoryLabel = vi.fn(async () => undefined)
-    const mutateIssueLabel = vi.fn(async () => undefined)
     const updateIssue = vi.fn(async () => undefined)
     const connection: GithubConnectionWrite = {
       publishPullRequest,
       closePullRequest: async () => undefined,
       postIssueComment,
-      ensureRepositoryLabel,
-      mutateIssueLabel,
       updateIssue,
     }
     const app = new AppGithubWriteback(connection)
@@ -1069,9 +1065,8 @@ describe('AppGithubWriteback', () => {
       author: 'app',
     })
     // Relayfile's GitHub adapter routes no label resource, so a status
-    // transition must never reach for one.
-    expect(ensureRepositoryLabel).not.toHaveBeenCalled()
-    expect(mutateIssueLabel).not.toHaveBeenCalled()
+    // transition has no per-label writer to reach for: `GithubConnectionWrite`
+    // no longer declares one (#431).
     expect(postIssueComment).toHaveBeenNthCalledWith(2, {
       repo: 'AgentWorkforce/factory',
       number: 221,
@@ -1120,19 +1115,14 @@ describe('AppGithubWriteback', () => {
     // issue PATCH cannot: it replaces the label set, so an identical
     // concurrent transition is indistinguishable from ours. Keep the receipt
     // fail-closed rather than let a caller infer claim ownership from it.
-    const mutateIssueLabel: NonNullable<GithubConnectionWrite['mutateIssueLabel']> = vi.fn(async (input) =>
-      input.operation === 'add' ? 'applied' : 'already-matched')
     const app = new AppGithubWriteback({
       publishPullRequest: async () => { throw new Error('not used') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel,
       updateIssue: async () => undefined,
     })
 
     await expect(app.setStatus(appIssue, 'in-progress')).resolves.toBe('acknowledged')
-    expect(mutateIssueLabel).not.toHaveBeenCalled()
   })
 
   it('computes the status label set from the connected App projection, not the dispatched one', async () => {
@@ -1305,8 +1295,6 @@ describe('AppGithubWriteback', () => {
       publishPullRequest: async () => { throw new Error('not used') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => undefined,
       updateIssue: async () => undefined,
     }, { getIssue: fallbackGetIssue })
 
@@ -1334,8 +1322,6 @@ describe('AppGithubWriteback', () => {
       publishPullRequest: async () => { throw new Error('not used') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => undefined,
       updateIssue: async () => undefined,
     }, { getIssue: fallbackGetIssue })
 
@@ -1364,8 +1350,6 @@ describe('AppGithubWriteback', () => {
       publishPullRequest: async () => { throw new Error('not used') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => undefined,
       updateIssue: async () => undefined,
     }, { getIssue: fallbackGetIssue })
     const privateIssue: LinearIssue = {
@@ -1425,8 +1409,6 @@ describe('AppGithubWriteback', () => {
       publishPullRequest: async () => { throw new Error('not used') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => undefined,
       updateIssue: async () => undefined,
     }, { getIssue: fallbackGetIssue })
     const privateIssue: LinearIssue = {
@@ -1476,8 +1458,6 @@ describe('AppGithubWriteback', () => {
       publishPullRequest: async () => { throw new Error('not used') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel: async () => undefined,
       updateIssue: async () => undefined,
     }, { getIssue: fallbackGetIssue })
     const privateIssue: LinearIssue = {
@@ -1510,32 +1490,31 @@ describe('AppGithubWriteback', () => {
   })
 
   it('refuses to roll back an App claim from acknowledgement alone', async () => {
-    const mutateIssueLabel = vi.fn(async () => undefined)
+    // Watched on `updateIssue` rather than a per-label writer: the adapter
+    // routes no label resource, so that is the only way a rollback could
+    // write anything at all (#431).
+    const updateIssue = vi.fn(async () => undefined)
     const getIssue = vi.fn<GithubConnectionRead['getIssue']>()
     const app = new AppGithubWriteback({
       publishPullRequest: async () => { throw new Error('not used') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel,
-      updateIssue: async () => undefined,
+      updateIssue,
     }, { getIssue })
 
     await expect(app.rollbackStatusClaim(appIssue, 'in-progress', 'unavailable-token'))
       .resolves.toBe('unproven')
     expect(getIssue).not.toHaveBeenCalled()
-    expect(mutateIssueLabel).not.toHaveBeenCalled()
+    expect(updateIssue).not.toHaveBeenCalled()
   })
 
   it('fails closed instead of read-then-removing an App-backed in-progress claim', async () => {
-    const mutateIssueLabel = vi.fn(async () => undefined)
+    const updateIssue = vi.fn(async () => undefined)
     const connection: GithubConnectionWrite = {
       publishPullRequest: async () => { throw new Error('not used') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel,
-      updateIssue: async () => undefined,
+      updateIssue,
     }
     const read: GithubConnectionRead = {
       getIssue: async () => ({
@@ -1553,18 +1532,16 @@ describe('AppGithubWriteback', () => {
     await expect(app.rollbackStatusClaim(appIssue, 'in-progress', 'provider-event-1'))
       .resolves.toBe('unproven')
     await expect(app.getIssueStatus(appIssue)).resolves.toBe('in-progress')
-    expect(mutateIssueLabel).not.toHaveBeenCalled()
+    expect(updateIssue).not.toHaveBeenCalled()
   })
 
   it('preserves a newer App-backed human-review status during claim rollback', async () => {
-    const mutateIssueLabel = vi.fn(async () => undefined)
+    const updateIssue = vi.fn(async () => undefined)
     const connection: GithubConnectionWrite = {
       publishPullRequest: async () => { throw new Error('not used') },
       closePullRequest: async () => undefined,
       postIssueComment: async () => undefined,
-      ensureRepositoryLabel: async () => undefined,
-      mutateIssueLabel,
-      updateIssue: async () => undefined,
+      updateIssue,
     }
     const read: GithubConnectionRead = {
       getIssue: async () => ({
@@ -1586,7 +1563,7 @@ describe('AppGithubWriteback', () => {
     await expect(app.rollbackStatusClaim(appIssue, 'in-progress', 'provider-event-1'))
       .resolves.toBe('unproven')
     await expect(app.getIssueStatus(appIssue)).resolves.toBe('human-review')
-    expect(mutateIssueLabel).not.toHaveBeenCalled()
+    expect(updateIssue).not.toHaveBeenCalled()
   })
 })
 

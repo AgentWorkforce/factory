@@ -149,28 +149,15 @@ export interface GithubConnectionWrite {
     body: string
     author: 'app'
   }): Promise<void>
-  /** Idempotently provision a repository label through the connected App. */
-  ensureRepositoryLabel?(input: {
-    repo: string
-    name: string
-    color: string
-    description: string
-    author: 'app'
-  }): Promise<void>
-  /** Add or remove exactly one issue label without replacing unrelated labels. */
-  mutateIssueLabel?(input: {
-    repo: string
-    number: number
-    operation: 'add' | 'remove'
-    label: string
-    author: 'app'
-  }): Promise<GithubConnectionMutationReceipt | void>
+  // There is deliberately no label writer here. Relayfile's GitHub adapter
+  // routes no label resource, so `ensureRepositoryLabel` and
+  // `mutateIssueLabel` could only ever author paths it refused (#431, #411).
+  // A label change reaches the provider as a complete-set `updateIssue` PATCH
+  // and nothing else; re-adding a per-label method would re-open the failure
+  // this port shape now makes unrepresentable.
   /** App-authored partial issue update through the workspace GitHub connection. */
   updateIssue?(input: GithubConnectionIssueUpdateInput): Promise<void>
 }
-
-/** Whether a connected App mutation proves it created the visible change. */
-export type GithubConnectionMutationReceipt = 'applied' | 'already-matched' | 'acknowledged'
 
 type GithubConnectionIssueUpdateTarget = {
   repo: string
