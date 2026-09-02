@@ -1,0 +1,408 @@
+# Prove the P0 end-to-end path still works after every live deploy:
+# file a fresh [factory]-labeled canary issue in THIS repo, wait up to 45 min
+# for the deployed container to dispatch it (JIT-provisioned sandbox, impl
+# agent, branch push, PR create), and fail if nothing appears.
+#
+# WHY THIS EXISTS
+#
+# The entire 2026-08-31/09-01 outage looked like "factory is running healthy"
+# to /healthz and /evidence right up until you tried to prove a dispatch could
+# actually complete end-to-end. Every green subsystem could pass with the
+# dispatch pipeline totally broken (mirror stale, rate-limited on ensure, slots
+# held forever, impl agents landing on repo-less sandboxes). The only signal
+# that actually catches this is a REAL issue turning into a REAL branch and
+# REAL PR. This is that signal, wired to fail loudly.
+#
+# WHY IT LIVES HERE AND NOT IN factory-cloud
+#
+# It was originally added to AgentWorkforce/factory-cloud, where it ran twice
+# (33500196999, 33513690229) and died at step one both times:
+#
+#   File canary issue -> GraphQL: Resource not accessible by integration (createIssue)
+#
+# `permissions: issues: write` scopes GITHUB_TOKEN to the repo the workflow
+# runs in. The canary must be filed in AgentWorkforce/factory, because that is
+# what the deployed sweep polls (factory-cloud's config/factory.config.template.json
+# `repos.names`) - and a repo-scoped token cannot create an issue in another
+# repo. Filing it anywhere the sweep does not poll is equally useless: the
+# issue would simply never be ingested.
+#
+# Moving the workflow into the polled repo resolves both halves at once. The
+# issue create, the branch listing and the PR listing are now all same-repo, so
+# the default GITHUB_TOKEN covers them with no PAT and no new secret.
+#
+# This also removes the old TARGET_REPO input and its 21-entry allowlist. That
+# allowlist could accept a repo the sweep does not poll - a canary that cannot
+# pass the gate it is meant to test - and it had already drifted from the live
+# config, which is narrowed to ["factory"]. The canary now files into the repo
+# it lives in, so the target cannot drift from the poll target by construction.
+#
+# FAILING CLOSED, IN BOTH DIRECTIONS
+#
+# A canary is only worth having if a green really means the pipeline worked and
+# a red really means it did not. Three things here exist solely to protect that:
+#
+#   - The branch lookup paginates. `?per_page=100` alone silently stops seeing
+#     new branches once this repo passes 100, and every poll would then miss the
+#     canary branch and report a 45-minute FALSE FAILURE.
+#   - The PR must be opened by EXPECTED_PR_AUTHOR. Accepting a PR from any
+#     author means a credential regression - a human or a different app pushing
+#     the branch - still reports GREEN, which is the one outcome this workflow
+#     must never produce. The expected author is PINNED below rather than being
+#     an input, so it cannot be relaxed at dispatch time.
+#   - A canary that times out is DISARMED before the job exits. The dispatch
+#     labels are what make it ingestible, so an abandoned canary left open with
+#     them is a live work item that consumes a real batch slot later. Slot
+#     exhaustion is part of the outage this workflow exists to detect; it must
+#     not cause it.
+#
+# NOT triggered automatically on every deploy - the 45-min wait would clog CI
+# and the canary issues would accumulate. Run this after any deliberate
+# dispatch-path change (fresh cut of factory, new sandbox image, cloud ensure
+# quota bump) via workflow_dispatch.
+
+name: Verify P0 canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      wait_minutes:
+        description: How long to wait for the branch+PR to appear before failing (positive integer, max 55)
+        required: false
+        type: number
+        default: 45
+      close_after:
+        description: Close the canary issue after a successful check (leave open for triage otherwise)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  # Listing branches through the REST API.
+  contents: read
+  # Creating, labelling, commenting on and closing the canary issue. Same-repo,
+  # so the default GITHUB_TOKEN grants this; this is the permission the
+  # factory-cloud copy could never get, because its target was a different repo.
+  issues: write
+  # Finding the PR raised off the canary branch.
+  pull-requests: read
+
+concurrency:
+  # Two overlapping P0 verifications would race the same batch slot and both
+  # would time out. Serialize.
+  group: verify-p0-canary
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TARGET_REPO: ${{ github.repository }}
+      WAIT_MINUTES: ${{ github.event.inputs.wait_minutes || '45' }}
+      CLOSE_AFTER: ${{ github.event.inputs.close_after || 'false' }}
+      # PINNED, deliberately not a workflow input. If a caller can choose the
+      # identity that counts as proof, the author check stops being a check --
+      # dispatching the canary yourself and naming yourself would go green. A
+      # real change of dispatching identity should be a reviewed edit here.
+      EXPECTED_PR_AUTHOR: app/agent-relay-code
+    steps:
+      - name: Verify this repo is a configured factory poll target
+        run: |
+          set -euo pipefail
+          # The sweep only ingests repos named in factory-cloud's
+          # config/factory.config.template.json `repos.names`. That list is
+          # currently narrowed to ["factory"], and this repo is the one entry
+          # guaranteed to be on it however the list is later widened. Filing
+          # anywhere else produces an issue nothing will ever dispatch, so fail
+          # loudly rather than wait 45 minutes for a foregone timeout.
+          if [ "${TARGET_REPO}" != "AgentWorkforce/factory" ]; then
+            echo "::error::${TARGET_REPO} is not a configured factory poll target; the sweep will never ingest a canary here"
+            exit 1
+          fi
+          echo "Filing canary into ${TARGET_REPO} (a configured poll target)."
+
+      - name: Validate the wait window
+        id: window
+        run: |
+          set -euo pipefail
+          # `WAIT_MINUTES` is fed straight into shell arithmetic below. A
+          # fractional or non-numeric value makes that arithmetic fail mid-run,
+          # AFTER the canary issue has already been filed; and anything at or
+          # above the 60-minute job timeout means the runner is killed before
+          # the failure path can disarm the canary it created. Reject both here,
+          # while nothing has been filed yet.
+          case "${WAIT_MINUTES}" in
+            ''|*[!0-9]*)
+              echo "::error::wait_minutes must be a positive whole number of minutes; got '${WAIT_MINUTES}'"
+              exit 1
+              ;;
+          esac
+          # Normalise with an explicit base. A leading zero ("08") passes the
+          # digit test above but is an INVALID OCTAL in `$(( ))`, so the
+          # deadline arithmetic would blow up in the wait step -- after the
+          # canary issue has already been filed, which is precisely the
+          # orphaned-issue state the disarm step exists to avoid.
+          NORMALISED=$(( 10#${WAIT_MINUTES} ))
+          if [ "${NORMALISED}" -lt 1 ] || [ "${NORMALISED}" -gt 55 ]; then
+            echo "::error::wait_minutes must be between 1 and 55 (the job timeout is 60 min and the disarm step needs headroom); got '${WAIT_MINUTES}'"
+            exit 1
+          fi
+          echo "wait_minutes=${NORMALISED}" >> "${GITHUB_OUTPUT}"
+          echo "Wait window: ${NORMALISED} min. Expecting the canary PR from '${EXPECTED_PR_AUTHOR}'."
+
+      - name: File canary issue
+        id: file
+        env:
+          WAIT_MINUTES: ${{ steps.window.outputs.wait_minutes }}
+        run: |
+          set -euo pipefail
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          TITLE="[factory] Canary — P0 verify ${TS}"
+          BODY_FILE="$(mktemp)"
+          cat > "${BODY_FILE}" <<'EOF'
+          ## Canary probe
+
+          Filed by `verify-p0-canary.yml` to prove the factory dispatch pipeline
+          works end-to-end after the latest deploy. Deliberately trivial so the
+          impl agent's work is fast and unambiguous.
+
+          Expected pipeline:
+          1. Sweep ingests within ~5 min.
+          2. JIT provisions a Daytona sandbox with this repo cloned.
+          3. Implementer agent (`ar-<n>-impl-factory`) makes a trivial commit
+             appending one comment line to `README.md`.
+          4. `factory/<n>-*` branch appears on GitHub.
+          5. PR opens by `app/agent-relay-code`.
+
+          The verify job fails loudly if any step doesn't happen inside the
+          wait window. Any green here proves the P0 path is really working;
+          any red demands operator attention.
+          EOF
+          URL="$(gh issue create --repo "${TARGET_REPO}" --title "${TITLE}" --body-file "${BODY_FILE}" \
+            --label factory --label factory-ready --label agent:single)"
+          NUM="${URL##*/}"
+          echo "Filed canary ${URL}"
+          echo "issue_number=${NUM}" >> "${GITHUB_OUTPUT}"
+          echo "issue_url=${URL}" >> "${GITHUB_OUTPUT}"
+          # Emit a step summary line the operator can click straight to.
+          {
+            echo "## Canary filed"
+            echo "- ${URL}"
+            echo ""
+            echo "Waiting up to ${WAIT_MINUTES} min for branch \`factory/${NUM}-*\` + a matching PR."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Wait for factory/<n>-* branch + PR
+        id: wait
+        env:
+          WAIT_MINUTES: ${{ steps.window.outputs.wait_minutes }}
+        run: |
+          set -euo pipefail
+          NUM="${{ steps.file.outputs.issue_number }}"
+          # NUM is interpolated into a jq program below, so pin it to digits
+          # before it gets there rather than trusting the upstream step.
+          case "${NUM}" in
+            ''|*[!0-9]*)
+              echo "::error::canary issue number is not numeric: '${NUM}'"
+              exit 1
+              ;;
+          esac
+          DEADLINE=$(( $(date -u +%s) + WAIT_MINUTES * 60 ))
+          BRANCH=""
+          PR_NUM=""
+          PR_URL=""
+          FOREIGN_PR=""
+          # A lookup that fails is not a lookup that found nothing, but it is
+          # also not automatically a dispatch failure: one 5xx or DNS blip on a
+          # single poll should not fail a 45-minute canary. Tolerate a few
+          # CONSECUTIVE failures, then give up loudly and say it was the
+          # lookups that broke, not the dispatch pipeline. Any success resets
+          # the count, so this absorbs blips without ever absorbing an outage.
+          LOOKUP_FAILURES=0
+          MAX_LOOKUP_FAILURES=3
+          LOOKUP_ERROR=""
+          while [ "$(date -u +%s)" -lt "${DEADLINE}" ]; do
+            REMAINING=$(( DEADLINE - $(date -u +%s) ))
+            # Branch first: it's the earlier signal in the pipeline.
+            # --paginate, or this stops seeing new branches past the first 100
+            # and reports a false 45-minute failure.
+            #
+            # Every lookup below ends `| sed -n '1p'`, deliberately, and must
+            # not become `| head -1` or regain a `|| true`. sed reads to EOF
+            # instead of closing the pipe on the first line, so it cannot
+            # SIGPIPE the producer -- which is what `|| true` was there to
+            # absorb -- while still letting a real gh failure travel out
+            # through pipefail. With the failure masked, a broken credential or
+            # a 5xx looks identical to "the branch isn't there yet": the canary
+            # then burns the whole window and pages someone for a dispatch
+            # outage that never happened.
+            #
+            # Each lookup runs under `if !` so that a failure is CLASSIFIED
+            # here rather than killing the step at the point of failure.
+            LOOKUP_OK=1
+            if [ -z "${BRANCH}" ]; then
+              if ! BRANCH="$(gh api --paginate "repos/${TARGET_REPO}/branches?per_page=100" \
+                --jq ".[] | select(.name | startswith(\"factory/${NUM}-\")) | .name" \
+                | sed -n '1p')"; then
+                LOOKUP_OK=0
+                BRANCH=""
+                LOOKUP_ERROR="branch lookup (gh api repos/${TARGET_REPO}/branches)"
+              fi
+            fi
+            if [ "${LOOKUP_OK}" = "1" ] && [ -n "${BRANCH}" ]; then
+              # Branch exists; look for its PR, from the expected author only.
+              # A PR from anyone else is NOT proof the dispatch path worked --
+              # it is evidence something else pushed the branch -- so it is
+              # recorded for the failure report rather than accepted as green.
+              #
+              # BRANCH is matched with `--head`, as DATA. It must never be
+              # interpolated into a --jq program: a branch name is attacker-
+              # supplied (anyone who can push names it), it is only required to
+              # be a valid git ref, and a valid ref may contain `"` and `)`.
+              # Spliced into jq source it can close the string literal and drop
+              # the author filter -- turning the one check that detects an
+              # identity regression into an unconditional green.
+              if ! PR_LINE="$(gh pr list --repo "${TARGET_REPO}" --state all --limit 100 \
+                --head "${BRANCH}" \
+                --json number,headRefName,url,author \
+                --jq ".[] | select(.author.login == \"${EXPECTED_PR_AUTHOR}\") | \"\(.number) \(.url)\"" \
+                | sed -n '1p')"; then
+                LOOKUP_OK=0
+                PR_LINE=""
+                LOOKUP_ERROR="PR lookup (gh pr list --head)"
+              fi
+              if [ "${LOOKUP_OK}" = "1" ] && [ -n "${PR_LINE}" ]; then
+                PR_NUM="${PR_LINE%% *}"
+                PR_URL="${PR_LINE#* }"
+                break
+              fi
+              if [ "${LOOKUP_OK}" = "1" ]; then
+                if ! FOREIGN_PR="$(gh pr list --repo "${TARGET_REPO}" --state all --limit 100 \
+                  --head "${BRANCH}" \
+                  --json number,headRefName,url,author \
+                  --jq ".[] | \"\(.url) (author: \(.author.login))\"" \
+                  | sed -n '1p')"; then
+                  LOOKUP_OK=0
+                  FOREIGN_PR=""
+                  LOOKUP_ERROR="foreign-PR lookup (gh pr list --head)"
+                fi
+              fi
+            fi
+            if [ "${LOOKUP_OK}" = "1" ]; then
+              LOOKUP_FAILURES=0
+            else
+              LOOKUP_FAILURES=$(( LOOKUP_FAILURES + 1 ))
+              echo "  lookup failed: ${LOOKUP_ERROR} (${LOOKUP_FAILURES}/${MAX_LOOKUP_FAILURES} consecutive)"
+              if [ "${LOOKUP_FAILURES}" -ge "${MAX_LOOKUP_FAILURES}" ]; then
+                {
+                  echo "## P0 canary INCONCLUSIVE"
+                  echo "- issue: ${{ steps.file.outputs.issue_url }}"
+                  echo "- ${MAX_LOOKUP_FAILURES} consecutive failures of the ${LOOKUP_ERROR}."
+                  echo ""
+                  echo "The canary could not observe the dispatch pipeline, so this says"
+                  echo "NOTHING about whether dispatch works. Check GitHub API status and"
+                  echo "the workflow token, then re-run."
+                } >> "${GITHUB_STEP_SUMMARY}"
+                echo "::error::P0 canary lookups failed ${MAX_LOOKUP_FAILURES} times in a row (${LOOKUP_ERROR}); this is a canary/API failure, NOT a dispatch outage"
+                exit 1
+              fi
+            fi
+            echo "  waiting: branch=${BRANCH:-(none)} pr=${PR_NUM:-(none)} remaining=${REMAINING}s"
+            sleep 60
+          done
+          if [ -z "${BRANCH}" ] || [ -z "${PR_NUM}" ]; then
+            {
+              echo "## P0 canary FAILED"
+              echo "- issue: ${{ steps.file.outputs.issue_url }}"
+              echo "- branch after ${WAIT_MINUTES} min: \`${BRANCH:-(none)}\`"
+              echo "- PR after ${WAIT_MINUTES} min: \`${PR_NUM:-(none)}\`"
+              if [ -n "${FOREIGN_PR}" ]; then
+                echo "- a PR exists on the canary branch but NOT from \`${EXPECTED_PR_AUTHOR}\`: ${FOREIGN_PR}"
+                echo "  That is a credential/identity regression, not a dispatch timeout."
+              fi
+              echo ""
+              echo "The dispatch pipeline did not complete inside the wait window."
+              echo "Check /evidence and the container's readinessReconcile.state."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            if [ -n "${FOREIGN_PR}" ]; then
+              echo "::error::P0 canary branch got a PR from an unexpected author (expected ${EXPECTED_PR_AUTHOR}): ${FOREIGN_PR}"
+            else
+              echo "::error::P0 canary did not produce a branch and PR inside ${WAIT_MINUTES} min"
+            fi
+            exit 1
+          fi
+          echo "branch=${BRANCH}" >> "${GITHUB_OUTPUT}"
+          echo "pr_number=${PR_NUM}" >> "${GITHUB_OUTPUT}"
+          echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "## P0 canary PROVEN"
+            echo "- issue: ${{ steps.file.outputs.issue_url }}"
+            echo "- branch: \`${BRANCH}\`"
+            echo "- PR: ${PR_URL}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Disarm an unproven canary
+        # Runs whenever the canary was filed but never proven -- timeout,
+        # unexpected PR author, cancellation, or an error in the wait step.
+        # The dispatch labels are what make the issue ingestible, so leaving
+        # them on an abandoned canary hands the sweep a real work item and
+        # burns a batch slot later. Slot exhaustion is part of the outage this
+        # workflow exists to detect; it must not cause it.
+        #
+        # This step VERIFIES the disarm instead of assuming it. A silent
+        # cleanup failure is worse than no cleanup at all: it reports the
+        # canary as disarmed while leaving a labelled, open, dispatchable issue
+        # behind. Nothing is masked by failing loudly here -- this step only
+        # runs on paths where the canary was already not proven, so the job is
+        # failing regardless.
+        if: ${{ always() && steps.file.outputs.issue_number != '' && steps.wait.outputs.pr_number == '' }}
+        run: |
+          set -uo pipefail
+          NUM="${{ steps.file.outputs.issue_number }}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "Disarming unproven canary #${NUM}"
+
+          for attempt in 1 2 3; do
+            gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
+              --remove-label factory-ready --remove-label agent:single --remove-label factory >/dev/null 2>&1 || true
+            gh issue close "${NUM}" --repo "${TARGET_REPO}" --reason "not planned" \
+              --comment "P0 canary was not proven inside the wait window (${RUN_URL}). Dispatch labels removed and issue closed so the sweep does not later ingest an abandoned canary and consume a batch slot. Re-run verify-p0-canary to retry." >/dev/null 2>&1 || true
+
+            # Verify against the API rather than trusting the exit codes above.
+            STATE="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
+            LABELS="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo UNKNOWN)"
+            ARMED=0
+            case ",${LABELS}," in
+              *,factory-ready,*|*,agent:single,*|*,factory,*) ARMED=1 ;;
+            esac
+            if [ "${STATE}" = "CLOSED" ] && [ "${ARMED}" = "0" ]; then
+              echo "Disarmed on attempt ${attempt}: state=${STATE} labels=[${LABELS}]"
+              echo "- disarmed canary #${NUM} (dispatch labels removed, issue closed)" >> "${GITHUB_STEP_SUMMARY}"
+              exit 0
+            fi
+            echo "  attempt ${attempt} incomplete: state=${STATE} labels=[${LABELS}]"
+            sleep 5
+          done
+
+          # Still armed. Say so loudly and name the manual remedy -- an
+          # abandoned canary carrying dispatch labels WILL be picked up by the
+          # next sweep.
+          {
+            echo "## Canary disarm FAILED"
+            echo "- issue: ${{ steps.file.outputs.issue_url }}"
+            echo "- state: \`${STATE}\`  labels: \`${LABELS}\`"
+            echo ""
+            echo "This canary is still dispatchable and will consume a batch slot."
+            echo "Remove the \`factory\`, \`factory-ready\` and \`agent:single\` labels and close it by hand."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "::error::Could not disarm canary #${NUM} after 3 attempts (state=${STATE}, labels=[${LABELS}]); it remains dispatchable and needs manual cleanup"
+          exit 1
+
+      - name: Close canary issue (optional)
+        if: ${{ github.event.inputs.close_after == 'true' && steps.wait.outputs.pr_number != '' }}
+        run: |
+          gh issue close "${{ steps.file.outputs.issue_number }}" --repo "${TARGET_REPO}" \
+            --reason completed \
+            --comment "P0 canary succeeded. Branch \`${{ steps.wait.outputs.branch }}\`, PR ${{ steps.wait.outputs.pr_url }}. Closed by verify-p0-canary."

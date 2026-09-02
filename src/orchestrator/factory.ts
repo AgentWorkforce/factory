@@ -1111,6 +1111,21 @@ export class FactoryLoop implements Factory {
   readonly #dispatchLifecyclePersistenceSerial = new Map<string, Promise<void>>()
   readonly #agentUsageGroups = new Set<string>()
   #startupAgentAdoptionActive = false
+  /**
+   * Agent names this process has actually SEEN in the backend's tracked set.
+   *
+   * The set is the membership test that makes absence mean something. An agent
+   * enters the backend's tracked map exactly two ways -- this process spawned
+   * it, or `hydrateTracked` adopted it -- and only for a name that got in can
+   * "not in the map" mean "removed on an exit". For a name that was never
+   * there, absence means nobody put it there yet.
+   *
+   * Deliberately per-agent and not a single global "hydration done" flag. A
+   * global flag flips for the whole process on the first agent it sees, so one
+   * unrelated spawn after a partial `#adoptInFlightAgents` failure would make
+   * every never-hydrated restored placement read as dead at once.
+   */
+  #trackedAgentsObserved = new Set<string>()
   #startupRosterExitSignals?: Set<string>
   // Composite issue + PR identities for which a babysitter has already been spawned, so repeated
   // webhooks / agent-exit safety nets don't respawn it while multi-repository issues retain one
@@ -4944,6 +4959,8 @@ export class FactoryLoop implements Factory {
       }
       if (adopted.length > 0) {
         this.#fleet.hydrateTracked?.(adopted)
+        // Observed at the hydration, not after it: see `#placementLiveness`.
+        this.#observeTrackedAgents()
         await this.#saveDispatchLifecycle(record, 'published', publishedPr)
         for (const agent of adopted) {
           this.#increment('legacyLocalWorkersAdopted')
@@ -6168,10 +6185,14 @@ export class FactoryLoop implements Factory {
       eventListener: this.#eventListenerStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
       dispatchCapacity: this.#dispatchCapacityStatus(),
+      // The gate's own timeout, not the configured one: a record whose
+      // placements are all gone is held under the shorter fallback, and an
+      // operator surface that reported the four-hour deadline anyway would be
+      // the second clock this area already learned not to keep.
       heldAgents: batch?.inFlight.flatMap((record) => heldAgentsForRecord(
         record,
         nowMs,
-        this.#config.dispatch.agentHoldTimeoutMs,
+        this.#holdDeadline(record)?.timeoutMs ?? this.#config.dispatch.agentHoldTimeoutMs,
         this.#config.terminalState,
       )) ?? [],
     }
@@ -6447,6 +6468,12 @@ export class FactoryLoop implements Factory {
         if (this.#agentExitsInFlight.get(name) === handling) {
           this.#agentExitsInFlight.delete(name)
         }
+        // An exit that did not terminalize its record has just changed what
+        // `#holdDeadline` answers for it. The armed timer is only ever moved
+        // EARLIER, so re-arming here cannot extend a hold -- and without it
+        // the four-hour timer armed at placement is the only thing left, which
+        // is precisely how a record outlives every worker it placed.
+        this.#rescheduleHeldAgentDeadlineSweep()
       })
     this.#agentExitsInFlight.set(name, handling)
   }
@@ -6614,6 +6641,10 @@ export class FactoryLoop implements Factory {
       }
       if (agents.length > 0 && this.#fleet.hydrateTracked) {
         this.#fleet.hydrateTracked(agents)
+        // Sampled HERE, while the adopted names are still in the map and before
+        // the roster reconcile below evicts the dead ones. This is what makes a
+        // later absence mean "reconciled away" rather than "never hydrated".
+        this.#observeTrackedAgents()
       }
       if (this.#config.babysitter.enabled) {
         // Restore and reconcile exact PR ownership before asking the fleet to
@@ -6853,20 +6884,109 @@ export class FactoryLoop implements Factory {
     )
   }
 
+  /**
+   * Does this record still have a placement that could plausibly be running?
+   *
+   * `heldSinceAtMs` is a latch: the first successful placement stamps it and
+   * nothing ever clears it. So a record whose workers have all since gone kept
+   * the four-hour `agentHoldTimeoutMs` -- eight times the agent-less deadline
+   * -- purely because it once placed someone, which made a DEAD placement
+   * strictly worse than no placement at all. On a `batchSize: 1` factory that
+   * one occupant is the whole dispatch capacity.
+   *
+   * Fails CLOSED, deliberately. Only evidence already in hand may retire the
+   * agent hold: a placement this factory released, or one the backend's own
+   * tracked set has dropped -- the relay client's exit watcher reconciles that
+   * set against presence, so an agent missing from it is one the backend has
+   * already concluded is gone -- but only once that set has been reconciled at
+   * least once. A backend that keeps no tracked set (the internal fleet), and
+   * one whose set has not been reconciled yet, both contribute no evidence and
+   * every placement stays live to this predicate. Freeing a slot from a worker that is still running is the
+   * duplicate dispatch of AR-448, so "cannot tell" must read as live.
+   *
+   * A spec with no `result` is not counted: `recordPlanned` writes it before
+   * the spawn returns, so it is a name, not a worker (#303). A record holding
+   * only those is exactly what the agent-less deadline already bounds.
+   */
+  /** Records every name currently in the backend's tracked set. */
+  #observeTrackedAgents(): void {
+    const tracked = this.#fleet.trackedAgents?.()
+    if (!tracked) return
+    for (const name of tracked.keys()) this.#trackedAgentsObserved.add(name)
+  }
+
+  /**
+   * Which of the three states is this placement in?
+   *
+   * The whole correctness of the hold gate is that these are THREE states and
+   * not two. Collapsing them either way is a real outage we have already had:
+   *
+   * - `gone`       a positive determination that no worker is there. Decided
+   *                by our own bookkeeping (a spec `recordPlanned` wrote that no
+   *                spawn ever answered, or a placement this factory released),
+   *                or by watching a name enter the backend's tracked map and
+   *                then leave it. Only this state shortens the hold.
+   * - `live`       the name is in the backend's tracked map right now.
+   * - `unmeasured` we have no reading. The backend keeps no tracked set, or the
+   *                name has never been seen in it -- which is what a partial
+   *                `#adoptInFlightAgents` failure leaves behind, since adoption
+   *                restores records into the batch BEFORE it hydrates. Treated
+   *                as live for the hold, because evicting a worker we merely
+   *                failed to measure is AR-448 (#433 review, codex and cubic).
+   *
+   * `unmeasured` is not a resting state. Every hydration site records its names
+   * the moment they land and before any reconcile can remove them, so a
+   * genuinely dead agent resolves to `gone` rather than sitting unmeasured and
+   * keeping a four-hour hold it does not deserve (#433 review, cubic).
+   */
+  #placementLiveness(name: string, tracked: TrackedAgent): 'gone' | 'live' | 'unmeasured' {
+    if (tracked.result === undefined) return 'gone'
+    if (tracked.releasedAtMs !== undefined) return 'gone'
+    const fleetTracked = this.#fleet.trackedAgents?.()
+    if (fleetTracked === undefined) return 'unmeasured'
+    if (fleetTracked.has(name)) return 'live'
+    return this.#trackedAgentsObserved.has(name) ? 'gone' : 'unmeasured'
+  }
+
+  #hasLivePlacement(record: InFlightIssue): boolean {
+    this.#observeTrackedAgents()
+    for (const [name, tracked] of record.agents) {
+      if (this.#placementLiveness(name, tracked) !== 'gone') return true
+    }
+    return false
+  }
+
   #holdDeadline(record: InFlightIssue): {
     kind: 'agents' | 'agentless'
     sinceAtMs: number
     timeoutMs: number
     dueAtMs: number
+    /** True when the agent hold ran under the shorter dead-placement fallback. */
+    deadPlacementFallback: boolean
   } | undefined {
     if (record.dryRun) return undefined
     if (record.heldSinceAtMs !== undefined) {
-      const timeoutMs = this.#config.dispatch.agentHoldTimeoutMs
+      // Gated on still holding a slot, and not on dead placements alone. A
+      // record handed off to babysitters has released its implementers and is
+      // blocking nobody; shortening ITS deadline would abandon a dispatch that
+      // is progressing perfectly well. What this bounds is the occupant that
+      // costs everyone else their capacity.
+      const deadPlacementFallback = !this.#hasLivePlacement(record) && this.#recordOccupiesSlot(record)
+      // `Math.min`, not the agent-less timeout outright: the two are
+      // independently configurable, and a fallback that LENGTHENED a hold
+      // would be a worse bug than the one it fixes.
+      const timeoutMs = deadPlacementFallback
+        ? Math.min(
+          this.#config.dispatch.agentHoldTimeoutMs,
+          this.#config.dispatch.agentlessHoldTimeoutMs,
+        )
+        : this.#config.dispatch.agentHoldTimeoutMs
       return {
         kind: 'agents',
         sinceAtMs: record.heldSinceAtMs,
         timeoutMs,
         dueAtMs: record.heldSinceAtMs + timeoutMs,
+        deadPlacementFallback,
       }
     }
     // Only a row that is actually holding a slot is worth reaping; a `queued`
@@ -6880,6 +7000,7 @@ export class FactoryLoop implements Factory {
       sinceAtMs: record.slotHeldSinceAtMs,
       timeoutMs,
       dueAtMs: record.slotHeldSinceAtMs + timeoutMs,
+      deadPlacementFallback: false,
     }
   }
 
@@ -6922,6 +7043,36 @@ export class FactoryLoop implements Factory {
   #rescheduleHeldAgentDeadlineSweep(): void {
     if (this.#stopping) return
     for (const record of this.#batchView?.inFlight ?? []) this.#scheduleHeldAgentDeadline(record)
+    this.#pruneTrackedAgentsObserved()
+  }
+
+  /**
+   * Drops observations no hold decision can still consult.
+   *
+   * Why this cannot turn a `live` answer back into `unmeasured`: the ONLY
+   * caller of `#placementLiveness` is `#hasLivePlacement`, and it only ever
+   * asks about names taken from `record.agents` of a record in
+   * `#batchView.inFlight`. Every such name is retained here, so a pruned name
+   * is by construction one the gate cannot ask about. Names still in the
+   * backend's tracked map and names with an exit still being handled are
+   * retained too, since either can be adopted into a record before the next
+   * prune.
+   *
+   * A record that leaves the batch and later comes back does so through a
+   * takeover or startup adoption, and both hydrate before the gate runs --
+   * hydration re-records the names, so the observation is rebuilt rather than
+   * remembered (#433 review, cubic).
+   */
+  #pruneTrackedAgentsObserved(): void {
+    if (this.#trackedAgentsObserved.size === 0) return
+    const retained = new Set<string>(this.#fleet.trackedAgents?.().keys() ?? [])
+    for (const name of this.#agentExitsInFlight.keys()) retained.add(name)
+    for (const record of this.#batchView?.inFlight ?? []) {
+      for (const name of record.agents.keys()) retained.add(name)
+    }
+    for (const name of this.#trackedAgentsObserved) {
+      if (!retained.has(name)) this.#trackedAgentsObserved.delete(name)
+    }
   }
 
   async #sweepHeldAgentDeadlines(): Promise<void> {
@@ -6968,12 +7119,18 @@ export class FactoryLoop implements Factory {
         waitingForTerminalState: this.#config.terminalState,
         reason: agentless ? AGENTLESS_SLOT_PAST_DEADLINE_RELEASE_REASON : HELD_PAST_DEADLINE_RELEASE_REASON,
         agents: [...record.agents.keys()].sort(),
+        // Which of the two agent-hold durations this release ran under. An
+        // operator reading `holdTimeoutMs` alone cannot tell a four-hour team
+        // that overran from a team that died and kept the slot anyway.
+        ...(agentless ? {} : { deadPlacementFallback: effective.deadPlacementFallback }),
         ...(agentless ? { phase: record.lifecyclePhase } : {}),
       }
       this.#logger.warn?.(
         agentless
           ? '[factory] releasing a dispatch lifecycle that never placed an agent'
-          : '[factory] releasing agents held past deadline',
+          : effective.deadPlacementFallback
+            ? '[factory] releasing a dispatch lifecycle whose placements are all gone'
+            : '[factory] releasing agents held past deadline',
         details,
       )
       await this.#abandonStuckDispatch(record, details.reason)
@@ -6982,10 +7139,13 @@ export class FactoryLoop implements Factory {
         : undefined
       if (!lifecycle || isTerminalDispatchLifecycle(lifecycle)) {
         this.#increment(agentless ? 'agentlessSlotPastDeadlineReleases' : 'heldPastDeadlineReleases')
+        if (effective.deadPlacementFallback) this.#increment('deadPlacementHoldReleases')
         this.#logger.warn?.(
           agentless
             ? '[factory] released a dispatch lifecycle that never placed an agent'
-            : '[factory] released agents held past deadline',
+            : effective.deadPlacementFallback
+              ? '[factory] released a dispatch lifecycle whose placements are all gone'
+              : '[factory] released agents held past deadline',
           details,
         )
       }
@@ -8122,6 +8282,12 @@ export class FactoryLoop implements Factory {
           node: agent.tracked.result?.node,
         }))
         this.#fleet.hydrateTracked(hydrated)
+        // BEFORE the reconcile below, which is what removes the dead ones. A
+        // takeover that hydrated without recording the names would leave a
+        // genuinely dead agent reading as `unmeasured` forever, and unmeasured
+        // keeps the four-hour hold -- the mirror of the P1, and just as wrong
+        // (#433 review, cubic).
+        this.#observeTrackedAgents()
         try {
           await this.#fleet.reconcileTrackedAgents?.()
           const online = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
@@ -10538,7 +10704,7 @@ export class FactoryLoop implements Factory {
       issue: IssueRef,
       agentName: string,
       tracked: TrackedAgent,
-      hold?: Pick<InFlightIssue, 'heldSinceAtMs' | 'lifecyclePhase'>,
+      hold?: InFlightIssue,
     ): Promise<void> => {
       const key = registryHandoffKey(issue, agentName)
       if (seenAgents.has(key)) {
@@ -10567,7 +10733,13 @@ export class FactoryLoop implements Factory {
         ...(dispatchClaim ? { dispatchClaim: { ...dispatchClaim } } : {}),
         ...(hold?.heldSinceAtMs !== undefined ? {
           heldSinceAtMs: hold.heldSinceAtMs,
-          holdDeadlineAtMs: hold.heldSinceAtMs + this.#config.dispatch.agentHoldTimeoutMs,
+          // The gate's effective timeout, not the configured one. The external
+          // crash reaper releases held agents from THIS field under
+          // `--include-held`, so recomputing the four-hour value here would
+          // leave the backstop four hours behind the in-process sweep for the
+          // very records this change exists to reap (#433 review, CodeRabbit).
+          holdDeadlineAtMs: hold.heldSinceAtMs
+            + (this.#holdDeadline(hold)?.timeoutMs ?? this.#config.dispatch.agentHoldTimeoutMs),
           waitingForTerminalState: this.#config.terminalState,
           ...(hold.lifecyclePhase ? { lifecyclePhase: hold.lifecyclePhase } : {}),
         } : {}),
@@ -19808,15 +19980,16 @@ export class FactoryLoop implements Factory {
 export const defaultMergeGate = (config: FactoryConfig, mount: MountClient, run?: GhRunner): GithubMergeGatePort =>
   new MountedGithubMergeGate(mount, new GhCliGithubMergeGate(run, config.github.identity))
 
+// Label transitions ride the connected issue PATCH, not a per-label draft:
+// Relayfile's GitHub adapter routes no label resource. Gating on label
+// capabilities here would reject a write path that is in fact complete.
 const hasAppGithubLifecycleWrite = (
   write: GithubConnectionWrite | undefined,
 ): write is GithubConnectionWrite & Required<Pick<
   GithubConnectionWrite,
-  'postIssueComment' | 'ensureRepositoryLabel' | 'mutateIssueLabel' | 'updateIssue'
+  'postIssueComment' | 'updateIssue'
 >> => Boolean(
   write?.postIssueComment &&
-  write.ensureRepositoryLabel &&
-  write.mutateIssueLabel &&
   write.updateIssue,
 )
 
@@ -22525,6 +22698,17 @@ const factoryGithubRepositoryLabelWriteTarget = (
 const githubLifecycleLabel = (name: unknown) =>
   Object.values(FACTORY_GITHUB_STATUS_LABELS).find((label) => label.name === name)
 
+/**
+ * Case-insensitive lifecycle-label match. A complete-label-set PATCH carries
+ * the provider's own casing for labels Factory did not author, so an
+ * exact-name test would let a cased variant slip past the one-claim bound.
+ */
+const githubLifecycleLabelName = (name: unknown) =>
+  typeof name === 'string'
+    ? Object.values(FACTORY_GITHUB_STATUS_LABELS)
+      .find((label) => label.name.toLowerCase() === name.trim().toLowerCase())
+    : undefined
+
 const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean => {
   const actual = Object.keys(value).sort()
   const expected = [...keys].sort()
@@ -22534,11 +22718,51 @@ const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =
 const isAllowedFactoryGithubIssueWriteContent = (
   kind: 'issue-update' | 'comment' | 'label-operation',
   content: unknown,
+  requireLabel: string,
 ): boolean => {
   const value = asRecord(content)
   if (!value) return false
   if (kind === 'issue-update') {
-    return hasExactKeys(value, ['state']) && value.state === 'closed'
+    if (hasExactKeys(value, ['state'])) return value.state === 'closed'
+    // A status claim is a complete-label-set PATCH. Relayfile's GitHub adapter
+    // routes no label resource, so replacing the set on the issue itself is
+    // the only expression of a label change that reaches the provider at all —
+    // this guard has to admit it or the claim dies here instead.
+    if (hasExactKeys(value, ['labels']) || hasExactKeys(value, ['labels', 'state'])) {
+      if (!Array.isArray(value.labels)) return false
+      if (!value.labels.every((label) => typeof label === 'string' && label.trim().length > 0)) return false
+      // One write must never assert two contradictory Factory claims.
+      const lifecycle = value.labels.filter((label) => githubLifecycleLabelName(label))
+      if (lifecycle.length > 1) return false
+      // A complete-set PATCH can drop labels as well as add them, and the
+      // safety opt-in is the label that made this issue eligible at all. A set
+      // that omits it would silently remove the issue from Factory's scope, so
+      // require it to survive. `setStatus` preserves every non-Factory label,
+      // so its own payloads always carry it; nothing legitimate is rejected.
+      //
+      // Unless the opt-in IS a lifecycle label, which a status transition is
+      // supposed to change. That configuration is already self-contradictory
+      // (`#isIssueReady` refuses an issue carrying `factory:in-progress`, so
+      // such an issue could never be dispatched to begin with) and this guard
+      // is not the place to litigate it — skip the survival check rather than
+      // add a second, more confusing way for the same config to fail.
+      //
+      // The empty set is refused unconditionally, before the exemption below
+      // can apply to it: stripping every label from an in-scope open issue is
+      // never a status transition, whatever `requireLabel` is configured to
+      // be. `factoryStatusLabelSet` preserves every non-Factory label and an
+      // in-scope issue always carries at least the opt-in, so `setStatus`
+      // cannot author an empty set.
+      if (value.labels.length === 0) return false
+      const required = requireLabel.trim().toLowerCase()
+      const requiredIsLifecycle = Boolean(githubLifecycleLabelName(required))
+      if (required && !requiredIsLifecycle &&
+        !value.labels.some((label) => label.trim().toLowerCase() === required)) {
+        return false
+      }
+      return value.state === undefined || value.state === 'closed'
+    }
+    return false
   }
   if (kind === 'comment') {
     return hasExactKeys(value, ['body']) && typeof value.body === 'string' && value.body.trim().length > 0
@@ -22580,7 +22804,7 @@ export const isAllowedFactoryGithubDraft = async (
 
   const target = factoryGithubIssueWriteTarget(path)
   if (!target) return false
-  if (!isAllowedFactoryGithubIssueWriteContent(target.kind, content)) return false
+  if (!isAllowedFactoryGithubIssueWriteContent(target.kind, content, config.safety.requireLabel)) return false
   if (target.kind === 'comment') {
     const body = asRecord(content)?.body
     const draftName = path.slice(path.lastIndexOf('/') + 1)
