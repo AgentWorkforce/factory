@@ -1189,6 +1189,25 @@ class SilentlyLostPlacementFleetClient extends RemoteLifecycleFleetClient {
   }
 }
 
+/**
+ * A backend whose tracked set is real and POPULATED, but has never contained
+ * this dispatch's placements -- one unrelated worker is in it and the restored
+ * ones never were. The state a partial `#adoptInFlightAgents` failure leaves
+ * behind once any other spawn lands.
+ */
+class ForeignTrackedFleetClient extends RemoteLifecycleFleetClient {
+  override trackedAgents(): ReadonlyMap<string, { invocationId?: string; node?: string }> {
+    return new Map([['unrelated-neighbour-438', { node: 'sf-mini' }]])
+  }
+}
+
+/** A backend whose tracked set is empty because nothing ever reconciled it. */
+class UnreconciledTrackedFleetClient extends RemoteLifecycleFleetClient {
+  override trackedAgents(): ReadonlyMap<string, { invocationId?: string; node?: string }> {
+    return new Map()
+  }
+}
+
 class LaterSpawnHangingFleetClient extends RemoteLifecycleFleetClient {
   readonly laterSpawnGate = Promise.withResolvers<void>()
   terminalExitEmitted = false
@@ -12612,9 +12631,16 @@ describe('FactoryLoop', () => {
       await vi.waitFor(async () => expect(
         await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)),
       ).toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 8_000 })
-      expect(factory.status().counters.deadPlacementHoldReleases).toBe(1)
+      // Asserted on the PRE-abandon log deliberately. The counter and the
+      // past-tense log both sit behind `isTerminalDispatchLifecycle` on a
+      // re-read taken after `#abandonStuckDispatch`, and a durable write that
+      // needs a retry reaches `abandoned` on a later attempt without passing
+      // through that block again -- so under load they are a race, not a fact.
+      // This line is emitted unconditionally, and it carries what the test is
+      // actually about: the gate ran this record on the one-second fallback
+      // clock instead of the four-hour one.
       expect(logger.warn).toHaveBeenCalledWith(
-        '[factory] released a dispatch lifecycle whose placements are all gone',
+        '[factory] releasing a dispatch lifecycle whose placements are all gone',
         expect.objectContaining({
           issue: 'AR-431',
           holdTimeoutMs: 1_000,
@@ -12668,6 +12694,92 @@ describe('FactoryLoop', () => {
       const held = factory.status().heldAgents
       expect(held.map((agent) => agent.name)).toEqual(['ar-434-impl-pear', 'ar-434-review'])
       expect(held.every((agent) => !agent.pastDeadline)).toBe(true)
+      expect(held[0]!.holdDeadlineAtMs - held[0]!.heldSinceAtMs).toBe(4 * 60 * 60_000)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  // The third arm, and the subtlest. An EMPTY tracked set is not a set that
+  // says everyone is dead -- it can be a set nobody has filled in yet.
+  // `#adoptInFlightAgents` restores records into the batch BEFORE it calls
+  // `hydrateTracked`, so a partial adoption failure after a restart leaves live
+  // placements missing from a map that was never populated. Reading that as
+  // death releases running workers, which is AR-448 arriving through the very
+  // door this change opened.
+  it('keeps the full hold while the backend tracked set has never been reconciled', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-unreconciled-tracked-'))
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const mount = new FakeMountClient({ [issuePath(437)]: issueFile(437) })
+    const fleet = new UnreconciledTrackedFleetClient()
+    // Strip the hydration hook, which is what startup adoption gates its
+    // roster reconciliation on. Without it the tracked set is never reconciled
+    // -- exactly the state a partial adoption failure leaves behind.
+    ;(fleet as { hydrateTracked?: unknown }).hydrateTracked = undefined
+    const factory = createFactory(config({
+      dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 1_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), { mount, fleet, stateStore, triage: new StaticTriage() })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(437), issueFile(437)))
+      await factory.dispatch(decision)
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-437-impl-pear', 'ar-437-review'])
+      expect(fleet.trackedAgents().size).toBe(0)
+
+      fleet.emitAgentExit('unrelated-agent-437', 'exited')
+      await new Promise((resolve) => setTimeout(resolve, 3_000))
+
+      // Absence of evidence, so both placements keep the four-hour hold.
+      expect(fleet.releases).toEqual([])
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
+        .toMatchObject({ phase: 'running' })
+      expect(factory.status().counters.deadPlacementHoldReleases).toBeUndefined()
+      const held = factory.status().heldAgents
+      expect(held).toHaveLength(2)
+      expect(held[0]!.holdDeadlineAtMs - held[0]!.heldSinceAtMs).toBe(4 * 60 * 60_000)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  // The fourth arm, and the one a global "hydration done" flag fails. Such a
+  // flag flips for the WHOLE process on the first agent it sees, so a single
+  // unrelated spawn landing after a partial adoption failure would make every
+  // never-hydrated restored placement read as dead at once. The tracked map
+  // here is real and non-empty; it has simply never held these two names.
+  it('keeps the full hold for placements the tracked set has never contained', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-foreign-tracked-'))
+    const stateStore = new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const mount = new FakeMountClient({ [issuePath(438)]: issueFile(438) })
+    const fleet = new ForeignTrackedFleetClient()
+    const factory = createFactory(config({
+      dispatch: { agentHoldTimeoutMs: 4 * 60 * 60_000, agentlessHoldTimeoutMs: 1_000 },
+      loop: {
+        heartbeatPath: join(root, 'heartbeat.json'),
+        registryPath: join(root, 'registry.json'),
+      },
+    }), { mount, fleet, stateStore, triage: new StaticTriage() })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(438), issueFile(438)))
+      await factory.dispatch(decision)
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-438-impl-pear', 'ar-438-review'])
+      // A populated map that has never carried either placement.
+      expect([...fleet.trackedAgents().keys()]).toEqual(['unrelated-neighbour-438'])
+
+      fleet.emitAgentExit('unrelated-agent-438', 'exited')
+      await new Promise((resolve) => setTimeout(resolve, 3_000))
+
+      expect(fleet.releases).toEqual([])
+      expect(await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
+        .toMatchObject({ phase: 'running' })
+      expect(factory.status().counters.deadPlacementHoldReleases).toBeUndefined()
+      const held = factory.status().heldAgents
+      expect(held).toHaveLength(2)
       expect(held[0]!.holdDeadlineAtMs - held[0]!.heldSinceAtMs).toBe(4 * 60 * 60_000)
     } finally {
       await factory.stop()

@@ -1107,6 +1107,21 @@ export class FactoryLoop implements Factory {
   readonly #dispatchLifecyclePersistenceSerial = new Map<string, Promise<void>>()
   readonly #agentUsageGroups = new Set<string>()
   #startupAgentAdoptionActive = false
+  /**
+   * Agent names this process has actually SEEN in the backend's tracked set.
+   *
+   * The set is the membership test that makes absence mean something. An agent
+   * enters the backend's tracked map exactly two ways -- this process spawned
+   * it, or `hydrateTracked` adopted it -- and only for a name that got in can
+   * "not in the map" mean "removed on an exit". For a name that was never
+   * there, absence means nobody put it there yet.
+   *
+   * Deliberately per-agent and not a single global "hydration done" flag. A
+   * global flag flips for the whole process on the first agent it sees, so one
+   * unrelated spawn after a partial `#adoptInFlightAgents` failure would make
+   * every never-hydrated restored placement read as dead at once.
+   */
+  #trackedAgentsObserved = new Set<string>()
   #startupRosterExitSignals?: Set<string>
   // Composite issue + PR identities for which a babysitter has already been spawned, so repeated
   // webhooks / agent-exit safety nets don't respawn it while multi-repository issues retain one
@@ -6620,6 +6635,10 @@ export class FactoryLoop implements Factory {
       }
       if (agents.length > 0 && this.#fleet.hydrateTracked) {
         this.#fleet.hydrateTracked(agents)
+        // Sampled HERE, while the adopted names are still in the map and before
+        // the roster reconcile below evicts the dead ones. This is what makes a
+        // later absence mean "reconciled away" rather than "never hydrated".
+        this.#observeTrackedAgents()
       }
       if (this.#config.babysitter.enabled) {
         // Restore and reconcile exact PR ownership before asking the fleet to
@@ -6873,21 +6892,53 @@ export class FactoryLoop implements Factory {
    * agent hold: a placement this factory released, or one the backend's own
    * tracked set has dropped -- the relay client's exit watcher reconciles that
    * set against presence, so an agent missing from it is one the backend has
-   * already concluded is gone. A backend that keeps no tracked set (the
-   * internal fleet) contributes no evidence and every placement stays live to
-   * this predicate. Freeing a slot from a worker that is still running is the
+   * already concluded is gone -- but only once that set has been reconciled at
+   * least once. A backend that keeps no tracked set (the internal fleet), and
+   * one whose set has not been reconciled yet, both contribute no evidence and
+   * every placement stays live to this predicate. Freeing a slot from a worker that is still running is the
    * duplicate dispatch of AR-448, so "cannot tell" must read as live.
    *
    * A spec with no `result` is not counted: `recordPlanned` writes it before
    * the spawn returns, so it is a name, not a worker (#303). A record holding
    * only those is exactly what the agent-less deadline already bounds.
    */
-  #hasLivePlacement(record: InFlightIssue): boolean {
+  /** Records every name currently in the backend's tracked set. */
+  #observeTrackedAgents(): void {
+    const tracked = this.#fleet.trackedAgents?.()
+    if (!tracked) return
+    for (const name of tracked.keys()) this.#trackedAgentsObserved.add(name)
+  }
+
+  /**
+   * Has the backend positively determined this placement is gone?
+   *
+   * Absence from the tracked map is evidence ONLY for a name this process has
+   * seen in that map. `#adoptInFlightAgents` restores records into the batch
+   * BEFORE it calls `hydrateTracked`, so after a partial adoption failure every
+   * restored placement is missing from a set nobody populated -- and reading
+   * that as death evicts live work, at startup, while the factory is already
+   * recovering. That is AR-448 arriving through the one door this change opens
+   * (#433 review, codex and cubic, independently).
+   *
+   * So an unhydrated name is UNKNOWN, and unknown keeps the hold. Only a
+   * positive determination releases it.
+   */
+  #placementConfirmedGone(name: string): boolean {
     const fleetTracked = this.#fleet.trackedAgents?.()
+    if (fleetTracked === undefined) return false
+    if (!this.#trackedAgentsObserved.has(name)) return false
+    return !fleetTracked.has(name)
+  }
+
+  #hasLivePlacement(record: InFlightIssue): boolean {
+    this.#observeTrackedAgents()
     for (const [name, tracked] of record.agents) {
+      // A spec `recordPlanned` wrote before the spawn returned is a name, not a
+      // worker, and a placement this factory released is not one either. Both
+      // are positive determinations of our own (#303).
       if (tracked.result === undefined) continue
       if (tracked.releasedAtMs !== undefined) continue
-      if (fleetTracked !== undefined && !fleetTracked.has(name)) continue
+      if (this.#placementConfirmedGone(name)) continue
       return true
     }
     return false
@@ -10605,7 +10656,7 @@ export class FactoryLoop implements Factory {
       issue: IssueRef,
       agentName: string,
       tracked: TrackedAgent,
-      hold?: Pick<InFlightIssue, 'heldSinceAtMs' | 'lifecyclePhase'>,
+      hold?: InFlightIssue,
     ): Promise<void> => {
       const key = registryHandoffKey(issue, agentName)
       if (seenAgents.has(key)) {
@@ -10634,7 +10685,13 @@ export class FactoryLoop implements Factory {
         ...(dispatchClaim ? { dispatchClaim: { ...dispatchClaim } } : {}),
         ...(hold?.heldSinceAtMs !== undefined ? {
           heldSinceAtMs: hold.heldSinceAtMs,
-          holdDeadlineAtMs: hold.heldSinceAtMs + this.#config.dispatch.agentHoldTimeoutMs,
+          // The gate's effective timeout, not the configured one. The external
+          // crash reaper releases held agents from THIS field under
+          // `--include-held`, so recomputing the four-hour value here would
+          // leave the backstop four hours behind the in-process sweep for the
+          // very records this change exists to reap (#433 review, CodeRabbit).
+          holdDeadlineAtMs: hold.heldSinceAtMs
+            + (this.#holdDeadline(hold)?.timeoutMs ?? this.#config.dispatch.agentHoldTimeoutMs),
           waitingForTerminalState: this.#config.terminalState,
           ...(hold.lifecyclePhase ? { lifecyclePhase: hold.lifecyclePhase } : {}),
         } : {}),
