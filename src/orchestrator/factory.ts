@@ -9844,6 +9844,12 @@ export class FactoryLoop implements Factory {
     const reopenedFromTerminal = previousRole === 'done' || previousRole === 'humanReview'
     if (reopenedFromTerminal && role === 'readyForAgent') {
       await this.#clearTerminalRefusals(ref)
+    } else if (role === 'readyForAgent') {
+      // The edge above only repairs a row that went terminal because the work
+      // FINISHED. A row can also go terminal because the DISPATCH gave up, and
+      // that path never touches the surface — so there is no edge to run and
+      // this branch is the only thing that can reach it (#410, #412).
+      await this.#reconcileStaleAbandonedLifecycle(ref)
     }
     // Never erase a remembered terminal role on an intermediate observation.
     // A reopened issue is routinely seen in a non-ready shape first — reopened
@@ -9857,6 +9863,74 @@ export class FactoryLoop implements Factory {
     if (role === 'done' || role === 'humanReview' || role === 'readyForAgent') {
       await this.#state.recordCanonicalState(this.#workspaceId, canonicalKey, role)
     }
+  }
+
+  /**
+   * Clear a durable row that says this work unit is finished when the surface
+   * says it is still open and ready (#410, #412).
+   *
+   * `#clearTerminalRefusals` above is armed on a TRANSITION — `done |
+   * humanReview -> readyForAgent` — so it can only ever repair a row that went
+   * terminal because the work COMPLETED and a human then reopened it. A row
+   * also goes terminal when the DISPATCH gives up: a transient live read after
+   * spawn throws `LiveDispatchStateChangedError`, `#dispatch` saves `abandoned`
+   * on that branch, and — deliberately, so the unit is not also retry-latched —
+   * skips `#recordDispatchTerminal`. Nothing on that path writes to GitHub, so
+   * the issue stays open and `factory-ready`, its canonical role never leaves
+   * `readyForAgent`, and the reopen edge can never arm. The attempt gate then
+   * passes (that row is not terminal) and the claim gate refuses instead, which
+   * is why the live signature is `dispatch-failed` / `lifecycle-terminal` and
+   * not `dispatch-terminal`. Refused forever, on an issue nobody closed.
+   *
+   * So reconcile on the DISAGREEMENT rather than on a transition. The surface
+   * is the system of record for whether the work is wanted; a durable row
+   * claiming otherwise, with no surface transition behind it, is stale.
+   *
+   * Four things keep this from trading a stall for a duplicate dispatch — the
+   * strictly worse bug, since a claim belongs to the work unit and a dispatch
+   * gate fails closed:
+   *
+   * 1. `abandoned` only, never `complete`. `complete` has exactly one writer,
+   *    `#finishDurableRelease`, which is reachable only after terminal issue
+   *    writeback was acknowledged. A `complete` row therefore means the work
+   *    really finished, and finished work is never resurrected here — that
+   *    case still belongs to the reopen edge and its human.
+   * 2. Never a rekey alias. `migrationAliasOf` rows are `abandoned` by
+   *    construction and are audit evidence of the #211 rekey, not abandoned
+   *    work; clearing one would delete the evidence and orphan its canonical
+   *    row.
+   * 3. Never a row this process still owns. A live epoch means a dispatch is
+   *    mid-flight under this key; terminal saves drop the epoch, so a row that
+   *    is both terminal and epoch-held is a race, not a stale record.
+   * 4. The attempt counters are deliberately LEFT ALONE. This is an automatic
+   *    repair with no human behind it, so resetting `attempts` — which is what
+   *    `#clearTerminalRefusals` does for a human reopen — would delete the only
+   *    brake and spin a permanently-failing unit forever. Leaving them means
+   *    `dispatch.maxAttempts` still latches, and the unit settles in
+   *    `dispatch-retry-limit`: a different, honest terminal state that names
+   *    the real problem and that a human reopen can still clear.
+   *
+   * The new failure mode this accepts, stated plainly: a work unit whose
+   * dispatch keeps dying gets `maxAttempts` attempts instead of one before it
+   * latches, so a genuinely broken unit costs one extra placement attempt. That
+   * is the bound being traded for recoverability, and it is finite.
+   */
+  async #reconcileStaleAbandonedLifecycle(ref: IssueRef): Promise<boolean> {
+    if (!this.#usesDurableDispatchLifecycle()) return false
+    const key = safeDispatchLifecycleKey(ref)
+    if (key === undefined) return false
+    // A live epoch is this process's own dispatch fence: see (3) above.
+    if (this.#dispatchLifecycleEpochs.has(key)) return false
+    const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+    if (!lifecycle || lifecycle.phase !== 'abandoned') return false
+    if (lifecycle.migrationAliasOf !== undefined) return false
+    await this.#state.clearDispatchLifecycle(this.#workspaceId, key)
+    this.#increment('dispatchTerminalStaleReopened')
+    this.#logger.info?.('[factory] cleared a terminal dispatch row whose issue is still open and ready', {
+      issue: ref.key,
+      releaseReason: lifecycle.releaseReason,
+    })
+    return true
   }
 
   /**
