@@ -5,6 +5,7 @@ import type { DispatchLifecyclePhase, StateStore, TerminalDispatchLifecyclePhase
 import type { Clock, Logger } from './ports/system'
 import type { FactoryEventReporter } from './ports/observability'
 import type { AgentWorktreeManager } from './ports/worktree'
+import type { SandboxPush } from './ports/sandbox-push'
 import type { CloseProbePrInput, CloseProbePrResult } from './github/probe-closer'
 import type { GhRunner, GithubMergeGate } from './github/merge-gate'
 import type { AgentProcessFinder, ProcessIdentity } from './orchestrator/process-identity'
@@ -36,6 +37,12 @@ export interface FactoryPorts {
   verificationGate?: VerificationGate
   probeCloser?: ProbeCloser
   probePrResolver?: ProbePrResolver
+  /**
+   * Publishes an implementer's sandbox commits as a branch + PR when the
+   * placement was remote. Absent on a local-only host, where the implementer's
+   * clone is on this filesystem and the existing clone path already publishes.
+   */
+  sandboxPush?: SandboxPush
   /** @deprecated Ignored. Factory PR discovery uses the authenticated mounted projection. */
   probePrGhRunner?: GhRunner
   logger?: Logger

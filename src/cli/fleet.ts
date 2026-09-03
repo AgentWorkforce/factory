@@ -87,7 +87,7 @@ import {
   openIntegrationUrl,
   type FactoryIntegrationObservation,
 } from '../mount/relayfile-integration-preflight'
-import type { FactoryIntegrationProvider } from '../ports'
+import type { FactoryIntegrationProvider, SandboxPush } from '../ports'
 import type { StateStore } from '../ports/state'
 import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
@@ -185,6 +185,13 @@ export interface FleetCliDeps {
    * them. Forwarded to `RelayFleetClient` alongside {@link provisionSandbox}.
    */
   placementSandboxOnly?: boolean
+  /**
+   * Publishes an implementer's sandbox commits as a branch + PR. Injected by
+   * factory-cloud's container alongside {@link provisionSandbox}: the same
+   * boundary, for the same reason — the credential belongs on the host side,
+   * not in factory and not in the box. Forwarded to `FactoryPorts.sandboxPush`.
+   */
+  sandboxPush?: SandboxPush
   isInteractive?: () => boolean
   confirmIntegrationConnect?: (provider: FactoryIntegrationProvider) => Promise<boolean>
   openIntegrationUrl?: (url: string) => void | Promise<void>
@@ -597,6 +604,7 @@ export async function runFleetCli(argv: string[], deps: FleetCliDeps = {}): Prom
           logger,
           reporter,
           worktrees: globals.backend === 'internal' ? new GitAgentWorktreeManager() : undefined,
+          ...(deps.sandboxPush ? { sandboxPush: deps.sandboxPush } : {}),
           readOnly,
         })
         return await runFactoryCommand(

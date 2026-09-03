@@ -93,6 +93,16 @@ export interface SpawnResult {
   node?: string
   /** Explicit process locality; never infer whether a PID is local from a node name. */
   locality?: 'local' | 'remote'
+  /**
+   * Provider sandbox this agent was placed into, when the placement was
+   * JIT-provisioned. Present only on the `provisionSandbox` path, and it is
+   * the only handle factory has on the box holding the agent's clone — the
+   * node name is not one, because a sandbox is not labelled with the name the
+   * enrollment generates for it. Publishing the agent's commits needs this
+   * (see `ports/sandbox-push`), so a placement that omits it can be dispatched
+   * but not published from.
+   */
+  sandboxId?: string
 }
 
 export interface RosterEntry {

@@ -84,3 +84,8 @@ export type {
   AgentWorktreeManager,
   AgentWorktreeRepository,
 } from './worktree'
+export type {
+  SandboxPush,
+  SandboxPushInput,
+  SandboxPushResult,
+} from './sandbox-push'
