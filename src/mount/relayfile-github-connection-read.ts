@@ -57,12 +57,14 @@ export class RelayfileGithubConnectionRead implements GithubConnectionRead {
   readonly #timeoutMs: number
 
   constructor(config: RelayfileGithubConnectionReadConfig) {
-    const baseUrl = config.baseUrl.replace(/\/+$/u, '')
-    if (new URL(baseUrl).protocol !== 'https:') {
-      throw new Error(`Relayfile mount base URL must use https: ${baseUrl}`)
-    }
     this.#workspaceId = config.workspaceId
-    this.#baseUrl = baseUrl
+    // Not validated here: this reader is constructed unconditionally inside
+    // RelayfileCloudMountClient whenever a base URL is present, alongside
+    // file reads, writeback, and subscriptions that share the same client.
+    // Throwing eagerly on a malformed or non-HTTPS base URL would fail the
+    // entire mount, not just GitHub reads — validate lazily in #resolveBaseUrl
+    // instead, so only an actual GitHub issue read is affected.
+    this.#baseUrl = config.baseUrl.replace(/\/+$/u, '')
     this.#tokenProvider = config.tokenProvider
     this.#fetch = config.fetch ?? fetch
     this.#correlationIdFactory = config.correlationIdFactory ?? randomUUID
@@ -75,7 +77,7 @@ export class RelayfileGithubConnectionRead implements GithubConnectionRead {
       throw new Error(`GitHub issue number must be a positive integer: ${number}`)
     }
 
-    const url = `${this.#baseUrl}/v1/workspaces/${encodeURIComponent(this.#workspaceId)}` +
+    const url = `${this.#resolveBaseUrl()}/v1/workspaces/${encodeURIComponent(this.#workspaceId)}` +
       `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/issues/${number}/read`
 
     // Resolving the token is a credential-path operation, not a transport
@@ -112,6 +114,19 @@ export class RelayfileGithubConnectionRead implements GithubConnectionRead {
     }
 
     return parseGithubIssueLookup(await response.json(), owner, name, number)
+  }
+
+  #resolveBaseUrl(): string {
+    let parsed: URL
+    try {
+      parsed = new URL(this.#baseUrl)
+    } catch {
+      throw new Error(`Relayfile mount base URL is malformed: ${this.#baseUrl}`)
+    }
+    if (parsed.protocol !== 'https:') {
+      throw new Error(`Relayfile mount base URL must use https: ${this.#baseUrl}`)
+    }
+    return this.#baseUrl
   }
 }
 

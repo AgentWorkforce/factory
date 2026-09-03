@@ -135,12 +135,32 @@ describe('RelayfileGithubConnectionRead', () => {
     expect(request).not.toHaveBeenCalled()
   })
 
-  it('rejects a non-HTTPS mount base URL at construction', () => {
-    expect(() => new RelayfileGithubConnectionRead({
+  // Validated lazily, not in the constructor: this reader is built
+  // unconditionally inside RelayfileCloudMountClient whenever a base URL is
+  // present, alongside file reads, writeback, and subscriptions sharing the
+  // same client — an eager throw here would fail the entire mount, not just
+  // GitHub reads.
+  it('rejects a non-HTTPS mount base URL when a read is attempted, not at construction', async () => {
+    const request = vi.fn()
+    const insecureReader = new RelayfileGithubConnectionRead({
       workspaceId: 'rw_test',
       baseUrl: 'http://relayfile.example',
       tokenProvider: async () => 'delegated-relayfile-token',
-    })).toThrow(/must use https/)
+      fetch: request,
+    })
+
+    await expect(insecureReader.getIssue('AgentWorkforce/private-repo', 159)).rejects.toThrow(/must use https/)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('rejects a malformed mount base URL with a clear message when a read is attempted', async () => {
+    const malformedReader = new RelayfileGithubConnectionRead({
+      workspaceId: 'rw_test',
+      baseUrl: 'not-a-url',
+      tokenProvider: async () => 'delegated-relayfile-token',
+    })
+
+    await expect(malformedReader.getIssue('AgentWorkforce/private-repo', 159)).rejects.toThrow(/malformed/)
   })
 
   it('degrades to indeterminate when the mount itself cannot be reached', async () => {
