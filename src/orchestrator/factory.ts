@@ -6164,7 +6164,7 @@ export class FactoryLoop implements Factory {
       let failedState: { terminal: boolean } | undefined
       if (!liveStateChanged) {
         await this.#recordDispatchFailure(decision.issue)
-        failedState = await this.#state.getDispatchAttempts(this.#workspaceId, decision.issue.key)
+        failedState = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(decision.issue))
       }
       const terminalFailure = liveStateChanged || Boolean(failedState?.terminal)
       if (terminalFailure && !await this.#saveDispatchLifecycle(
