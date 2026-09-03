@@ -11852,13 +11852,20 @@ export class FactoryLoop implements Factory {
       // exist yet. Publish it from the host first. Best-effort — on any
       // outcome but a push we fall through to the existing path, which is
       // still correct for a run whose branch did somehow arrive.
-      const pushed = await this.#tryPushImplementerSandbox(record, implementer)
+      const pushAttempted = await this.#tryPushImplementerSandbox(record, implementer)
       const published = await this.#publishImplementerPullRequest(
         record,
         implementer,
-        // The push opened the PR as the App on its way through. Reconcile that
-        // one into a receipt rather than opening a second PR from the same head.
-        pushed ? { reconcileExisting: true } : {},
+        // Reconcile whenever the push path was APPLICABLE, not only when this
+        // attempt pushed. A push opens the PR on its way through, and under
+        // relayfile-cloud the mounted snapshot can lag that creation — so a
+        // single scan can miss a PR that exists, fall through to creation, and
+        // fail on a duplicate head. Worse, the retry then finds the sandbox
+        // already pushed and answers `no-changes`, which under a
+        // pushed-only condition would disable reconciliation for good and
+        // strand a perfectly valid PR unrecorded. The lookup is cheap and
+        // returns undefined when there is genuinely nothing to reconcile.
+        pushAttempted ? { reconcileExisting: true } : {},
       )
       if (published) {
         this.#increment('implementerPrsPublishedOnExit')
@@ -11884,9 +11891,12 @@ export class FactoryLoop implements Factory {
   /**
    * Publish a remote implementer's sandbox commits as a branch and a PR.
    *
-   * Returns true only when a push actually landed, because that is the one
-   * outcome that changes what the caller does next: it means a PR now exists
-   * for this head and must be reconciled rather than opened again.
+   * Returns whether this path was APPLICABLE — a remote implementer with a
+   * sandbox to push from — rather than whether this particular attempt pushed.
+   * That is what the caller needs: once a push has been attempted for a head,
+   * a PR may exist for it, and a later retry that answers `no-changes` because
+   * the sandbox was already pushed must still reconcile rather than try to
+   * create a duplicate.
    *
    * Everything here is best-effort and non-throwing. A dispatch whose work
    * cannot be published is not a dispatch that should be failed — the existing
@@ -11914,10 +11924,17 @@ export class FactoryLoop implements Factory {
     ) {
       return false
     }
-    const issue = await this.#readIssue(record.issue.path)
-    if (!issue) return false
-    const repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org)
+    // Both the issue read and the repo normalization run INSIDE the try:
+    // `#readIssue` can rethrow a pass-wide relayfile fault and
+    // `normalizeGithubRepo` throws for a bare repo name with no configured
+    // org. Outside, those failures would be counted as a skipped publish and
+    // never as a push failure, which hides a broken push behind the wrong
+    // counter.
+    let repo = implementer.spec.repo
     try {
+      const issue = await this.#readIssue(record.issue.path)
+      if (!issue) return true
+      repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org)
       const result = await push.push({
         sandboxId,
         repoPath: implementer.spec.clonePath,
@@ -11948,7 +11965,7 @@ export class FactoryLoop implements Factory {
         status: result.status,
         ...(result.status === 'failed' ? { reason: result.reason } : {}),
       })
-      return false
+      return true
     } catch (error) {
       this.#increment('sandboxPushesFailed')
       this.#logger.warn?.('[factory] implementer sandbox push threw', {
@@ -11957,7 +11974,7 @@ export class FactoryLoop implements Factory {
         branch,
         error: describeError(error).errorMessage,
       })
-      return false
+      return true
     }
   }
 

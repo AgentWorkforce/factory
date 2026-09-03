@@ -21309,6 +21309,58 @@ describe('FactoryLoop', () => {
       expect(calls).toEqual([])
     })
 
+    /**
+     * The retry case codex flagged. A push opens the PR on its way through,
+     * but under relayfile-cloud the mounted snapshot can lag that creation —
+     * so the first publish can miss it and fail on a duplicate head. On the
+     * retry the sandbox is already pushed, so the push answers `no-changes`.
+     * If reconciliation were conditioned on "did THIS attempt push", that
+     * retry would disable it and strand a real PR unrecorded forever.
+     */
+    it('still reconciles an existing PR when the retry finds the sandbox already pushed', async () => {
+      const publishPullRequest = vi.fn(async () => {
+        throw new Error('must reconcile the PR the push already opened, not publish another')
+      })
+      const mount = new FakeMountClient({
+        [issuePath(93)]: issueFile(93),
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, { publishPullRequest, closePullRequest: async () => undefined })
+      const fleet = new RemoteFleetClient()
+      const stateStore = new InMemoryStateStore({ batchSize: 1 })
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        // The idempotent second call: the branch is already pushed.
+        sandboxPush: { push: async () => ({ status: 'no-changes' }) },
+      })
+
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93)))
+      await factory.dispatch(decision)
+      const branch = (await stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(decision.issue),
+      ))!.decision.implementers[0]!.branch!
+      // The PR the earlier push already opened, now visible in the projection.
+      mount.files.set('/github/repos/AgentWorkforce/pear/pulls/1093/metadata.json', { content: {
+        number: 1093,
+        url: 'https://github.com/AgentWorkforce/pear/pull/1093',
+        head_ref: branch,
+        state: 'open',
+        draft: false,
+      } })
+
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+
+      await vi.waitFor(() =>
+        expect(factory.status().counters.githubPullRequestsReconciled).toBe(1))
+      expect(publishPullRequest).not.toHaveBeenCalled()
+      expect(factory.status().counters.sandboxPushesEmpty).toBe(1)
+    })
+
     // A push that does not land must not fail the dispatch: the existing
     // publish path runs behind it and owns that decision.
     it.each([
