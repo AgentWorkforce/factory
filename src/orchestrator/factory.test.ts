@@ -33962,3 +33962,263 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
     }
   }, 90_000)
 })
+
+/**
+ * The publish loop had no bound, and it holds a batch slot while it spins.
+ *
+ * `#saveDispatchLifecycle(record, 'publishing')` runs BEFORE the attempt and
+ * `publishing` is a slot-occupying phase, so a publication that can never
+ * succeed does not merely retry — it removes dispatch capacity for the life of
+ * the process, and the durable `publishing` row puts it straight back after a
+ * restart.
+ *
+ * Measured on the 2026-09-02 factory-cloud outage. A cloud dispatch's
+ * implementer commits only ever exist inside its sandbox, so the head ref is
+ * not on GitHub and `POST /pulls` answers 422 `Validation Failed` every time,
+ * for the same reason every time. One such row logged 274 attempts on a single
+ * boot; with `batchSize: 1` that was a total dispatch stop with eight work
+ * units queued behind it, and clearing the durable row by hand bought 8 seconds
+ * before the next sweep re-dispatched into the identical failure.
+ *
+ * The bound belongs at the publish site and not in the generic lifecycle
+ * re-arm: that arm serves dispatch and recovery failures too, which is exactly
+ * why #379 left it uncharged, and the source-scan guard above pins that.
+ */
+describe('a deterministic PR publication must not pin the batch slot forever (#430)', () => {
+  // Test-only cadence override, same rationale as the #379 suite: the budget
+  // under test is the real one, only the delay between attempts moves.
+  const RETRY_MS = 5
+
+  /** The verbatim production failure shape, message and all. */
+  const headRefNeverPushed = () => new Error(
+    'Writeback operation failed for /github/repos/AgentWorkforce/pear/pull-requests/' +
+    'factory-factory-902-agentworkforce-pear-pushed.json: ' +
+    'GitHub writeback failed with status 422: Validation Failed',
+  )
+
+  it('MUST FIRE: abandons the dispatch and gives the slot back when the publication can never succeed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-bound-fire-'))
+    const watchStatePath = join(root, 'state.json')
+    let attempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => {
+        attempts += 1
+        throw headRefNeverPushed()
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(902)]: issueFile(902),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const errors: unknown[][] = []
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      probePrResolver: async () => undefined,
+      logger: { warn: () => undefined, error: (...args: unknown[]) => errors.push(args) },
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(902), issueFile(902)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-902-impl-pear', 'exited')
+
+      // PRECONDITION, and it passes on BOTH sides of the fix: the loop really
+      // is turning. Asserting this first means the fail-first below cannot be
+      // satisfied by a fixture that never published at all.
+      await vi.waitFor(() => expect(attempts).toBeGreaterThan(5), { timeout: 10_000, interval: 5 })
+
+      // THE WEDGE, and the fail-first. The slot is what `batchSize` capacity is
+      // computed from, and `publishing` occupies one. Against `origin/main`
+      // this never empties: the publish throws out of the drive's `publishing`
+      // branch, the generic uncharged arm re-arms, and the loop turns for as
+      // long as the process lives — so the wait can only end in its own
+      // deadline, with the occupant still in the report. That failure names the
+      // retained occupant rather than a counter that main could not have had,
+      // so it is a property of the loop and not of any name chosen here.
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 10_000, interval: 5 })
+
+      // A waitFor, not a bare read. `#abandonExhaustedPublish` now abandons
+      // BEFORE it spends the counter and logs (cubic P2 - a throwing logger
+      // must not undo the abandonment), and the batch empties partway through
+      // `#abandonStuckDispatch`. So the slot can be observed free a beat before
+      // the counter moves; asserting it synchronously here was relying on the
+      // old ordering rather than on the guarantee.
+      await vi.waitFor(
+        () => expect(factory.status().counters.dispatchPublishRetriesExhausted).toBe(1),
+        { timeout: 10_000, interval: 5 },
+      )
+      // The exact budget, not merely "some bound fired" (#440 review,
+      // CodeRabbit). One uncharged attempt from the agent-exit handler, then
+      // DISPATCH_PUBLISH_MAX_ATTEMPTS charged retries through the drive's
+      // `publishing` branch, then the attempt that tips it over: 1 + 10 + 1.
+      // A budget quietly changed to 5 or 20 fails here rather than passing.
+      expect(attempts).toBe(12)
+      // Indexed, not `errors.at(-1)` (#440 review, cubic P3): nothing pins the
+      // give-up as the LAST thing the factory ever logs, and `#abandonStuckDispatch`
+      // runs after it. Finding the entry means a later error line cannot make
+      // this assertion inspect the wrong tuple or stringify `undefined`.
+      const giveUp = errors.findIndex(([message]) =>
+        message === '[factory] pull request publication retries exhausted; abandoning the dispatch')
+      expect(giveUp).toBeGreaterThanOrEqual(0)
+      // The give-up must name the provider's cause. A 422 on a head ref that
+      // was never pushed reads very differently from a 503, and this line is
+      // the only place an operator gets to see which one it was.
+      expect(JSON.stringify(errors[giveUp]?.[1])).toContain('422: Validation Failed')
+
+      // `abandoned`, never `complete`. A dispatch that produced no pull request
+      // must not be recorded as a successful one — that is the codex P1 on the
+      // sibling release path, and it is reachable here for the same reason.
+      const lifecycle = await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
+      expect(lifecycle?.phase).toBe('abandoned')
+      expect(factory.status().counters.done).toBeUndefined()
+
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  it('MUST NOT FIRE: a publication that recovers inside its budget still publishes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-bound-quiet-'))
+    const watchStatePath = join(root, 'state.json')
+    // Ten failures, then success. The first failure is caught by the agent-exit
+    // handler and is NOT charged — charging starts on the drive retries — so
+    // this spends nine of the ten-attempt budget and must come out the other
+    // side. One field different from the must-fire case, which is its control.
+    const failuresBeforeSuccess = 10
+    let attempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        attempts += 1
+        if (attempts <= failuresBeforeSuccess) throw headRefNeverPushed()
+        return {
+          repo: input.repo,
+          number: 903,
+          url: 'https://github.com/AgentWorkforce/pear/pull/903',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(903)]: issueFile(903),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 1, watchStatePath }),
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      probePrResolver: async () => undefined,
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(903), issueFile(903)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-903-impl-pear', 'exited')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1), { timeout: 10_000, interval: 5 })
+      expect(attempts).toBe(failuresBeforeSuccess + 1)
+      expect(factory.status().counters.dispatchPublishRetriesExhausted).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
+})
+
+/**
+ * The give-up must not be undoable by the caller's own logger (#440 review,
+ * cubic P2).
+ *
+ * The sibling finding in the same review - that the terminal `published` save
+ * needs its own budget - is fixed in `factory.ts` but has NO test here: the
+ * path could not be reached from a fixture. With the save rejecting, the
+ * publication succeeds once and the lifecycle is never re-driven at all
+ * (measured: one publish, one rejected save, no further attempt in 40 s, work
+ * unit still in flight), so the bound under test is never reached and a test
+ * built on it would pass or fail for unrelated reasons. That non-re-arm is
+ * tracked as #443 and is a defect in its own right.
+ */
+describe('the publish bound survives its own failure modes (#440)', () => {
+  const RETRY_MS = 5
+
+  /**
+   * cubic P2. `#chargeReleaseAttempt` already documents this hazard on the
+   * sibling path: `this.#logger.error` is caller-supplied and can throw. The
+   * original order spent the budget, logged, and only then abandoned — so a
+   * throwing logger rejected the helper with the cleanup never run AND the
+   * counter reset, and the outer retry re-armed with a fresh budget, forever.
+   * Losing the log line is acceptable; re-arming the wedge it announces is not.
+   */
+  it('abandons even when the injected logger throws on the give-up line', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-bound-logger-'))
+    const watchStatePath = join(root, 'state.json')
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => {
+        throw new Error('GitHub writeback failed with status 422: Validation Failed')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(906)]: issueFile(906),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    let giveUpLogCalls = 0
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 1, watchStatePath }),
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      probePrResolver: async () => undefined,
+      logger: {
+        warn: () => undefined,
+        // Throws ONLY on the give-up line (#440 review, codex P2). A logger
+        // that throws on EVERY error call never reaches the hazard under test:
+        // the publish `catch` inside `#handleAgentExit` calls `#error` BEFORE
+        // it calls `#scheduleDispatchLifecycleRetry`, so the very first failed
+        // publication would throw out before any retry was ever armed, and the
+        // budget could never be spent. The test would then be exercising a
+        // different failure entirely - and passing for a reason that has
+        // nothing to do with the ordering it claims to pin.
+        //
+        // Anchored to those symbols rather than to line numbers (#440 review,
+        // cubic P3): the ordering is the invariant, and an unrelated edit to
+        // `#handleAgentExit` must not silently invalidate the explanation.
+        error: (message: unknown) => {
+          if (message === '[factory] pull request publication retries exhausted; abandoning the dispatch') {
+            giveUpLogCalls += 1
+            throw new Error('logger exploded')
+          }
+        },
+      },
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(906), issueFile(906)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-906-impl-pear', 'exited')
+
+      await vi.waitFor(
+        () => expect(factory.status().counters.dispatchPublishRetriesExhausted).toBe(1),
+        { timeout: 40_000, interval: 5 },
+      )
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 40_000, interval: 5 })
+      // The give-up line really was reached and really did throw, so the pass
+      // is not vacuous - and it throws on THAT line specifically, so the
+      // abandonment is what survived it.
+      expect(giveUpLogCalls).toBe(1)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 60_000)
+})
