@@ -127,6 +127,29 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(mount.writes).toEqual([])
   })
 
+  it('does not treat a bare "404" substring in an unrelated error as a confirmed-absent ref (#453 review)', async () => {
+    // CodeRabbit, #453 review: a transport error whose message merely
+    // CONTAINS "404" - here, a branch name segment - must not classify as a
+    // confirmed-absent ref. Only unambiguous not-found phrasing (or a
+    // structured status/code) may.
+    class AmbiguousMessageMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        throw new Error(`request to fetch refs/heads/feature-404 failed: connection reset`)
+      }
+    }
+    const mount = new AmbiguousMessageMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'feature-404',
+      baseRef: 'main',
+      title: 'Issue 905',
+      body: 'Fixes #905',
+    })).rejects.toThrow('connection reset')
+    expect(mount.writes).toEqual([])
+  })
+
   it('confirms the ref through the encoded owner__repo projection when the nested layout 404s (#453 review)', async () => {
     // `getIssue` probes both of Relayfile's canonical layouts because a
     // workspace can expose only one of them. The ref-existence check must do

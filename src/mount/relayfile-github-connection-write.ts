@@ -414,10 +414,16 @@ const asRecord = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
 
 /**
- * A CONFIRMED absent read, as opposed to any other read failure. Mirrors
- * `isMountFileNotFound` in `src/cli/fleet.ts` - same status/code sniffing,
- * same message fallback - kept local because `mount/` is a lower layer than
- * `cli/` and must not depend on it.
+ * A CONFIRMED absent read, as opposed to any other read failure. Structured
+ * fields first, matching `isMountFileNotFound` in `src/cli/fleet.ts` (kept
+ * local because `mount/` is a lower layer than `cli/` and must not depend on
+ * it), but deliberately WITHOUT that helper's bare `\b404\b` message fallback
+ * (#453 review, CodeRabbit): a transport error whose text merely CONTAINS
+ * "404" - a URI segment like `feature-404`, an unrelated numeric id - would
+ * false-positive as a confirmed-absent ref here, and that false positive
+ * feeds straight into `isNonRetryablePublishError` abandoning a genuinely
+ * publishable dispatch. The message fallback is restricted to unambiguous
+ * not-found phrasing.
  */
 const isMountFileNotFound = (error: unknown): boolean => {
   const record = asRecord(error)
@@ -426,5 +432,5 @@ const isMountFileNotFound = (error: unknown): boolean => {
   const code = typeof record.code === 'string' ? record.code.toLowerCase() : undefined
   return status === 404 || status === '404' ||
     code === 'not_found' || code === 'file_not_found' ||
-    /(?:file\s+not\s+found|\b404\b)/iu.test(errorMessage(error))
+    /file\s+not\s+found/iu.test(errorMessage(error))
 }

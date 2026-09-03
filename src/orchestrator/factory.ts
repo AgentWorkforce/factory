@@ -558,14 +558,19 @@ const PUBLISH_NON_RETRYABLE_RELEASE_REASON = 'publish-non-retryable'
  * - `assertRoutedGithubWritebackPath`'s refusal of a draft the adapter never
  *   routes at all (#411/#431) - rejected before the request even reaches
  *   GitHub, for the same "this payload is wrong" reason.
- * - This surface's own pre-publish guards (`Refusing to publish GitHub
- *   PR: ...`), including the refs/heads existence check below: a branch that
- *   was CONFIRMED never pushed does not appear on a retry either (an
- *   indeterminate ref read is propagated as a different, retryable error -
- *   see `RelayfileGithubConnectionWrite#assertHeadRefPushed`).
+ * - Every "Refusing to publish" pre-publish guard, on this surface and on
+ *   `#publishImplementerPullRequest` itself (`Refusing to publish GitHub
+ *   PR: ...`, and `#publishImplementerPullRequest`'s own `Refusing to
+ *   publish ${issueKey}: ...` branch/no-branch guards - #453 review,
+ *   CodeRabbit: the earlier `publish GitHub PR`-only match missed those two).
+ *   All of them are deterministic validation failures, including the
+ *   refs/heads existence check below: a branch that was CONFIRMED never
+ *   pushed does not appear on a retry either (an indeterminate ref read is
+ *   propagated as a different, retryable error - see
+ *   `RelayfileGithubConnectionWrite#assertHeadRefPushed`).
  */
 const NON_RETRYABLE_WRITEBACK_ERROR_PATTERN =
-  /GitHub writeback failed with status (?:400|404|422)\b|^Refusing to (?:author an unroutable GitHub writeback path|publish GitHub PR)\b/u
+  /GitHub writeback failed with status (?:400|404|422)\b|^Refusing to (?:author an unroutable GitHub writeback path|publish)\b/u
 const isNonRetryablePublishError = (error: unknown): boolean =>
   NON_RETRYABLE_WRITEBACK_ERROR_PATTERN.test(describeError(error).errorMessage)
 /**

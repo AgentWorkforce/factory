@@ -34650,4 +34650,54 @@ describe('a non-retryable writeback status abandons on the first attempt (#430)'
       await rm(root, { recursive: true, force: true })
     }
   }, 20_000)
+
+  // #453 review (CodeRabbit): the pattern's "Refusing to publish" alternative
+  // originally required the literal text "GitHub PR", which this surface's
+  // own pre-publish guards never produce - `#publishImplementerPullRequest`
+  // throws `Refusing to publish ${issueKey}: ...` instead. Both guards are
+  // exactly as permanent as the ref-existence check (retrying does not grow
+  // a branch or fix a mismatched issue key), so they must fast-path too.
+  it('MUST FIRE: a "Refusing to publish <issue>: ..." pre-publish guard abandons on the first attempt', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-nonretryable-guard-'))
+    const watchStatePath = join(root, 'state.json')
+    let attempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => {
+        attempts += 1
+        throw new Error('Refusing to publish AR-913: implementer has no Factory-derived branch')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(913)]: issueFile(913),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      probePrResolver: async () => undefined,
+      logger: { warn: () => undefined, error: () => undefined },
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(913), issueFile(913)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-913-impl-pear', 'exited')
+
+      await vi.waitFor(
+        () => expect(factory.status().counters.dispatchPublishNonRetryable).toBe(1),
+        { timeout: 10_000, interval: 5 },
+      )
+      expect(attempts).toBe(1)
+      const lifecycle = await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
+      expect(lifecycle?.releaseReason).toBe('publish-non-retryable')
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
 })
