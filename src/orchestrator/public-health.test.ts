@@ -1248,6 +1248,64 @@ describe('sweep counters on the public surface (#355)', () => {
     expect(readiness?.dispatchFailures).toBe(readiness?.skipReasons?.['dispatch-failed'])
   })
 
+  // #410/#412 follow-up. The stale-terminal reconcile is silent by design — it
+  // answers every uncertainty by leaving the row alone — so from outside, "the
+  // repair is firing", "its reads are throwing and being swallowed", "it is
+  // losing a race" and "its preconditions are never met" all look identical:
+  // `lifecycle-terminal` simply persists. These three counts are what separate
+  // them, which is why they are published whole or not at all.
+  it('publishes the stale-terminal reconcile outcome as a whole group', () => {
+    const readiness = swept({
+      candidates: 20,
+      dispatched: 0,
+      skipped: 20,
+      staleTerminalReopens: { cleared: 0, conflicts: 0, failures: 0 },
+    })
+
+    // An all-zero group is a DIAGNOSIS, not an absence: the reconcile ran and
+    // its preconditions were never met. Coercing it away would delete exactly
+    // the reading that says the refused rows are not the shape it targets.
+    expect(readiness?.staleTerminalReopens).toEqual({ cleared: 0, conflicts: 0, failures: 0 })
+  })
+
+  it('drops the stale-terminal group rather than publishing a partial one', () => {
+    // A reader seeing `cleared` without `failures` would take the missing field
+    // for a zero and call a silently-erroring repair healthy.
+    const partial = swept({
+      candidates: 20,
+      dispatched: 0,
+      skipped: 20,
+      staleTerminalReopens: { cleared: 8, conflicts: 0 },
+    })
+    expect(Object.hasOwn(partial ?? {}, 'staleTerminalReopens')).toBe(false)
+
+    for (const malformed of [
+      { cleared: -1, conflicts: 0, failures: 0 },
+      { cleared: 1.5, conflicts: 0, failures: 0 },
+      { cleared: '8', conflicts: 0, failures: 0 },
+      null,
+      'nope',
+    ]) {
+      const rejected = swept({
+        candidates: 20,
+        dispatched: 0,
+        skipped: 20,
+        staleTerminalReopens: malformed,
+      })
+      expect(Object.hasOwn(rejected ?? {}, 'staleTerminalReopens')).toBe(false)
+    }
+  })
+
+  it('keeps the sweep block when a producer does not know the stale-terminal group', () => {
+    // Independently optional, for the reason `dispatchFailures` is: an older
+    // daemon publishes the trio and nothing else, and requiring this field
+    // would drop its whole sweep block — deleting the counters that are
+    // currently the only view of the outage.
+    const older = swept({ candidates: 20, dispatched: 0, skipped: 20 })
+    expect(older?.candidates).toBe(20)
+    expect(Object.hasOwn(older ?? {}, 'staleTerminalReopens')).toBe(false)
+  })
+
   // THE CONTROL. `skipReasons` omits zero counts, so on that field alone
   // "every dispatch succeeded" is the same absence as "this producer has never
   // heard of dispatch failures" — and 0.1.72 is in production right now being

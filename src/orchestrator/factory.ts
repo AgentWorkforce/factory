@@ -6381,6 +6381,22 @@ export class FactoryLoop implements Factory {
       ...(this.#readinessReconcileLastSweepDeferred
         ? { discoveryDeferred: this.#readinessReconcileLastSweepDeferred }
         : {}),
+      // Cumulative since process start, not per-sweep like the block above:
+      // a stale-terminal clear is a one-shot repair per work unit, so a
+      // per-sweep view would read zero on nearly every sweep and the sweep that
+      // mattered would have to be caught live. Published whole and always once
+      // the reconcile can run at all, so that an all-zero reading is itself a
+      // diagnosis — "the repair ran and its preconditions were never met" —
+      // rather than an absence a reader has to guess about (#410, #412).
+      ...(this.#usesDurableDispatchLifecycle()
+        ? {
+            staleTerminalReopens: {
+              cleared: this.#counters.dispatchTerminalStaleReopened ?? 0,
+              conflicts: this.#counters.dispatchTerminalStaleReopenConflicts ?? 0,
+              failures: this.#counters.dispatchTerminalStaleReopenFailures ?? 0,
+            },
+          }
+        : {}),
       ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
       ...(this.#readinessReconcileLastErrorClass
         ? { lastErrorClass: this.#readinessReconcileLastErrorClass }
