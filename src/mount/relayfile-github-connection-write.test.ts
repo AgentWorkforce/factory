@@ -31,6 +31,7 @@ describe('RelayfileGithubConnectionWrite', () => {
 
   it('publishes an already-pushed remote branch without reading an orchestrator-local clone', async () => {
     const pullRequestPath = '/github/repos/AgentWorkforce/factory/pull-requests/factory-factory-ar-85-agentworkforce-factory-pushed.json'
+    const refPath = '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffactory%2Far-85-agentworkforce-factory.json'
     class ReceiptMount extends FakeMountClient {
       override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
         await super.writeFile(path, content, opts)
@@ -39,7 +40,9 @@ describe('RelayfileGithubConnectionWrite', () => {
         }
       }
     }
-    const mount = new ReceiptMount()
+    const mount = new ReceiptMount({
+      [refPath]: { ref: 'refs/heads/factory/ar-85-agentworkforce-factory', object: { sha: 'deadbeef' } },
+    })
     const git = vi.fn(async () => { throw new Error('remote publication must not inspect local git') })
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: git })
 
@@ -72,6 +75,32 @@ describe('RelayfileGithubConnectionWrite', () => {
 
     await expect(write.publishPullRequest(input)).resolves.toMatchObject({ number: 85 })
     expect(mount.writes[1]?.path).toBe(pullRequestPath)
+  })
+
+  it('refuses to open a PR against a remote branch that was never pushed (#430)', async () => {
+    // Measured production shape: a remote implementer supplies `headRef` and
+    // no `headSha`, so nothing in this process created the branch. Against
+    // `origin/main` this proceeds straight to the PR create, which GitHub
+    // rejects with a bare `422 Validation Failed` that reads like a payload
+    // bug rather than naming the actual cause. The fix confirms the ref
+    // exists first and names the real cause instead.
+    const mount = new FakeMountClient()
+    const git = vi.fn(async () => { throw new Error('remote publication must not inspect local git') })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: git })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/ar-902-agentworkforce-factory',
+      baseRef: 'main',
+      title: 'Issue 902',
+      body: 'Fixes #902',
+    })).rejects.toThrow(
+      'Refusing to publish GitHub PR: implementer branch factory/ar-902-agentworkforce-factory ' +
+      'was never pushed to AgentWorkforce/factory (refs/heads/factory/ar-902-agentworkforce-factory does not exist',
+    )
+    // The real fix, not merely a thrown error: no PR draft is ever authored
+    // against a head GitHub has never seen, so no 422 is ever provoked.
+    expect(mount.writes).toEqual([])
   })
 
   it('pushes the current ref before creating a pull request through Relayfile', async () => {

@@ -34210,17 +34210,29 @@ describe('reclaiming an occupied slot past its deadline (#419)', () => {
  * The bound belongs at the publish site and not in the generic lifecycle
  * re-arm: that arm serves dispatch and recovery failures too, which is exactly
  * why #379 left it uncharged, and the source-scan guard above pins that.
+ *
+ * The 422 `Validation Failed` shape that motivated this suite is now caught
+ * earlier and abandoned on the FIRST attempt rather than spending this
+ * budget at all — see "a non-retryable writeback status abandons on the
+ * first attempt (#430)" below. What remains here is the budget itself, for a
+ * failure that genuinely might clear on retry (a control-plane blip, a
+ * confirm timeout) and therefore cannot fast-path.
  */
 describe('a deterministic PR publication must not pin the batch slot forever (#430)', () => {
   // Test-only cadence override, same rationale as the #379 suite: the budget
   // under test is the real one, only the delay between attempts moves.
   const RETRY_MS = 5
 
-  /** The verbatim production failure shape, message and all. */
-  const headRefNeverPushed = () => new Error(
+  /**
+   * A transient writeback failure, shaped like the production 502/503s a
+   * confirm timeout produces — NOT a 4xx, so it exercises the bounded-retry
+   * budget rather than the non-retryable fast path (#430) tested separately.
+   */
+  const transientWritebackFailure = () => new Error(
     'Writeback operation failed for /github/repos/AgentWorkforce/pear/pull-requests/' +
     'factory-factory-902-agentworkforce-pear-pushed.json: ' +
-    'GitHub writeback failed with status 422: Validation Failed',
+    'GitHub writeback did not complete for /github/repos/AgentWorkforce/pear/pull-requests/' +
+    'factory-factory-902-agentworkforce-pear-pushed.json: agent_host_unavailable',
   )
 
   it('MUST FIRE: abandons the dispatch and gives the slot back when the publication can never succeed', async () => {
@@ -34230,7 +34242,7 @@ describe('a deterministic PR publication must not pin the batch slot forever (#4
     const githubWrite: GithubConnectionWrite = {
       publishPullRequest: async () => {
         attempts += 1
-        throw headRefNeverPushed()
+        throw transientWritebackFailure()
       },
       closePullRequest: async () => undefined,
     }
@@ -34296,7 +34308,7 @@ describe('a deterministic PR publication must not pin the batch slot forever (#4
       // The give-up must name the provider's cause. A 422 on a head ref that
       // was never pushed reads very differently from a 503, and this line is
       // the only place an operator gets to see which one it was.
-      expect(JSON.stringify(errors[giveUp]?.[1])).toContain('422: Validation Failed')
+      expect(JSON.stringify(errors[giveUp]?.[1])).toContain('agent_host_unavailable')
 
       // `abandoned`, never `complete`. A dispatch that produced no pull request
       // must not be recorded as a successful one — that is the codex P1 on the
@@ -34323,7 +34335,7 @@ describe('a deterministic PR publication must not pin the batch slot forever (#4
     const githubWrite: GithubConnectionWrite = {
       publishPullRequest: async (input) => {
         attempts += 1
-        if (attempts <= failuresBeforeSuccess) throw headRefNeverPushed()
+        if (attempts <= failuresBeforeSuccess) throw transientWritebackFailure()
         return {
           repo: input.repo,
           number: 903,
@@ -34390,7 +34402,7 @@ describe('the publish bound survives its own failure modes (#440)', () => {
     const watchStatePath = join(root, 'state.json')
     const githubWrite: GithubConnectionWrite = {
       publishPullRequest: async () => {
-        throw new Error('GitHub writeback failed with status 422: Validation Failed')
+        throw new Error('GitHub writeback did not complete: agent_host_unavailable')
       },
       closePullRequest: async () => undefined,
     }
@@ -34448,4 +34460,138 @@ describe('the publish bound survives its own failure modes (#440)', () => {
       await rm(root, { recursive: true, force: true })
     }
   }, 60_000)
+})
+
+/**
+ * #440 bounded the retry loop to `DISPATCH_PUBLISH_MAX_ATTEMPTS`, so a
+ * deterministic 422 no longer pins the slot forever - but it still spends the
+ * FULL budget (12 attempts, ~10s at the test cadence) before releasing, and
+ * gives up with the generic "retries exhausted" reason rather than naming
+ * what actually happened.
+ *
+ * factory#430's suggested split asks for more: a writeback failure GitHub (or
+ * the adapter) rejects for its PAYLOAD - a 4xx status, an unroutable draft,
+ * an implementer branch that was never pushed - is not going to change on
+ * attempt two through ten. It should abandon on the FIRST attempt, with a
+ * release reason that says so.
+ */
+describe('a non-retryable writeback status abandons on the first attempt (#430)', () => {
+  const RETRY_MS = 5
+
+  it('MUST FIRE: releases the slot on attempt 1 instead of spending the retry budget', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-nonretryable-fire-'))
+    const watchStatePath = join(root, 'state.json')
+    let attempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => {
+        attempts += 1
+        // The measured shape from `RelayfileGithubConnectionWrite`'s new
+        // refs/heads existence check (#430): a remote implementer's branch
+        // that was never pushed, named as the cause rather than surfaced as
+        // a bare 422.
+        throw new Error(
+          'Refusing to publish GitHub PR: implementer branch factory/factory-910-agentworkforce-pear ' +
+          'was never pushed to AgentWorkforce/pear (refs/heads/factory/factory-910-agentworkforce-pear ' +
+          'does not exist: File not found)',
+        )
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(910)]: issueFile(910),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const errors: unknown[][] = []
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      probePrResolver: async () => undefined,
+      logger: { warn: () => undefined, error: (...args: unknown[]) => errors.push(args) },
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(910), issueFile(910)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-910-impl-pear', 'exited')
+
+      await vi.waitFor(
+        () => expect(factory.status().counters.dispatchPublishNonRetryable).toBe(1),
+        { timeout: 10_000, interval: 5 },
+      )
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 10_000, interval: 5 })
+
+      // THE FAIL-FIRST. Against `origin/main` (before this fix) every
+      // publish failure is treated alike: the drive spends the full
+      // `DISPATCH_PUBLISH_MAX_ATTEMPTS` budget regardless of the error, so
+      // this failure would also retry through all 12 attempts (the same
+      // count the #440 suite pins) before releasing. With the fix, a
+      // non-retryable failure never reaches a second attempt.
+      expect(attempts).toBe(1)
+      // Not the generic exhaustion counter - that name means the budget ran
+      // out, and it did not.
+      expect(factory.status().counters.dispatchPublishRetriesExhausted).toBeUndefined()
+
+      const giveUp = errors.findIndex(([message]) =>
+        message === '[factory] pull request publication failed with a non-retryable writeback status; abandoning the dispatch')
+      expect(giveUp).toBeGreaterThanOrEqual(0)
+      expect(JSON.stringify(errors[giveUp]?.[1])).toContain('was never pushed to AgentWorkforce/pear')
+
+      // The release reason names WHY, distinctly from a budget running out.
+      const lifecycle = await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
+      expect(lifecycle?.phase).toBe('abandoned')
+      expect(lifecycle?.releaseReason).toBe('publish-non-retryable')
+      expect(factory.status().counters.done).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  it('MUST NOT FIRE: a transient (non-4xx) failure still spends the full retry budget', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-nonretryable-quiet-'))
+    const watchStatePath = join(root, 'state.json')
+    let attempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        attempts += 1
+        if (attempts <= 3) throw new Error('GitHub writeback did not complete for /github/repos/AgentWorkforce/pear/pull-requests/factory-factory-911-agentworkforce-pear-pushed.json: timeout')
+        return {
+          repo: input.repo,
+          number: 911,
+          url: 'https://github.com/AgentWorkforce/pear/pull/911',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(911)]: issueFile(911),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 1, watchStatePath }),
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      probePrResolver: async () => undefined,
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(911), issueFile(911)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-911-impl-pear', 'exited')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1), { timeout: 10_000, interval: 5 })
+      expect(attempts).toBe(4)
+      expect(factory.status().counters.dispatchPublishNonRetryable).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
 })

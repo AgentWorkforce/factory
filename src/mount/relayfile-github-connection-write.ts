@@ -119,6 +119,14 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
           force: false,
         })
       }
+    } else {
+      // Nothing in this process can create the branch: no clone to push from,
+      // no sha to point a ref at. A remote implementer is trusted to have
+      // pushed it, and when that trust is misplaced GitHub answers a bare
+      // `422 Validation Failed` on the PR create - true, but it reads like a
+      // payload bug rather than the missing push it actually is (#430).
+      // Confirm the ref exists first, so the failure names the real cause.
+      await this.#assertHeadRefPushed(updateRefPath, headRef, input.repo)
     }
 
     const pullRequestPath = `${repoRoot}/pull-requests/${draftName}.json`
@@ -217,6 +225,30 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
         ...(input.state === undefined ? {} : { state: input.state }),
       },
     )
+  }
+
+  /**
+   * Confirm `refs/heads/<headRef>` actually exists on GitHub before a PR is
+   * opened against it (#430).
+   *
+   * This only runs on the path where no `headSha` was supplied, so nothing
+   * above could have created the ref itself - a positive result here means an
+   * implementer really did push, not merely that this process pushed for it.
+   * A read failure is reported as the implementer branch never having been
+   * pushed, which is the only way this path fails: the alternative,
+   * transient read unavailability, is indistinguishable from the outside and
+   * either reading is correctly non-retryable at the writeback layer this
+   * error feeds - a branch absent now was not created by waiting.
+   */
+  async #assertHeadRefPushed(refPath: string, headRef: string, repo: string): Promise<void> {
+    try {
+      await this.#mount.readFile(refPath)
+    } catch (error) {
+      throw new Error(
+        `Refusing to publish GitHub PR: implementer branch ${headRef} was never pushed to ${repo} ` +
+        `(refs/heads/${headRef} does not exist: ${errorMessage(error)})`,
+      )
+    }
   }
 
   async #gitValue(args: string[], description: string): Promise<string> {
