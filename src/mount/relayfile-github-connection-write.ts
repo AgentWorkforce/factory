@@ -126,7 +126,7 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       // `422 Validation Failed` on the PR create - true, but it reads like a
       // payload bug rather than the missing push it actually is (#430).
       // Confirm the ref exists first, so the failure names the real cause.
-      await this.#assertHeadRefPushed(updateRefPath, headRef, input.repo)
+      await this.#assertHeadRefPushed(owner, repo, fullHeadRef, headRef)
     }
 
     const pullRequestPath = `${repoRoot}/pull-requests/${draftName}.json`
@@ -234,21 +234,39 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
    * This only runs on the path where no `headSha` was supplied, so nothing
    * above could have created the ref itself - a positive result here means an
    * implementer really did push, not merely that this process pushed for it.
-   * A read failure is reported as the implementer branch never having been
-   * pushed, which is the only way this path fails: the alternative,
-   * transient read unavailability, is indistinguishable from the outside and
-   * either reading is correctly non-retryable at the writeback layer this
-   * error feeds - a branch absent now was not created by waiting.
+   *
+   * Only a CONFIRMED-absent read (`isMountFileNotFound`) is reported as the
+   * branch never having been pushed. Every other read failure - a transport
+   * blip, an auth hiccup, the projection not yet having caught up with a
+   * branch that really was just pushed - is propagated unclassified instead
+   * (#453 review, codex + cubic P1): the non-retryable classifier upstream
+   * would otherwise abandon a genuinely publishable dispatch on its first bad
+   * network moment, rather than letting the existing publish-retry budget
+   * recover it. Both of `getIssue`'s canonical layouts (the encoded
+   * `owner__repo` provider projection and the nested `owner/repo` writeback
+   * tree) are probed for the same reason `getIssue` probes both: a workspace
+   * that only exposes one of them must not read as "branch absent".
    */
-  async #assertHeadRefPushed(refPath: string, headRef: string, repo: string): Promise<void> {
-    try {
-      await this.#mount.readFile(refPath)
-    } catch (error) {
-      throw new Error(
-        `Refusing to publish GitHub PR: implementer branch ${headRef} was never pushed to ${repo} ` +
-        `(refs/heads/${headRef} does not exist: ${errorMessage(error)})`,
-      )
+  async #assertHeadRefPushed(owner: string, repo: string, fullHeadRef: string, headRef: string): Promise<void> {
+    const paths = [
+      `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/refs/${encodeURIComponent(fullHeadRef)}.json`,
+      `/github/repos/${encodeURIComponent(owner)}__${encodeURIComponent(repo)}/refs/${encodeURIComponent(fullHeadRef)}.json`,
+    ]
+    let lastError: unknown
+    for (const path of paths) {
+      try {
+        await this.#mount.readFile(path)
+        return
+      } catch (error) {
+        lastError = error
+        if (!isMountFileNotFound(error)) throw error
+        // Try the alternate canonical layout before concluding absence.
+      }
     }
+    throw new Error(
+      `Refusing to publish GitHub PR: implementer branch ${headRef} was never pushed to ${owner}/${repo} ` +
+      `(refs/heads/${headRef} does not exist: ${errorMessage(lastError)})`,
+    )
   }
 
   async #gitValue(args: string[], description: string): Promise<string> {
@@ -391,3 +409,22 @@ const errorMessage = (error: unknown): string => {
 
 const isGithubReferenceAlreadyExistsError = (error: unknown): boolean =>
   /reference already exists/iu.test(errorMessage(error))
+
+const asRecord = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
+
+/**
+ * A CONFIRMED absent read, as opposed to any other read failure. Mirrors
+ * `isMountFileNotFound` in `src/cli/fleet.ts` - same status/code sniffing,
+ * same message fallback - kept local because `mount/` is a lower layer than
+ * `cli/` and must not depend on it.
+ */
+const isMountFileNotFound = (error: unknown): boolean => {
+  const record = asRecord(error)
+  const response = asRecord(record.response)
+  const status = record.status ?? record.statusCode ?? response.status ?? response.statusCode
+  const code = typeof record.code === 'string' ? record.code.toLowerCase() : undefined
+  return status === 404 || status === '404' ||
+    code === 'not_found' || code === 'file_not_found' ||
+    /(?:file\s+not\s+found|\b404\b)/iu.test(errorMessage(error))
+}

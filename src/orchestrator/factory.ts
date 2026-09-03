@@ -546,20 +546,26 @@ const PUBLISH_NON_RETRYABLE_RELEASE_REASON = 'publish-non-retryable'
  * Matches a writeback failure whose payload will be rejected identically on
  * every retry, not a transient control-plane blip:
  *
- * - A GitHub 4xx response (`GitHub writeback failed with status 4xx: ...`,
+ * - A GitHub status that specifically proves the PAYLOAD is permanently
+ *   invalid (`GitHub writeback failed with status 400|404|422: ...`,
  *   `#writeAndConfirmUnlocked`'s confirmed-failure message) - `422
  *   Validation Failed` against a head ref that was never pushed is the
- *   measured case (#430), but the shape covers every 4xx the provider can
- *   return for a payload it will never accept.
+ *   measured case (#430). Deliberately NOT every 4xx (#453 review, codex +
+ *   cubic P1): 401/403 can be a transient credential blip, 408/429 are
+ *   explicitly transient (timeout / rate limit), and blanket-matching them
+ *   would abandon a genuinely publishable dispatch on its first throttle
+ *   instead of letting the existing retry budget recover it.
  * - `assertRoutedGithubWritebackPath`'s refusal of a draft the adapter never
  *   routes at all (#411/#431) - rejected before the request even reaches
  *   GitHub, for the same "this payload is wrong" reason.
  * - This surface's own pre-publish guards (`Refusing to publish GitHub
  *   PR: ...`), including the refs/heads existence check below: a branch that
- *   was never pushed does not appear on a retry either.
+ *   was CONFIRMED never pushed does not appear on a retry either (an
+ *   indeterminate ref read is propagated as a different, retryable error -
+ *   see `RelayfileGithubConnectionWrite#assertHeadRefPushed`).
  */
 const NON_RETRYABLE_WRITEBACK_ERROR_PATTERN =
-  /GitHub writeback failed with status 4\d\d\b|^Refusing to (?:author an unroutable GitHub writeback path|publish GitHub PR)\b/u
+  /GitHub writeback failed with status (?:400|404|422)\b|^Refusing to (?:author an unroutable GitHub writeback path|publish GitHub PR)\b/u
 const isNonRetryablePublishError = (error: unknown): boolean =>
   NON_RETRYABLE_WRITEBACK_ERROR_PATTERN.test(describeError(error).errorMessage)
 /**

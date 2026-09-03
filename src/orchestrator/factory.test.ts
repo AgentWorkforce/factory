@@ -34594,4 +34594,60 @@ describe('a non-retryable writeback status abandons on the first attempt (#430)'
       await rm(root, { recursive: true, force: true })
     }
   }, 20_000)
+
+  // #453 review (codex + cubic, both P1): the FIRST version of this fix
+  // blanket-matched every GitHub 4xx as non-retryable, which would abandon a
+  // dispatch on its first 429 rate-limit or 403 secondary-rate-limit
+  // response instead of letting the retry budget recover from what GitHub
+  // itself is telling the caller to retry. Only a status that proves the
+  // PAYLOAD is permanently invalid (400/404/422) may fast-path.
+  it('MUST NOT FIRE: a GitHub 429 rate-limit response still spends the full retry budget', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-nonretryable-429-'))
+    const watchStatePath = join(root, 'state.json')
+    let attempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        attempts += 1
+        if (attempts <= 3) {
+          throw new Error(
+            'Writeback operation failed for /github/repos/AgentWorkforce/pear/pull-requests/' +
+            'factory-factory-912-agentworkforce-pear-pushed.json: ' +
+            'GitHub writeback failed with status 429: rate limit exceeded',
+          )
+        }
+        return {
+          repo: input.repo,
+          number: 912,
+          url: 'https://github.com/AgentWorkforce/pear/pull/912',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(912)]: issueFile(912),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 1, watchStatePath }),
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      probePrResolver: async () => undefined,
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(912), issueFile(912)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-912-impl-pear', 'exited')
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1), { timeout: 10_000, interval: 5 })
+      expect(attempts).toBe(4)
+      expect(factory.status().counters.dispatchPublishNonRetryable).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
 })

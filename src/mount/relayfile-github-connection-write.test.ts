@@ -103,6 +103,59 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(mount.writes).toEqual([])
   })
 
+  it('propagates an indeterminate ref read instead of declaring the branch absent (#453 review)', async () => {
+    // A transport blip, an auth hiccup, or the projection simply not having
+    // caught up with a branch that really was just pushed must NOT read the
+    // same as a confirmed-missing ref: doing so hands the upstream
+    // non-retryable classifier a false "never pushed" and abandons a
+    // genuinely publishable dispatch on its first bad network moment.
+    class FlakyMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        throw Object.assign(new Error('upstream request timed out'), { status: 503 })
+      }
+    }
+    const mount = new FlakyMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/ar-903-agentworkforce-factory',
+      baseRef: 'main',
+      title: 'Issue 903',
+      body: 'Fixes #903',
+    })).rejects.toThrow('upstream request timed out')
+    expect(mount.writes).toEqual([])
+  })
+
+  it('confirms the ref through the encoded owner__repo projection when the nested layout 404s (#453 review)', async () => {
+    // `getIssue` probes both of Relayfile's canonical layouts because a
+    // workspace can expose only one of them. The ref-existence check must do
+    // the same, or a workspace on the encoded-only layout would see every
+    // remote publish misreported as an unpushed branch.
+    const encodedRefPath = '/github/repos/AgentWorkforce__factory/refs/refs%2Fheads%2Ffactory%2Far-904-agentworkforce-factory.json'
+    const pullRequestPath = '/github/repos/AgentWorkforce/factory/pull-requests/factory-factory-ar-904-agentworkforce-factory-pushed.json'
+    class EncodedOnlyMount extends FakeMountClient {
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        await super.writeFile(path, content, opts)
+        if (path === pullRequestPath) {
+          this.files.set(path, { content: { created: 90, url: 'https://github.com/AgentWorkforce/factory/pull/90' } })
+        }
+      }
+    }
+    const mount = new EncodedOnlyMount({
+      [encodedRefPath]: { ref: 'refs/heads/factory/ar-904-agentworkforce-factory', object: { sha: 'deadbeef' } },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/ar-904-agentworkforce-factory',
+      baseRef: 'main',
+      title: 'Issue 904',
+      body: 'Fixes #904',
+    })).resolves.toMatchObject({ number: 90 })
+  })
+
   it('pushes the current ref before creating a pull request through Relayfile', async () => {
     const draft = 'factory-fix-issue-52-1234567890ab'
     const pullRequestPath = `/github/repos/AgentWorkforce/factory/pull-requests/${draft}.json`
