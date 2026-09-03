@@ -34184,12 +34184,16 @@ describe('the publish bound survives its own failure modes (#440)', () => {
         warn: () => undefined,
         // Throws ONLY on the give-up line (#440 review, codex P2). A logger
         // that throws on EVERY error call never reaches the hazard under test:
-        // `#handleAgentExit`'s catch calls `#error` before
-        // `#scheduleDispatchLifecycleRetry` (factory.ts:11528 then :11529), so
-        // the very first failed publication would throw out before any retry
-        // was ever armed, and the budget could never be spent. The test would
-        // then be exercising a different failure entirely - and passing for a
-        // reason that has nothing to do with the ordering it claims to pin.
+        // the publish `catch` inside `#handleAgentExit` calls `#error` BEFORE
+        // it calls `#scheduleDispatchLifecycleRetry`, so the very first failed
+        // publication would throw out before any retry was ever armed, and the
+        // budget could never be spent. The test would then be exercising a
+        // different failure entirely - and passing for a reason that has
+        // nothing to do with the ordering it claims to pin.
+        //
+        // Anchored to those symbols rather than to line numbers (#440 review,
+        // cubic P3): the ordering is the invariant, and an unrelated edit to
+        // `#handleAgentExit` must not silently invalidate the explanation.
         error: (message: unknown) => {
           if (message === '[factory] pull request publication retries exhausted; abandoning the dispatch') {
             giveUpLogCalls += 1
