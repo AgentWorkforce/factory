@@ -7940,6 +7940,57 @@ export class FactoryLoop implements Factory {
    * release must abort the RETRY — the work is already done either way, and
    * the only thing still running is the spin.
    */
+  #chargeReleaseAttempt(record: InFlightIssue, key: string, context: string): boolean {
+    if (this.#dispatchLifecycleReleaseAbandoned.has(key)) {
+      // Re-entry, and the reason relinquishing the lease once is not enough.
+      // `#driveDispatchLifecycle` re-claims the lease at the TOP of every
+      // drive, before it has read the phase, so anything that drives an
+      // already-dead-lettered key — the held-agent-deadline sweep, a registry
+      // restore, a takeover — puts the epoch straight back into the renewal
+      // map and re-arms the livelock this bound just escaped. Whenever the
+      // budget declines a re-arm, ownership goes back too.
+      this.#trackDispatchLifecycleDrive(this.#relinquishDispatchLifecycleLease(key, record.issue.key))
+      return false
+    }
+    const attempts = (this.#dispatchLifecycleReleaseAttempts.get(key) ?? 0) + 1
+    this.#dispatchLifecycleReleaseAttempts.set(key, attempts)
+    if (attempts <= DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS) return true
+    this.#dispatchLifecycleReleaseAbandoned.add(key)
+    this.#dispatchLifecycleReleaseAttempts.delete(key)
+    this.#increment('dispatchLifecycleReleaseAbandoned')
+    const durableLifecycleRetained = this.#usesDurableDispatchLifecycle()
+    // Cleanup is armed BEFORE anything that can throw (#391 review, P1). The
+    // only statements above are set/map writes and a counter, none of which can
+    // reject; `this.#logger.error` below is caller-supplied and can. Ordering
+    // the drive first means nothing between "this unit is abandoned" and "its
+    // lease is handed back" is allowed to fail in a way that skips the handback
+    // — which is precisely the defect shape this whole method exists to fix.
+    this.#trackDispatchLifecycleDrive(
+      this.#releaseDeadLetteredSlot(record, key)
+        .catch((error) => {
+          this.#logger.warn?.('[factory] dead-lettered release could not free its batch slot', {
+            issue: record.issue.key,
+            error: describeError(error).errorMessage,
+          })
+        }),
+    )
+    // `error`, not `warn`. Every previous layer of this failure was invisible
+    // until somebody read stderr by hand; a work unit whose cleanup this
+    // process has permanently given up on is exactly the event that must not
+    // be inferable only from the absence of further log lines.
+    this.#logger.error?.('[factory] release retries exhausted; abandoning cleanup for this work unit', {
+      issue: record.issue.key,
+      attempts: attempts - 1,
+      maxAttempts: DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS,
+      context,
+      // The durable lifecycle is retained on purpose: a takeover or a restart
+      // re-drives it from the persisted phase. This bounds THIS process's
+      // spin, it does not declare the work unit clean.
+      durableLifecycleRetained,
+    })
+    return false
+  }
+
   /** Drop every repository's publish budget for one work unit. */
   #clearPublishAttempts(key: string): void {
     const prefix = `${key}${PUBLISH_ATTEMPT_KEY_SEPARATOR}`
@@ -7994,57 +8045,6 @@ export class FactoryLoop implements Factory {
     })
     await this.#abandonStuckDispatch(record, PUBLISH_RETRIES_EXHAUSTED_RELEASE_REASON)
     return true
-  }
-
-  #chargeReleaseAttempt(record: InFlightIssue, key: string, context: string): boolean {
-    if (this.#dispatchLifecycleReleaseAbandoned.has(key)) {
-      // Re-entry, and the reason relinquishing the lease once is not enough.
-      // `#driveDispatchLifecycle` re-claims the lease at the TOP of every
-      // drive, before it has read the phase, so anything that drives an
-      // already-dead-lettered key — the held-agent-deadline sweep, a registry
-      // restore, a takeover — puts the epoch straight back into the renewal
-      // map and re-arms the livelock this bound just escaped. Whenever the
-      // budget declines a re-arm, ownership goes back too.
-      this.#trackDispatchLifecycleDrive(this.#relinquishDispatchLifecycleLease(key, record.issue.key))
-      return false
-    }
-    const attempts = (this.#dispatchLifecycleReleaseAttempts.get(key) ?? 0) + 1
-    this.#dispatchLifecycleReleaseAttempts.set(key, attempts)
-    if (attempts <= DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS) return true
-    this.#dispatchLifecycleReleaseAbandoned.add(key)
-    this.#dispatchLifecycleReleaseAttempts.delete(key)
-    this.#increment('dispatchLifecycleReleaseAbandoned')
-    const durableLifecycleRetained = this.#usesDurableDispatchLifecycle()
-    // Cleanup is armed BEFORE anything that can throw (#391 review, P1). The
-    // only statements above are set/map writes and a counter, none of which can
-    // reject; `this.#logger.error` below is caller-supplied and can. Ordering
-    // the drive first means nothing between "this unit is abandoned" and "its
-    // lease is handed back" is allowed to fail in a way that skips the handback
-    // — which is precisely the defect shape this whole method exists to fix.
-    this.#trackDispatchLifecycleDrive(
-      this.#releaseDeadLetteredSlot(record, key)
-        .catch((error) => {
-          this.#logger.warn?.('[factory] dead-lettered release could not free its batch slot', {
-            issue: record.issue.key,
-            error: describeError(error).errorMessage,
-          })
-        }),
-    )
-    // `error`, not `warn`. Every previous layer of this failure was invisible
-    // until somebody read stderr by hand; a work unit whose cleanup this
-    // process has permanently given up on is exactly the event that must not
-    // be inferable only from the absence of further log lines.
-    this.#logger.error?.('[factory] release retries exhausted; abandoning cleanup for this work unit', {
-      issue: record.issue.key,
-      attempts: attempts - 1,
-      maxAttempts: DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS,
-      context,
-      // The durable lifecycle is retained on purpose: a takeover or a restart
-      // re-drives it from the persisted phase. This bounds THIS process's
-      // spin, it does not declare the work unit clean.
-      durableLifecycleRetained,
-    })
-    return false
   }
 
   /** Keeps a lifecycle-side effect awaitable by `stop()` without leaking the set entry. */
@@ -8466,16 +8466,31 @@ export class FactoryLoop implements Factory {
       // its source-scan guard) exactly as it is.
       for (const implementer of implementers) {
         let published: GithubPublishPullRequestResult | undefined
+        let saved = false
         try {
           published = await this.#publishImplementerPullRequest(record, implementer, { reconcileExisting: true })
           if (!published) throw new Error(`durable dispatch ${record.issue.key} did not produce a pull request for ${implementer.spec.repo}`)
+          publishedReceipts.push(published)
+          // The lifecycle save is INSIDE the charged region (#440 review, cubic
+          // P1). A save that throws after the PR was created is just as
+          // permanent, and just as slot-holding, as a publish that never
+          // succeeds - and it would otherwise reach the uncharged generic
+          // re-arm and spin forever on a `publishing` row.
+          saved = await this.#saveDispatchLifecycle(record, 'publishing', published)
         } catch (error) {
           // Abandoned: the slot is already released and the row terminalized, so
           // resolving here (rather than rethrowing) is what stops the re-arm.
           if (await this.#abandonExhaustedPublish(record, implementer, error)) return
           throw error
         }
-        // Refunded per REPOSITORY, and only on that repository's own success.
+        // A `false` save is a lost lease, not a failure: another owner is
+        // driving this row now. Returning without charging is correct - there
+        // is nothing here still spinning to bound.
+        if (!saved) return
+        // Refunded per REPOSITORY, and only after that repository has BOTH
+        // published and recorded the receipt. Refunding on the publish alone
+        // would zero the budget on every pass of a permanently failing save,
+        // which is the same unbounded spin one layer down.
         //
         // A shared work-unit budget is wrong in both directions for a team
         // dispatch (#440 review, codex P1). Charged in common, one repo's ten
@@ -8486,8 +8501,6 @@ export class FactoryLoop implements Factory {
         // this change exists to remove. Per-repository is the only split where
         // neither happens.
         this.#publishAttempts.delete(publishAttemptKey(record, implementer))
-        publishedReceipts.push(published)
-        if (!await this.#saveDispatchLifecycle(record, 'publishing', published)) return
       }
       if (!await this.#saveDispatchLifecycle(record, 'published')) return
       if (this.#config.babysitter.enabled) {

@@ -34050,13 +34050,17 @@ describe('a deterministic PR publication must not pin the batch slot forever (#4
       // `publishing` branch, then the attempt that tips it over: 1 + 10 + 1.
       // A budget quietly changed to 5 or 20 fails here rather than passing.
       expect(attempts).toBe(12)
-      expect(errors.map(([message]) => message)).toContain(
-        '[factory] pull request publication retries exhausted; abandoning the dispatch',
-      )
+      // Indexed, not `errors.at(-1)` (#440 review, cubic P3): nothing pins the
+      // give-up as the LAST thing the factory ever logs, and `#abandonStuckDispatch`
+      // runs after it. Finding the entry means a later error line cannot make
+      // this assertion inspect the wrong tuple or stringify `undefined`.
+      const giveUp = errors.findIndex(([message]) =>
+        message === '[factory] pull request publication retries exhausted; abandoning the dispatch')
+      expect(giveUp).toBeGreaterThanOrEqual(0)
       // The give-up must name the provider's cause. A 422 on a head ref that
       // was never pushed reads very differently from a 503, and this line is
       // the only place an operator gets to see which one it was.
-      expect(JSON.stringify(errors.at(-1)?.[1])).toContain('422: Validation Failed')
+      expect(JSON.stringify(errors[giveUp]?.[1])).toContain('422: Validation Failed')
 
       // `abandoned`, never `complete`. A dispatch that produced no pull request
       // must not be recorded as a successful one — that is the codex P1 on the
