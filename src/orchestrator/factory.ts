@@ -8577,9 +8577,66 @@ export class FactoryLoop implements Factory {
       await this.#resumeDurableDispatch(record)
       return
     }
-    if (lifecycle.phase === 'publishing') {
+    // A team dispatch (more than one implementer) can reach `published`
+    // durably from the FIRST implementer to save its receipt, even though a
+    // sibling implementer's own publish never landed — `lifecycleFromInFlight
+    // Record` stamps `phase` as whatever the caller passes, with no awareness
+    // of the other implementers. Without this OR, a retry armed by the
+    // sibling's failed publish would read the durable `published` phase here,
+    // fall straight to the babysitter-attach branch below (or, with
+    // babysitting disabled, the `!allImplementersHaveCompletionPr` branch),
+    // and return without ever attempting the sibling's publish again — the
+    // row then holds its batch slot forever (#443). This applies regardless
+    // of `babysitter.enabled` (#454 review, CodeRabbit/cubic P1): the
+    // babysitter-attach branch below fires on ANY `published` row with a
+    // receipt, with no completeness check of its own, so excluding
+    // babysitter mode here left exactly the same wedge open under it.
+    // Reusing this same loop for that case is safe: `reconcileExisting: true`
+    // makes re-publishing an implementer that already succeeded a no-op
+    // lookup, not a duplicate PR, and the loop's own babysitter-attach tail
+    // (below) covers every repository's receipt once the retry succeeds.
+    //
+    // Gated on `record.decision.implementers.length > 1` (matching the same
+    // guard the completion sweep already uses), not merely on
+    // `!allImplementersHaveCompletionPr`: that helper also returns `false`
+    // when `record.agents` has no implementer entry at all, which is exactly
+    // the shape of an unrelated single-implementer restart/promotion path
+    // (`FactoryLoop > queues a verified legacy orphan PR...`, caught in CI).
+    // Routing THAT into this loop hits `implementers.length === 0` and
+    // throws `has no implementer to publish` — the loop must stay scoped to
+    // genuine multi-implementer team dispatches.
+    if (
+      lifecycle.phase === 'publishing' ||
+      (
+        lifecycle.phase === 'published' &&
+        record.decision.implementers.length > 1 &&
+        !await this.#allImplementersHaveCompletionPr(record)
+      )
+    ) {
       const implementers = [...record.agents.values()].filter((agent) => agent.spec.role === 'implementer')
       if (implementers.length === 0) throw new Error(`durable dispatch ${record.issue.key} has no implementer to publish`)
+      if (lifecycle.phase === 'published') {
+        // Reaching here from `published` (not `publishing`) means a SIBLING
+        // already has a receipt; whichever implementer still lacks one might
+        // have failed to publish (safe to retry here) OR might simply still
+        // be actively working — a restart, or a drive that lands mid-team-
+        // dispatch, is not evidence of failure. Publishing a still-running
+        // implementer's branch here would grab a partial, in-progress commit
+        // (#454 review, codex P1). Only proceed once every implementer
+        // without a receipt has genuinely exited; leave one that's still
+        // live to its own eventual exit handler instead.
+        const online = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
+        const fleetTracked = this.#fleet.trackedAgents?.()
+        for (const implementer of implementers) {
+          if (await this.#issueHasCompletionPr(record, {}, implementer)) continue
+          const name = implementer.result?.name ?? implementer.spec.name
+          const stillActive = implementer.releasedAtMs === undefined &&
+            (online.has(name) ||
+              (fleetTracked !== undefined && fleetTracked.has(name)) ||
+              this.#agentExitsInFlight.has(name))
+          if (stillActive) return
+        }
+      }
       const publishedReceipts: GithubPublishPullRequestResult[] = []
       // THIS is where the publish retry loop actually turns, and therefore
       // where it has to be bounded. The agent-exit handler's catch runs once,
@@ -11708,21 +11765,41 @@ export class FactoryLoop implements Factory {
       // / human-review path. Best-effort: with no publishable branch (no commits
       // ahead of base, clone gone) it returns undefined and we fall through.
       if (tracked.spec.role === 'implementer') {
-        await this.#saveDispatchLifecycle(record, 'publishing')
-        if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit PR publication started', { issue: record.issue.key, name })
-        const { published: publishedPr, nonRetryableError } = await this.#tryPublishImplementerPr(record, tracked)
-        if (publishedPr) {
-          await this.#saveDispatchLifecycle(record, 'published', publishedPr)
-          if (this.#config.babysitter.enabled) {
-            await this.#ensureBabysitter(record, {
-              repo: publishedPr.repo,
-              prNumber: publishedPr.number,
-              url: publishedPr.url,
-              authoritative: true,
-            })
-          } else {
-            if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
+        // `nonRetryableError` is read AFTER the try/catch (#430's abandon
+        // check below), so it has to be hoisted out of the block that sets
+        // it.
+        let nonRetryableError: unknown
+        try {
+          await this.#saveDispatchLifecycle(record, 'publishing')
+          if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit PR publication started', { issue: record.issue.key, name })
+          const result = await this.#tryPublishImplementerPr(record, tracked)
+          nonRetryableError = result.nonRetryableError
+          if (result.published) {
+            const publishedPr = result.published
+            await this.#saveDispatchLifecycle(record, 'published', publishedPr)
+            if (this.#config.babysitter.enabled) {
+              await this.#ensureBabysitter(record, {
+                repo: publishedPr.repo,
+                prNumber: publishedPr.number,
+                url: publishedPr.url,
+                authoritative: true,
+              })
+            } else {
+              if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
+            }
+            return
           }
+        } catch (error) {
+          // Mirrors the two sibling publish blocks above (#440, #443). Without
+          // this catch, a dispatch-lifecycle save that throws here — after
+          // `#tryPublishImplementerPr` already succeeded — falls through to
+          // this method's generic outer catch, which only logs and never
+          // re-arms `#driveDispatchLifecycle`. The row is then stuck in
+          // `publishing`, still holding its batch slot, with nothing left to
+          // retry it (#443).
+          this.#increment('githubPullRequestPublishFailures')
+          this.#error(error, record.issue)
+          this.#scheduleDispatchLifecycleRetry(record)
           return
         }
         // A non-retryable failure (#430) - a GitHub 4xx, an implementer branch
@@ -16912,7 +16989,25 @@ export class FactoryLoop implements Factory {
       await this.#ensureBabysitterResourceSubscription(record.issue, ref, tracked)
       await this.#retargetSlackConversationToBabysitter(record)
       await this.#writeInFlightRegistry()
-      if (!await this.#saveDispatchLifecycle(record, 'running')) return
+      // Only advance the row to `running` once every implementer has a
+      // completion PR (trivially true for a single-repo dispatch). Spawning
+      // ONE implementer's babysitter is not the whole team dispatch finishing
+      // publication — saving `running` unconditionally here durably erases
+      // the `published` phase a sibling implementer's retry loop reads to
+      // know it still has work to do (#443, PR #454 review, CodeRabbit/cubic
+      // P1). Leaving the row at its current phase when the team isn't done
+      // yet costs nothing: the retry loop above already reconciles this
+      // babysitter's own receipt via `reconcileExisting` on its next pass.
+      //
+      // This narrows, but does not by itself close, the babysitter-enabled
+      // team-dispatch gap: `#spawnAgent` above this line unconditionally
+      // saves `dispatching` while placing the babysitter, which can still
+      // move the row off `published` before this check runs. Fully closing
+      // that needs the babysitter spawn itself deferred for an incomplete
+      // team, tracked separately from this fix.
+      if (await this.#allImplementersHaveCompletionPr(record)) {
+        if (!await this.#saveDispatchLifecycle(record, 'running')) return
+      }
       this.#increment('babysittersSpawned')
       this.#logger.info?.('[factory] babysitter spawned for open PR', {
         issue: record.issue.key,

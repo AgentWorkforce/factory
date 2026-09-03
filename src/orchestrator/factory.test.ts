@@ -34676,3 +34676,377 @@ describe('a non-retryable writeback status abandons on the first attempt (#430)'
     }
   }, 20_000)
 })
+
+describe('a dispatch-lifecycle save failure on the publish path must re-arm the drive (#443)', () => {
+  const RETRY_MS = 5
+
+  /**
+   * The exact shape from the #443 corroboration comment: `publishPullRequest`
+   * succeeds, but the durable store rejects the SAVE that records it. This
+   * needs a durable (`FileStateStore`-like) fixture, per the issue's own
+   * note — `InMemoryStateStore` never drives `#driveDispatchLifecycle` off a
+   * persisted row the way production does, so it cannot reproduce a bug that
+   * lives entirely in "does the retry that follows a save failure ever turn
+   * again".
+   */
+  class ThrowOnPublishedSaveStore extends FileStateStore {
+    publishedSaveAttempts = 0
+
+    override async saveDispatchLifecycle(
+      ...args: Parameters<FileStateStore['saveDispatchLifecycle']>
+    ): Promise<boolean> {
+      const lifecycle = args[5]
+      if (lifecycle.phase === 'published') {
+        this.publishedSaveAttempts += 1
+        throw new Error('durable store rejected the published phase save')
+      }
+      return super.saveDispatchLifecycle(...args)
+    }
+  }
+
+  /**
+   * MUST-FIRE. Against `origin/main` (4f0e5fc) this times out: the implementer
+   * exits with a reason that is not one of `isCompletionReason`'s ('exited'),
+   * so it takes `#handleAgentExit`'s "no completion PR yet" branch. That
+   * branch calls `#saveDispatchLifecycle(record, 'published', publishedPr)`
+   * with no try/catch of its own, so the throw falls through to the method's
+   * generic outer `catch (error) { this.#error(error, record.issue) }`,
+   * which only logs — it never calls `#scheduleDispatchLifecycleRetry`. The
+   * row is left in `publishing`, still holding its batch slot, with exactly
+   * one save attempt on record and nothing left to retry it.
+   *
+   * `pnpm exec vitest run src/orchestrator/factory.test.ts -t "re-arms after a terminal published save throws"`
+   * against 4f0e5fc: FAIL (timeout waiting for `dispatchPublishRetriesExhausted`), exit code 1.
+   * With the fix in this branch: PASS, exit code 0.
+   */
+  it('re-arms after a terminal published save throws, instead of leaving the row wedged in publishing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-443-save-throw-'))
+    const watchStatePath = join(root, 'state.json')
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => ({
+        repo: input.repo,
+        number: 443,
+        url: 'https://github.com/AgentWorkforce/pear/pull/443',
+        headRef: input.headRef!,
+      }),
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(4430)]: issueFile(4430),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new ThrowOnPublishedSaveStore({ batchSize: 1, watchStatePath })
+    const errors: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      probePrResolver: async () => undefined,
+      logger: { warn: () => undefined, error: (...args: unknown[]) => errors.push(args) },
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(4430), issueFile(4430)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-4430-impl-pear', 'exited')
+
+      // The store rejects the `published` save on EVERY attempt, so a working
+      // re-arm must keep retrying until it hits its own budget and abandons —
+      // proving the loop actually turned more than once, not merely that it
+      // fired the same single save the outer catch already logged.
+      await vi.waitFor(
+        () => expect(factory.status().counters.dispatchPublishRetriesExhausted).toBe(1),
+        { timeout: 20_000, interval: 5 },
+      )
+      expect(stateStore.publishedSaveAttempts).toBeGreaterThan(1)
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 20_000, interval: 5 })
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  /**
+   * MUST-NOT-FIRE. A save that succeeds must still drive the dispatch to
+   * completion normally, with no retry and no error — the fix must not turn
+   * every save into a retry loop.
+   */
+  it('does not re-arm or error when the published save succeeds', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-443-save-ok-'))
+    const watchStatePath = join(root, 'state.json')
+    let publishAttempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishAttempts += 1
+        return {
+          repo: input.repo,
+          number: 444,
+          url: 'https://github.com/AgentWorkforce/pear/pull/444',
+          headRef: input.headRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(4440)]: issueFile(4440),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    const errors: unknown[][] = []
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 1, watchStatePath }),
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      probePrResolver: async () => undefined,
+      logger: { warn: () => undefined, error: (...args: unknown[]) => errors.push(args) },
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(4440), issueFile(4440)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-4440-impl-pear', 'exited')
+
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 10_000, interval: 5 })
+      expect(publishAttempts).toBe(1)
+      expect(factory.status().counters.dispatchPublishRetriesExhausted).toBeUndefined()
+      expect(errors).toEqual([])
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  /**
+   * MUST-FIRE, the team-dispatch shape from the issue itself. `pear` keeps
+   * failing to publish while `hoopsheet` succeeds and saves `published` —
+   * which, because `phase` is one scalar for the whole row, overwrites
+   * whatever phase `pear`'s own failed attempt left behind. Against
+   * `origin/main` (4f0e5fc) a retry that lands after that overwrite reads
+   * durable phase `published`, takes the
+   * `!allImplementersHaveCompletionPr` branch, and returns without ever
+   * re-attempting `pear` — this test times out waiting for both PRs.
+   *
+   * `pnpm exec vitest run src/orchestrator/factory.test.ts -t "retries a sibling implementer's publish after another has already reached published"`
+   * against 4f0e5fc: FAIL (timeout waiting for inFlight to clear), exit code 1.
+   * With the fix in this branch: PASS, exit code 0.
+   */
+  it("retries a sibling implementer's publish after another has already reached published", async () => {
+    // Generous relative to `pear`'s failure window (below): `hoopsheet`'s
+    // exit-to-durable-`published`-save chain (a real `FileStateStore` write)
+    // must land well before `pear`'s own retry timer next fires, or the test
+    // would be racing wall-clock instead of pinning the ordering the bug
+    // depends on.
+    const TEAM_RETRY_MS = 500
+    const number = 4431
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const issueFileContent = githubIssueFile(number, {
+      repo: 'pear',
+      labels: ['factory', 'pear', 'hoopsheet', 'agent:team'],
+    })
+    let pearAttempts = 0
+    let hoopsheetPublished = false
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        if (input.repo.endsWith('/pear')) {
+          pearAttempts += 1
+          // Fails for as long as the sibling hasn't published yet, so the
+          // repro cannot pass merely by winning a timing race: it only
+          // succeeds once retried AFTER `hoopsheet` has overwritten the
+          // durable phase to `published`.
+          if (!hoopsheetPublished) throw new Error('pear publish transiently unavailable')
+          return {
+            repo: input.repo,
+            number: 128,
+            url: `https://github.com/${input.repo}/pull/128`,
+            headRef: input.headRef ?? input.expectedHeadRef!,
+          }
+        }
+        hoopsheetPublished = true
+        return {
+          repo: input.repo,
+          number: 129,
+          url: `https://github.com/${input.repo}/pull/129`,
+          headRef: input.headRef ?? input.expectedHeadRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const root = await mkdtemp(join(tmpdir(), 'factory-443-team-wedge-'))
+    const watchStatePath = join(root, 'state.json')
+    const mount = new FakeMountClient({
+      [path]: issueFileContent,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      '/github/repos/AgentWorkforce/hoopsheet/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new FileStateStore({ batchSize: 4, watchStatePath })
+    const factory = createFactory(multiRepoGithubConfig({
+      babysitter: { enabled: false },
+      terminalState: 'human-review',
+    }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrGhRunner: async () => ({ stdout: '[]' }),
+      dispatchLifecycleRetryMs: TEAM_RETRY_MS,
+      probePrResolver: async () => undefined,
+    })
+    try {
+      const decision = await factory.triageIssue(parseGithubFactoryIssue(path, issueFileContent))
+      await factory.dispatch(decision)
+      const implementers = fleet.spawns.filter((spawn) => spawn.name.includes('-impl-'))
+      const pearImplementer = implementers.find((spawn) => spawn.repo === 'AgentWorkforce/pear')!
+      const hoopsheetImplementer = implementers.find((spawn) => spawn.repo === 'AgentWorkforce/hoopsheet')!
+
+      // Pin the ordering explicitly rather than emitting both exits together
+      // and hoping the interleaving lands right: `pear` must fail and have
+      // its retry armed BEFORE `hoopsheet` overwrites the durable phase to
+      // `published`, or the repro proves nothing about the phase-gating bug.
+      fleet.emitAgentExit(pearImplementer.name, 'issue-done')
+      await vi.waitFor(() => expect(pearAttempts).toBe(1), { timeout: 10_000, interval: 5 })
+      await vi.waitFor(() => expect(stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(decision.issue),
+      )).resolves.toMatchObject({ phase: 'publishing' }), { timeout: 10_000, interval: 5 })
+
+      fleet.emitAgentExit(hoopsheetImplementer.name, 'issue-done')
+      await vi.waitFor(() => expect(stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(decision.issue),
+      )).resolves.toMatchObject({ phase: 'published' }), { timeout: 10_000, interval: 5 })
+
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 30_000, interval: 5 })
+      await expect(stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(decision.issue),
+      )).resolves.toMatchObject({
+        pullRequests: expect.arrayContaining([
+          expect.objectContaining({ repo: 'AgentWorkforce/pear', number: 128 }),
+          expect.objectContaining({ repo: 'AgentWorkforce/hoopsheet', number: 129 }),
+        ]),
+      })
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 40_000)
+
+  /**
+   * MUST-NOT-FIRE (codex #454 review, P1). A restart that finds a `published`
+   * row with an incomplete team must not treat "the sibling has no receipt
+   * yet" as "the sibling's publish failed and needs retrying" — the sibling
+   * might simply still be genuinely working. Startup schedules a drive for
+   * every non-`running` lifecycle (factory.ts:6677), so this is directly
+   * reachable, not hypothetical: without the fix, the drive would publish
+   * `pear`'s branch mid-work.
+   */
+  it('does not publish a sibling implementer that is still actively running after a restart', async () => {
+    const number = 4433
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const issueFileContent = githubIssueFile(number, {
+      repo: 'pear',
+      labels: ['factory', 'pear', 'hoopsheet', 'agent:team'],
+    })
+    let pearPublishAttempts = 0
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        if (input.repo.endsWith('/pear')) {
+          pearPublishAttempts += 1
+          return {
+            repo: input.repo,
+            number: 132,
+            url: `https://github.com/${input.repo}/pull/132`,
+            headRef: input.headRef ?? input.expectedHeadRef!,
+          }
+        }
+        return {
+          repo: input.repo,
+          number: 133,
+          url: `https://github.com/${input.repo}/pull/133`,
+          headRef: input.headRef ?? input.expectedHeadRef!,
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const root = await mkdtemp(join(tmpdir(), 'factory-443-still-running-'))
+    const watchStatePath = join(root, 'state.json')
+    const mount = new FakeMountClient({
+      [path]: issueFileContent,
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      '/github/repos/AgentWorkforce/hoopsheet/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new RemoteLifecycleFleetClient()
+    const stateStore = new FileStateStore({ batchSize: 4, watchStatePath })
+    const factoryConfig = multiRepoGithubConfig({
+      babysitter: { enabled: false },
+      terminalState: 'human-review',
+    })
+    const factory = createFactory(factoryConfig, {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrGhRunner: async () => ({ stdout: '[]' }),
+      dispatchLifecycleRetryMs: 100,
+      probePrResolver: async () => undefined,
+    })
+    const decision = await factory.triageIssue(parseGithubFactoryIssue(path, issueFileContent))
+    await factory.dispatch(decision)
+    const implementers = fleet.spawns.filter((spawn) => spawn.name.includes('-impl-'))
+    const pearImplementer = implementers.find((spawn) => spawn.repo === 'AgentWorkforce/pear')!
+    const hoopsheetImplementer = implementers.find((spawn) => spawn.repo === 'AgentWorkforce/hoopsheet')!
+
+    // `hoopsheet` finishes and publishes; `pear` NEVER exits — it is still
+    // genuinely working when the row reaches `published`.
+    fleet.emitAgentExit(hoopsheetImplementer.name, 'issue-done')
+    await vi.waitFor(() => expect(stateStore.getDispatchLifecycle(
+      'factory-test',
+      dispatchIssueIdentity(decision.issue),
+    )).resolves.toMatchObject({ phase: 'published' }), { timeout: 10_000, interval: 5 })
+    await factory.stop()
+
+    // Restart against the same durable store. `pear`'s agent name is still
+    // online in the fresh fleet's roster, simulating a restart landing while
+    // it is genuinely still running.
+    const restartedFleet = new RemoteLifecycleFleetClient()
+    await restartedFleet.spawn({
+      name: pearImplementer.name,
+      capability: pearImplementer.capability,
+      node: 'self',
+      repo: pearImplementer.repo,
+      task: 'still working',
+    })
+    const restarted = createFactory(factoryConfig, {
+      mount,
+      fleet: restartedFleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrGhRunner: async () => ({ stdout: '[]' }),
+      dispatchLifecycleRetryMs: 100,
+      probePrResolver: async () => undefined,
+    })
+    try {
+      await restarted.start({ mode: 'dispatch-owner' })
+      // Real wall-clock window for startup's scheduled retry (100ms) to fire
+      // and, without the fix, wrongly publish `pear`.
+      await new Promise((resolve) => setTimeout(resolve, 1_500))
+      expect(pearPublishAttempts).toBe(0)
+      await expect(stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(decision.issue),
+      )).resolves.toMatchObject({ phase: 'published' })
+    } finally {
+      await restarted.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
+})
