@@ -6386,8 +6386,18 @@ export class FactoryLoop implements Factory {
       // per-sweep view would read zero on nearly every sweep and the sweep that
       // mattered would have to be caught live. Published whole and always once
       // the reconcile can run at all, so that an all-zero reading is itself a
-      // diagnosis — "the repair ran and its preconditions were never met" —
-      // rather than an absence a reader has to guess about (#410, #412).
+      // diagnosis rather than an absence a reader has to guess about
+      // (#410, #412).
+      //
+      // `#counters` starts empty and `#increment` only creates a key when its
+      // branch runs, so an all-zero group does NOT on its own prove the
+      // reconcile executed — it is read against the sweep trio beside it, which
+      // is why both live on this same block. All zeroes with `candidates > 0`
+      // means the reconcile ran and its preconditions were never met; all
+      // zeroes with `candidates: 0` or no trio at all means it never had a
+      // ready issue to run against. Defaulting the three to 0 rather than
+      // tracking a separate "has run" flag keeps that distinction in the
+      // fields that already carry it (coderabbitai, #444 review).
       ...(this.#usesDurableDispatchLifecycle()
         ? {
             staleTerminalReopens: {

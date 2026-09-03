@@ -333,6 +333,13 @@ const sweepOutcome = (
   const deferred = status.discoveryDeferred === 'sweep-in-flight'
     ? { discoveryDeferred: 'sweep-in-flight' as const }
     : {}
+  // Computed BEFORE the enumeration gate below, and returned on BOTH paths.
+  // These counters are cumulative and independent of any sweep's arithmetic, so
+  // gating them on a completed trio would hide them in exactly the outage they
+  // exist to diagnose: a sweep that never completes publishes no trio, takes
+  // the early return, and the reconcile's own outcome would vanish with it
+  // (chatgpt-codex-connector P1 and coderabbitai, independently, #444 review).
+  const staleTerminalReopens = staleTerminalReopenCounts(status.staleTerminalReopens)
   const candidates = optionalCount('candidates', status.candidates)
   const dispatched = optionalCount('dispatched', status.dispatched)
   const skipped = optionalCount('skipped', status.skipped)
@@ -347,6 +354,7 @@ const sweepOutcome = (
       dispatched.dispatched === undefined ||
       skipped.skipped === undefined) {
     return {
+      ...staleTerminalReopens,
       ...deferred,
       ...(suppliedCounts ? { enumerationCountsInvalid: true as const } : {}),
     }
@@ -382,7 +390,7 @@ const sweepOutcome = (
     // independently optional for the same reason `dispatchFailures` is: an
     // older daemon publishes the trio and knows nothing about this field, and
     // requiring it would drop that producer's whole sweep block.
-    ...staleTerminalReopenCounts(status.staleTerminalReopens),
+    ...staleTerminalReopens,
     ...treeReadOutcome(status),
     // Part of the same atomic snapshot as the counts: it is what dates them,
     // and without it retained counts have no freshness a reader can recover

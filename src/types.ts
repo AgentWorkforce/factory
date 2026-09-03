@@ -346,6 +346,25 @@ export interface FactoryReadinessReconcileStatus {
    */
   dispatchFailureReasons?: Partial<Record<FactoryDispatchFailureReasonCode, number>>
   /**
+   * The stale-terminal reconcile's cumulative outcome (#410, #412).
+   *
+   * Declared here as well as on the public health type: `#readinessReconcileStatus()`
+   * returns this interface, and a conditional spread bypasses excess-property
+   * checking — so without it the field exists at runtime while every
+   * `FactoryStatus` and `FactoryLoopHeartbeat` consumer would need a cast to
+   * reach it (chatgpt-codex-connector P2, #444 review).
+   *
+   * Only interpretable ALONGSIDE the sweep trio above it. All zeroes with
+   * `candidates` present means the reconcile ran and its preconditions were
+   * never met; all zeroes with no trio, or with `candidates: 0`, means it never
+   * had a ready issue to run against (coderabbitai, #444 review).
+   */
+  staleTerminalReopens?: {
+    cleared: number
+    conflicts: number
+    failures: number
+  }
+  /**
    * When the pass the counts above describe finished enumerating (#359 review).
    *
    * NOT `lastCompletedAtMs`, and the difference is the point. That timestamp
