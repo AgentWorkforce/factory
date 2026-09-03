@@ -15704,8 +15704,7 @@ describe('FactoryLoop', () => {
             abandoningReached.resolve()
             await abandoningGate.promise
           }
-          PublishedSaveFailsStore.phases.push(lifecycle.phase)
-      return await super.saveDispatchLifecycle(workspaceId, key, owner, epoch, nowMs, lifecycle)
+          return await super.saveDispatchLifecycle(workspaceId, key, owner, epoch, nowMs, lifecycle)
         }
       }
 
