@@ -541,9 +541,25 @@ const HELD_PAST_DEADLINE_RELEASE_REASON = 'held-past-deadline'
  * means a team ran and never finished, this one means no team ever existed.
  */
 const AGENTLESS_SLOT_PAST_DEADLINE_RELEASE_REASON = 'agentless-slot-past-deadline'
-/** Publish budgets are per work unit AND per repository (#440 review, codex). */
-const publishAttemptKey = (record: InFlightIssue, implementer: TrackedAgent): string =>
-  `${dispatchLifecycleKey(record.issue)}${PUBLISH_ATTEMPT_KEY_SEPARATOR}${implementer.spec.repo.toLowerCase()}`
+/**
+ * Publish budgets are per work unit AND per STEP (#440 review, codex + cubic).
+ *
+ * A step is one repository's publish-and-record, or the terminal `published`
+ * save that follows them all. Every step that can fail permanently while the
+ * row sits in the slot-occupying `publishing` phase needs its own budget: a
+ * shared one lets an earlier step's failures abandon a later step on its first,
+ * and a shared refund lets a step that always succeeds zero a failing step's
+ * charge on every pass.
+ */
+const publishAttemptKey = (record: InFlightIssue, step: string): string =>
+  `${dispatchLifecycleKey(record.issue)}${PUBLISH_ATTEMPT_KEY_SEPARATOR}${step}`
+/**
+ * The work-unit-level step: the `published` save after every repository is in.
+ * `<` cannot occur in a repository name, so this can never collide with one.
+ */
+const PUBLISHED_SAVE_STEP = '<published-save>'
+/** One repository's publish-and-record step. */
+const publishRepoStep = (implementer: TrackedAgent): string => implementer.spec.repo.toLowerCase()
 const HELD_DEADLINE_OVERDUE_RETRY_MS = 1_000
 const STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS = 30_000
 const RECONCILED_AGENT_EXIT_CONCURRENCY = 4
@@ -8020,15 +8036,27 @@ export class FactoryLoop implements Factory {
    */
   async #abandonExhaustedPublish(
     record: InFlightIssue,
-    implementer: TrackedAgent,
+    step: string,
     error: unknown,
   ): Promise<boolean> {
-    const attemptKey = publishAttemptKey(record, implementer)
+    const attemptKey = publishAttemptKey(record, step)
     const attempts = (this.#publishAttempts.get(attemptKey) ?? 0) + 1
     this.#publishAttempts.set(attemptKey, attempts)
     if (attempts <= DISPATCH_PUBLISH_MAX_ATTEMPTS) return false
-    // The whole work unit is going away, so every repository's counter goes
-    // with it, not just the one that ran out.
+    // ABANDON FIRST, and do not spend the counter until it has returned
+    // (#440 review, cubic P2). This is the same hazard `#chargeReleaseAttempt`
+    // documents on the sibling path: `this.#logger.error` is caller-supplied
+    // and can throw, and the original order cleared the budget, then logged,
+    // then abandoned — so a throwing logger rejected the helper with the
+    // cleanup never run AND the budget reset, and the outer retry re-armed
+    // with a fresh ten attempts. Forever.
+    //
+    // Keeping the counter spent until the abandonment has actually returned
+    // also makes a THROWING abandon retry the abandonment on the next pass
+    // rather than starting the budget over.
+    await this.#abandonStuckDispatch(record, PUBLISH_RETRIES_EXHAUSTED_RELEASE_REASON)
+    // The whole work unit is going away, so every step's counter goes with it,
+    // not just the one that ran out.
     this.#clearPublishAttempts(dispatchLifecycleKey(record.issue))
     this.#increment('dispatchPublishRetriesExhausted')
     // `error`, not `warn`: a work unit whose publication this process has
@@ -8036,14 +8064,19 @@ export class FactoryLoop implements Factory {
     // further log lines. The provider message is what names the cause - a 422
     // on a head ref that was never pushed reads very differently from a 503 -
     // and it is the line an operator will grep for.
-    this.#logger.error?.('[factory] pull request publication retries exhausted; abandoning the dispatch', {
-      issue: record.issue.key,
-      repo: implementer.spec.repo,
-      attempts: attempts - 1,
-      maxAttempts: DISPATCH_PUBLISH_MAX_ATTEMPTS,
-      error: describeError(error).errorMessage,
-    })
-    await this.#abandonStuckDispatch(record, PUBLISH_RETRIES_EXHAUSTED_RELEASE_REASON)
+    try {
+      this.#logger.error?.('[factory] pull request publication retries exhausted; abandoning the dispatch', {
+        issue: record.issue.key,
+        step,
+        attempts: attempts - 1,
+        maxAttempts: DISPATCH_PUBLISH_MAX_ATTEMPTS,
+        error: describeError(error).errorMessage,
+      })
+    } catch {
+      // A caller-supplied logger must not be able to undo an abandonment that
+      // has already happened. Losing the line is bad; re-arming the wedge it
+      // announces is worse.
+    }
     return true
   }
 
@@ -8480,7 +8513,7 @@ export class FactoryLoop implements Factory {
         } catch (error) {
           // Abandoned: the slot is already released and the row terminalized, so
           // resolving here (rather than rethrowing) is what stops the re-arm.
-          if (await this.#abandonExhaustedPublish(record, implementer, error)) return
+          if (await this.#abandonExhaustedPublish(record, publishRepoStep(implementer), error)) return
           throw error
         }
         // A `false` save is a lost lease, not a failure: another owner is
@@ -8500,9 +8533,23 @@ export class FactoryLoop implements Factory {
         // succeeds could then spin forever — reintroducing exactly the wedge
         // this change exists to remove. Per-repository is the only split where
         // neither happens.
-        this.#publishAttempts.delete(publishAttemptKey(record, implementer))
+        this.#publishAttempts.delete(publishAttemptKey(record, publishRepoStep(implementer)))
       }
-      if (!await this.#saveDispatchLifecycle(record, 'published')) return
+      // The terminal save is bounded too (#440 review, cubic P1). A throw here
+      // leaves the row in `publishing` — still holding the slot — and every
+      // retry reconciles the existing receipts cheaply, refunds each
+      // repository's budget because those steps DID succeed, and throws again.
+      // Without its own budget that is an unbounded spin on a work unit whose
+      // pull requests already exist.
+      let publishedSaved = false
+      try {
+        publishedSaved = await this.#saveDispatchLifecycle(record, 'published')
+      } catch (error) {
+        if (await this.#abandonExhaustedPublish(record, PUBLISHED_SAVE_STEP, error)) return
+        throw error
+      }
+      if (!publishedSaved) return
+      this.#publishAttempts.delete(publishAttemptKey(record, PUBLISHED_SAVE_STEP))
       if (this.#config.babysitter.enabled) {
         for (const receipt of publishedReceipts) {
           await this.#ensureBabysitter(record, {

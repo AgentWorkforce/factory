@@ -15704,7 +15704,8 @@ describe('FactoryLoop', () => {
             abandoningReached.resolve()
             await abandoningGate.promise
           }
-          return await super.saveDispatchLifecycle(workspaceId, key, owner, epoch, nowMs, lifecycle)
+          PublishedSaveFailsStore.phases.push(lifecycle.phase)
+      return await super.saveDispatchLifecycle(workspaceId, key, owner, epoch, nowMs, lifecycle)
         }
       }
 
@@ -34043,7 +34044,16 @@ describe('a deterministic PR publication must not pin the batch slot forever (#4
       // so it is a property of the loop and not of any name chosen here.
       await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 10_000, interval: 5 })
 
-      expect(factory.status().counters.dispatchPublishRetriesExhausted).toBe(1)
+      // A waitFor, not a bare read. `#abandonExhaustedPublish` now abandons
+      // BEFORE it spends the counter and logs (cubic P2 - a throwing logger
+      // must not undo the abandonment), and the batch empties partway through
+      // `#abandonStuckDispatch`. So the slot can be observed free a beat before
+      // the counter moves; asserting it synchronously here was relying on the
+      // old ordering rather than on the guarantee.
+      await vi.waitFor(
+        () => expect(factory.status().counters.dispatchPublishRetriesExhausted).toBe(1),
+        { timeout: 10_000, interval: 5 },
+      )
       // The exact budget, not merely "some bound fired" (#440 review,
       // CodeRabbit). One uncharged attempt from the agent-exit handler, then
       // DISPATCH_PUBLISH_MAX_ATTEMPTS charged retries through the drive's
@@ -34118,6 +34128,76 @@ describe('a deterministic PR publication must not pin the batch slot forever (#4
       await vi.waitFor(() => expect(factory.status().counters.done).toBe(1), { timeout: 10_000, interval: 5 })
       expect(attempts).toBe(failuresBeforeSuccess + 1)
       expect(factory.status().counters.dispatchPublishRetriesExhausted).toBeUndefined()
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
+})
+
+/**
+ * The give-up must not be undoable by the caller's own logger (#440 review,
+ * cubic P2).
+ *
+ * The sibling finding in the same review - that the terminal `published` save
+ * needs its own budget - is fixed in `factory.ts` but has NO test here: the
+ * path could not be reached from a fixture. With the save rejecting, the
+ * publication succeeds once and the lifecycle is never re-driven at all
+ * (measured: one publish, one rejected save, no further attempt in 40 s, work
+ * unit still in flight), so the bound under test is never reached and a test
+ * built on it would pass or fail for unrelated reasons. That non-re-arm is
+ * tracked as #443 and is a defect in its own right.
+ */
+describe('the publish bound survives its own failure modes (#440)', () => {
+  const RETRY_MS = 5
+
+  /**
+   * cubic P2. `#chargeReleaseAttempt` already documents this hazard on the
+   * sibling path: `this.#logger.error` is caller-supplied and can throw. The
+   * original order spent the budget, logged, and only then abandoned — so a
+   * throwing logger rejected the helper with the cleanup never run AND the
+   * counter reset, and the outer retry re-armed with a fresh budget, forever.
+   * Losing the log line is acceptable; re-arming the wedge it announces is not.
+   */
+  it('abandons even when the injected logger throws on the give-up line', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-publish-bound-logger-'))
+    const watchStatePath = join(root, 'state.json')
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async () => {
+        throw new Error('GitHub writeback failed with status 422: Validation Failed')
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(906)]: issueFile(906),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new RemoteLifecycleFleetClient()
+    let errorCalls = 0
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      stateStore: new FileStateStore({ batchSize: 1, watchStatePath }),
+      triage: new StaticTriage(),
+      dispatchLifecycleRetryMs: RETRY_MS,
+      probePrResolver: async () => undefined,
+      logger: {
+        warn: () => undefined,
+        error: () => { errorCalls += 1; throw new Error('logger exploded') },
+      },
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(906), issueFile(906)))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-906-impl-pear', 'exited')
+
+      await vi.waitFor(
+        () => expect(factory.status().counters.dispatchPublishRetriesExhausted).toBe(1),
+        { timeout: 10_000, interval: 5 },
+      )
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 10_000, interval: 5 })
+      // The logger really did throw, so this is not a vacuous pass.
+      expect(errorCalls).toBeGreaterThan(0)
     } finally {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
