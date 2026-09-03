@@ -19958,6 +19958,49 @@ describe('FactoryLoop', () => {
     expect(fleet.attemptTimes).toEqual([0, 1_000])
   })
 
+  // #438: `#recordDispatchFailure` writes the failed attempt row under
+  // `issueStateKey(issue)`, which for a GitHub-native ref is the composed
+  // Relayfile sense path (`issueKey()`), not the bare `issue.key` (a GitHub
+  // issue number). The terminal-dispatch-failure branch immediately below
+  // that write reads it back under `decision.issue.key` instead — a key that
+  // only coincides with `issueStateKey()` on the Linear surface (see
+  // `issueStateKey`, factory.ts:20871). So `failedState` is always
+  // `undefined` for a GitHub-native issue, `terminalFailure` is always
+  // `false`, and the lifecycle is saved `'retryable'` (factory.ts:6187) and
+  // handed to `#scheduleDispatchLifecycleRetry` (factory.ts:6190) instead of
+  // being closed out `'abandoned'` — even though the attempt row itself
+  // (written and read consistently elsewhere via `issueStateKey`) is already
+  // `terminal: true` and refuses every further dispatch with "dispatch
+  // already terminal". This is the GitHub-native counterpart of the
+  // Linear-surface test above ('leaves an abandoned row alone when the
+  // attempt latch already refuses the issue'), which already passes today
+  // because `issueStateKey()` happens to equal `issue.key` on Linear.
+  it('closes a GitHub-native lifecycle abandoned, not retryable, once the attempt latch refuses it', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 438)
+    const mount = new FakeMountClient({ [path]: githubIssueFile(438, { labels: ['factory'] }) })
+    const fleet = new DurableSpawnFailingFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(
+      config({ issueSource: 'github', dispatch: { errorCooldownMs: 0, maxAttempts: 1 } }),
+      { mount, fleet, stateStore, triage: new StaticTriage() },
+    )
+
+    await factory.runOnce()
+    const attemptKey = issueKey({ uuid: 'AgentWorkforce/pear#438', key: '438', path })
+    await vi.waitFor(async () => {
+      await expect(stateStore.getDispatchAttempts('factory-test', attemptKey))
+        .resolves.toMatchObject({ terminal: true })
+    })
+    // The attempt latch is already terminal, so the durable lifecycle must be
+    // closed out `abandoned`, not left `retryable` to be picked back up by a
+    // scheduled retry against an issue that can never dispatch again.
+    await vi.waitFor(async () => {
+      const lifecycles = await stateStore.listDispatchLifecycles('factory-test')
+      expect(lifecycles.map(([, lifecycle]) => lifecycle.phase)).toEqual(['abandoned'])
+    })
+    await factory.stop()
+  })
+
   it('ignores triage-provided duplicate implementers when dispatch derives implementers from labels', async () => {
     const mount = new FakeMountClient({ [issuePath(14)]: issueFile(14) })
     const fleet = new FakeFleetClient()
