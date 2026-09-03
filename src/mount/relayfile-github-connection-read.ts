@@ -44,7 +44,9 @@ const DEFAULT_READ_TIMEOUT_MS = 30_000
  *   client's own request timeout) is genuinely unknown lookup state, distinct
  *   from the mount's own structured error responses above, so it degrades to
  *   `indeterminate` the same way the unauthenticated GitHub API reader
- *   degrades an unclassifiable failure.
+ *   degrades an unclassifiable failure. A failure to resolve the bearer token
+ *   itself is a credential-path failure, not a transport one, so it is
+ *   resolved outside that degradation and always throws.
  */
 export class RelayfileGithubConnectionRead implements GithubConnectionRead {
   readonly #workspaceId: string
@@ -55,8 +57,12 @@ export class RelayfileGithubConnectionRead implements GithubConnectionRead {
   readonly #timeoutMs: number
 
   constructor(config: RelayfileGithubConnectionReadConfig) {
+    const baseUrl = config.baseUrl.replace(/\/+$/u, '')
+    if (new URL(baseUrl).protocol !== 'https:') {
+      throw new Error(`Relayfile mount base URL must use https: ${baseUrl}`)
+    }
     this.#workspaceId = config.workspaceId
-    this.#baseUrl = config.baseUrl.replace(/\/+$/u, '')
+    this.#baseUrl = baseUrl
     this.#tokenProvider = config.tokenProvider
     this.#fetch = config.fetch ?? fetch
     this.#correlationIdFactory = config.correlationIdFactory ?? randomUUID
@@ -72,9 +78,15 @@ export class RelayfileGithubConnectionRead implements GithubConnectionRead {
     const url = `${this.#baseUrl}/v1/workspaces/${encodeURIComponent(this.#workspaceId)}` +
       `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/issues/${number}/read`
 
+    // Resolving the token is a credential-path operation, not a transport
+    // one: a token-provider failure (e.g. no workspace token available) is
+    // exactly the kind of loud, operator-visible configuration failure the
+    // accepted contract amendment requires — it must not be caught below and
+    // degraded to `indeterminate` alongside a genuine network failure.
+    const token = await this.#tokenProvider()
+
     let response: Response
     try {
-      const token = await this.#tokenProvider()
       response = await this.#fetch(url, {
         method: 'POST',
         signal: AbortSignal.timeout(this.#timeoutMs),

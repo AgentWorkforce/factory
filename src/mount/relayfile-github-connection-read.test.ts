@@ -116,6 +116,33 @@ describe('RelayfileGithubConnectionRead', () => {
     await expect(reader(request).getIssue('AgentWorkforce/private-repo', 159)).rejects.toThrow(/HTTP 502/)
   })
 
+  // Must-not-fire: the workspace token provider throws when no token is
+  // available (see relayfile-cloud-mount-client.ts's wiring). That is a
+  // credential-path failure, not a transport one, and must stay a loud
+  // thrown error under the same accepted-amendment reasoning as the 424/503
+  // cases above — catching it alongside network errors would let an expired
+  // or missing Relayfile token masquerade as `indeterminate`.
+  it('propagates a token-provider failure instead of degrading to indeterminate', async () => {
+    const request = vi.fn()
+    const badReader = new RelayfileGithubConnectionRead({
+      workspaceId: 'rw_test',
+      baseUrl: 'https://relayfile.example',
+      tokenProvider: async () => { throw new Error('no workspace token available') },
+      fetch: request,
+    })
+
+    await expect(badReader.getIssue('AgentWorkforce/private-repo', 159)).rejects.toThrow('no workspace token available')
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('rejects a non-HTTPS mount base URL at construction', () => {
+    expect(() => new RelayfileGithubConnectionRead({
+      workspaceId: 'rw_test',
+      baseUrl: 'http://relayfile.example',
+      tokenProvider: async () => 'delegated-relayfile-token',
+    })).toThrow(/must use https/)
+  })
+
   it('degrades to indeterminate when the mount itself cannot be reached', async () => {
     const request = vi.fn(async () => { throw new Error('fetch failed: ECONNREFUSED') })
 
