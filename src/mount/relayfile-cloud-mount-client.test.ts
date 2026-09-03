@@ -24,6 +24,8 @@ import {
   type RelayFileClientLike,
 } from './relayfile-cloud-mount-client'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
+import { RelayfileGithubConnectionRead } from './relayfile-github-connection-read'
+import { GithubApiIssueRead } from './github-api-issue-read'
 import { MountAuthScopeError } from './mount-auth-error'
 
 const storedAuth = (overrides: Partial<StoredAuth> = {}): StoredAuth => ({
@@ -1294,6 +1296,39 @@ describe('RelayfileCloudMountClient', () => {
     expect(capturedTokenProvider).toBeDefined()
     await expect(capturedTokenProvider?.()).resolves.toBe('cld_at_rotated')
     expect(cloudSessionProvider).toHaveBeenCalledTimes(2)
+  })
+
+  it('wires the mount-native app-actor GitHub issue read at construction (factory#449)', async () => {
+    const request = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toBe(
+        'https://relayfile.invalid/v1/workspaces/rw_test/github/repos/AgentWorkforce/private-repo/issues/159/read',
+      )
+      expect(JSON.parse(String(init?.body))).toEqual({ actor: 'app' })
+      expect((init?.headers as Record<string, string>).authorization).toBe('Bearer relayfile-token')
+      return Response.json({ outcome: 'not-found' })
+    })
+    // The reader captures the ambient `fetch` at construction time (no
+    // per-call override is threaded through the mount client), so the stub
+    // must be installed before the client — and therefore the reader — is
+    // constructed.
+    vi.stubGlobal('fetch', request)
+    try {
+      const fake = new FakeRelayFileClient()
+      const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
+
+      expect(mount.githubRead).toBeInstanceOf(RelayfileGithubConnectionRead)
+      await expect(mount.githubRead?.getIssue('AgentWorkforce/private-repo', 159)).resolves.toEqual({ outcome: 'not-found' })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls back to the unauthenticated GitHub API reader when no mount base URL is resolvable', () => {
+    const clientWithoutBaseUrl = { ...new FakeRelayFileClient(), getBaseUrl: undefined } as unknown as RelayFileClientLike
+    const mount = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: clientWithoutBaseUrl })
+
+    expect(mount.githubRead).toBeInstanceOf(GithubApiIssueRead)
   })
 
   it('adapts durable resource subscriptions through the canonical Relayfile SDK methods', async () => {
