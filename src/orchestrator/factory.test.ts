@@ -32709,12 +32709,25 @@ describe('completion release retry budget (#379)', () => {
   it('charges the release budget from the release scheduler only', () => {
     const source = readFileSync(new URL('./factory.ts', import.meta.url), 'utf8')
 
-    // Two call sites, both inside `#scheduleReleaseRetry` — its durable branch
-    // and its local branch. Every caller of that method is a failed release:
-    // the three inside `#finishDurableRelease`, and `#completeIssue`'s catch
-    // once `releaseReasonForRetry` is set.
+    // Three call sites, and the contract is about WHICH retries may charge, not
+    // how many there are: every charge site must be a failed RELEASE.
+    //
+    //   two inside `#scheduleReleaseRetry` — its durable branch and its local
+    //   branch. Every caller of that method is a failed release: the three
+    //   inside `#finishDurableRelease`, and `#completeIssue`'s catch once
+    //   `releaseReasonForRetry` is set.
+    //
+    //   one inside `#scheduleAbandonedDispatchRetry`. That loop re-arms
+    //   `#abandonStuckDispatchFenced`, which releases the record's agents and
+    //   frees its batch slot — a release by any other name. It was left
+    //   uncharged, and because `#abandonStuckDispatch` fences the held-agent
+    //   sweep on `#abandonedDispatchReasons` before its first await, it was
+    //   also the ONLY thing that could still free the slot. An unreachable
+    //   broker refusing every release therefore re-armed at 1 Hz forever with
+    //   the row parked in `abandoning`, a phase that still occupies a slot,
+    //   and a `batchSize: 1` deployment dispatched nothing for two weeks.
     const callSites = [...source.matchAll(/!this\.#chargeReleaseAttempt\(/gu)]
-    expect(callSites).toHaveLength(2)
+    expect(callSites).toHaveLength(3)
 
     // The generic lifecycle re-arm — dispatch, publishing, recovery — passes no
     // release charge, so it cannot dead-letter a unit that never released.
