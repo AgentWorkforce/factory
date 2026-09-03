@@ -98,6 +98,10 @@ describe('local gh mutations under github.identity', () => {
         headRefOid: mergeInput.expectedHeadSha,
         reviewDecision: 'APPROVED',
         statusCheckRollup: [{ conclusion: 'SUCCESS' }],
+        author: 'pr-author',
+        reviews: [
+          { login: 'reviewer', state: 'APPROVED', commitId: mergeInput.expectedHeadSha, body: 'Looks correct, ship it.' },
+        ],
       } }),
     }, new GhCliGithubMergeGate(async () => {
       throw new Error('local gh must not be used for readiness reads')
