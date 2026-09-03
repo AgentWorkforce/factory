@@ -57,6 +57,7 @@ import {
 } from '../subscriptions'
 import type { ResourceSubscriptionsClient } from '../subscriptions'
 import { RelayfileGithubConnectionWrite } from './relayfile-github-connection-write'
+import { RelayfileGithubConnectionRead } from './relayfile-github-connection-read'
 import { GithubApiIssueRead } from './github-api-issue-read'
 import {
   ensureLocalMount as runLocalMountPreflight,
@@ -405,7 +406,22 @@ export class RelayfileCloudMountClient implements MountClient {
         resolveRegisteredWorkspaceMirror(workspaceIds)?.localDir)
     this.#isAllowedDraft = config.isAllowedDraft
     this.#isAllowedDelete = config.isAllowedDelete
-    this.githubRead = new GithubApiIssueRead()
+    // The mount-native app-actor read (relayfile-cloud#159) requires a
+    // resolved API base URL to call. Every real deployment (fromConfig())
+    // sets one; fall back to the unauthenticated GitHub API reader only when
+    // none is available (e.g. a bare test-constructed client), since that
+    // reader cannot resolve private-repo issues at all.
+    this.githubRead = this.#baseUrl
+      ? new RelayfileGithubConnectionRead({
+        workspaceId: this.workspaceId,
+        baseUrl: this.#baseUrl,
+        tokenProvider: async () => {
+          const token = await this.#tokenProvider()
+          if (!token) throw new Error('GitHub App issue read requires a Relayfile workspace token')
+          return token
+        },
+      })
+      : new GithubApiIssueRead()
     this.githubWrite = new RelayfileGithubConnectionWrite({ mount: this })
     this.integrationConnections = relayfileIntegrationConnections(
       config.relayfileWorkspace,
