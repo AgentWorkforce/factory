@@ -33917,6 +33917,10 @@ describe('merge gate identity selection', () => {
           headRefOid: mergeInput.expectedHeadSha,
           reviewDecision: 'APPROVED',
           statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }],
+          author: 'pr-author',
+          reviews: [
+            { login: 'reviewer', state: 'APPROVED', commitId: mergeInput.expectedHeadSha, body: 'Looks correct, ship it.' },
+          ],
         },
       },
     })
