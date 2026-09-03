@@ -478,7 +478,10 @@ How an issue enters the factory depends on `issueSource`:
 
 The **safety gate** keeps both flows opt-in. Linear dispatch uses the configured
 title prefix and team; GitHub-native dispatch uses `safety.requireLabel` and an
-open issue. Everything else is ignored. Loosen these checks deliberately —
+open issue. Set `safety.requireTitlePrefix` to `null` to disable the title path
+explicitly when a deployment uses its required label as the only issue opt-in;
+omitting the key retains the `[factory-e2e]` default, and an empty string is
+rejected. Everything else is ignored. Loosen these checks deliberately —
 they're the main guardrail.
 
 To sequence issues, add one exact standalone line to the issue body or Linear

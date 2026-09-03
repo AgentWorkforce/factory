@@ -65,6 +65,29 @@ describe('MountLinearWriteback', () => {
     payload.stateId = 'ready-state'
   })
 
+  it('preserves a null title prefix for label-only writeback scope', async () => {
+    const title = 'Label-only garden issue'
+    const labelOnlyIssue = structuredClone(issue)
+    labelOnlyIssue.title = title
+    labelOnlyIssue.labels = ['garden-ready']
+    labelOnlyIssue.raw = wrappedIssueRecord({
+      title,
+      labels: [{ name: 'garden-ready' }],
+    })
+    const mount = new FakeMountClient({
+      [issuePath]: labelOnlyIssue.raw,
+    })
+    const linear = MountLinearWriteback(mount, {
+      safety: {
+        requireTitlePrefix: null,
+        requireLabel: 'garden-ready',
+        requireTeamKey: 'AR',
+      },
+    })
+
+    await expect(linear.setState(labelOnlyIssue, 'implementing-state')).resolves.toEqual({ claimToken: '1' })
+  })
+
   it('writes a full writable issue record with only stateId changed and verifies read-back', async () => {
     const mount = new FakeMountClient({
       [issuePath]: wrappedIssueRecord(),

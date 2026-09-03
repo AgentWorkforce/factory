@@ -67,6 +67,23 @@ describe('isInFactoryScope', () => {
     })).toBe(false)
   })
 
+  it('treats a null title prefix as label-only scope', () => {
+    const labelOnlySafety = {
+      ...safety,
+      requireTitlePrefix: null,
+      requireLabel: 'garden-ready',
+    }
+
+    expect(isInFactoryScope(issue({
+      title: 'No title marker',
+      labels: ['garden-ready'],
+    }), labelOnlySafety)).toBe(true)
+    expect(isInFactoryScope(issue({
+      title: '[factory-e2e] A prefix alone is not enough',
+      labels: [],
+    }), labelOnlySafety)).toBe(false)
+  })
+
   it('matches raw Linear connection label shapes case-insensitively', () => {
     expect(isInFactoryScope(issue({
       payloadLabels: {

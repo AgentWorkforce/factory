@@ -22391,7 +22391,9 @@ export const resolveIssuePrFromMount = async (
       walk.push(path)
     }
 
-    const marker = opts.titleMarker ?? config.safety.requireTitlePrefix
+    // A null config value disables title-based issue eligibility; PR
+    // association still needs a concrete marker when a caller requests it.
+    const marker = opts.titleMarker ?? config.safety.requireTitlePrefix ?? FACTORY_E2E_MARKER
     const fromIndex = await resolveProbePrFromPullIndex(
       mount,
       repo,

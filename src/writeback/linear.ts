@@ -17,7 +17,7 @@ export interface LinearCommentPayload {
 export interface MountLinearWritebackConfig {
   stateIds?: LinearStateIds
   safety?: {
-    requireTitlePrefix?: string
+    requireTitlePrefix?: string | null
     requireLabel?: string
     requireTeamKey?: string
   }
@@ -51,9 +51,11 @@ const safetyFromConfig = (configOrStateIds?: LinearStateIds | MountLinearWriteba
   const safety = asRecord(asRecord(configOrStateIds)?.safety)
   if (safety) {
     return {
-      requireTitlePrefix: typeof safety.requireTitlePrefix === 'string' && safety.requireTitlePrefix
-        ? safety.requireTitlePrefix
-        : '[factory-e2e]',
+      requireTitlePrefix: safety.requireTitlePrefix === null
+        ? null
+        : typeof safety.requireTitlePrefix === 'string' && safety.requireTitlePrefix
+          ? safety.requireTitlePrefix
+          : '[factory-e2e]',
       requireLabel: typeof safety.requireLabel === 'string'
         ? safety.requireLabel
         : 'factory',

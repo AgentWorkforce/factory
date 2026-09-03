@@ -5,6 +5,25 @@ import { join } from 'node:path'
 import { FactoryConfigSchema, NodeConfigSchema, loadFactoryConfig } from './schema'
 import { routedPrRepos } from '../github/routed-pr-babysitter'
 
+describe('safety.requireTitlePrefix', () => {
+  it('accepts null as an explicit opt-out while omission keeps the default', () => {
+    const labelOnly = FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/hoopsheet' },
+      safety: { requireTitlePrefix: null, requireLabel: 'garden-ready' },
+    })
+    const defaulted = FactoryConfigSchema.parse({
+      repos: { default: 'AgentWorkforce/factory' },
+    })
+
+    expect(labelOnly.safety.requireTitlePrefix).toBeNull()
+    expect(defaulted.safety.requireTitlePrefix).toBe('[factory-e2e]')
+    expect(FactoryConfigSchema.safeParse({
+      repos: { default: 'AgentWorkforce/hoopsheet' },
+      safety: { requireTitlePrefix: '', requireLabel: 'garden-ready' },
+    }).success).toBe(false)
+  })
+})
+
 describe('relay.agentName', () => {
   it('keeps an explicit relay agent name', () => {
     const parsed = FactoryConfigSchema.parse({
