@@ -34172,7 +34172,7 @@ describe('the publish bound survives its own failure modes (#440)', () => {
       '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
     }, githubWrite)
     const fleet = new RemoteLifecycleFleetClient()
-    let errorCalls = 0
+    let giveUpLogCalls = 0
     const factory = createFactory(config(), {
       mount,
       fleet,
@@ -34182,7 +34182,20 @@ describe('the publish bound survives its own failure modes (#440)', () => {
       probePrResolver: async () => undefined,
       logger: {
         warn: () => undefined,
-        error: () => { errorCalls += 1; throw new Error('logger exploded') },
+        // Throws ONLY on the give-up line (#440 review, codex P2). A logger
+        // that throws on EVERY error call never reaches the hazard under test:
+        // `#handleAgentExit`'s catch calls `#error` before
+        // `#scheduleDispatchLifecycleRetry` (factory.ts:11528 then :11529), so
+        // the very first failed publication would throw out before any retry
+        // was ever armed, and the budget could never be spent. The test would
+        // then be exercising a different failure entirely - and passing for a
+        // reason that has nothing to do with the ordering it claims to pin.
+        error: (message: unknown) => {
+          if (message === '[factory] pull request publication retries exhausted; abandoning the dispatch') {
+            giveUpLogCalls += 1
+            throw new Error('logger exploded')
+          }
+        },
       },
     })
     try {
@@ -34192,14 +34205,16 @@ describe('the publish bound survives its own failure modes (#440)', () => {
 
       await vi.waitFor(
         () => expect(factory.status().counters.dispatchPublishRetriesExhausted).toBe(1),
-        { timeout: 10_000, interval: 5 },
+        { timeout: 40_000, interval: 5 },
       )
-      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 10_000, interval: 5 })
-      // The logger really did throw, so this is not a vacuous pass.
-      expect(errorCalls).toBeGreaterThan(0)
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 40_000, interval: 5 })
+      // The give-up line really was reached and really did throw, so the pass
+      // is not vacuous - and it throws on THAT line specifically, so the
+      // abandonment is what survived it.
+      expect(giveUpLogCalls).toBe(1)
     } finally {
       await factory.stop()
       await rm(root, { recursive: true, force: true })
     }
-  }, 20_000)
+  }, 60_000)
 })
