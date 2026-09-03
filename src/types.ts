@@ -227,6 +227,17 @@ export interface FactoryLoopHeartbeat {
    */
   fleetConnect?: FleetConnectStatus
   /**
+   * Slack writeback gate counters, named explicitly rather than spread from
+   * `#counters` (that map carries dozens of other counters nobody has vetted
+   * for this surface). Left undefined until the gate has fired at least once
+   * so a counter that never incremented reads as absent, not a fabricated 0
+   * (factory-slack-silence-0903).
+   */
+  slackWritebacksSkipped?: number
+  slackDegradedEpisodes?: number
+  slackGateBypassedByWebhookHealth?: number
+  slackGateBypassedByObservedEvent?: number
+  /**
    * Redacted projection of this record, safe to serve unauthenticated (#295).
    *
    * The deployed container reads this file to answer `/healthz` and has no
