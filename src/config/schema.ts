@@ -472,7 +472,9 @@ const stateIdsSchema = z.object({
 }).default({})
 
 const safetySchema = z.object({
-  requireTitlePrefix: z.string().min(1).default('[factory-e2e]'),
+  // `null` explicitly disables the title path while leaving the label path in
+  // force. This is distinct from omission, which keeps the safe default.
+  requireTitlePrefix: z.string().min(1).nullable().default('[factory-e2e]'),
   requireLabel: z.string().default('factory'),
   requireTeamKey: z.string().min(1).default('AR'),
   // Issues carrying one of these labels are never closed by an observed PR

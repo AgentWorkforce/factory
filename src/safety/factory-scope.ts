@@ -2,13 +2,13 @@ import type { FactoryConfig } from '../config/schema'
 import type { LinearIssue } from '../types'
 
 export interface FactoryScopeSafety {
-  requireTitlePrefix?: string
+  requireTitlePrefix?: string | null
   requireLabel?: string
   requireTeamKey?: string
 }
 
 export interface NormalizedFactoryScopeSafety {
-  titlePrefix: string
+  titlePrefix: string | null
   label?: string
   teamKey: string
 }
@@ -55,9 +55,12 @@ function factoryScopeFailureReason(
   const payload = wrappedPayload(issue.raw)
   const title = stringValue(payload.title) ?? issue.title
   if (!hasAcceptedFactoryMarker(issue, payload, title, expected)) {
-    return expected.label
-      ? `title must start with ${expected.titlePrefix} boundary or labels must include ${expected.label}`
-      : `title must start with ${expected.titlePrefix} boundary`
+    const titleFailure = expected.titlePrefix
+      ? `title must start with ${expected.titlePrefix} boundary`
+      : undefined
+    if (titleFailure && expected.label) return `${titleFailure} or labels must include ${expected.label}`
+    if (expected.label) return `labels must include ${expected.label}`
+    return titleFailure ?? 'no title prefix or label safety gate is configured'
   }
 
   const team = asRecord(payload.team)
@@ -73,8 +76,11 @@ function factoryScopeFailureReason(
 
 const normalizeSafety = (safety: FactoryScopeSafety = {}): NormalizedFactoryScopeSafety => {
   const label = normalizeRequiredLabel(safety.requireLabel)
+  const titlePrefix = safety.requireTitlePrefix === null
+    ? null
+    : safety.requireTitlePrefix || '[factory-e2e]'
   return {
-    titlePrefix: safety.requireTitlePrefix || '[factory-e2e]',
+    titlePrefix,
     ...(label ? { label } : {}),
     teamKey: safety.requireTeamKey || 'AR',
   }
@@ -142,10 +148,10 @@ const titleHasFactoryMarker = (title: string, marker: string): boolean =>
 // `[factory] ...`.
 const titleHasAcceptedFactoryMarker = (
   title: string,
-  configuredMarker: string,
+  configuredMarker: string | null,
   isGithubMirror: boolean,
 ): boolean =>
-  titleHasFactoryMarker(title, configuredMarker) ||
+  (configuredMarker ? titleHasFactoryMarker(title, configuredMarker) : false) ||
   (isGithubMirror && titleHasFactoryMarker(title, GITHUB_MIRROR_TITLE_PREFIX))
 
 // Mirror drafts created from GitHub issues carry source.provider === 'github'.
