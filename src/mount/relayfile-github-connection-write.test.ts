@@ -150,6 +150,34 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(mount.writes).toEqual([])
   })
 
+  it.each([
+    ['ref not found', 'ref not found'],
+    ['branch not found', 'branch not found: refs/heads/factory/ar-906-agentworkforce-factory'],
+    ['404 Not Found', '404 Not Found'],
+  ])('still recognizes an unambiguous "%s" phrasing as a confirmed-absent ref (#453 review)', async (_label, message) => {
+    // cubic, #453 review: the fix for the bare-404 false positive above must
+    // not overshoot into missing the real not-found phrasings a provider or
+    // transport can actually use - a REAL unpushed branch must still
+    // terminalize immediately instead of spending the full retry budget.
+    class NotFoundMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        throw new Error(message)
+      }
+    }
+    const mount = new NotFoundMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/ar-906-agentworkforce-factory',
+      baseRef: 'main',
+      title: 'Issue 906',
+      body: 'Fixes #906',
+    })).rejects.toThrow(
+      'Refusing to publish GitHub PR: implementer branch factory/ar-906-agentworkforce-factory was never pushed',
+    )
+  })
+
   it('confirms the ref through the encoded owner__repo projection when the nested layout 404s (#453 review)', async () => {
     // `getIssue` probes both of Relayfile's canonical layouts because a
     // workspace can expose only one of them. The ref-existence check must do

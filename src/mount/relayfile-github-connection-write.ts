@@ -410,27 +410,31 @@ const errorMessage = (error: unknown): string => {
 const isGithubReferenceAlreadyExistsError = (error: unknown): boolean =>
   /reference already exists/iu.test(errorMessage(error))
 
-const asRecord = (value: unknown): Record<string, unknown> =>
-  value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
-
 /**
  * A CONFIRMED absent read, as opposed to any other read failure. Structured
  * fields first, matching `isMountFileNotFound` in `src/cli/fleet.ts` (kept
  * local because `mount/` is a lower layer than `cli/` and must not depend on
- * it), but deliberately WITHOUT that helper's bare `\b404\b` message fallback
- * (#453 review, CodeRabbit): a transport error whose text merely CONTAINS
+ * it; reuses this file's own `record` coercion rather than a second
+ * near-identical helper - #453 review, cubic P3).
+ *
+ * The message fallback is deliberately narrower than a bare `\b404\b`
+ * (#453 review, CodeRabbit P1): a transport error whose text merely CONTAINS
  * "404" - a URI segment like `feature-404`, an unrelated numeric id - would
- * false-positive as a confirmed-absent ref here, and that false positive
- * feeds straight into `isNonRetryablePublishError` abandoning a genuinely
- * publishable dispatch. The message fallback is restricted to unambiguous
- * not-found phrasing.
+ * false-positive as a confirmed-absent ref, and that false positive feeds
+ * straight into `isNonRetryablePublishError` abandoning a genuinely
+ * publishable dispatch. It is also deliberately broader than the single
+ * phrase "file not found" (#453 review, cubic P2, on the same line the
+ * CodeRabbit fix landed on): a ref/branch/resource-flavored "not found", or
+ * the unambiguous compound "404 not found", must still count as confirmed
+ * absence, or a REAL unpushed branch stops terminalizing and spends the full
+ * retry budget instead.
  */
 const isMountFileNotFound = (error: unknown): boolean => {
-  const record = asRecord(error)
-  const response = asRecord(record.response)
-  const status = record.status ?? record.statusCode ?? response.status ?? response.statusCode
-  const code = typeof record.code === 'string' ? record.code.toLowerCase() : undefined
+  const errorRecord = record(error)
+  const response = record(errorRecord.response)
+  const status = errorRecord.status ?? errorRecord.statusCode ?? response.status ?? response.statusCode
+  const code = typeof errorRecord.code === 'string' ? errorRecord.code.toLowerCase() : undefined
   return status === 404 || status === '404' ||
     code === 'not_found' || code === 'file_not_found' ||
-    /file\s+not\s+found/iu.test(errorMessage(error))
+    /(?:file|ref(?:erence)?|branch|resource)\s+not\s+found|\b404\s+not\s+found\b/iu.test(errorMessage(error))
 }
