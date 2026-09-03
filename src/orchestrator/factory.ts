@@ -530,6 +530,50 @@ const DISPATCH_PUBLISH_MAX_ATTEMPTS = 10
  */
 const PUBLISH_RETRIES_EXHAUSTED_RELEASE_REASON = 'publish-retries-exhausted'
 /**
+ * Release reason for a publish that failed on a non-retryable writeback
+ * status (#430): a GitHub 4xx response, or an adapter-side payload-shape
+ * rejection like #411's unroutable draft. Neither ever changes on retry -
+ * the request is rejected for what it IS, not for a transient control-plane
+ * condition - so spending the same ten-attempt budget the transient case
+ * earns only delays the release by ~10s and reports a generic exhaustion
+ * instead of the provider's actual reason. Distinct from
+ * `PUBLISH_RETRIES_EXHAUSTED_RELEASE_REASON` because that name means the
+ * budget ran out; this means the first attempt already proved retrying is
+ * pointless.
+ */
+const PUBLISH_NON_RETRYABLE_RELEASE_REASON = 'publish-non-retryable'
+/**
+ * Matches a writeback failure whose payload will be rejected identically on
+ * every retry, not a transient control-plane blip:
+ *
+ * - A GitHub status that specifically proves the PAYLOAD is permanently
+ *   invalid (`GitHub writeback failed with status 400|404|422: ...`,
+ *   `#writeAndConfirmUnlocked`'s confirmed-failure message) - `422
+ *   Validation Failed` against a head ref that was never pushed is the
+ *   measured case (#430). Deliberately NOT every 4xx (#453 review, codex +
+ *   cubic P1): 401/403 can be a transient credential blip, 408/429 are
+ *   explicitly transient (timeout / rate limit), and blanket-matching them
+ *   would abandon a genuinely publishable dispatch on its first throttle
+ *   instead of letting the existing retry budget recover it.
+ * - `assertRoutedGithubWritebackPath`'s refusal of a draft the adapter never
+ *   routes at all (#411/#431) - rejected before the request even reaches
+ *   GitHub, for the same "this payload is wrong" reason.
+ * - Every "Refusing to publish" pre-publish guard, on this surface and on
+ *   `#publishImplementerPullRequest` itself (`Refusing to publish GitHub
+ *   PR: ...`, and `#publishImplementerPullRequest`'s own `Refusing to
+ *   publish ${issueKey}: ...` branch/no-branch guards - #453 review,
+ *   CodeRabbit: the earlier `publish GitHub PR`-only match missed those two).
+ *   All of them are deterministic validation failures, including the
+ *   refs/heads existence check below: a branch that was CONFIRMED never
+ *   pushed does not appear on a retry either (an indeterminate ref read is
+ *   propagated as a different, retryable error - see
+ *   `RelayfileGithubConnectionWrite#assertHeadRefPushed`).
+ */
+const NON_RETRYABLE_WRITEBACK_ERROR_PATTERN =
+  /GitHub writeback failed with status (?:400|404|422)\b|^Refusing to (?:author an unroutable GitHub writeback path|publish)\b/u
+const isNonRetryablePublishError = (error: unknown): boolean =>
+  NON_RETRYABLE_WRITEBACK_ERROR_PATTERN.test(describeError(error).errorMessage)
+/**
  * Separator for the per-repository publish budget key. `::` cannot appear in a
  * dispatch lifecycle key (`github:owner/repo#n` or `linear:uuid`), so the
  * prefix scan in `#clearPublishAttempts` cannot match a neighbouring work unit.
@@ -8036,7 +8080,43 @@ export class FactoryLoop implements Factory {
    * `#finishDurableRelease` into a terminal `complete` that counts `done` and
    * emits `issue-done` - recording a dispatch that produced no pull request as
    * a successful one (#429 review, codex, on the sibling path).
+   *
+   * A NON-RETRYABLE failure (#430) skips the budget entirely and abandons on
+   * the first attempt. `isNonRetryablePublishError` only matches a failure
+   * whose payload GitHub (or the adapter) rejects for what it IS - a 4xx
+   * response, an unroutable draft, one of this surface's own pre-publish
+   * guards - and retrying ten times at the 1 Hz floor changes nothing about
+   * that; it only holds the slot ~10s longer and reports a generic
+   * "retries exhausted" instead of the provider's actual reason. A transient
+   * failure (a 503, a confirm timeout) still spends the full budget exactly as
+   * before.
    */
+  /**
+   * A publish failure caught before the durable `publishing` retry drive ever
+   * turns (#430): the very first attempt, made from `#handleAgentExit`
+   * itself. That attempt is deliberately uncharged against the publish
+   * budget - `#abandonExhaustedPublish`'s callers are the ones that spend it
+   * - so on a genuinely transient failure this schedules an ordinary retry
+   * exactly as before. A NON-retryable failure must not wait for that drive
+   * to turn at all: routing it through `#abandonExhaustedPublish` here
+   * charges and immediately exceeds the same budget, releasing the slot on
+   * this, the very first attempt, instead of only once a second attempt
+   * eventually reaches the charged path.
+   */
+  async #handleFirstPublishFailure(
+    record: InFlightIssue,
+    implementer: TrackedAgent,
+    error: unknown,
+  ): Promise<void> {
+    this.#increment('githubPullRequestPublishFailures')
+    this.#error(error, record.issue)
+    if (isNonRetryablePublishError(error)) {
+      await this.#abandonExhaustedPublish(record, publishRepoStep(implementer), error)
+      return
+    }
+    this.#scheduleDispatchLifecycleRetry(record)
+  }
+
   async #abandonExhaustedPublish(
     record: InFlightIssue,
     step: string,
@@ -8045,7 +8125,8 @@ export class FactoryLoop implements Factory {
     const attemptKey = publishAttemptKey(record, step)
     const attempts = (this.#publishAttempts.get(attemptKey) ?? 0) + 1
     this.#publishAttempts.set(attemptKey, attempts)
-    if (attempts <= DISPATCH_PUBLISH_MAX_ATTEMPTS) return false
+    const nonRetryable = isNonRetryablePublishError(error)
+    if (!nonRetryable && attempts <= DISPATCH_PUBLISH_MAX_ATTEMPTS) return false
     // ABANDON FIRST, and do not spend the counter until it has returned
     // (#440 review, cubic P2). This is the same hazard `#chargeReleaseAttempt`
     // documents on the sibling path: `this.#logger.error` is caller-supplied
@@ -8057,24 +8138,32 @@ export class FactoryLoop implements Factory {
     // Keeping the counter spent until the abandonment has actually returned
     // also makes a THROWING abandon retry the abandonment on the next pass
     // rather than starting the budget over.
-    await this.#abandonStuckDispatch(record, PUBLISH_RETRIES_EXHAUSTED_RELEASE_REASON)
+    const releaseReason = nonRetryable
+      ? PUBLISH_NON_RETRYABLE_RELEASE_REASON
+      : PUBLISH_RETRIES_EXHAUSTED_RELEASE_REASON
+    await this.#abandonStuckDispatch(record, releaseReason)
     // The whole work unit is going away, so every step's counter goes with it,
     // not just the one that ran out.
     this.#clearPublishAttempts(dispatchLifecycleKey(record.issue))
-    this.#increment('dispatchPublishRetriesExhausted')
+    this.#increment(nonRetryable ? 'dispatchPublishNonRetryable' : 'dispatchPublishRetriesExhausted')
     // `error`, not `warn`: a work unit whose publication this process has
     // permanently given up on must not be inferable only from the absence of
     // further log lines. The provider message is what names the cause - a 422
     // on a head ref that was never pushed reads very differently from a 503 -
     // and it is the line an operator will grep for.
     try {
-      this.#logger.error?.('[factory] pull request publication retries exhausted; abandoning the dispatch', {
-        issue: record.issue.key,
-        step,
-        attempts: attempts - 1,
-        maxAttempts: DISPATCH_PUBLISH_MAX_ATTEMPTS,
-        error: describeError(error).errorMessage,
-      })
+      this.#logger.error?.(
+        nonRetryable
+          ? '[factory] pull request publication failed with a non-retryable writeback status; abandoning the dispatch'
+          : '[factory] pull request publication retries exhausted; abandoning the dispatch',
+        {
+          issue: record.issue.key,
+          step,
+          attempts: attempts - 1,
+          maxAttempts: DISPATCH_PUBLISH_MAX_ATTEMPTS,
+          error: describeError(error).errorMessage,
+        },
+      )
     } catch {
       // A caller-supplied logger must not be able to undo an abandonment that
       // has already happened. Losing the line is bad; re-arming the wedge it
@@ -11527,9 +11616,7 @@ export class FactoryLoop implements Factory {
           publishedPr = await this.#publishImplementerPullRequest(record, exiting)
           if (publishedPr) await this.#saveDispatchLifecycle(record, 'published', publishedPr)
         } catch (error) {
-          this.#increment('githubPullRequestPublishFailures')
-          this.#error(error, record.issue)
-          this.#scheduleDispatchLifecycleRetry(record)
+          await this.#handleFirstPublishFailure(record, exiting, error)
           return
         }
       }
@@ -11590,9 +11677,7 @@ export class FactoryLoop implements Factory {
             })
             if (reconciledPr && !await this.#saveDispatchLifecycle(record, 'published', reconciledPr)) return
           } catch (error) {
-            this.#increment('githubPullRequestPublishFailures')
-            this.#error(error, record.issue)
-            this.#scheduleDispatchLifecycleRetry(record)
+            await this.#handleFirstPublishFailure(record, tracked, error)
             return
           }
         }
@@ -11625,7 +11710,7 @@ export class FactoryLoop implements Factory {
       if (tracked.spec.role === 'implementer') {
         await this.#saveDispatchLifecycle(record, 'publishing')
         if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit PR publication started', { issue: record.issue.key, name })
-        const publishedPr = await this.#tryPublishImplementerPr(record, tracked)
+        const { published: publishedPr, nonRetryableError } = await this.#tryPublishImplementerPr(record, tracked)
         if (publishedPr) {
           await this.#saveDispatchLifecycle(record, 'published', publishedPr)
           if (this.#config.babysitter.enabled) {
@@ -11638,6 +11723,16 @@ export class FactoryLoop implements Factory {
           } else {
             if (await this.#allImplementersHaveCompletionPr(record)) await this.#completeIssue(record)
           }
+          return
+        }
+        // A non-retryable failure (#430) - a GitHub 4xx, an implementer branch
+        // that was never pushed - is not going to change on the next scan of
+        // this exact same branch either. Abandon here, on this first attempt,
+        // rather than falling into the retry below only to have the charged
+        // drive (`#abandonExhaustedPublish`'s other caller) reach the same
+        // conclusion one attempt later.
+        if (nonRetryableError !== undefined) {
+          await this.#abandonExhaustedPublish(record, publishRepoStep(tracked), nonRetryableError)
           return
         }
         // A normal remote exit can race branch replication, so leave it in the
@@ -11825,21 +11920,29 @@ export class FactoryLoop implements Factory {
   }
 
   // Publish a PR from the implementer's committed branch when it exited without
-  // opening one. Best-effort and idempotent: returns undefined when there is no
+  // opening one. Best-effort and idempotent: returns `{}` when there is no
   // clone or nothing publishable (no branch / no commits ahead of base —
   // `#publishImplementerPullRequest` refuses head==base), so the caller falls
   // back to its normal restart/conclude handling. Explicit app identity errors
   // remain fail-closed and propagate to the lifecycle error path.
+  //
+  // A non-retryable writeback failure (#430) is reported through
+  // `nonRetryableError` rather than by throwing: the caller needs to abandon
+  // the dispatch immediately rather than fall into its normal
+  // "leave it in the publishing retry loop" branch, and a throw here would
+  // instead surface all the way out to `#handleAgentExit`'s outermost catch,
+  // which does not retry OR abandon anything — it only logs. Every other
+  // failure keeps returning `{}`, exactly as before.
   async #tryPublishImplementerPr(
     record: InFlightIssue,
     implementer: TrackedAgent,
-  ): Promise<GithubPublishPullRequestResult | undefined> {
+  ): Promise<{ published?: GithubPublishPullRequestResult; nonRetryableError?: unknown }> {
     if (
       record.dryRun ||
       (!implementer.spec.clonePath && !implementer.spec.branch) ||
       !this.#shouldAttemptPullRequestPublication()
     ) {
-      return undefined
+      return {}
     }
     try {
       // A missed exit can be reconciled after the worker checkout was pruned.
@@ -11875,7 +11978,7 @@ export class FactoryLoop implements Factory {
           prNumber: published.number,
         })
       }
-      return published
+      return { published }
     } catch (error) {
       if (this.#config.github.identity === 'app' && !this.#mount.githubWrite) throw error
       this.#increment('exitPrPublishSkipped')
@@ -11884,7 +11987,7 @@ export class FactoryLoop implements Factory {
         name: implementer.result?.name ?? implementer.spec.name,
         error: describeError(error).errorMessage,
       })
-      return undefined
+      return isNonRetryablePublishError(error) ? { nonRetryableError: error } : {}
     }
   }
 

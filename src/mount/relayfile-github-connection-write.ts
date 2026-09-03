@@ -119,6 +119,14 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
           force: false,
         })
       }
+    } else {
+      // Nothing in this process can create the branch: no clone to push from,
+      // no sha to point a ref at. A remote implementer is trusted to have
+      // pushed it, and when that trust is misplaced GitHub answers a bare
+      // `422 Validation Failed` on the PR create - true, but it reads like a
+      // payload bug rather than the missing push it actually is (#430).
+      // Confirm the ref exists first, so the failure names the real cause.
+      await this.#assertHeadRefPushed(owner, repo, fullHeadRef, headRef)
     }
 
     const pullRequestPath = `${repoRoot}/pull-requests/${draftName}.json`
@@ -216,6 +224,48 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
         ...(labels === undefined ? {} : { labels }),
         ...(input.state === undefined ? {} : { state: input.state }),
       },
+    )
+  }
+
+  /**
+   * Confirm `refs/heads/<headRef>` actually exists on GitHub before a PR is
+   * opened against it (#430).
+   *
+   * This only runs on the path where no `headSha` was supplied, so nothing
+   * above could have created the ref itself - a positive result here means an
+   * implementer really did push, not merely that this process pushed for it.
+   *
+   * Only a CONFIRMED-absent read (`isMountFileNotFound`) is reported as the
+   * branch never having been pushed. Every other read failure - a transport
+   * blip, an auth hiccup, the projection not yet having caught up with a
+   * branch that really was just pushed - is propagated unclassified instead
+   * (#453 review, codex + cubic P1): the non-retryable classifier upstream
+   * would otherwise abandon a genuinely publishable dispatch on its first bad
+   * network moment, rather than letting the existing publish-retry budget
+   * recover it. Both of `getIssue`'s canonical layouts (the encoded
+   * `owner__repo` provider projection and the nested `owner/repo` writeback
+   * tree) are probed for the same reason `getIssue` probes both: a workspace
+   * that only exposes one of them must not read as "branch absent".
+   */
+  async #assertHeadRefPushed(owner: string, repo: string, fullHeadRef: string, headRef: string): Promise<void> {
+    const paths = [
+      `/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/refs/${encodeURIComponent(fullHeadRef)}.json`,
+      `/github/repos/${encodeURIComponent(owner)}__${encodeURIComponent(repo)}/refs/${encodeURIComponent(fullHeadRef)}.json`,
+    ]
+    let lastError: unknown
+    for (const path of paths) {
+      try {
+        await this.#mount.readFile(path)
+        return
+      } catch (error) {
+        lastError = error
+        if (!isMountFileNotFound(error)) throw error
+        // Try the alternate canonical layout before concluding absence.
+      }
+    }
+    throw new Error(
+      `Refusing to publish GitHub PR: implementer branch ${headRef} was never pushed to ${owner}/${repo} ` +
+      `(refs/heads/${headRef} does not exist: ${errorMessage(lastError)})`,
     )
   }
 
@@ -359,3 +409,32 @@ const errorMessage = (error: unknown): string => {
 
 const isGithubReferenceAlreadyExistsError = (error: unknown): boolean =>
   /reference already exists/iu.test(errorMessage(error))
+
+/**
+ * A CONFIRMED absent read, as opposed to any other read failure. Structured
+ * fields first, matching `isMountFileNotFound` in `src/cli/fleet.ts` (kept
+ * local because `mount/` is a lower layer than `cli/` and must not depend on
+ * it; reuses this file's own `record` coercion rather than a second
+ * near-identical helper - #453 review, cubic P3).
+ *
+ * The message fallback is deliberately narrower than a bare `\b404\b`
+ * (#453 review, CodeRabbit P1): a transport error whose text merely CONTAINS
+ * "404" - a URI segment like `feature-404`, an unrelated numeric id - would
+ * false-positive as a confirmed-absent ref, and that false positive feeds
+ * straight into `isNonRetryablePublishError` abandoning a genuinely
+ * publishable dispatch. It is also deliberately broader than the single
+ * phrase "file not found" (#453 review, cubic P2, on the same line the
+ * CodeRabbit fix landed on): a ref/branch/resource-flavored "not found", or
+ * the unambiguous compound "404 not found", must still count as confirmed
+ * absence, or a REAL unpushed branch stops terminalizing and spends the full
+ * retry budget instead.
+ */
+const isMountFileNotFound = (error: unknown): boolean => {
+  const errorRecord = record(error)
+  const response = record(errorRecord.response)
+  const status = errorRecord.status ?? errorRecord.statusCode ?? response.status ?? response.statusCode
+  const code = typeof errorRecord.code === 'string' ? errorRecord.code.toLowerCase() : undefined
+  return status === 404 || status === '404' ||
+    code === 'not_found' || code === 'file_not_found' ||
+    /(?:file|ref(?:erence)?|branch|resource)\s+not\s+found|\b404\s+not\s+found\b/iu.test(errorMessage(error))
+}

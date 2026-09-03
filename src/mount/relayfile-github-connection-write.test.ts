@@ -31,6 +31,7 @@ describe('RelayfileGithubConnectionWrite', () => {
 
   it('publishes an already-pushed remote branch without reading an orchestrator-local clone', async () => {
     const pullRequestPath = '/github/repos/AgentWorkforce/factory/pull-requests/factory-factory-ar-85-agentworkforce-factory-pushed.json'
+    const refPath = '/github/repos/AgentWorkforce/factory/refs/refs%2Fheads%2Ffactory%2Far-85-agentworkforce-factory.json'
     class ReceiptMount extends FakeMountClient {
       override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
         await super.writeFile(path, content, opts)
@@ -39,7 +40,9 @@ describe('RelayfileGithubConnectionWrite', () => {
         }
       }
     }
-    const mount = new ReceiptMount()
+    const mount = new ReceiptMount({
+      [refPath]: { ref: 'refs/heads/factory/ar-85-agentworkforce-factory', object: { sha: 'deadbeef' } },
+    })
     const git = vi.fn(async () => { throw new Error('remote publication must not inspect local git') })
     const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: git })
 
@@ -72,6 +75,136 @@ describe('RelayfileGithubConnectionWrite', () => {
 
     await expect(write.publishPullRequest(input)).resolves.toMatchObject({ number: 85 })
     expect(mount.writes[1]?.path).toBe(pullRequestPath)
+  })
+
+  it('refuses to open a PR against a remote branch that was never pushed (#430)', async () => {
+    // Measured production shape: a remote implementer supplies `headRef` and
+    // no `headSha`, so nothing in this process created the branch. Against
+    // `origin/main` this proceeds straight to the PR create, which GitHub
+    // rejects with a bare `422 Validation Failed` that reads like a payload
+    // bug rather than naming the actual cause. The fix confirms the ref
+    // exists first and names the real cause instead.
+    const mount = new FakeMountClient()
+    const git = vi.fn(async () => { throw new Error('remote publication must not inspect local git') })
+    const write = new RelayfileGithubConnectionWrite({ mount, gitRunner: git })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/ar-902-agentworkforce-factory',
+      baseRef: 'main',
+      title: 'Issue 902',
+      body: 'Fixes #902',
+    })).rejects.toThrow(
+      'Refusing to publish GitHub PR: implementer branch factory/ar-902-agentworkforce-factory ' +
+      'was never pushed to AgentWorkforce/factory (refs/heads/factory/ar-902-agentworkforce-factory does not exist',
+    )
+    // The real fix, not merely a thrown error: no PR draft is ever authored
+    // against a head GitHub has never seen, so no 422 is ever provoked.
+    expect(mount.writes).toEqual([])
+  })
+
+  it('propagates an indeterminate ref read instead of declaring the branch absent (#453 review)', async () => {
+    // A transport blip, an auth hiccup, or the projection simply not having
+    // caught up with a branch that really was just pushed must NOT read the
+    // same as a confirmed-missing ref: doing so hands the upstream
+    // non-retryable classifier a false "never pushed" and abandons a
+    // genuinely publishable dispatch on its first bad network moment.
+    class FlakyMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        throw Object.assign(new Error('upstream request timed out'), { status: 503 })
+      }
+    }
+    const mount = new FlakyMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/ar-903-agentworkforce-factory',
+      baseRef: 'main',
+      title: 'Issue 903',
+      body: 'Fixes #903',
+    })).rejects.toThrow('upstream request timed out')
+    expect(mount.writes).toEqual([])
+  })
+
+  it('does not treat a bare "404" substring in an unrelated error as a confirmed-absent ref (#453 review)', async () => {
+    // CodeRabbit, #453 review: a transport error whose message merely
+    // CONTAINS "404" - here, a branch name segment - must not classify as a
+    // confirmed-absent ref. Only unambiguous not-found phrasing (or a
+    // structured status/code) may.
+    class AmbiguousMessageMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        throw new Error(`request to fetch refs/heads/feature-404 failed: connection reset`)
+      }
+    }
+    const mount = new AmbiguousMessageMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'feature-404',
+      baseRef: 'main',
+      title: 'Issue 905',
+      body: 'Fixes #905',
+    })).rejects.toThrow('connection reset')
+    expect(mount.writes).toEqual([])
+  })
+
+  it.each([
+    ['ref not found', 'ref not found'],
+    ['branch not found', 'branch not found: refs/heads/factory/ar-906-agentworkforce-factory'],
+    ['404 Not Found', '404 Not Found'],
+  ])('still recognizes an unambiguous "%s" phrasing as a confirmed-absent ref (#453 review)', async (_label, message) => {
+    // cubic, #453 review: the fix for the bare-404 false positive above must
+    // not overshoot into missing the real not-found phrasings a provider or
+    // transport can actually use - a REAL unpushed branch must still
+    // terminalize immediately instead of spending the full retry budget.
+    class NotFoundMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        throw new Error(message)
+      }
+    }
+    const mount = new NotFoundMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/ar-906-agentworkforce-factory',
+      baseRef: 'main',
+      title: 'Issue 906',
+      body: 'Fixes #906',
+    })).rejects.toThrow(
+      'Refusing to publish GitHub PR: implementer branch factory/ar-906-agentworkforce-factory was never pushed',
+    )
+  })
+
+  it('confirms the ref through the encoded owner__repo projection when the nested layout 404s (#453 review)', async () => {
+    // `getIssue` probes both of Relayfile's canonical layouts because a
+    // workspace can expose only one of them. The ref-existence check must do
+    // the same, or a workspace on the encoded-only layout would see every
+    // remote publish misreported as an unpushed branch.
+    const encodedRefPath = '/github/repos/AgentWorkforce__factory/refs/refs%2Fheads%2Ffactory%2Far-904-agentworkforce-factory.json'
+    const pullRequestPath = '/github/repos/AgentWorkforce/factory/pull-requests/factory-factory-ar-904-agentworkforce-factory-pushed.json'
+    class EncodedOnlyMount extends FakeMountClient {
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        await super.writeFile(path, content, opts)
+        if (path === pullRequestPath) {
+          this.files.set(path, { content: { created: 90, url: 'https://github.com/AgentWorkforce/factory/pull/90' } })
+        }
+      }
+    }
+    const mount = new EncodedOnlyMount({
+      [encodedRefPath]: { ref: 'refs/heads/factory/ar-904-agentworkforce-factory', object: { sha: 'deadbeef' } },
+    })
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/ar-904-agentworkforce-factory',
+      baseRef: 'main',
+      title: 'Issue 904',
+      body: 'Fixes #904',
+    })).resolves.toMatchObject({ number: 90 })
   })
 
   it('pushes the current ref before creating a pull request through Relayfile', async () => {
