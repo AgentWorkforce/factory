@@ -45,6 +45,7 @@ import type {
   ProviderSyncStatus,
   PreviewReference,
   RosterEntry,
+  SandboxPush,
   SlackWriteback,
   SpawnResult,
   Subscription,
@@ -857,6 +858,7 @@ export class FactoryLoop implements Factory {
   readonly #workspaceId: string
   readonly #relayflows?: FactoryPorts['relayflows']
   readonly #worktrees?: AgentWorktreeManager
+  readonly #sandboxPush?: SandboxPush
   readonly #reporter?: FactoryEventReporter
   readonly #costLedger: CostLedger
   #batchView?: BatchSnapshot
@@ -1360,6 +1362,7 @@ export class FactoryLoop implements Factory {
     this.#workspaceId = config.workspaceId ?? 'default'
     this.#relayflows = ports.relayflows
     this.#worktrees = ports.worktrees
+    this.#sandboxPush = ports.sandboxPush
     this.#reporter = ports.reporter
     this.#costLedger = ports.costLedger ?? new CostLedger()
     this.#offUnpricedModel = this.#costLedger.onUnpricedModel((record) => {
@@ -11843,7 +11846,27 @@ export class FactoryLoop implements Factory {
       // Re-create its deterministic worktree from the retained local branch so
       // publication can still push/read the completed commit.
       await this.#prepareAgentWorktree(record, implementer.spec)
-      const published = await this.#publishImplementerPullRequest(record, implementer)
+      // A remote implementer's commits are inside its sandbox and have never
+      // reached GitHub: the box holds no push credential by design, so the
+      // branch `#publishImplementerPullRequest` is about to ask for does not
+      // exist yet. Publish it from the host first. Best-effort — on any
+      // outcome but a push we fall through to the existing path, which is
+      // still correct for a run whose branch did somehow arrive.
+      const pushAttempted = await this.#tryPushImplementerSandbox(record, implementer)
+      const published = await this.#publishImplementerPullRequest(
+        record,
+        implementer,
+        // Reconcile whenever the push path was APPLICABLE, not only when this
+        // attempt pushed. A push opens the PR on its way through, and under
+        // relayfile-cloud the mounted snapshot can lag that creation — so a
+        // single scan can miss a PR that exists, fall through to creation, and
+        // fail on a duplicate head. Worse, the retry then finds the sandbox
+        // already pushed and answers `no-changes`, which under a
+        // pushed-only condition would disable reconciliation for good and
+        // strand a perfectly valid PR unrecorded. The lookup is cheap and
+        // returns undefined when there is genuinely nothing to reconcile.
+        pushAttempted ? { reconcileExisting: true } : {},
+      )
       if (published) {
         this.#increment('implementerPrsPublishedOnExit')
         this.#logger.info?.('[factory] published PR from implementer clone after it exited without opening one', {
@@ -11862,6 +11885,96 @@ export class FactoryLoop implements Factory {
         error: describeError(error).errorMessage,
       })
       return undefined
+    }
+  }
+
+  /**
+   * Publish a remote implementer's sandbox commits as a branch and a PR.
+   *
+   * Returns whether this path was APPLICABLE — a remote implementer with a
+   * sandbox to push from — rather than whether this particular attempt pushed.
+   * That is what the caller needs: once a push has been attempted for a head,
+   * a PR may exist for it, and a later retry that answers `no-changes` because
+   * the sandbox was already pushed must still reconcile rather than try to
+   * create a duplicate.
+   *
+   * Everything here is best-effort and non-throwing. A dispatch whose work
+   * cannot be published is not a dispatch that should be failed — the existing
+   * publish path still runs behind this, and its own error handling is what
+   * decides the record's fate. The one thing this must never do is make a
+   * local-placement dispatch worse, so it is gated on remote locality.
+   *
+   * No credential passes through here. `SandboxPush` names the sandbox, the
+   * clone path and the branch; the host mints a GitHub App installation token
+   * on its own side and the sandbox never sees one.
+   */
+  async #tryPushImplementerSandbox(
+    record: InFlightIssue,
+    implementer: TrackedAgent,
+  ): Promise<boolean> {
+    const push = this.#sandboxPush
+    const sandboxId = implementer.result?.sandboxId
+    const branch = implementer.spec.branch
+    if (
+      !push ||
+      !sandboxId ||
+      !branch ||
+      implementer.result?.locality !== 'remote' ||
+      !implementer.spec.clonePath
+    ) {
+      return false
+    }
+    // Both the issue read and the repo normalization run INSIDE the try:
+    // `#readIssue` can rethrow a pass-wide relayfile fault and
+    // `normalizeGithubRepo` throws for a bare repo name with no configured
+    // org. Outside, those failures would be counted as a skipped publish and
+    // never as a push failure, which hides a broken push behind the wrong
+    // counter.
+    let repo = implementer.spec.repo
+    try {
+      const issue = await this.#readIssue(record.issue.path)
+      if (!issue) return true
+      repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org)
+      const result = await push.push({
+        sandboxId,
+        repoPath: implementer.spec.clonePath,
+        repo,
+        branch,
+        title: `${issue.key}: ${issue.title}`,
+        body: githubPullRequestBody(issue, implementer.spec.preview, canonicalTrajectorySessionRef(implementer.sessionRef)),
+      })
+      if (result.status === 'pushed') {
+        this.#increment('sandboxPushesPublished')
+        this.#logger.info?.('[factory] pushed implementer sandbox changes', {
+          issue: record.issue.key,
+          repo,
+          branch: result.branch,
+          prUrl: result.prUrl,
+          commitSha: result.commitSha,
+        })
+        return true
+      }
+      // `no-changes` is not a failure and must not be counted as one: the
+      // agent committed nothing, and the publish path below will reach the
+      // same conclusion on its own.
+      this.#increment(result.status === 'no-changes' ? 'sandboxPushesEmpty' : 'sandboxPushesFailed')
+      this.#logger.warn?.('[factory] implementer sandbox changes were not pushed', {
+        issue: record.issue.key,
+        repo,
+        branch,
+        status: result.status,
+        ...(result.status === 'failed' ? { reason: result.reason } : {}),
+      })
+      return true
+    } catch (error) {
+      this.#increment('sandboxPushesFailed')
+      this.#logger.warn?.('[factory] implementer sandbox push threw', {
+        issue: record.issue.key,
+        repo,
+        branch,
+        error: describeError(error).errorMessage,
+      })
+      return true
     }
   }
 

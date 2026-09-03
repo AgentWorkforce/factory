@@ -125,7 +125,7 @@ export interface RelayFleetClientOptions {
     repo?: string
     capability: Capability
     name: string
-  }) => Promise<{ nodeName: string }>
+  }) => Promise<{ nodeName: string; sandboxId?: string }>
   /**
    * Refuse to place a `spawn:*` invocation that has no JIT sandbox behind
    * it. Requires {@link provisionSandbox}. Turns "landed on a laptop and
@@ -372,6 +372,7 @@ export class RelayFleetClient implements FleetClient {
     // `placementSandboxOnly` prevents a silent fall-back to a laptop node whose
     // filesystem cannot honor factory-cloud's dispatch cloneRoot.
     let sandboxTargetNode: string | undefined
+    let sandboxTargetId: string | undefined
     if (input.capability.startsWith('spawn:')) {
       if (this.#options.provisionSandbox) {
         const provisioned = await this.#withinDeadline(
@@ -390,6 +391,11 @@ export class RelayFleetClient implements FleetClient {
           )
         }
         sandboxTargetNode = proposedName
+        // Retained so the agent's commits can be published later. A hook that
+        // provisions but reports no sandbox id still places fine — the
+        // dispatch runs, it just cannot be published from, which is strictly
+        // better than refusing to dispatch at all.
+        sandboxTargetId = provisioned?.sandboxId?.trim() || undefined
       } else if (this.#options.placementSandboxOnly) {
         throw new Error(
           'placementSandboxOnly is set but no provisionSandbox hook is configured; ' +
@@ -474,9 +480,13 @@ export class RelayFleetClient implements FleetClient {
     // placement with an unknown node is tracked without one; the roster
     // reconciliation loop is what later attributes it.
     const { node: _untrustedNode, ...resultWithoutNode } = result
-    const trustedResult: SpawnResult = acknowledgedNode
-      ? { ...result, node: acknowledgedNode }
-      : resultWithoutNode
+    const trustedResult: SpawnResult = {
+      ...(acknowledgedNode ? { ...result, node: acknowledgedNode } : resultWithoutNode),
+      // Unlike the node name, this is not derived from action output: it comes
+      // from the provisioning hook we called ourselves, so the `self` guard
+      // above has nothing to say about it.
+      ...(sandboxTargetId ? { sandboxId: sandboxTargetId } : {}),
+    }
     this.#track(trustedResult.name, {
       invocationId: ack.invocationId,
       ...(acknowledgedNode ? { node: acknowledgedNode } : {}),

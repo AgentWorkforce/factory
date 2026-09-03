@@ -32,7 +32,7 @@ import { LatePlacementReleasedError, changeEventPath, defaultMergeGate } from '.
 import type { GhRunner } from '../github'
 import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
 import { RelayfileOperationTimeoutError } from '../mount/relayfile-operation-timeout'
-import type { AgentSpec, AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubIssueCloseWriteResult, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
+import type { AgentSpec, AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubIssueCloseWriteResult, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SandboxPushInput, SandboxPushResult, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
@@ -21164,6 +21164,233 @@ describe('FactoryLoop', () => {
     expect(fleet.releases.map((release) => release.name)).toEqual(
       expect.arrayContaining(['ar-92-impl-pear', 'ar-92-review']),
     )
+  })
+
+  // The other half of the #67 follow-up, for CLOUD placement. A remote
+  // implementer's commits live inside its Daytona sandbox and have never
+  // reached GitHub — the box holds no push credential by design — so the
+  // branch the publish path is about to open a PR from does not exist. Before
+  // this, every cloud dispatch ended here: work committed, nothing published,
+  // and `factory/273` stayed the newest branch for two and a half weeks.
+  describe('publishing a remote implementer\'s sandbox commits', () => {
+    // Extends the established remote fixture rather than FakeFleetClient:
+    // `#usesDurableDispatchLifecycle()` is `durableOwnership ?? placementLocality
+    // === 'remote'`, so a remote placement runs the DURABLE lifecycle, and a
+    // fake without the lifecycle action / roster that path needs never reaches
+    // the exit handler at all.
+    class RemoteFleetClient extends RemoteLifecycleFleetClient {
+      sandboxId: string | undefined = 'sandbox-abc'
+
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        const result = await super.spawn(input)
+        return { ...result, ...(this.sandboxId ? { sandboxId: this.sandboxId } : {}) }
+      }
+    }
+
+    const publishingMount = (publishInputs: GithubPublishPullRequestInput[]) => {
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => {
+          publishInputs.push(input)
+          return {
+            repo: input.repo,
+            number: 274,
+            url: 'https://github.com/AgentWorkforce/pear/pull/274',
+            headRef: input.headRef ?? input.expectedHeadRef!,
+            headSha: 'sha-274',
+          }
+        },
+        closePullRequest: async () => undefined,
+      }
+      return new FakeMountClient({
+        [issuePath(93)]: issueFile(93),
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+    }
+
+    const pushed = (): SandboxPushResult => ({
+      status: 'pushed',
+      branch: 'factory/93',
+      prUrl: 'https://github.com/AgentWorkforce/pear/pull/274',
+      commitSha: 'commit-274',
+    })
+
+    it('pushes the sandbox changes before publishing, naming the sandbox and its clone path', async () => {
+      const calls: SandboxPushInput[] = []
+      const publishInputs: GithubPublishPullRequestInput[] = []
+      const fleet = new RemoteFleetClient()
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount: publishingMount(publishInputs),
+        fleet,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        sandboxPush: { push: async (input) => { calls.push(input); return pushed() } },
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+      await vi.waitFor(() => expect(calls).toHaveLength(1))
+
+      expect(calls[0]).toMatchObject({
+        sandboxId: 'sandbox-abc',
+        // The path INSIDE the sandbox. On factory-cloud this is
+        // `${repos.cloneRoot}/<name>`, which the container itself cannot read —
+        // it is only ever meaningful to the box.
+        repoPath: '/work/pear',
+        repo: 'AgentWorkforce/pear',
+      })
+      expect(calls[0]?.title).toContain('93')
+      expect(factory.status().counters.sandboxPushesPublished).toBe(1)
+    })
+
+    // The credential-isolation property, asserted rather than described.
+    it('hands the sandbox push no credential', async () => {
+      const calls: SandboxPushInput[] = []
+      const fleet = new RemoteFleetClient()
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount: publishingMount([]),
+        fleet,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        sandboxPush: { push: async (input) => { calls.push(input); return pushed() } },
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+      await vi.waitFor(() => expect(calls).toHaveLength(1))
+
+      const serialized = JSON.stringify(calls[0])
+      for (const shape of ['ghs_', 'ghp_', 'github_pat_', 'rk_live_', 'relay_pa_', 'token']) {
+        expect(serialized.toLowerCase()).not.toContain(shape)
+      }
+    })
+
+    it('leaves a local placement alone', async () => {
+      const calls: SandboxPushInput[] = []
+      const publishInputs: GithubPublishPullRequestInput[] = []
+      // A plain FakeFleetClient places locally and reports no sandbox.
+      const fleet = new FakeFleetClient()
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount: publishingMount(publishInputs),
+        fleet,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        sandboxPush: { push: async (input) => { calls.push(input); return pushed() } },
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+      await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+      expect(calls).toEqual([])
+      expect(factory.status().counters.sandboxPushesPublished ?? 0).toBe(0)
+    })
+
+    it('still publishes when the placement reports no sandbox id', async () => {
+      const calls: SandboxPushInput[] = []
+      const publishInputs: GithubPublishPullRequestInput[] = []
+      const fleet = new RemoteFleetClient()
+      fleet.sandboxId = undefined
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount: publishingMount(publishInputs),
+        fleet,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        sandboxPush: { push: async (input) => { calls.push(input); return pushed() } },
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+      await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+      expect(calls).toEqual([])
+    })
+
+    /**
+     * The retry case codex flagged. A push opens the PR on its way through,
+     * but under relayfile-cloud the mounted snapshot can lag that creation —
+     * so the first publish can miss it and fail on a duplicate head. On the
+     * retry the sandbox is already pushed, so the push answers `no-changes`.
+     * If reconciliation were conditioned on "did THIS attempt push", that
+     * retry would disable it and strand a real PR unrecorded forever.
+     */
+    it('still reconciles an existing PR when the retry finds the sandbox already pushed', async () => {
+      const publishPullRequest = vi.fn(async () => {
+        throw new Error('must reconcile the PR the push already opened, not publish another')
+      })
+      const mount = new FakeMountClient({
+        [issuePath(93)]: issueFile(93),
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, { publishPullRequest, closePullRequest: async () => undefined })
+      const fleet = new RemoteFleetClient()
+      const stateStore = new InMemoryStateStore({ batchSize: 1 })
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        // The idempotent second call: the branch is already pushed.
+        sandboxPush: { push: async () => ({ status: 'no-changes' }) },
+      })
+
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93)))
+      await factory.dispatch(decision)
+      const branch = (await stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(decision.issue),
+      ))!.decision.implementers[0]!.branch!
+      // The PR the earlier push already opened, now visible in the projection.
+      mount.files.set('/github/repos/AgentWorkforce/pear/pulls/1093/metadata.json', { content: {
+        number: 1093,
+        url: 'https://github.com/AgentWorkforce/pear/pull/1093',
+        head_ref: branch,
+        state: 'open',
+        draft: false,
+      } })
+
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+
+      await vi.waitFor(() =>
+        expect(factory.status().counters.githubPullRequestsReconciled).toBe(1))
+      expect(publishPullRequest).not.toHaveBeenCalled()
+      expect(factory.status().counters.sandboxPushesEmpty).toBe(1)
+    })
+
+    // A push that does not land must not fail the dispatch: the existing
+    // publish path runs behind it and owns that decision.
+    it.each([
+      ['a failure', { status: 'failed', reason: 'base_branch_moved' } as SandboxPushResult, 'sandboxPushesFailed'],
+      ['an empty sandbox', { status: 'no-changes' } as SandboxPushResult, 'sandboxPushesEmpty'],
+      ['a throw', 'throw' as const, 'sandboxPushesFailed'],
+    ])('falls through to the normal publish path on %s', async (_label, outcome, counter) => {
+      const publishInputs: GithubPublishPullRequestInput[] = []
+      const fleet = new RemoteFleetClient()
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount: publishingMount(publishInputs),
+        fleet,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        sandboxPush: {
+          push: async () => {
+            if (outcome === 'throw') throw new Error('daytona unreachable')
+            return outcome
+          },
+        },
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+      await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+      expect(factory.status().counters[counter]).toBe(1)
+      expect(factory.status().counters.errors ?? 0).toBe(0)
+    })
   })
 
   it('does not complete on an implementer exit when only a draft PR exists', async () => {
