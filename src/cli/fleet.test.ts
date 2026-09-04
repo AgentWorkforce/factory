@@ -34,6 +34,31 @@ import { GhCliGithubWriteback } from '../writeback/github'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, resolveFactoryBrokerConnectionPath, runFleetCli } from './fleet'
 
+// MITIGATION for this file only, not a fix (#442). Scoped here rather than set
+// in vitest.config.ts because this repo deliberately configures no global
+// `testTimeout` (see the note in sweep-counters.test.ts) and uses per-test
+// budgets instead; a global raise would weaken hung-test detection across all
+// 117 test files.
+//
+// The race that made "keeps relay dispatch ownership…" fail is fixed at its
+// source, in `CompletingRemoteFleetClient`. This covers what is left: these CLI
+// tests each drive a whole dispatch through real filesystem I/O and cost 2-10s
+// apiece, so at Vitest's 5s default a loaded runner fails a rotating cast of
+// them. Measured on 8 cores at load average ~155, one run failed 10 different
+// tests, every one between 4.3s and 10.4s — the "each rerun fails a different
+// test" signature reported on #442.
+//
+// Deliberately ABOVE REMOTE_AGENT_REGISTRATION_TIMEOUT_MS (30s,
+// factory.ts:459). If the registration race ever regresses, the run should
+// reach the production deadline and fail as `expect(code).toBe(0)` with a
+// RemoteAgentRegistrationTimeoutError on stderr — the diagnostic failure. A
+// budget under 30s would truncate that into a bare "Test timed out", which is
+// the exact failure mode that hid this bug in the first place.
+//
+// This buys headroom; it makes no test cheaper. The real cure is for these
+// tests to stop doing seconds of real I/O each.
+vi.setConfig({ testTimeout: 40_000 })
+
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
 
 // Explicit state UUIDs for the CLI tests (pinned via config.stateIds, which the
