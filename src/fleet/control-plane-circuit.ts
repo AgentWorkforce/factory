@@ -70,6 +70,7 @@ export class FleetControlPlaneCircuit {
   // half-open recovery probe, even if it resolves after the cooldown.
   #openGeneration = 0
   #probeInFlight?: Promise<RosterEntry>
+  #probeOpenGeneration?: number
 
   constructor(options: FleetControlPlaneCircuitOptions) {
     this.#timeoutMs = options.timeoutMs
@@ -103,7 +104,12 @@ export class FleetControlPlaneCircuit {
     if (status.state === 'open') {
       throw new FleetControlPlaneCircuitOpenError(status.retryAtMs!)
     }
-    if (this.#probeInFlight) return this.#probeInFlight
+    // A probe that began before the circuit opened cannot recover the newer
+    // generation. Once cooldown reaches half-open, start one recovery probe
+    // instead of joining that stale request.
+    if (this.#probeInFlight && (
+      status.state !== 'half-open' || this.#probeOpenGeneration === this.#openGeneration
+    )) return this.#probeInFlight
 
     const openGeneration = this.#openGeneration
     const probe = withTimeout(roster, this.#timeoutMs)
@@ -139,9 +145,13 @@ export class FleetControlPlaneCircuit {
         return result
       })
       .finally(() => {
-        if (this.#probeInFlight === probe) this.#probeInFlight = undefined
+        if (this.#probeInFlight === probe) {
+          this.#probeInFlight = undefined
+          this.#probeOpenGeneration = undefined
+        }
       })
     this.#probeInFlight = probe
+    this.#probeOpenGeneration = openGeneration
     return probe
   }
 

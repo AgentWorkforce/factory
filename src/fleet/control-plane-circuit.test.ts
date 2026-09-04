@@ -329,6 +329,36 @@ describe('FleetControlPlaneCircuit', () => {
     expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
   })
 
+  it('does not join a stale pre-open roster request during half-open recovery', async () => {
+    let now = 1_000
+    let resolveStaleProbe: ((value: RosterEntry) => void) | undefined
+    const fleet = new FakeFleetClient()
+    const rosterProbe = vi.spyOn(fleet, 'roster')
+      .mockImplementationOnce(() => new Promise<RosterEntry>((resolve) => { resolveStaleProbe = resolve }))
+      .mockResolvedValueOnce(roster)
+    const circuit = new FleetControlPlaneCircuit({
+      timeoutMs: 1_000,
+      failureThreshold: 2,
+      resetTimeoutMs: 100,
+      now: () => now,
+    })
+    const guarded = guardFleetControlPlane(fleet, circuit, { now: () => now })
+
+    const staleProbe = guarded.roster()
+    await vi.waitFor(() => { expect(resolveStaleProbe).toBeTypeOf('function') })
+    circuit.recordFailure(new Error('broker unavailable'))
+    circuit.recordFailure(new Error('broker unavailable'))
+    now += 100
+
+    const recovering = guarded.spawn({ name: 'recovery-worker', capability: 'spawn:codex' })
+    await vi.waitFor(() => { expect(rosterProbe).toHaveBeenCalledTimes(2) })
+    await expect(recovering).resolves.toMatchObject({ name: 'recovery-worker' })
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
+
+    resolveStaleProbe?.(roster)
+    await expect(staleProbe).rejects.toBeInstanceOf(FleetControlPlaneCircuitOpenError)
+  })
+
   it('MUST FIRE at mutation admission: two wedged rosters open the circuit and the next spawn fails fast', async () => {
     vi.useFakeTimers()
     const fleet = new FakeFleetClient()
