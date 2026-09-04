@@ -26,7 +26,7 @@ import { MountAuthScopeError, mountAuthRemediation } from '../mount/mount-auth-e
 import { DocumentStateStore, FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import { GhCliIssuePublisher } from '../intake/notion'
-import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, GithubWriteback, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
+import type { Capability, GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, GithubWriteback, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import type { RelayMessaging } from '@agent-relay/sdk'
 import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
@@ -157,13 +157,39 @@ class ControlledCompletingRemoteFleetClient extends CompletingRemoteFleetBase {
 
 class CompletingRemoteFleetClient extends CompletingRemoteFleetBase {
   readonly lifecycleOrder: string[] = []
+  #exitOnRegistration?: string
 
   override async spawn(input: SpawnInput): Promise<SpawnResult> {
     const result = await super.spawn(input)
-    if (input.name.includes('-impl-')) {
+    // Arm the exit here, but let the registration probe below release it. A
+    // bare `setTimeout(..., 0)` raced the remote-registration wait: this is a
+    // `remote` placement, so dispatch polls until the agent is roster-visible,
+    // and `emitAgentExit` *removes* the agent from the fake roster. Whenever
+    // the timer won that race the placement became permanently unobservable,
+    // so dispatch burned the full 30s startup deadline and exited 1. The
+    // scheduler picked the winner, which is why an idle runner passed and a
+    // loaded one failed (#442).
+    if (input.name.includes('-impl-')) this.#exitOnRegistration = input.name
+    return { ...result, node: 'sf-mini', locality: 'remote' }
+  }
+
+  /**
+   * Dispatch prefers this probe over a roster read when it is present. Emitting
+   * the exit only once it has answered `true` keeps the exit on a timer — the
+   * ordering this class exists to provide, rather than one the test body drives
+   * — while making it causally *after* registration instead of a coin flip
+   * against it.
+   */
+  async isAgentRegistered(input: { name: string; node: string; capability: Capability }): Promise<boolean> {
+    const roster = await this.roster()
+    const registered = roster.agents.some((agent) => agent.name === input.name && agent.node === input.node)
+      && roster.nodes.some((node) =>
+        node.name === input.node && node.live && node.capabilities.includes(input.capability))
+    if (registered && this.#exitOnRegistration === input.name) {
+      this.#exitOnRegistration = undefined
       setTimeout(() => this.emitAgentExit(input.name, 'exited'), 0)
     }
-    return { ...result, node: 'sf-mini', locality: 'remote' }
+    return registered
   }
 
   override async release(name: string, reason?: string): Promise<void> {
