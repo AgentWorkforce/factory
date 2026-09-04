@@ -5,6 +5,11 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  GARDEN_E2E_TITLE_PREFIX,
+  GARDEN_TITLE_PREFIX,
+  hasGardenTitlePrefix,
+} from '../constants/lifecycle-labels'
+import {
   loadNotionIntakeManifest,
   normalizeNotionManifest,
   normalizeNotionPageId,
@@ -346,6 +351,36 @@ describe('Notion spec intake', () => {
 
     expect(vi.mocked(github.createIssue).mock.calls[0]![0].title)
       .toBe('[garden-e2e] Resume the checkpoint')
+  })
+
+  // `hasGardenTitlePrefix` -- the discovery side -- matches case-SENSITIVELY on
+  // the marker followed by a space. A title whose marker differs in case, or
+  // which lacks the space, therefore has no usable marker, and an issue created
+  // under one is invisible to the discovery that has to find it again.
+  it.each([
+    ['[GARDEN] Resume the checkpoint', '[garden] Resume the checkpoint'],
+    ['[FACTORY] Resume the checkpoint', '[garden] Resume the checkpoint'],
+    ['[FACTORY-E2E] Resume the checkpoint', '[garden-e2e] Resume the checkpoint'],
+    ['[garden]Resume the checkpoint', '[garden] [garden]Resume the checkpoint'],
+  ])('emits a marker discovery can read for %s', async (given, expected) => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: {
+        ...bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+        title: given,
+      },
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+
+    await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    const title = vi.mocked(github.createIssue).mock.calls[0]![0].title
+    expect(title).toBe(expected)
+    // The invariant the literal above only illustrates.
+    expect(
+      hasGardenTitlePrefix(title, GARDEN_TITLE_PREFIX) ||
+      hasGardenTitlePrefix(title, GARDEN_E2E_TITLE_PREFIX),
+    ).toBe(true)
   })
 
   it('leaves a canonical e2e prefix untouched rather than stacking a second marker', async () => {

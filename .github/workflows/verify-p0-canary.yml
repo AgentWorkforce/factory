@@ -399,14 +399,22 @@ jobs:
             # keeps that single edit safe: a label the issue has necessarily
             # exists in the repository, so the edit cannot fail as a whole over
             # a name the target repo never provisioned.
-            ARMED_LABELS="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" \
-              --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo '')"
+            # Match case-insensitively and remove by the PROVIDER's own casing.
+            # A label created as `Garden` comes back as `Garden`, an exact-match
+            # test would add no removal flag for it, and the dispatcher would
+            # still read the issue as armed -- `matchesGardenLabelAlias`
+            # normalizes, so it sees `Garden` as the opt-in. Passing the name
+            # back exactly as the API gave it also avoids assuming anything
+            # about how `gh` folds label case.
             REMOVE_ARGS=()
-            for LABEL in garden-ready factory-ready agent:single garden factory; do
-              case ",${ARMED_LABELS}," in
-                *",${LABEL},"*) REMOVE_ARGS+=(--remove-label "${LABEL}") ;;
+            while IFS= read -r LABEL; do
+              [ -n "${LABEL}" ] || continue
+              case "$(printf '%s' "${LABEL}" | tr '[:upper:]' '[:lower:]')" in
+                garden-ready|factory-ready|agent:single|garden|factory)
+                  REMOVE_ARGS+=(--remove-label "${LABEL}") ;;
               esac
-            done
+            done <<< "$(gh issue view "${NUM}" --repo "${TARGET_REPO}" \
+              --json labels --jq '.labels[].name' 2>/dev/null || echo '')"
             if [ "${#REMOVE_ARGS[@]}" -gt 0 ]; then
               gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
                 "${REMOVE_ARGS[@]}" >/dev/null 2>&1 || true
@@ -418,7 +426,11 @@ jobs:
             STATE="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
             LABELS="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo UNKNOWN)"
             ARMED=0
-            case ",${LABELS}," in
+            # Fold case here too: reporting "disarmed" while a provider-cased
+            # `Garden` survives is the one outcome worse than failing loudly,
+            # because the dispatcher's own match IS case-insensitive.
+            LABELS_LC="$(printf '%s' "${LABELS}" | tr '[:upper:]' '[:lower:]')"
+            case ",${LABELS_LC}," in
               *,garden-ready,*|*,agent:single,*|*,garden,*|*,factory-ready,*|*,factory,*) ARMED=1 ;;
             esac
             if [ "${STATE}" = "CLOSED" ] && [ "${ARMED}" = "0" ]; then

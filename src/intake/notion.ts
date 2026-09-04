@@ -653,25 +653,35 @@ async function publishRepoTask(
 }
 
 function factoryIssueTitle(title: string): string {
-  // New issues are prefixed with the canonical `[garden]` marker. A title that
-  // already carries a canonical prefix is left untouched, and a title carrying
-  // a legacy one is REWRITTEN to its canonical successor rather than passed
-  // through: a new write must not mint legacy naming, and discovery accepts
-  // both spellings (`hasGardenTitlePrefix`) so the rewrite cannot make an
-  // issue unrecognizable. No branch can double-prefix.
+  // New issues carry a canonical marker. A title that already carries one --
+  // canonical or legacy, in any casing -- has that marker REPLACED by its
+  // canonical spelling rather than being passed through: a new write must not
+  // mint legacy naming, and a marker discovery cannot read is worse than no
+  // marker at all. No branch can double-prefix.
+  //
+  // The boundary test is the one `hasGardenTitlePrefix` uses, exactly: the
+  // marker alone, or the marker followed by a space. That agreement is the
+  // whole point. `[garden]Ship it` carries no marker by that rule, so it must
+  // GET one rather than be trusted to have one; `[GARDEN] Ship it` carries one
+  // in the wrong casing, so it is re-emitted canonically. Either title left
+  // untouched would create an issue the discovery that has to find it again
+  // cannot see, stranding the Notion intake behind an invisible issue.
   //
   // The e2e pair is checked FIRST. `[factory-e2e]` does not start with
   // `[factory]` (the `]` differs), so the plain legacy branch would not have
   // mangled it -- but it would have prepended a second `[garden] ` marker in
   // front of a prefix that already scopes the issue.
   const normalized = title.toLowerCase()
+  const carriesMarker = (marker: string): boolean => {
+    const lowered = marker.toLowerCase()
+    return normalized === lowered || normalized.startsWith(`${lowered} `)
+  }
   for (const [canonical, legacy] of [
     [GARDEN_E2E_TITLE_PREFIX, LEGACY_FACTORY_E2E_TITLE_PREFIX],
     [GARDEN_TITLE_PREFIX, LEGACY_FACTORY_TITLE_PREFIX],
   ] as const) {
-    if (normalized.startsWith(canonical.toLowerCase())) return title
-    if (normalized.startsWith(legacy.toLowerCase())) {
-      return `${canonical}${title.slice(legacy.length)}`
+    for (const marker of [canonical, legacy]) {
+      if (carriesMarker(marker)) return `${canonical}${title.slice(marker.length)}`
     }
   }
   return `${GARDEN_TITLE_PREFIX} ${title}`
