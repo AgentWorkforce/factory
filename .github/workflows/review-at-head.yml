@@ -74,10 +74,14 @@ on:
 permissions: {}
 
 concurrency:
-  # The repository is part of the key: a reusable caller can evaluate the same
-  # PR number in two different repositories, and those must not cancel each
-  # other. The event name keeps the advisory and enforced runs independent.
-  group: review-at-head-${{ github.event_name }}-${{ inputs.repository || github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}
+  # Keyed by role, not by event. Every advisory trigger — push, review,
+  # inline comment — shares one group, so a review that arrives as a burst of
+  # comment events collapses to a single run instead of queueing one per
+  # comment. `enforced` is keyed separately so the two never cancel each
+  # other. The repository is part of the key because a reusable caller can
+  # evaluate the same PR number in two different repositories.
+  group: >-
+    review-at-head-${{ github.event_name == 'pull_request_target' && 'enforced' || 'advisory' }}-${{ inputs.repository || github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
