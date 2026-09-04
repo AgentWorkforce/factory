@@ -193,6 +193,74 @@ describe('formatSweepOutcome (#359)', () => {
   })
 })
 
+describe('factory diagnose --deployed reads back the running build (#446)', () => {
+  const commit = '9'.repeat(40)
+
+  it('names the version and commit the instance reported', async () => {
+    const out = buffer()
+    const code = await runFleetCli(['diagnose', '--deployed', BASE], {
+      stdout: out,
+      stderr: buffer(),
+      env: HERMETIC_ENV,
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          body: { ...healthy, health: { ...healthy.health, build: { version: '0.1.90', commit } } },
+        },
+      }),
+    })
+
+    expect(code).toBe(0)
+    // The lookup that replaces the argument: "is the fix I merged running?"
+    // answered by reading the build, not by comparing a boot time to a merge.
+    expect(out.text()).toContain(`build                : 0.1.90 @ ${commit}`)
+  })
+
+  it('distinguishes "too old to tell you" from "it told you unknown"', async () => {
+    const render = async (health: Record<string, unknown>) => {
+      const out = buffer()
+      await runFleetCli(['diagnose', '--deployed', BASE], {
+        stdout: out,
+        stderr: buffer(),
+        env: HERMETIC_ENV,
+        diagnoseFetch: stubFetch({ healthz: { status: 200, body: { ...healthy, health } } }),
+      })
+      return out.text()
+    }
+
+    // An instance predating this change publishes no `build` at all. Saying so
+    // IS the answer — it means the deployed image is older than #446.
+    expect(await render({ ...healthy.health })).toContain(
+      'build                : not reported (instance predates the build identity field)',
+    )
+
+    // An instance that ran an UNSTAMPED artifact answered the question and its
+    // answer was "I cannot tell". Different fact, different remedy, so it must
+    // not be rendered as the same line.
+    expect(await render({ ...healthy.health, build: { version: '0.1.90', commit: 'unknown' } }))
+      .toContain('build                : 0.1.90 @ unknown')
+  })
+
+  it('never renders a commit the instance did not send', async () => {
+    const out = buffer()
+    await runFleetCli(['diagnose', '--deployed', BASE], {
+      stdout: out,
+      stderr: buffer(),
+      env: HERMETIC_ENV,
+      diagnoseFetch: stubFetch({
+        healthz: {
+          status: 200,
+          // A remote running an unknown version, or a hostile responder.
+          body: { ...healthy, health: { ...healthy.health, build: { version: 12, commit: 'HEAD' } } },
+        },
+      }),
+    })
+
+    expect(out.text()).toContain('build                : unknown @ unknown')
+    expect(out.text()).not.toContain('HEAD')
+  })
+})
+
 describe('factory diagnose --deployed (#295)', () => {
   it('reports a healthy deployed instance and exits zero without any credential', async () => {
     const seen: string[] = []

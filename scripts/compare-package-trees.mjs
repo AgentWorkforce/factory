@@ -4,13 +4,78 @@ import { lstat, readdir, readFile, readlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-export async function comparePackageTrees(leftRoot, rightRoot) {
+/**
+ * The one file in the payload that is EXPECTED to differ between two builds of
+ * the same code (#446).
+ *
+ * `dist/build-info.json` records which commit produced the artifact. That is
+ * the point of it — it is what lets `/healthz` answer "is the fix I merged
+ * actually running?" without an argument from boot times.
+ *
+ * It also breaks the release-recovery path in `.github/workflows/publish.yml`
+ * if compared byte-for-byte. That path exists because the 0.1.58 incident left
+ * a release tag on an EQUIVALENT ORPHANED COMMIT: it rebuilds the tagged commit
+ * and proves its payload matches what npm holds. A stamped commit makes two
+ * distinct commits differ by construction, so that proof could never succeed
+ * again — the recovery would report a payload mismatch that is really a
+ * provenance difference it was designed to tolerate.
+ *
+ * So this file is compared as a build stamp rather than as bytes: every field
+ * except `commit` must match exactly, both sides must parse, and a differing
+ * commit is reported as a NOTE naming both SHAs. The check keeps its meaning
+ * ("the code is identical") and the reader gains the fact it was missing
+ * ("...and here are the two commits that produced it").
+ */
+const BUILD_STAMP_PATH = 'dist/build-info.json'
+const BUILD_STAMP_PROVENANCE_FIELD = 'commit'
+
+export async function comparePackageTrees(leftRoot, rightRoot, { notes } = {}) {
   const differences = []
-  await compareEntry(leftRoot, rightRoot, '.', differences)
+  await compareEntry(leftRoot, rightRoot, '.', differences, notes)
   return differences
 }
 
-async function compareEntry(leftPath, rightPath, relativePath, differences) {
+/**
+ * @returns `true` when the two stamps describe the same build of the same code,
+ * `false` when they differ in any way a payload comparison must reject.
+ */
+function compareBuildStamps(leftBytes, rightBytes, relativePath, differences, notes) {
+  let left
+  let right
+  try {
+    left = JSON.parse(leftBytes.toString('utf8'))
+    right = JSON.parse(rightBytes.toString('utf8'))
+  } catch {
+    // An unparseable stamp gets no exemption: it is not a build stamp.
+    differences.push(`${relativePath}: content differs (unparseable build stamp)`)
+    return false
+  }
+  const plain = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
+  if (!plain(left) || !plain(right)) {
+    differences.push(`${relativePath}: content differs (build stamp is not an object)`)
+    return false
+  }
+  const keys = [...new Set([...Object.keys(left), ...Object.keys(right)])].sort()
+  for (const key of keys) {
+    if (key === BUILD_STAMP_PROVENANCE_FIELD) continue
+    if (JSON.stringify(left[key]) !== JSON.stringify(right[key])) {
+      differences.push(`${relativePath}: build stamp field ${key} differs`)
+      return false
+    }
+  }
+  const leftCommit = left[BUILD_STAMP_PROVENANCE_FIELD]
+  const rightCommit = right[BUILD_STAMP_PROVENANCE_FIELD]
+  if (typeof leftCommit !== 'string' || typeof rightCommit !== 'string') {
+    differences.push(`${relativePath}: build stamp carries no commit`)
+    return false
+  }
+  if (leftCommit !== rightCommit) {
+    notes?.push(`${relativePath}: same code, built from ${leftCommit} and ${rightCommit}`)
+  }
+  return true
+}
+
+async function compareEntry(leftPath, rightPath, relativePath, differences, notes) {
   const [left, right] = await Promise.all([
     lstat(leftPath).catch(() => undefined),
     lstat(rightPath).catch(() => undefined),
@@ -47,6 +112,7 @@ async function compareEntry(leftPath, rightPath, relativePath, differences) {
         join(rightPath, name),
         relativePath === '.' ? name : `${relativePath}/${name}`,
         differences,
+        notes,
       )
     }
   } else if (left.isSymbolicLink()) {
@@ -56,7 +122,12 @@ async function compareEntry(leftPath, rightPath, relativePath, differences) {
     }
   } else if (left.isFile()) {
     const [leftBytes, rightBytes] = await Promise.all([readFile(leftPath), readFile(rightPath)])
-    if (!leftBytes.equals(rightBytes)) differences.push(`${relativePath}: content differs`)
+    if (leftBytes.equals(rightBytes)) return
+    if (relativePath === BUILD_STAMP_PATH) {
+      compareBuildStamps(leftBytes, rightBytes, relativePath, differences, notes)
+      return
+    }
+    differences.push(`${relativePath}: content differs`)
   }
 }
 
@@ -73,7 +144,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     console.error('usage: compare-package-trees.mjs LEFT_TREE RIGHT_TREE')
     process.exitCode = 2
   } else {
-    const differences = await comparePackageTrees(leftRoot, rightRoot)
+    const notes = []
+    const differences = await comparePackageTrees(leftRoot, rightRoot, { notes })
+    // Printed whether or not the comparison passes: when it passes, this is the
+    // provenance the caller came for; when it fails, it says which two builds
+    // failed to match.
+    for (const note of notes) console.error(`note: ${note}`)
     if (differences.length > 0) {
       for (const difference of differences) console.error(difference)
       process.exitCode = 1

@@ -656,6 +656,27 @@ export interface FactoryPublicFleetControlPlaneHealth {
 }
 
 /**
+ * Which build is answering (#446).
+ *
+ * Not health — identity. It rides in the public health block because that block
+ * is the one part of the heartbeat the container passes through to `/healthz`
+ * verbatim (`container/entrypoint.mjs`, `publicHeartbeat()`), so putting the
+ * two facts here is what makes them readable from outside the container without
+ * a second repository having to learn a new field.
+ *
+ * Both fields are the literal string `unknown` when the running artifact does
+ * not carry them, never a synthesised stand-in. See
+ * `src/orchestrator/build-identity.ts` for why an absent stamp must not be
+ * filled in from the reader's environment.
+ */
+export interface FactoryPublicBuildIdentity {
+  /** Published npm version of the running package, or `unknown`. */
+  version: string
+  /** Full 40-hex commit the running build was produced from, or `unknown`. */
+  commit: string
+}
+
+/**
  * The unauthenticated health record (#295).
  *
  * `ok` is process liveness — the question the container ping endpoint asks,
@@ -690,6 +711,13 @@ export interface FactoryPublicHealth {
   /** Fleet event socket. NOT dispatch-gating: see DISPATCH_GATING_SUBSYSTEMS. */
   fleetConnect?: FactoryPublicFleetConnectHealth
   dispatchCapacity?: FactoryPublicDispatchCapacityHealth
+  /**
+   * Which build is answering (#446). Absent from records published by a
+   * Factory older than this change — which is itself the answer to "is the fix
+   * I merged running?", so a reader must not read its absence as `unknown`
+   * having been reported.
+   */
+  build?: FactoryPublicBuildIdentity
 }
 
 export interface FactoryInFlightRegistryAgent {

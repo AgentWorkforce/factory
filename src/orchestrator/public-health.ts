@@ -17,10 +17,17 @@ import {
   factoryDispatchFailureReasonCode,
 } from './dispatch-failure-reason'
 import type { FactoryDispatchFailureReasonCode } from './dispatch-failure-reason'
+import {
+  FULL_COMMIT_SHA,
+  PUBLISHABLE_VERSION,
+  readBuildIdentity,
+  UNKNOWN_BUILD_FIELD,
+} from './build-identity'
 import type {
   FactoryDispatchCapacityStatus,
   FactoryEventListenerStatus,
   FactoryLoopHeartbeat,
+  FactoryPublicBuildIdentity,
   FactoryPublicDispatchCapacityHealth,
   FactoryPublicDispatchSlotOccupant,
   FactoryPublicEventListenerHealth,
@@ -440,6 +447,36 @@ const dispatchCapacityState = (
       ? value as FactoryPublicDispatchCapacityHealth['state']
       : deriveDispatchCapacityState(waiting, longestWaitMs, warnMs, agentlessOccupants, occupiedOccupants)
 
+/**
+ * Build identity, coerced for the unauthenticated surface (#446).
+ *
+ * Used on BOTH sides of the wire — by the writer, over the values
+ * `build-identity.ts` read off this process's own artifact, and by
+ * `normalizePublicHealth` over a record that arrived as JSON from a remote
+ * process running a version this one has never seen. The remote case is why
+ * the writer's own values go through it too: one coercion, one set of rules,
+ * no second copy of the judgement to drift.
+ *
+ * Anything that is not a full 40-hex commit or a bounded version token becomes
+ * `unknown`. An abbreviated SHA is rejected on purpose — it is not what was
+ * stamped, and a reader who pastes it into `git show` and gets a hit has
+ * learned nothing about which artifact answered.
+ */
+const buildIdentity = (value: unknown): FactoryPublicBuildIdentity | undefined => {
+  const parsed = plainRecord(value)
+  if (!parsed) return undefined
+  const version = parsed.version
+  const commit = parsed.commit
+  return {
+    version: typeof version === 'string' && PUBLISHABLE_VERSION.test(version)
+      ? version
+      : UNKNOWN_BUILD_FIELD,
+    commit: typeof commit === 'string' && FULL_COMMIT_SHA.test(commit)
+      ? commit
+      : UNKNOWN_BUILD_FIELD,
+  }
+}
+
 const enumValue = <T extends string>(value: unknown, allowed: readonly T[]): T | 'unknown' =>
   typeof value === 'string' && (allowed as readonly string[]).includes(value) ? value as T : 'unknown'
 
@@ -782,6 +819,10 @@ export function publicHealthFromHeartbeat(
       stale: true,
       reason: 'heartbeat missing',
       degradedSubsystems: [],
+      // Still published: this process knows what it is even when it has no
+      // heartbeat to describe, and "no heartbeat, and here is the build that
+      // has none" is strictly more diagnosable than "no heartbeat" (#446).
+      build: buildIdentity(readBuildIdentity()),
     }
   }
 
@@ -876,6 +917,12 @@ export function publicHealthFromHeartbeat(
     ...(fleetControlPlane ? { fleetControlPlane } : {}),
     ...(fleetConnect ? { fleetConnect } : {}),
     ...(dispatchCapacity ? { dispatchCapacity } : {}),
+    // Identity, not health, and unconditional (#446). It is published even on
+    // the heartbeat-missing path above and even when both halves read
+    // `unknown`, because "which build is answering" is a question about the
+    // PROCESS serving the record, not about the record — and the moment it is
+    // most worth asking is the moment the daemon looks wrong.
+    build: buildIdentity(readBuildIdentity()),
   }
 }
 
@@ -902,6 +949,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   const fleet = plainRecord(record.fleetControlPlane)
   const fleetConnect = plainRecord(record.fleetConnect)
   const capacity = plainRecord(record.dispatchCapacity)
+  const build = buildIdentity(record.build)
   // Re-derive the wedge from the occupants the record carries rather than
   // trusting its own `agentlessOccupants`: a producer that published the
   // occupants but predates the count still has to project as stalled (#315).
@@ -1003,6 +1051,12 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
           },
         }
       : {}),
+    // Absent stays ABSENT here (#446). A producer older than this change
+    // published no identity at all, and coercing that into
+    // `{version: 'unknown', commit: 'unknown'}` would claim the remote
+    // ANSWERED the question — erasing the very distinction ("is that instance
+    // even new enough to tell me?") this field exists to make.
+    ...(build ? { build } : {}),
     ...(capacity
       ? {
           dispatchCapacity: {
