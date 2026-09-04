@@ -386,8 +386,27 @@ describe('GithubMergeGate', () => {
         ],
       }))
 
+      // The reported description has to be the string that made the call. If
+      // the generic `output.title` were reported instead, the refusal message
+      // would say "AI review" and hide the reason the check was ruled vacuous.
       expect(verdict.live.checkSignals).toEqual([
-        expect.objectContaining({ kind: 'VACUOUS' }),
+        expect.objectContaining({
+          kind: 'VACUOUS',
+          description: 'AI review line limit reached for this month',
+        }),
+      ])
+      expect(verdict.reason).toMatch(/all vacuous/)
+    })
+
+    it('reports the plain description when nothing is vacuous', () => {
+      const verdict = evaluateGithubMergeGate(input, live({
+        statusCheckRollup: [
+          { name: 'package', conclusion: 'success', output: { title: 'Build passed', summary: 'all green' } },
+        ],
+      }))
+
+      expect(verdict.live.checkSignals).toEqual([
+        expect.objectContaining({ kind: 'REAL', description: 'Build passed' }),
       ])
     })
 

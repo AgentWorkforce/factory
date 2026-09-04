@@ -11,20 +11,33 @@ name: Review at head
 # never a check run) and `/commits/{sha}/check-runs`, so a vacuous bot green is
 # reported as vacuous from either source.
 #
-# ROLLOUT: land non-required and measure for a week before requiring it. On the
-# audited data the correct predicate blocks the large majority of recent merges,
-# so making it required before the cubic seat, CodeRabbit public-repo and Devin
-# trial repairs land would only train people to bypass it. Those repairs are
-# configuration and are tracked on #432 for the principal.
+# TWO JOBS, DELIBERATELY. A check that can be edited by the pull request it
+# judges is not a gate:
+#
+#   advisory  runs the PULL REQUEST'S copy of the predicate. A change to the
+#             merge rule has to be exercised by the change that makes it, so
+#             this is the job that proves a predicate edit works. It must
+#             never be a required check — a PR can rewrite it.
+#   enforced  runs the BASE BRANCH'S copy, under `pull_request_target`, so the
+#             code deciding the verdict is code that already passed review.
+#             This is the job to require. It cannot be altered by the PR it is
+#             judging, and it never checks out or executes contributor code.
+#
+# ROLLOUT: keep both non-required and measure for a week; then require only
+# `enforced`. On the audited data the correct predicate blocks the large
+# majority of recent merges, so requiring it before the cubic seat, CodeRabbit
+# public-repo and Devin trial repairs land would only train people to bypass
+# it. Those repairs are configuration and are tracked on #432.
 
 on:
-  # `pull_request`, not `pull_request_target`, so the predicate that runs on a
-  # PR is the PR's own copy of it. This workflow exists to change the merge
-  # rule, and a rule change has to be exercised by the PR that makes it —
-  # under `pull_request_target` the run would silently use `main`'s copy and
-  # test the wrong code. The job builds and runs repository source, which is
-  # the same trust model `ci.yml` already applies.
   pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+  # Runs from the base branch and never checks out contributor code.
+  pull_request_target:
     types:
       - opened
       - reopened
@@ -35,6 +48,13 @@ on:
       - submitted
       - edited
       - dismissed
+  # Inline comments count toward the predicate, so a comment-only change has
+  # to re-evaluate or the verdict goes stale.
+  pull_request_review_comment:
+    types:
+      - created
+      - edited
+      - deleted
   workflow_call:
     inputs:
       repository:
@@ -54,20 +74,29 @@ on:
 permissions: {}
 
 concurrency:
-  group: review-at-head-${{ inputs.pr_number || github.event.pull_request.number }}
+  # The repository is part of the key: a reusable caller can evaluate the same
+  # PR number in two different repositories, and those must not cancel each
+  # other. The event name keeps the advisory and enforced runs independent.
+  group: review-at-head-${{ github.event_name }}-${{ inputs.repository || github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  review-at-head:
-    # A draft is not claiming to be mergeable yet.
-    if: ${{ inputs.pr_number || !github.event.pull_request.draft }}
+  # Advisory. Runs the PR's own copy of the predicate — never require this.
+  advisory:
+    if: ${{ inputs.pr_number || (github.event_name != 'pull_request_target' && !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
+      # `/commits/{sha}/status` and `/commits/{sha}/check-runs` are gated by
+      # their own scopes. They are readable without these on a public
+      # repository, which is why this workflow passed before they were
+      # declared — a reusable call against a private repository would 403.
+      checks: read
+      statuses: read
     steps:
-      # This repository's own PR: use the PR's copy of the predicate, so a
-      # change to the rule is tested by the change that makes it.
+      # This repository's own PR: use the PR's copy, so a change to the rule is
+      # tested by the change that makes it.
       - name: Check out the pull request under test
         if: ${{ !inputs.pr_number }}
         uses: actions/checkout@v6
@@ -98,4 +127,39 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET_REPO: ${{ inputs.repository || github.repository }}
           TARGET_PR: ${{ inputs.pr_number || github.event.pull_request.number }}
+        run: npx tsx src/github/review-at-head-cli.ts "$TARGET_REPO" "$TARGET_PR"
+
+  # Enforced. Runs the base branch's copy, which the PR cannot edit. Require
+  # this one.
+  enforced:
+    if: ${{ github.event_name == 'pull_request_target' && !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    steps:
+      # Default checkout under `pull_request_target` is the base branch, which
+      # is exactly the point: reviewed code decides the verdict. The PR's own
+      # source is never fetched or executed here.
+      - name: Check out the base branch predicate
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Require a substantive review of the commit that would merge
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ github.repository }}
+          TARGET_PR: ${{ github.event.pull_request.number }}
         run: npx tsx src/github/review-at-head-cli.ts "$TARGET_REPO" "$TARGET_PR"

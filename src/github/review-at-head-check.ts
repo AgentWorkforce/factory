@@ -65,6 +65,45 @@ const splitRepo = (repo: string): { owner: string, name: string } => {
   return { owner, name }
 }
 
+const PAGE_SIZE = 100
+
+/**
+ * Safety stop. 100 pages is 10,000 reviews or checks — far past any real PR,
+ * but a bound is required so a server that keeps returning full pages cannot
+ * spin here forever.
+ */
+const MAX_PAGES = 100
+
+/**
+ * Reads every page of a collection, not just the first.
+ *
+ * `per_page=100` alone silently truncates: a PR with more than 100 reviews
+ * would drop the review anchored to head and be refused as unreviewed, and a
+ * commit with more than 100 statuses would hide the very vacuous signals this
+ * check exists to surface. Both failure modes are silent, which is why this
+ * pages explicitly rather than trusting one request.
+ *
+ * `key` names the array inside an object response (`statuses`,
+ * `check_runs`); omit it for endpoints that return a bare array.
+ */
+export const collectPages = async (
+  fetch: GithubRestFetch,
+  path: string,
+  key?: string,
+): Promise<unknown[]> => {
+  const collected: unknown[] = []
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    const separator = path.includes('?') ? '&' : '?'
+    const body = await fetch(`${path}${separator}per_page=${PAGE_SIZE}&page=${page}`)
+    const batch = key === undefined ? asArray(body) : asArray(asRecord(body)[key])
+    collected.push(...batch)
+    // A short page is the last page. GitHub returns the Link header for this,
+    // but `GithubRestFetch` yields a parsed body only, so length is the signal.
+    if (batch.length < PAGE_SIZE) return collected
+  }
+  return collected
+}
+
 /**
  * Both check sources, merged into the one rollup shape
  * `checkSignalsFromRollup` classifies. Legacy statuses keep their
@@ -159,21 +198,30 @@ export async function evaluateReviewAtHeadCheck(
   if (!head) {
     throw new Error(`GitHub returned no head SHA for ${input.repo}#${input.number}`)
   }
+  // Fail closed on missing author metadata, matching `evaluateGithubMergeGate`,
+  // which refuses outright when `author` is absent. An undefined author makes
+  // every `review.login !== author` comparison true, so a PR whose user has
+  // been deleted would have its own author's review counted as third-party
+  // evidence — the check would pass on a self-review.
   const author = stringValue(asRecord(pull.user).login)
+  if (!author) {
+    throw new Error(
+      `GitHub returned no author for ${input.repo}#${input.number}; refusing to evaluate a ` +
+      'third-party review predicate without knowing who the PR author is',
+    )
+  }
 
   const [reviewsRaw, comments, legacy, runs] = await Promise.all([
-    fetch(`${base}/pulls/${input.number}/reviews?per_page=100`),
-    fetch(`${base}/pulls/${input.number}/comments?per_page=100`),
-    fetch(`${base}/commits/${head}/status`),
-    fetch(`${base}/commits/${head}/check-runs?per_page=100`),
+    collectPages(fetch, `${base}/pulls/${input.number}/reviews`),
+    collectPages(fetch, `${base}/pulls/${input.number}/comments`),
+    collectPages(fetch, `${base}/commits/${head}/status`, 'statuses'),
+    collectPages(fetch, `${base}/commits/${head}/check-runs`, 'check_runs'),
   ])
 
   const reviewsAtHead = reviewsFromPayload(
-    withInlineCommentsAtHead(asArray(reviewsRaw), asArray(comments), head),
+    withInlineCommentsAtHead(reviewsRaw, comments, head),
   )
-  const checkSignals = checkSignalsFromRollup(
-    rollupFromRestSources(asRecord(legacy).statuses, asRecord(runs).check_runs),
-  )
+  const checkSignals = checkSignalsFromRollup(rollupFromRestSources(legacy, runs))
 
   const reason = reviewAtHeadRefusal(reviewsAtHead, head, author)
   const summary = [

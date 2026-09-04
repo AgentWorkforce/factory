@@ -403,8 +403,11 @@ const checkDescriptions = (record: Record<string, unknown>): string[] => {
  */
 const normalizeCheckState = (state: string): string => state.trim().toUpperCase()
 
+const isVacuousDescription = (text: string): boolean =>
+  VACUOUS_REVIEW_MARKERS.some((marker) => marker.test(text))
+
 const classifyCheckKind = (state: string, descriptions: string[]): CheckSignal['kind'] => {
-  if (descriptions.some((text) => VACUOUS_REVIEW_MARKERS.some((marker) => marker.test(text)))) {
+  if (descriptions.some(isVacuousDescription)) {
     return 'VACUOUS'
   }
   return nonBlockingCheckStates.has(normalizeCheckState(state)) ? 'REAL' : 'BLOCKING'
@@ -423,7 +426,11 @@ export const checkSignalsFromRollup = (value: unknown): CheckSignal[] => {
     return {
       context,
       state: normalizeCheckState(raw),
-      description: descriptions[0],
+      // Report the string that made the call. A check run whose `output.title`
+      // is a generic "AI review" while the reason sits in `output.summary`
+      // would otherwise be surfaced by its title, hiding why it was ruled
+      // vacuous in the very message meant to explain the refusal.
+      description: descriptions.find(isVacuousDescription) ?? descriptions[0],
       kind: classifyCheckKind(raw, descriptions),
     }
   })

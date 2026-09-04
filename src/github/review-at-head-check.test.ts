@@ -51,17 +51,21 @@ const fetcher = (routes: Record<string, unknown>): GithubRestFetch => async (pat
   return routes[path]
 }
 
+const PULL = 'repos/AgentWorkforce/software-garden/pulls/462'
+const REVIEWS = `${PULL}/reviews?per_page=100`
+const COMMENTS = `${PULL}/comments?per_page=100`
+const STATUS = `repos/AgentWorkforce/software-garden/commits/${HEAD}/status?per_page=100`
+const CHECK_RUNS = `repos/AgentWorkforce/software-garden/commits/${HEAD}/check-runs?per_page=100`
+
+// `collectPages` appends `&page=N`, so a single-page fixture answers page 1.
 const routes = (overrides: Record<string, unknown> = {}) => ({
-  'repos/AgentWorkforce/software-garden/pulls/462': pull(),
-  'repos/AgentWorkforce/software-garden/pulls/462/reviews?per_page=100': [],
-  'repos/AgentWorkforce/software-garden/pulls/462/comments?per_page=100': [],
-  [`repos/AgentWorkforce/software-garden/commits/${HEAD}/status`]: legacyStatuses,
-  [`repos/AgentWorkforce/software-garden/commits/${HEAD}/check-runs?per_page=100`]: checkRuns,
+  [PULL]: pull(),
+  [`${REVIEWS}&page=1`]: [],
+  [`${COMMENTS}&page=1`]: [],
+  [`${STATUS}&page=1`]: legacyStatuses,
+  [`${CHECK_RUNS}&page=1`]: checkRuns,
   ...overrides,
 })
-
-const REVIEWS = 'repos/AgentWorkforce/software-garden/pulls/462/reviews?per_page=100'
-const COMMENTS = 'repos/AgentWorkforce/software-garden/pulls/462/comments?per_page=100'
 
 const input = { repo: 'AgentWorkforce/software-garden', number: 462 }
 
@@ -76,7 +80,7 @@ describe('review-at-head CI check (factory#432 part c)', () => {
 
   it('fails a PR whose only review at head is empty-bodied — the relay#1638 shape', async () => {
     const result = await evaluateReviewAtHeadCheck(input, fetcher(routes({
-      [REVIEWS]: [
+      [`${REVIEWS}&page=1`]: [
         { user: { login: 'coderabbitai[bot]' }, state: 'COMMENTED', commit_id: STALE, body: 'x'.repeat(2575) },
         { user: { login: 'reviewer' }, state: 'APPROVED', commit_id: HEAD, body: '' },
       ],
@@ -88,7 +92,7 @@ describe('review-at-head CI check (factory#432 part c)', () => {
 
   it('fails when the only review at head is the PR author', async () => {
     const result = await evaluateReviewAtHeadCheck(input, fetcher(routes({
-      [REVIEWS]: [
+      [`${REVIEWS}&page=1`]: [
         { user: { login: 'pr-author' }, state: 'APPROVED', commit_id: HEAD, body: 'self approve' },
       ],
     })))
@@ -99,7 +103,7 @@ describe('review-at-head CI check (factory#432 part c)', () => {
 
   it('passes when a third party leaves a substantive review at head', async () => {
     const result = await evaluateReviewAtHeadCheck(input, fetcher(routes({
-      [REVIEWS]: [
+      [`${REVIEWS}&page=1`]: [
         { user: { login: 'cubic-dev-ai[bot]' }, state: 'COMMENTED', commit_id: HEAD, body: 'x'.repeat(513) },
       ],
     })))
@@ -150,8 +154,8 @@ describe('review-at-head CI check (factory#432 part c)', () => {
 
     it('passes an empty-bodied review whose substance is inline at head', async () => {
       const result = await evaluateReviewAtHeadCheck(input, fetcher(routes({
-        [REVIEWS]: inlineOnlyReview,
-        [COMMENTS]: [
+        [`${REVIEWS}&page=1`]: inlineOnlyReview,
+        [`${COMMENTS}&page=1`]: [
           { pull_request_review_id: 9001, commit_id: HEAD, body: 'this branch is never taken' },
           { pull_request_review_id: 9001, commit_id: HEAD, body: 'off-by-one here' },
         ],
@@ -165,8 +169,8 @@ describe('review-at-head CI check (factory#432 part c)', () => {
 
     it('does not count inline comments left on an older commit', async () => {
       const result = await evaluateReviewAtHeadCheck(input, fetcher(routes({
-        [REVIEWS]: inlineOnlyReview,
-        [COMMENTS]: [
+        [`${REVIEWS}&page=1`]: inlineOnlyReview,
+        [`${COMMENTS}&page=1`]: [
           { pull_request_review_id: 9001, commit_id: STALE, body: 'reviewed two pushes ago' },
         ],
       })))
@@ -180,11 +184,11 @@ describe('review-at-head CI check (factory#432 part c)', () => {
 
     it('attributes inline comments to the review that carried them', async () => {
       const result = await evaluateReviewAtHeadCheck(input, fetcher(routes({
-        [REVIEWS]: [
+        [`${REVIEWS}&page=1`]: [
           ...inlineOnlyReview,
           { id: 9002, user: { login: 'other' }, state: 'COMMENTED', commit_id: HEAD, body: '' },
         ],
-        [COMMENTS]: [
+        [`${COMMENTS}&page=1`]: [
           { pull_request_review_id: 9002, commit_id: HEAD, body: 'only this review has substance' },
         ],
       })))
@@ -203,9 +207,85 @@ describe('review-at-head CI check (factory#432 part c)', () => {
     expect(result.summary).toMatch(/4 check\(s\): 3 real, 1 vacuous, 0 blocking/)
   })
 
+  describe('pagination', () => {
+    it('finds a review at head that falls on the second page', async () => {
+      // 100 stale reviews fill page 1 exactly, so a single `per_page=100`
+      // request would see none of the substantive review behind them and
+      // refuse a PR that was in fact reviewed.
+      const stale = Array.from({ length: 100 }, (_, index) => ({
+        id: index + 1,
+        user: { login: 'coderabbitai[bot]' },
+        state: 'COMMENTED',
+        commit_id: STALE,
+        body: 'stale',
+      }))
+      const atHead = { id: 999, user: { login: 'reviewer' }, state: 'APPROVED', commit_id: HEAD, body: 'ship it' }
+
+      const result = await evaluateReviewAtHeadCheck(input, async (path) => {
+        if (path.endsWith(`${REVIEWS}&page=1`)) return stale
+        if (path.endsWith(`${REVIEWS}&page=2`)) return [atHead]
+        if (path.endsWith(`${COMMENTS}&page=1`)) return []
+        if (path.startsWith(PULL)) return pull()
+        if (path.includes('/status')) return legacyStatuses
+        if (path.includes('/check-runs')) return checkRuns
+        throw new Error(`unexpected GET /${path}`)
+      })
+
+      expect(result.ok).toBe(true)
+      expect(result.reviewsAtHead).toHaveLength(101)
+    })
+
+    it('collects vacuous legacy statuses across pages rather than truncating at one', async () => {
+      const filler = Array.from({ length: 100 }, (_, index) => ({
+        context: `ci/shard-${index}`,
+        state: 'success',
+        description: 'passed',
+      }))
+
+      const result = await evaluateReviewAtHeadCheck(input, async (path) => {
+        if (path.startsWith(PULL) && !path.includes('/reviews') && !path.includes('/comments')) return pull()
+        if (path.startsWith(REVIEWS)) return []
+        if (path.startsWith(COMMENTS)) return []
+        if (path.includes('/status') && path.endsWith('page=1')) return { statuses: filler }
+        if (path.includes('/status') && path.endsWith('page=2')) return { statuses: legacyStatuses.statuses }
+        if (path.includes('/check-runs')) return { check_runs: [] }
+        throw new Error(`unexpected GET /${path}`)
+      })
+
+      expect(result.checkSignals).toHaveLength(102)
+      expect(result.summary).toMatch(/vacuous: Devin Review \(Full review skipped/)
+    })
+
+    it('stops paging on a short page instead of requesting forever', async () => {
+      const seen: string[] = []
+      await evaluateReviewAtHeadCheck(input, async (path) => {
+        seen.push(path)
+        if (path.startsWith(PULL) && !path.includes('/reviews') && !path.includes('/comments')) return pull()
+        if (path.startsWith(REVIEWS)) return []
+        if (path.startsWith(COMMENTS)) return []
+        if (path.includes('/status')) return legacyStatuses
+        if (path.includes('/check-runs')) return checkRuns
+        throw new Error(`unexpected GET /${path}`)
+      })
+
+      expect(seen.filter((path) => path.includes('page=2'))).toEqual([])
+    })
+  })
+
+  it('fails closed when GitHub returns no PR author, rather than counting a self-review', async () => {
+    // Without an author every `review.login !== author` comparison is true, so
+    // the PR author's own review would satisfy the third-party requirement.
+    await expect(evaluateReviewAtHeadCheck(input, fetcher(routes({
+      [PULL]: { number: 462, head: { sha: HEAD }, user: null },
+      [`${REVIEWS}&page=1`]: [
+        { id: 1, user: { login: 'pr-author' }, state: 'APPROVED', commit_id: HEAD, body: 'self approve' },
+      ],
+    })))).rejects.toThrow(/no author for/)
+  })
+
   it('refuses to guess when GitHub returns no head SHA', async () => {
     await expect(evaluateReviewAtHeadCheck(input, fetcher(routes({
-      'repos/AgentWorkforce/software-garden/pulls/462': { number: 462, head: {} },
+      [PULL]: { number: 462, head: {} },
     })))).rejects.toThrow(/no head SHA/)
   })
 
