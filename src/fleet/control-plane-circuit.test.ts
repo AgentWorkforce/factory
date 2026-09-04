@@ -359,6 +359,31 @@ describe('FleetControlPlaneCircuit', () => {
     await expect(staleProbe).rejects.toBeInstanceOf(FleetControlPlaneCircuitOpenError)
   })
 
+  it('does not let a stale pre-open rejection reopen a recovered circuit', async () => {
+    let now = 1_000
+    let rejectStaleProbe: ((reason: Error) => void) | undefined
+    const circuit = new FleetControlPlaneCircuit({
+      timeoutMs: 1_000,
+      failureThreshold: 1,
+      resetTimeoutMs: 100,
+      now: () => now,
+    })
+
+    const staleProbe = circuit.probe(() => new Promise<RosterEntry>((_resolve, reject) => {
+      rejectStaleProbe = reject
+    }))
+    await vi.waitFor(() => { expect(rejectStaleProbe).toBeTypeOf('function') })
+    circuit.recordFailure(new Error('broker unavailable'))
+    now += 100
+
+    await expect(circuit.probe(async () => roster)).resolves.toEqual(roster)
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
+
+    rejectStaleProbe?.(new Error('stale broker timeout'))
+    await expect(staleProbe).rejects.toThrow('stale broker timeout')
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
+  })
+
   it('MUST FIRE at mutation admission: two wedged rosters open the circuit and the next spawn fails fast', async () => {
     vi.useFakeTimers()
     const fleet = new FakeFleetClient()

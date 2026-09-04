@@ -114,7 +114,11 @@ export class FleetControlPlaneCircuit {
     const openGeneration = this.#openGeneration
     const probe = withTimeout(roster, this.#timeoutMs)
       .catch((error: unknown) => {
-        this.recordFailure(error)
+        // A delayed failure from a request that predates an open transition
+        // cannot describe the health of the generation that recovered after
+        // it. In particular, never let that stale settlement reopen a circuit
+        // after the fresh half-open probe has already succeeded.
+        if (openGeneration === this.#openGeneration) this.recordFailure(error)
         // The failure that trips the threshold IS the open transition, but the
         // transport error it arrives as says nothing about that. Callers that
         // saw only the original error could not tell "one roster request
