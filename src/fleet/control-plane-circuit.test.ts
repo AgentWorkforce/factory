@@ -4,6 +4,7 @@ import type { RosterEntry } from '../ports/fleet'
 import { FakeFleetClient } from '../testing/fakes'
 import {
   DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD,
+  DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS,
   DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS,
   DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
   FleetControlPlaneCircuit,
@@ -194,8 +195,7 @@ describe('FleetControlPlaneCircuit', () => {
       },
     )
     void laterProbe.catch(() => undefined)
-    await Promise.resolve()
-    await Promise.resolve()
+    await vi.waitFor(() => { expect(laterSettled).toBe(true) })
     const laterFailedFast = laterSettled && laterError instanceof FleetControlPlaneCircuitOpenError
 
     now += DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS
@@ -232,6 +232,156 @@ describe('FleetControlPlaneCircuit', () => {
     resolveProbe?.(roster)
     await expect(spawning).resolves.toMatchObject({ name: 'pending-worker' })
     expect(fleet.spawns).toHaveLength(1)
+  })
+
+  it('reuses a successful placement as admission evidence for the adjacent team member', async () => {
+    let now = 1_000
+    const fleet = new FakeFleetClient()
+    const rosterProbe = vi.spyOn(fleet, 'roster')
+      .mockResolvedValueOnce(roster)
+      // This is the production failure shape: the first worker placed, then a
+      // repeated fleet-node inventory exceeded the 5s roster boundary before
+      // the reviewer could start.
+      .mockImplementationOnce(() => new Promise<RosterEntry>(() => undefined))
+    const circuit = new FleetControlPlaneCircuit({
+      timeoutMs: DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
+      failureThreshold: DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD,
+      resetTimeoutMs: DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS,
+      now: () => now,
+    })
+    const guarded = guardFleetControlPlane(fleet, circuit, { now: () => now })
+
+    await expect(guarded.spawn({ name: 'implementer', capability: 'spawn:codex' }))
+      .resolves.toMatchObject({ name: 'implementer' })
+    await expect(guarded.spawn({ name: 'reviewer', capability: 'spawn:codex' }))
+      .resolves.toMatchObject({ name: 'reviewer' })
+
+    expect(rosterProbe).toHaveBeenCalledTimes(1)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['implementer', 'reviewer'])
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
+
+    // The lease is deliberately finite. Once it expires, the very same next
+    // mutation must run its own roster admission and surface the stalled read.
+    vi.useFakeTimers()
+    now += DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS + 1
+    const expired = guarded.spawn({ name: 'later-worker', capability: 'spawn:codex' })
+    const expiredFailure = expect(expired).rejects.toMatchObject({ name: 'TimeoutError' })
+    await vi.advanceTimersByTimeAsync(DEFAULT_FLEET_ROSTER_TIMEOUT_MS)
+    await expiredFailure
+    expect(rosterProbe).toHaveBeenCalledTimes(2)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['implementer', 'reviewer'])
+  })
+
+  it('invalidates recent admission evidence when a direct roster read fails', async () => {
+    const fleet = new FakeFleetClient()
+    const rosterProbe = vi.spyOn(fleet, 'roster')
+      .mockResolvedValueOnce(roster)
+      .mockRejectedValueOnce(new Error('broker unavailable'))
+      .mockResolvedValueOnce(roster)
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 2, resetTimeoutMs: 1_000 })
+    const guarded = guardFleetControlPlane(fleet, circuit)
+
+    await expect(guarded.spawn({ name: 'first-worker', capability: 'spawn:codex' })).resolves.toBeDefined()
+    await expect(guarded.roster()).rejects.toThrow('broker unavailable')
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 1 })
+
+    await expect(guarded.spawn({ name: 'second-worker', capability: 'spawn:codex' })).resolves.toBeDefined()
+    expect(rosterProbe).toHaveBeenCalledTimes(3)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['first-worker', 'second-worker'])
+  })
+
+  it('does not let unrelated successful roster reads extend the admission lease', async () => {
+    let now = 1_000
+    const fleet = new FakeFleetClient()
+    const rosterProbe = vi.spyOn(fleet, 'roster').mockResolvedValue(roster)
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 2, resetTimeoutMs: 1_000 })
+    const guarded = guardFleetControlPlane(fleet, circuit, { admissionLeaseMs: 100, now: () => now })
+
+    await expect(guarded.spawn({ name: 'first-worker', capability: 'spawn:codex' })).resolves.toBeDefined()
+    now += 99
+    await expect(guarded.roster()).resolves.toEqual(roster)
+    now += 2
+    await expect(guarded.spawn({ name: 'second-worker', capability: 'spawn:codex' })).resolves.toBeDefined()
+
+    expect(rosterProbe).toHaveBeenCalledTimes(3)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['first-worker', 'second-worker'])
+  })
+
+  it('lets a half-open mutation perform the roster probe that recovers the circuit', async () => {
+    let now = 1_000
+    const fleet = new FakeFleetClient()
+    const rosterProbe = vi.spyOn(fleet, 'roster').mockResolvedValue(roster)
+    const circuit = new FleetControlPlaneCircuit({
+      timeoutMs: 100,
+      failureThreshold: 2,
+      resetTimeoutMs: 1_000,
+      now: () => now,
+    })
+    const guarded = guardFleetControlPlane(fleet, circuit, { now: () => now })
+    circuit.recordFailure(new Error('broker unavailable'))
+    circuit.recordFailure(new Error('broker unavailable'))
+    now += 1_000
+    expect(circuit.status()).toMatchObject({ state: 'half-open', consecutiveFailures: 2 })
+
+    await expect(guarded.spawn({ name: 'recovery-worker', capability: 'spawn:codex' }))
+      .resolves.toMatchObject({ name: 'recovery-worker' })
+    expect(rosterProbe).toHaveBeenCalledTimes(1)
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
+  })
+
+  it('does not join a stale pre-open roster request during half-open recovery', async () => {
+    let now = 1_000
+    let resolveStaleProbe: ((value: RosterEntry) => void) | undefined
+    const fleet = new FakeFleetClient()
+    const rosterProbe = vi.spyOn(fleet, 'roster')
+      .mockImplementationOnce(() => new Promise<RosterEntry>((resolve) => { resolveStaleProbe = resolve }))
+      .mockResolvedValueOnce(roster)
+    const circuit = new FleetControlPlaneCircuit({
+      timeoutMs: 1_000,
+      failureThreshold: 2,
+      resetTimeoutMs: 100,
+      now: () => now,
+    })
+    const guarded = guardFleetControlPlane(fleet, circuit, { now: () => now })
+
+    const staleProbe = guarded.roster()
+    await vi.waitFor(() => { expect(resolveStaleProbe).toBeTypeOf('function') })
+    circuit.recordFailure(new Error('broker unavailable'))
+    circuit.recordFailure(new Error('broker unavailable'))
+    now += 100
+
+    const recovering = guarded.spawn({ name: 'recovery-worker', capability: 'spawn:codex' })
+    await vi.waitFor(() => { expect(rosterProbe).toHaveBeenCalledTimes(2) })
+    await expect(recovering).resolves.toMatchObject({ name: 'recovery-worker' })
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
+
+    resolveStaleProbe?.(roster)
+    await expect(staleProbe).rejects.toBeInstanceOf(FleetControlPlaneCircuitOpenError)
+  })
+
+  it('does not let a stale pre-open rejection reopen a recovered circuit', async () => {
+    let now = 1_000
+    let rejectStaleProbe: ((reason: Error) => void) | undefined
+    const circuit = new FleetControlPlaneCircuit({
+      timeoutMs: 1_000,
+      failureThreshold: 1,
+      resetTimeoutMs: 100,
+      now: () => now,
+    })
+
+    const staleProbe = circuit.probe(() => new Promise<RosterEntry>((_resolve, reject) => {
+      rejectStaleProbe = reject
+    }))
+    await vi.waitFor(() => { expect(rejectStaleProbe).toBeTypeOf('function') })
+    circuit.recordFailure(new Error('broker unavailable'))
+    now += 100
+
+    await expect(circuit.probe(async () => roster)).resolves.toEqual(roster)
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
+
+    rejectStaleProbe?.(new Error('stale broker timeout'))
+    await expect(staleProbe).rejects.toThrow('stale broker timeout')
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
   })
 
   it('MUST FIRE at mutation admission: two wedged rosters open the circuit and the next spawn fails fast', async () => {

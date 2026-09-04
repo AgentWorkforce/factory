@@ -3,6 +3,13 @@ import type { FleetClient, RosterEntry, SpawnInput, SpawnResult } from '../ports
 export const DEFAULT_FLEET_ROSTER_TIMEOUT_MS = 5_000
 export const DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD = 2
 export const DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS = 60_000
+/**
+ * A completed placement is stronger evidence than another read-only roster
+ * round-trip: the control plane selected a node and observed the mutation
+ * finish. Reuse that evidence briefly so a multi-agent dispatch does not ask
+ * the expensive fleet-node inventory the same question before every member.
+ */
+export const DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS = 15_000
 
 export type FleetControlPlaneState = 'closed' | 'open' | 'half-open'
 
@@ -63,6 +70,7 @@ export class FleetControlPlaneCircuit {
   // half-open recovery probe, even if it resolves after the cooldown.
   #openGeneration = 0
   #probeInFlight?: Promise<RosterEntry>
+  #probeOpenGeneration?: number
 
   constructor(options: FleetControlPlaneCircuitOptions) {
     this.#timeoutMs = options.timeoutMs
@@ -96,12 +104,21 @@ export class FleetControlPlaneCircuit {
     if (status.state === 'open') {
       throw new FleetControlPlaneCircuitOpenError(status.retryAtMs!)
     }
-    if (this.#probeInFlight) return this.#probeInFlight
+    // A probe that began before the circuit opened cannot recover the newer
+    // generation. Once cooldown reaches half-open, start one recovery probe
+    // instead of joining that stale request.
+    if (this.#probeInFlight && (
+      status.state !== 'half-open' || this.#probeOpenGeneration === this.#openGeneration
+    )) return this.#probeInFlight
 
     const openGeneration = this.#openGeneration
     const probe = withTimeout(roster, this.#timeoutMs)
       .catch((error: unknown) => {
-        this.recordFailure(error)
+        // A delayed failure from a request that predates an open transition
+        // cannot describe the health of the generation that recovered after
+        // it. In particular, never let that stale settlement reopen a circuit
+        // after the fresh half-open probe has already succeeded.
+        if (openGeneration === this.#openGeneration) this.recordFailure(error)
         // The failure that trips the threshold IS the open transition, but the
         // transport error it arrives as says nothing about that. Callers that
         // saw only the original error could not tell "one roster request
@@ -132,9 +149,13 @@ export class FleetControlPlaneCircuit {
         return result
       })
       .finally(() => {
-        if (this.#probeInFlight === probe) this.#probeInFlight = undefined
+        if (this.#probeInFlight === probe) {
+          this.#probeInFlight = undefined
+          this.#probeOpenGeneration = undefined
+        }
       })
     this.#probeInFlight = probe
+    this.#probeOpenGeneration = openGeneration
     return probe
   }
 
@@ -166,25 +187,59 @@ export class FleetControlPlaneCircuit {
 }
 
 /**
- * Gates spawn and resume with a bounded read-only roster admission. Transport
- * failures from admitted mutations also count toward the circuit without
- * abandoning or timing the mutation; domain rejections remain uncounted.
+ * Gates spawn and resume with a bounded read-only roster admission. Successful
+ * admission probes and mutations refresh the short evidence lease; unrelated
+ * roster reads cannot extend it, while any failed read invalidates it.
+ * Transport failures from admitted mutations also count toward the circuit
+ * without abandoning or timing the mutation; domain rejections remain
+ * uncounted.
  */
 export function guardFleetControlPlane(
   fleet: FleetClient,
   circuit: FleetControlPlaneCircuit,
+  options: { admissionLeaseMs?: number; now?: () => number } = {},
 ): FleetClient {
+  const admissionLeaseMs = options.admissionLeaseMs ?? DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS
+  const now = options.now ?? Date.now
+  let lastSuccessfulEvidenceAtMs: number | undefined
+
+  const recordSuccessfulEvidence = <T>(result: T): T => {
+    lastSuccessfulEvidenceAtMs = now()
+    return result
+  }
+
+  const probeRoster = (recordAdmissionEvidence: boolean): Promise<RosterEntry> =>
+    circuit.probe(() => fleet.roster())
+      .then((result) => recordAdmissionEvidence ? recordSuccessfulEvidence(result) : result)
+      .catch((error: unknown) => {
+        // A newer failed read supersedes any older success even when it is the
+        // first failure and the circuit remains closed.
+        lastSuccessfulEvidenceAtMs = undefined
+        throw error
+      })
+
+  const hasFreshAdmissionEvidence = (): boolean =>
+    lastSuccessfulEvidenceAtMs !== undefined &&
+    now() - lastSuccessfulEvidenceAtMs <= admissionLeaseMs
+
   const guardedMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
     // A fresh Factory instance starts with a closed circuit, so checking state
     // alone would let resume/cold-start paths that did not run discovery bypass
-    // admission. Probe the same roster path before every spawn/resume.
-    // Concurrent mutations coalesce onto one in-flight probe, and an open
-    // circuit rejects here without calling either roster or the mutation.
-    await circuit.probe(() => fleet.roster())
+    // admission. Require recent successful control-plane evidence before each
+    // spawn/resume. Concurrent first mutations coalesce onto one in-flight
+    // roster probe, while adjacent successful placements share a short lease.
+    // An open circuit rejects here without calling roster or the mutation;
+    // half-open must run the recovery probe even if older evidence exists.
+    const admissionState = circuit.status().state
+    if (admissionState === 'open') circuit.assertMutationAllowed()
+    if (admissionState === 'half-open' || !hasFreshAdmissionEvidence()) await probeRoster(true)
     circuit.assertMutationAllowed()
     try {
-      return await operation()
+      return recordSuccessfulEvidence(await operation())
     } catch (error) {
+      // Never let evidence from an earlier success admit work after any newer
+      // mutation failed. The next attempt must establish health for itself.
+      lastSuccessfulEvidenceAtMs = undefined
       if (isFleetControlPlaneFailure(error)) circuit.recordFailure(error)
       throw error
     }
@@ -193,7 +248,7 @@ export function guardFleetControlPlane(
   return new Proxy(fleet, {
     get(target, property) {
       if (property === 'roster') {
-        return (): Promise<RosterEntry> => circuit.probe(() => target.roster())
+        return (): Promise<RosterEntry> => probeRoster(false)
       }
       if (property === 'spawn') {
         return (input: SpawnInput): Promise<SpawnResult> => guardedMutation(() => target.spawn(input))

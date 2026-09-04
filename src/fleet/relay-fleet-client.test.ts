@@ -27,6 +27,7 @@ function relayMessage(overrides: Partial<RelayMessage> & { text: string }): Rela
 class FakeMessaging {
   readonly placements: RelaySpawnPlacementInput[] = []
   readonly invokes: Array<{ name: string; input?: Record<string, unknown> }> = []
+  readonly agentReleases: Array<{ name: string; reason?: string; deleteAgent?: boolean }> = []
   readonly directs: Array<{ to: string; text: string; mode?: 'wait' | 'steer' }> = []
   readonly channelSends: Array<{ channel: string; text: string; mode?: 'wait' | 'steer' }> = []
   readonly commandRegistrations: Array<{ command: string; handlerAgent: string }> = []
@@ -63,6 +64,10 @@ class FakeMessaging {
       }))
     },
     me: async () => ({ name: this.meName }),
+    release: async (input: { name: string; reason?: string; deleteAgent?: boolean }) => {
+      this.agentReleases.push(input)
+      return await this.commands.invoke('release', { ...input, agent: input.name })
+    },
   }
 
   readonly nodes = {
@@ -451,6 +456,7 @@ describe('RelayFleetClient', () => {
         name: 'ar-1-impl',
         agent: 'ar-1-impl',
         reason: 'unverified-placement',
+        deleteAgent: true,
       },
     })
   })
@@ -925,7 +931,7 @@ describe('RelayFleetClient', () => {
     expect(messaging.placements[0]?.input).not.toHaveProperty('exit_after_task')
   })
 
-  it('releases through commands.invoke and stops tracking the agent', async () => {
+  it('requests identity-deleting release and stops tracking the agent', async () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging)
     await fleet.spawn({ name: 'ar-4-impl', capability: 'spawn:codex' })
@@ -933,8 +939,14 @@ describe('RelayFleetClient', () => {
 
     await fleet.release('ar-4-impl', 'issue-done')
 
+    expect(messaging.agentReleases).toEqual([
+      { name: 'ar-4-impl', reason: 'issue-done', deleteAgent: true },
+    ])
     expect(messaging.invokes).toEqual([
-      { name: 'release', input: { name: 'ar-4-impl', agent: 'ar-4-impl', reason: 'issue-done' } },
+      {
+        name: 'release',
+        input: { name: 'ar-4-impl', agent: 'ar-4-impl', reason: 'issue-done', deleteAgent: true },
+      },
     ])
     expect(fleet.trackedAgents().has('ar-4-impl')).toBe(false)
   })
