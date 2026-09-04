@@ -10,7 +10,7 @@ The published descriptor schema is
 - `byoc` (the default) uses the customer's scoped EKS/kubeconfig connection.
   This is the high-fidelity path because Kubernetes version, CNI, IAM/IRSA,
   ingress, add-ons, and nodes are the customer's real substrate.
-- `managed` uses Factory's shared verification cluster. Every managed
+- `managed` uses Software Garden's shared verification cluster. Every managed
   environment carries this caveat in `bindings.kubernetes.fidelityCaveat`:
   our Kubernetes version, CNI, IAM/IRSA, ingress, add-ons, and node types may
   differ from the customer environment. A managed run must not be presented as

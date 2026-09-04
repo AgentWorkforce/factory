@@ -16,7 +16,7 @@ describe('safety.requireTitlePrefix', () => {
     })
 
     expect(labelOnly.safety.requireTitlePrefix).toBeNull()
-    expect(defaulted.safety.requireTitlePrefix).toBe('[factory-e2e]')
+    expect(defaulted.safety.requireTitlePrefix).toBe('[garden-e2e]')
     expect(FactoryConfigSchema.safeParse({
       repos: { default: 'AgentWorkforce/hoopsheet' },
       safety: { requireTitlePrefix: '', requireLabel: 'garden-ready' },
@@ -197,7 +197,7 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.babysitter).toEqual({
       enabled: false,
       mode: 'factory-created',
-      excludeLabels: ['factory:skip-babysitter'],
+      excludeLabels: ['garden:skip-babysitter'],
       excludePullRequests: [],
       notifyHumans: false,
     })
@@ -245,8 +245,8 @@ describe('FactoryConfigSchema', () => {
       teamIds: {},
     })
     expect(parsed.safety).toEqual({
-      requireTitlePrefix: '[factory-e2e]',
-      requireLabel: 'factory',
+      requireTitlePrefix: '[garden-e2e]',
+      requireLabel: 'garden',
       requireTeamKey: 'AR',
       neverAutoCloseLabels: ['incident', 'outage', 'sev1', 'sev2'],
     })

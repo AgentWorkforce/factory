@@ -12,6 +12,13 @@ import type {
   GithubWriteback,
 } from '../ports/writeback'
 import { defaultGhRunner, type GhRunner } from '../github/merge-gate'
+import {
+  GARDEN_HUMAN_REVIEW_LABEL,
+  GARDEN_IN_PROGRESS_LABEL,
+  LEGACY_FACTORY_HUMAN_REVIEW_LABEL,
+  LEGACY_FACTORY_IN_PROGRESS_LABEL,
+  gardenLifecycleStatusFromLabels,
+} from '../constants/lifecycle-labels'
 import type { LinearIssue, PrSummary } from '../types'
 import { asRecord, wrappedPayload } from './shared'
 
@@ -19,16 +26,38 @@ const execFileAsync = promisify(execFile)
 
 export const FACTORY_GITHUB_STATUS_LABELS: Record<Exclude<GithubIssueStatus, 'ready'>, { name: string; color: string; description: string }> = {
   'in-progress': {
-    name: 'factory:in-progress',
+    name: GARDEN_IN_PROGRESS_LABEL,
     color: '1d76db',
-    description: 'Factory agents are working on this issue.',
+    description: 'Software Garden agents are working on this issue.',
   },
   'human-review': {
-    name: 'factory:human-review',
+    name: GARDEN_HUMAN_REVIEW_LABEL,
     color: 'fbca04',
-    description: 'Factory work is ready for human review.',
+    description: 'Software Garden work is ready for human review.',
   },
 }
+
+/**
+ * The legacy Factory names these labels carried before the Software Garden
+ * rename. Read paths (status derivation, receipt attribution, removal
+ * confirmation) accept both spellings so in-flight issues labeled by an older
+ * build remain readable; writes only apply the canonical garden names, and a
+ * status transition replaces any legacy label it finds with the canonical one.
+ */
+export const LEGACY_FACTORY_GITHUB_STATUS_LABEL_NAMES: Record<Exclude<GithubIssueStatus, 'ready'>, string> = {
+  'in-progress': LEGACY_FACTORY_IN_PROGRESS_LABEL,
+  'human-review': LEGACY_FACTORY_HUMAN_REVIEW_LABEL,
+}
+
+const statusLabelNames = (status: Exclude<GithubIssueStatus, 'ready'>): readonly string[] => [
+  FACTORY_GITHUB_STATUS_LABELS[status].name.toLowerCase(),
+  LEGACY_FACTORY_GITHUB_STATUS_LABEL_NAMES[status].toLowerCase(),
+]
+
+const allStatusLabelNames = (): readonly string[] => [
+  ...statusLabelNames('in-progress'),
+  ...statusLabelNames('human-review'),
+]
 
 const repoDir = (repo: string): string => {
   if (repo.includes('__')) {
@@ -193,7 +222,7 @@ export class AppGithubWriteback implements GithubWriteback {
    * about the claim. `ready` is exactly what BOTH "the claim has not landed in
    * this projection yet" and "the claim was removed after it did" look like, so
    * it counts only when it is strictly newer than a projection this adapter saw
-   * carrying the claim. Any other Factory status label is positive evidence of
+   * carrying the claim. Any other lifecycle status label is positive evidence of
    * a later lifecycle decision on its own — no incidental edit produces one
    * (#346 review, codex).
    */
@@ -257,10 +286,10 @@ export class AppGithubWriteback implements GithubWriteback {
    * or a shape this reader cannot parse), not that the issue is bare. Treating
    * it as authoritative would compute the whole replace set from nothing, and
    * that fails twice over: `factoryStatusLabelSet([], status)` yields only the
-   * target Factory label, so the PATCH both drops the configured safety label
+   * target lifecycle label, so the PATCH both drops the configured safety label
    * — which `isAllowedFactoryGithubIssueWriteContent` then rejects, stalling
    * the claim through the same door #434 exists to close — and clobbers every
-   * other label on the issue, including the `factory`/`factory-ready`/`agent:*`
+   * other label on the issue, including the `garden`/`garden-ready`/`agent:*`
    * set the dispatch protocol itself runs on (#434 review, CodeRabbit).
    */
   async #currentIssueLabels(
@@ -318,7 +347,7 @@ export class AppGithubWriteback implements GithubWriteback {
 /**
  * Compatibility GitHub issue lifecycle writeback using authenticated `gh`
  * primitives. Labels are created idempotently before use so a newly-onboarded
- * repository does not need Factory status labels provisioned by hand.
+ * repository does not need Software Garden status labels provisioned by hand.
  */
 export class GhCliGithubWriteback implements GithubWriteback {
   readonly #run: GhRunner
@@ -435,9 +464,7 @@ export class GhCliGithubWriteback implements GithubWriteback {
 
   async getIssueStatus(issue: LinearIssue): Promise<GithubIssueStatus> {
     const labels = await this.#issueLabels(githubIssueRef(issue))
-    if (labels.has(FACTORY_GITHUB_STATUS_LABELS['human-review'].name.toLowerCase())) return 'human-review'
-    if (labels.has(FACTORY_GITHUB_STATUS_LABELS['in-progress'].name.toLowerCase())) return 'in-progress'
-    return 'ready'
+    return githubStatusFromLabels(labels)
   }
 
   async postComment(issue: LinearIssue, body: string): Promise<void> {
@@ -479,9 +506,9 @@ export class GhCliGithubWriteback implements GithubWriteback {
       const labels = await this.#issueLabels(ref)
       const statusBefore = githubStatusFromLabels(labels)
       const editArgs = ['issue', 'edit', String(ref.number), '--repo', ref.repo]
-      for (const label of Object.values(FACTORY_GITHUB_STATUS_LABELS)) {
-        if (labels.has(label.name.toLowerCase())) {
-          editArgs.push('--remove-label', label.name)
+      for (const name of allStatusLabelNames()) {
+        if (labels.has(name)) {
+          editArgs.push('--remove-label', name)
         }
       }
       const editRequired = editArgs.length > 5
@@ -492,8 +519,8 @@ export class GhCliGithubWriteback implements GithubWriteback {
         await this.#run(editArgs)
       }
       const confirmed = await this.#issueLabels(ref)
-      if (Object.values(FACTORY_GITHUB_STATUS_LABELS).some((label) => confirmed.has(label.name.toLowerCase()))) {
-        throw new Error(`GitHub writeback did not confirm removal of Factory status labels on ${ref.repo}#${ref.number}`)
+      if (allStatusLabelNames().some((name) => confirmed.has(name))) {
+        throw new Error(`GitHub writeback did not confirm removal of lifecycle status labels on ${ref.repo}#${ref.number}`)
       }
       if (!editRequired) return { result: 'already-matched' }
       const claimToken = await this.#authoredStatusTransitionToken(ref, receiptBaseline, statusBefore, status)
@@ -502,7 +529,14 @@ export class GhCliGithubWriteback implements GithubWriteback {
         : { result: 'acknowledged' }
     }
     const target = FACTORY_GITHUB_STATUS_LABELS[status]
-    const previous = FACTORY_GITHUB_STATUS_LABELS[status === 'in-progress' ? 'human-review' : 'in-progress']
+    // Every lifecycle label except the canonical target comes off — the other
+    // status under both spellings AND the target status's own legacy alias.
+    // Removing only the other status would leave `factory:in-progress` sitting
+    // beside a freshly added `garden:in-progress`, so a same-status write would
+    // never complete the rename migration and the issue would carry two
+    // lifecycle labels for the same state. This matches `factoryStatusLabelSet`,
+    // which the mount writeback path already computes the same way.
+    const previousNames = allStatusLabelNames().filter((name) => name !== target.name.toLowerCase())
     await this.#run([
       'label',
       'create',
@@ -527,8 +561,10 @@ export class GhCliGithubWriteback implements GithubWriteback {
     if (!labels.has(target.name.toLowerCase())) {
       editArgs.push('--add-label', target.name)
     }
-    if (labels.has(previous.name.toLowerCase())) {
-      editArgs.push('--remove-label', previous.name)
+    for (const previousName of previousNames) {
+      if (labels.has(previousName)) {
+        editArgs.push('--remove-label', previousName)
+      }
     }
     const editRequired = editArgs.length > 5
     const receiptBaseline = editRequired
@@ -538,7 +574,7 @@ export class GhCliGithubWriteback implements GithubWriteback {
       await this.#run(editArgs)
     }
     const confirmed = await this.#issueLabels(ref)
-    if (confirmed.has(target.name.toLowerCase()) && !confirmed.has(previous.name.toLowerCase())) {
+    if (confirmed.has(target.name.toLowerCase()) && !previousNames.some((name) => confirmed.has(name))) {
       // Removing an obsolete label is a provider mutation, but it does not
       // establish ownership when the requested effective status already won
       // before our first read (notably human-review over in-progress).
@@ -564,8 +600,8 @@ export class GhCliGithubWriteback implements GithubWriteback {
     const claimIndex = events.findIndex((event) => event.id === claimToken)
     const claimEvent = claimIndex >= 0 ? events[claimIndex] : undefined
     if (claimEvent?.event !== 'labeled'
-      || claimEvent.label !== FACTORY_GITHUB_STATUS_LABELS['in-progress'].name) return 'unproven'
-    const statusLabels = new Set(Object.values(FACTORY_GITHUB_STATUS_LABELS).map((label) => label.name))
+      || !statusLabelNames('in-progress').includes(claimEvent.label)) return 'unproven'
+    const statusLabels = new Set(allStatusLabelNames())
     if (events.slice(claimIndex + 1).some((event) => statusLabels.has(event.label))) return 'superseded'
     // `gh issue edit` has no atomic label-event precondition. Even this exact
     // provider token can become stale after the read, so never turn it into an
@@ -601,11 +637,11 @@ export class GhCliGithubWriteback implements GithubWriteback {
     const actor = (await this.#run(['api', 'user', '--jq', '.login'])).stdout.trim().toLowerCase()
     if (!actor) throw new Error('GitHub lifecycle receipt could not resolve the authenticated actor')
     const events = await this.#issueLabelEvents(ref)
-    const statusLabelNames = new Set(Object.values(FACTORY_GITHUB_STATUS_LABELS).map((label) => label.name))
+    const statusLabelNamesSet = new Set(allStatusLabelNames())
     return {
       actor,
       eventIds: new Set(events.map((event) => event.id)),
-      statusLabels: new Set([...labels].filter((label) => statusLabelNames.has(label))),
+      statusLabels: new Set([...labels].filter((label) => statusLabelNamesSet.has(label))),
     }
   }
 
@@ -619,7 +655,7 @@ export class GhCliGithubWriteback implements GithubWriteback {
     const expected = githubStatusTransitionEvent(from, to)
     if (!expected) return undefined
     const events = await this.#issueLabelEvents(ref).catch(() => [])
-    const statusLabels = new Set(Object.values(FACTORY_GITHUB_STATUS_LABELS).map((label) => label.name))
+    const statusLabels = new Set(allStatusLabelNames())
     const newStatusEvents = events.filter((event) =>
       !baseline.eventIds.has(event.id) && statusLabels.has(event.label),
     )
@@ -637,7 +673,7 @@ export class GhCliGithubWriteback implements GithubWriteback {
     // not later status-label cleanup that leaves the effective status intact.
     return definingEvent?.actor === baseline.actor
       && definingEvent.event === expected.event
-      && definingEvent.label === expected.label
+      && expected.labels.includes(definingEvent.label)
       ? definingEvent.id
       : undefined
   }
@@ -759,11 +795,8 @@ export class GhCliGithubWriteback implements GithubWriteback {
   }
 }
 
-const githubStatusFromLabels = (labels: Set<string>): GithubIssueStatus => {
-  if (labels.has(FACTORY_GITHUB_STATUS_LABELS['human-review'].name.toLowerCase())) return 'human-review'
-  if (labels.has(FACTORY_GITHUB_STATUS_LABELS['in-progress'].name.toLowerCase())) return 'in-progress'
-  return 'ready'
-}
+const githubStatusFromLabels = (labels: Set<string>): GithubIssueStatus =>
+  gardenLifecycleStatusFromLabels(labels) ?? 'ready'
 
 const githubLabelNamesFromContent = (content: unknown): string[] => {
   const payload = wrappedPayload(content)
@@ -777,22 +810,22 @@ const githubLabelNamesFromContent = (content: unknown): string[] => {
 
 /**
  * The complete label set the issue should carry for `status`, or `undefined`
- * when `current` already matches it. Every Factory status label is dropped
- * first so a transition can never leave both on the issue, and non-Factory
- * labels are preserved in their original order and casing.
+ * when `current` already matches it. Every lifecycle status label — canonical
+ * garden or legacy factory — is dropped first so a transition can never leave
+ * two on the issue (and so a legacy-labeled in-flight issue is migrated to
+ * the canonical name by its next transition), and non-lifecycle labels are
+ * preserved in their original order and casing.
  */
 const factoryStatusLabelSet = (
   current: string[],
   status: GithubIssueStatus,
 ): string[] | undefined => {
-  const factoryNames = new Set(
-    Object.values(FACTORY_GITHUB_STATUS_LABELS).map((label) => label.name.toLowerCase()),
-  )
+  const lifecycleNames = new Set(allStatusLabelNames())
   const seen = new Set<string>()
   const next: string[] = []
   for (const label of current) {
     const key = label.toLowerCase()
-    if (factoryNames.has(key) || seen.has(key)) continue
+    if (lifecycleNames.has(key) || seen.has(key)) continue
     seen.add(key)
     next.push(label)
   }
@@ -828,19 +861,19 @@ const githubIssueUpdatedAtMs = (content: unknown): number | undefined => {
 const githubStatusTransitionEvent = (
   from: GithubIssueStatus,
   to: GithubIssueStatus,
-): Pick<GithubLabelEvent, 'event' | 'label'> | undefined => {
+): { event: 'labeled' | 'unlabeled'; labels: readonly string[] } | undefined => {
   if (from === to) return undefined
   if (to === 'human-review') {
-    return { event: 'labeled', label: FACTORY_GITHUB_STATUS_LABELS['human-review'].name }
+    return { event: 'labeled', labels: statusLabelNames('human-review') }
   }
   if (to === 'in-progress') {
     return from === 'human-review'
-      ? { event: 'unlabeled', label: FACTORY_GITHUB_STATUS_LABELS['human-review'].name }
-      : { event: 'labeled', label: FACTORY_GITHUB_STATUS_LABELS['in-progress'].name }
+      ? { event: 'unlabeled', labels: statusLabelNames('human-review') }
+      : { event: 'labeled', labels: statusLabelNames('in-progress') }
   }
   return from === 'human-review'
-    ? { event: 'unlabeled', label: FACTORY_GITHUB_STATUS_LABELS['human-review'].name }
-    : { event: 'unlabeled', label: FACTORY_GITHUB_STATUS_LABELS['in-progress'].name }
+    ? { event: 'unlabeled', labels: statusLabelNames('human-review') }
+    : { event: 'unlabeled', labels: statusLabelNames('in-progress') }
 }
 
 const defaultGitRunner: GhRunner = async (args) => {

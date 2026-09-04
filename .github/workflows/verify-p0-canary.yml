@@ -1,5 +1,10 @@
 # Prove the P0 end-to-end path still works after every live deploy:
-# file a fresh [factory]-labeled canary issue in THIS repo, wait up to 45 min
+# file a fresh [garden]-labeled canary issue in THIS repo, wait up to 45 min
+#
+# NOTE (Software Garden rename): new automation writes are canonical — the
+# canary files with the `garden` / `garden-ready` labels and `[garden]` title
+# prefix. The post-rename sweep ingests garden names natively (and still
+# accepts the legacy `factory` spellings on read for in-flight issues).
 # for the deployed container to dispatch it (JIT-provisioned sandbox, impl
 # agent, branch push, PR create), and fail if nothing appears.
 #
@@ -159,12 +164,12 @@ jobs:
         run: |
           set -euo pipefail
           TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          TITLE="[factory] Canary — P0 verify ${TS}"
+          TITLE="[garden] Canary — P0 verify ${TS}"
           BODY_FILE="$(mktemp)"
           cat > "${BODY_FILE}" <<'EOF'
           ## Canary probe
 
-          Filed by `verify-p0-canary.yml` to prove the factory dispatch pipeline
+          Filed by `verify-p0-canary.yml` to prove the Software Garden dispatch pipeline
           works end-to-end after the latest deploy. Deliberately trivial so the
           impl agent's work is fast and unambiguous.
 
@@ -180,8 +185,23 @@ jobs:
           wait window. Any green here proves the P0 path is really working;
           any red demands operator attention.
           EOF
+          # `gh issue create --label` does NOT create a missing label -- it
+          # fails the whole call. The canonical `garden`/`garden-ready` names
+          # arrived with the Software Garden rename, so a target repository
+          # provisioned before it carries only the legacy `factory` spellings
+          # and the canary could never be filed at all. Provision the dispatch
+          # labels first. Deliberately WITHOUT `--force`: a label that already
+          # exists must keep the colour and description the repository chose
+          # for it, so the create is allowed to fail and `gh issue create`
+          # below stays the real verification.
+          gh label create garden --repo "${TARGET_REPO}" --color 0e8a16 \
+            --description "Software Garden may act on this issue." 2>/dev/null || true
+          gh label create garden-ready --repo "${TARGET_REPO}" --color 0e8a16 \
+            --description "Software Garden may dispatch this issue." 2>/dev/null || true
+          gh label create agent:single --repo "${TARGET_REPO}" --color ededed \
+            --description "Dispatch shape: a single implementer agent." 2>/dev/null || true
           URL="$(gh issue create --repo "${TARGET_REPO}" --title "${TITLE}" --body-file "${BODY_FILE}" \
-            --label factory --label factory-ready --label agent:single)"
+            --label garden --label garden-ready --label agent:single)"
           NUM="${URL##*/}"
           echo "Filed canary ${URL}"
           echo "issue_number=${NUM}" >> "${GITHUB_OUTPUT}"
@@ -365,8 +385,40 @@ jobs:
           echo "Disarming unproven canary #${NUM}"
 
           for attempt in 1 2 3; do
-            gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
-              --remove-label factory-ready --remove-label agent:single --remove-label factory >/dev/null 2>&1 || true
+            # The ARMED check below treats the legacy `factory`/`factory-ready`
+            # spellings as dispatchable too, so they must come off here as
+            # well; otherwise a canary filed by an older build can never
+            # verify as disarmed, every retry fails, and the issue stays
+            # ingestible.
+            #
+            # ONE edit removes all of them. Readiness needs only the `garden`
+            # opt-in -- `garden-ready` is not part of the test -- so a
+            # label-at-a-time loop would leave the canary dispatchable in the
+            # gap after `garden-ready` came off, and the sweep could claim it
+            # mid-cleanup. Naming only the labels the issue actually carries
+            # keeps that single edit safe: a label the issue has necessarily
+            # exists in the repository, so the edit cannot fail as a whole over
+            # a name the target repo never provisioned.
+            # Match case-insensitively and remove by the PROVIDER's own casing.
+            # A label created as `Garden` comes back as `Garden`, an exact-match
+            # test would add no removal flag for it, and the dispatcher would
+            # still read the issue as armed -- `matchesGardenLabelAlias`
+            # normalizes, so it sees `Garden` as the opt-in. Passing the name
+            # back exactly as the API gave it also avoids assuming anything
+            # about how `gh` folds label case.
+            REMOVE_ARGS=()
+            while IFS= read -r LABEL; do
+              [ -n "${LABEL}" ] || continue
+              case "$(printf '%s' "${LABEL}" | tr '[:upper:]' '[:lower:]')" in
+                garden-ready|factory-ready|agent:single|garden|factory)
+                  REMOVE_ARGS+=(--remove-label "${LABEL}") ;;
+              esac
+            done <<< "$(gh issue view "${NUM}" --repo "${TARGET_REPO}" \
+              --json labels --jq '.labels[].name' 2>/dev/null || echo '')"
+            if [ "${#REMOVE_ARGS[@]}" -gt 0 ]; then
+              gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
+                "${REMOVE_ARGS[@]}" >/dev/null 2>&1 || true
+            fi
             gh issue close "${NUM}" --repo "${TARGET_REPO}" --reason "not planned" \
               --comment "P0 canary was not proven inside the wait window (${RUN_URL}). Dispatch labels removed and issue closed so the sweep does not later ingest an abandoned canary and consume a batch slot. Re-run verify-p0-canary to retry." >/dev/null 2>&1 || true
 
@@ -374,8 +426,12 @@ jobs:
             STATE="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
             LABELS="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo UNKNOWN)"
             ARMED=0
-            case ",${LABELS}," in
-              *,factory-ready,*|*,agent:single,*|*,factory,*) ARMED=1 ;;
+            # Fold case here too: reporting "disarmed" while a provider-cased
+            # `Garden` survives is the one outcome worse than failing loudly,
+            # because the dispatcher's own match IS case-insensitive.
+            LABELS_LC="$(printf '%s' "${LABELS}" | tr '[:upper:]' '[:lower:]')"
+            case ",${LABELS_LC}," in
+              *,garden-ready,*|*,agent:single,*|*,garden,*|*,factory-ready,*|*,factory,*) ARMED=1 ;;
             esac
             if [ "${STATE}" = "CLOSED" ] && [ "${ARMED}" = "0" ]; then
               echo "Disarmed on attempt ${attempt}: state=${STATE} labels=[${LABELS}]"
@@ -395,7 +451,7 @@ jobs:
             echo "- state: \`${STATE}\`  labels: \`${LABELS}\`"
             echo ""
             echo "This canary is still dispatchable and will consume a batch slot."
-            echo "Remove the \`factory\`, \`factory-ready\` and \`agent:single\` labels and close it by hand."
+            echo "Remove the \`garden\`, \`garden-ready\` and \`agent:single\` labels (or their legacy \`factory\` spellings) and close it by hand."
           } >> "${GITHUB_STEP_SUMMARY}"
           echo "::error::Could not disarm canary #${NUM} after 3 attempts (state=${STATE}, labels=[${LABELS}]); it remains dispatchable and needs manual cleanup"
           exit 1

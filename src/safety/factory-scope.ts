@@ -1,5 +1,12 @@
 import type { FactoryConfig } from '../config/schema'
 import type { LinearIssue } from '../types'
+import {
+  GARDEN_AUTOMATION_LABEL,
+  GARDEN_E2E_TITLE_PREFIX,
+  GARDEN_TITLE_PREFIX,
+  gardenLabelAliases,
+  hasGardenTitlePrefix,
+} from '../constants/lifecycle-labels'
 
 export interface FactoryScopeSafety {
   requireTitlePrefix?: string | null
@@ -76,9 +83,11 @@ function factoryScopeFailureReason(
 
 const normalizeSafety = (safety: FactoryScopeSafety = {}): NormalizedFactoryScopeSafety => {
   const label = normalizeRequiredLabel(safety.requireLabel)
+  // Mirrors the config-schema default after the Software Garden rename. The
+  // legacy `[factory-e2e]` prefix stays acceptable at the title check below.
   const titlePrefix = safety.requireTitlePrefix === null
     ? null
-    : safety.requireTitlePrefix || '[factory-e2e]'
+    : safety.requireTitlePrefix || GARDEN_E2E_TITLE_PREFIX
   return {
     titlePrefix,
     ...(label ? { label } : {}),
@@ -87,7 +96,7 @@ const normalizeSafety = (safety: FactoryScopeSafety = {}): NormalizedFactoryScop
 }
 
 const normalizeRequiredLabel = (label: string | undefined): string | undefined => {
-  if (label === undefined) return DEFAULT_FACTORY_LABEL
+  if (label === undefined) return GARDEN_AUTOMATION_LABEL
   const normalized = label.trim().toLowerCase()
   return normalized || undefined
 }
@@ -111,7 +120,11 @@ const payloadHasFactoryLabel = (
     ...issueLabels(issue.labels),
     ...payloadLabels(payload.labels),
   ]
-  return labels.some((label) => label.trim().toLowerCase() === expectedLabel)
+  // Rename transition: a `garden` (or `garden-ready`) requirement also admits
+  // the legacy `factory`/`factory-ready` spelling, so an in-flight issue
+  // labeled by an older build stays inside the safety scope.
+  const aliases = new Set(gardenLabelAliases(expectedLabel))
+  return labels.some((label) => aliases.has(label.trim().toLowerCase()))
 }
 
 const issueLabels = (labels: unknown): string[] =>
@@ -139,27 +152,24 @@ const labelName = (value: unknown): string | undefined => {
   return stringValue(record?.name)
 }
 
-const titleHasFactoryMarker = (title: string, marker: string): boolean =>
-  title === marker || title.startsWith(`${marker} `)
-
-// Accept the configured prefix always. The bare `[factory]` mirror marker is
-// only honored for GitHub mirror issues, so a stricter custom prefix (e.g.
-// `[factory-e2e]`) still rejects a human-authored issue merely titled
-// `[factory] ...`.
+// Accept the configured prefix always (and its legacy rename alias — a
+// `[garden-e2e]` requirement still admits `[factory-e2e]`, and vice versa, so
+// in-flight issues titled before the rename stay in scope). The bare mirror
+// markers (`[garden]` and its legacy `[factory]` spelling) are only honored
+// for GitHub mirror issues, so a stricter custom prefix still rejects a
+// human-authored issue merely titled `[garden] ...`.
 const titleHasAcceptedFactoryMarker = (
   title: string,
   configuredMarker: string | null,
   isGithubMirror: boolean,
 ): boolean =>
-  (configuredMarker ? titleHasFactoryMarker(title, configuredMarker) : false) ||
-  (isGithubMirror && titleHasFactoryMarker(title, GITHUB_MIRROR_TITLE_PREFIX))
+  (configuredMarker ? hasGardenTitlePrefix(title, configuredMarker) : false) ||
+  // hasGardenTitlePrefix on the mirror prefix admits both spellings.
+  (isGithubMirror && hasGardenTitlePrefix(title, GARDEN_TITLE_PREFIX))
 
 // Mirror drafts created from GitHub issues carry source.provider === 'github'.
 const isGithubMirrorPayload = (payload: Record<string, unknown>): boolean =>
   stringValue(asRecord(payload.source)?.provider)?.toLowerCase() === 'github'
-
-const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
-const DEFAULT_FACTORY_LABEL = 'factory'
 
 const wrappedPayload = (value: unknown): Record<string, unknown> => {
   const record = asRecord(value)

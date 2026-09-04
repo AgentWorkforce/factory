@@ -113,7 +113,7 @@ function mountAuthDiagnosis(details?: MountAuthErrorDetails): string {
 export function mountAuthRemediation(details?: MountAuthErrorDetails): string {
   return (
     `[factory] ${mountAuthDiagnosis(details)} ` +
-    'Factory will not spawn agents against a read-denied mirror.'
+    'Software Garden will not spawn agents against a read-denied mirror.'
   )
 }
 
@@ -129,7 +129,7 @@ export function mountAuthRemediation(details?: MountAuthErrorDetails): string {
 export function mountAuthDegradedWarning(details?: MountAuthErrorDetails): string {
   return (
     `[factory] warning: ${mountAuthDiagnosis(details)} ` +
-    'The mount is still reconciling and readable, so Factory is continuing against it. ' +
+    'The mount is still reconciling and readable, so Software Garden is continuing against it. ' +
     'Fix the scope if reads or writeback look wrong.'
   )
 }

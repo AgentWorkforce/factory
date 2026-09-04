@@ -838,8 +838,9 @@ export interface IterationReport {
   dryRun: boolean
   slackDegraded?: boolean
   /**
-   * Orphan recovery did not run for this sweep, so `factory:in-progress`
-   * claims were preserved rather than reconciled.
+   * Orphan recovery did not run for this sweep, so `garden:in-progress`
+   * (or legacy `factory:in-progress`) claims were preserved rather than
+   * reconciled.
    *
    * `dry-run` is expected and benign: a dry run never releases a claim, so it
    * deliberately skips building the safety context — which on a read-only

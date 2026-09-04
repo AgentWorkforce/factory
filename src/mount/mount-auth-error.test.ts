@@ -12,7 +12,7 @@ import {
 } from './mount-auth-error'
 
 /** The sentence that promises no agents will run. Only a refusal may say it. */
-const REFUSAL_PROMISE = 'Factory will not spawn agents against a read-denied mirror'
+const REFUSAL_PROMISE = 'Software Garden will not spawn agents against a read-denied mirror'
 
 async function withTempStateFile(
   lastError: unknown,
@@ -128,9 +128,9 @@ describe('mountAuthDegradedWarning', () => {
     expect(mountAuthDegradedWarning()).not.toContain(REFUSAL_PROMISE)
   })
 
-  it('says Factory is continuing, and is distinguishable from the refusal', () => {
+  it('says Software Garden is continuing, and is distinguishable from the refusal', () => {
     const warning = mountAuthDegradedWarning(details)
-    expect(warning).toContain('continuing')
+    expect(warning).toContain('Software Garden is continuing')
     expect(warning).not.toBe(mountAuthRemediation(details))
   })
 

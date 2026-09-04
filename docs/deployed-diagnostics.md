@@ -1,6 +1,6 @@
-# Diagnosing a deployed Factory
+# Diagnosing a deployed Software Garden instance
 
-> Issue: [#295](https://github.com/AgentWorkforce/factory/issues/295) · companion: AgentWorkforce/factory-cloud `fix/295-healthz-diagnostics` — a deployed Factory had no
+> Issue: [#295](https://github.com/AgentWorkforce/factory/issues/295) · companion: AgentWorkforce/factory-cloud `fix/295-healthz-diagnostics` — a deployed Software Garden had no
 > operator-reachable diagnostics. The field naming the 2026-08-19/20 outage existed the whole time
 > and was unreachable for ~10 hours.
 
@@ -32,7 +32,7 @@ cannot be reached.
 | route | why not |
 |---|---|
 | `factory status`, `factory loop-status` | inspect a **local** instance only |
-| `wrangler tail` | Worker scope — the Factory process runs in the Container and its stdout does not surface |
+| `wrangler tail` | Worker scope — the Software Garden process runs in the Container and its stdout does not surface |
 | `wrangler containers ssh` | WebSocket 400: the container is private-networked with no sshd |
 | `GET /evidence` | carries the answer, but is bearer-gated by a token minted per deploy and destroyed at the end of the run that created it |
 
@@ -260,7 +260,7 @@ return {
 so `/healthz` answers `{ ok, phase, factoryProcess, heartbeat: { …, health } }`. `factory diagnose`
 reads the block from `heartbeat.health`, and accepts a top-level `health` as well.
 
-Instances running a Factory older than this change publish no `health` block; `factory diagnose`
+Instances running a Software Garden build older than this change publish no `health` block; `factory diagnose`
 detects that and says so rather than reporting a false green.
 
 Two other shapes the command refuses to read as green:
@@ -268,7 +268,7 @@ Two other shapes the command refuses to read as green:
 - **Event-driven short-sleep mode.** With `FACTORY_EVENT_DRIVEN_SLEEP_ENABLED=1` the Worker answers
   `/healthz` itself and never probes the container, deliberately — anonymous polling must not be a
   second wake path. That response (`phase: "worker-ready"`, `container: "not-probed"`) is Worker
-  liveness and carries no Factory health, so `factory diagnose` reports *cannot tell* and points at
+  liveness and carries no Software Garden health, so `factory diagnose` reports *cannot tell* and points at
   `/evidence`, which does reach the container.
 - **A container serving a heartbeat its daemon stopped updating.** The block's own `stale`/`ageMs`
   are not measurements of a read — they are constants of the write: `ageMs` is always `0` and

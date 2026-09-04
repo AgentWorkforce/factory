@@ -1,4 +1,5 @@
 import { linearByIdPath, linearByUuidPath, linearCommentPath, linearIssuePath } from '../constants/linear'
+import { GARDEN_AUTOMATION_LABEL, GARDEN_E2E_TITLE_PREFIX } from '../constants/lifecycle-labels'
 import type { MountClient } from '../ports'
 import type { Logger } from '../ports/system'
 import { assertInFactoryScope, isInFactoryScope } from '../safety/factory-scope'
@@ -55,16 +56,18 @@ const safetyFromConfig = (configOrStateIds?: LinearStateIds | MountLinearWriteba
         ? null
         : typeof safety.requireTitlePrefix === 'string' && safety.requireTitlePrefix
           ? safety.requireTitlePrefix
-          : '[factory-e2e]',
+          : GARDEN_E2E_TITLE_PREFIX,
       requireLabel: typeof safety.requireLabel === 'string'
         ? safety.requireLabel
-        : 'factory',
+        : GARDEN_AUTOMATION_LABEL,
       requireTeamKey: typeof safety.requireTeamKey === 'string' && safety.requireTeamKey
         ? safety.requireTeamKey
         : 'AR',
     }
   }
-  return { requireTitlePrefix: '[factory-e2e]', requireLabel: 'factory', requireTeamKey: 'AR' }
+  // Mirrors the post-rename config defaults; isInFactoryScope accepts the
+  // legacy `[factory-e2e]` title prefix and `factory` label as aliases.
+  return { requireTitlePrefix: GARDEN_E2E_TITLE_PREFIX, requireLabel: GARDEN_AUTOMATION_LABEL, requireTeamKey: 'AR' }
 }
 
 const payloadInFactoryScope = (
@@ -84,7 +87,7 @@ const readIssuePayloadForGuard = async (
   // The primary <key>__<uuid>.json may be a change-event STUB (no title/labels/
   // team — the sparse-sync case); fall back to the canonical by-id/by-uuid
   // records so the factory-scope guard sees the real fields and doesn't refuse a
-  // legitimately-[factory] issue.
+  // legitimately-prefixed mirror issue.
   const candidates = [
     issuePath(issue),
     ...(issue.key ? [linearByIdPath(issue.key)] : []),

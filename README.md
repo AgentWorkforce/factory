@@ -1,8 +1,8 @@
-# Agent Workforce Factory
+# Agent Workforce Software Garden
 
 **Turn issues into reviewed pull requests, automatically.**
 
-Point the factory at your ticketing system (Linear, GitHub, Shortcut, Asana etc) and it does the loop a human
+Point Software Garden at your ticketing system (Linear, GitHub, Shortcut, Asana etc) and it does the loop a human
 otherwise babysits: it discovers the issues that are ready, decides how to tackle
 each one, spawns coding agents to implement and review the change, opens a PR,
 drives it through a merge gate, and closes the issue — all inside a safety scope
@@ -13,7 +13,7 @@ you define, so it only ever acts on work you've explicitly opted in.
 - **Clear the small-but-real backlog.** The well-scoped fixes and chores that pile
   up get done without a person shepherding each one.
 - **It only touches what you allow.** A safety gate (title prefix + team) means
-  the factory dispatches *exactly* the issues you mark for it and ignores
+  the garden dispatches *exactly* the issues you mark for it and ignores
   everything else — opt-in by construction.
 - **Real PRs, not blind merges.** Every change goes through an implement → review
   → merge-gate flow and lands as a normal PR. It defaults to *never* auto-merging
@@ -42,7 +42,7 @@ are pulled but never dispatched.
 npm install @agent-relay/factory
 ```
 
-The factory talks to a relay broker through the **`agent-relay`** sidecar; install
+Software Garden talks to a relay broker through the **`agent-relay`** sidecar; install
 and sign in to that separately (it's a peer of this package). Once installed, the
 CLI is available as `factory`:
 
@@ -55,7 +55,7 @@ From a source checkout instead of an npm install, run
 
 ## Quick start
 
-From the repository checkout you want Factory to work in, the quickest setup is:
+From the repository checkout you want Software Garden to work in, the quickest setup is:
 
 ```bash
 factory init
@@ -68,15 +68,15 @@ something is missing, it explains what to do and writes no partial config. Use
 `factory init owner/repo` when the checkout has no GitHub `origin`, or add
 `--workspace <id>` to choose a workspace explicitly.
 
-After init, add the `factory` label to an open issue and run a dry run below.
+After init, add the `garden` label to an open issue (the legacy `factory` label also works during the rename transition) and run a dry run below.
 
 1. **Connect GitHub to your relay workspace** with push access for the target
-   repositories. Factory uses that workspace connection to publish branches and
+   repositories. Software Garden uses that workspace connection to publish branches and
    open pull requests by default. A local `gh` installation and `gh auth login`
    are required when `github.identity` is `"user"`, or when the default
    `"auto"` mode uses the compatibility GitHub issue lifecycle path. Exact
    `"app"` mode needs no local GitHub credential. If a required
-   connection is missing, an interactive Factory command offers to open the
+   connection is missing, an interactive Software Garden command offers to open the
    Relayfile connection flow and waits for it to finish. Linear-backed operations
    require both Linear and GitHub; GitHub-native operations require GitHub.
 
@@ -99,13 +99,17 @@ After init, add the `factory` label to an open issue and run a dry run below.
    somewhere to make changes.
 
    For a GitHub-only workspace, add `"issueSource": "github"` (or omit it and
-   Factory will select GitHub when Relayfile authoritatively reports that Linear
+   Software Garden will select GitHub when Relayfile authoritatively reports that Linear
    is not connected). Connection errors and connected-but-still-syncing states
    stop the command instead of silently selecting the wrong source. An open
    issue carrying the configured `safety.requireLabel`
-   label—`factory` by default—is then dispatched directly, with lifecycle
-   updates written back as GitHub comments and `factory:in-progress` /
-   `factory:human-review` labels. No Linear mirror is created.
+   label—`garden` by default—is then dispatched directly, with lifecycle
+   updates written back as GitHub comments and `garden:in-progress` /
+   `garden:human-review` labels (issues still carrying the legacy `factory`
+   label or `factory:in-progress` / `factory:human-review` labels from a
+   pre-rename install stay dispatchable during the transition; see
+   [Software Garden naming](#software-garden-naming-and-factory-compatibility)).
+   No Linear mirror is created.
 
 3. **Plan a cycle without touching anything** — `--dry-run` discovers and triages
    but writes nothing and spawns no agents:
@@ -136,22 +140,22 @@ After init, add the `factory` label to an open issue and run a dry run below.
 | `factory run-once` | One discover→triage→dispatch cycle, then exit. Honors `--dry-run`. |
 | `factory loop` | A bounded multi-iteration loop, then exit. |
 | `factory start --mode live` | Long-lived daemon — the production entrypoint. Runs until you stop it. |
-| `factory status` | Print current factory status as JSON, including held agents, lifecycle deadlines, and periodic readiness-reconcile health. |
+| `factory status` | Print current Software Garden status as JSON, including held agents, lifecycle deadlines, and periodic readiness-reconcile health. |
 | `factory triage <KEY\|path>` | Triage one issue and print the decision. |
 | `factory dispatch <KEY\|path>` | Triage + dispatch one issue. Honors `--dry-run`. |
-| `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Factory. |
+| `factory babysit <PR\|PR-URL>` | Spawn a one-shot babysitter for an existing open PR, even when it was not created by Software Garden. |
 | `factory diagnose --deployed <url>` | Ask a **deployed** instance why it is or is not dispatching. Reads the unauthenticated `/healthz` diagnostics block — readiness failure count, error class, in-flight sweep age — with no credential; `--token` (or `FACTORY_EVIDENCE_TOKEN`) also reads the gated `/evidence` message. Exits non-zero when the instance is not dispatching. See [deployed diagnostics](docs/deployed-diagnostics.md). |
 | `factory canary <KEY\|path>` | Assert a known "Ready for Agent" issue is dispatch-ready by the real dry-run triage path. Prints `{ok,issue,status,reason}`; exits non-zero (with the skip reason) if it isn't. |
-| `factory reap-orphans [--include-held]` | Report stale factory processes and held agents. By default held agents are visible but retained; `--include-held` releases held agents whose configured deadline has elapsed. Kubernetes cleanup is reported as not applicable when no environment provider is configured. |
+| `factory reap-orphans [--include-held]` | Report stale Software Garden processes and held agents. By default held agents are visible but retained; `--include-held` releases held agents whose configured deadline has elapsed. Kubernetes cleanup is reported as not applicable when no environment provider is configured. |
 | `factory featuremap check [--manifest <path>] [--base <ref>]` | Validate the repository feature/test manifest and optionally report advisory drift for unchanged entries whose locations changed. |
 | `factory intake notion <manifest>` | Normalize ready specs from a read-only Notion mount into GitHub lifecycle issues or exact-path fleet work. Honors `--dry-run`. |
 
 `factory status` includes `inFlightDispatches`, grouped by issue with agent
 names and the provider-claim state (`pending`, `verified`, or `degraded`). This
-view is read from Factory's local in-flight registry, so it remains available
+view is read from Software Garden's local in-flight registry, so it remains available
 when GitHub lifecycle writeback is the degraded subsystem.
 
-It also reports `fleetControlPlane`. Factory bounds its read-only roster probe,
+It also reports `fleetControlPlane`. Software Garden bounds its read-only roster probe,
 pauses a live dispatch immediately when that probe fails, and opens a circuit
 after repeated failures. While the circuit is open, new spawn and resume calls
 fail fast. After `fleetHealth.resetTimeoutMs`, one half-open roster probe may
@@ -172,11 +176,11 @@ circuit as an empty queue or successful no-work iteration.
 
 For production, set `fleetHealth.requireDedicatedBroker` to `true` and point
 `AGENT_RELAY_STATE_DIR` at a state directory that is distinct from the
-project's `.agentworkforce/relay`. Factory then refuses startup if it would
+project's `.agentworkforce/relay`. Software Garden then refuses startup if it would
 silently reuse the interactive project broker.
 
-Factory now defaults `batchSize` to `1`. Operators may explicitly raise it to
-at most `5` after isolating Factory workers from an interactive broker and
+Software Garden now defaults `batchSize` to `1`. Operators may explicitly raise it to
+at most `5` after isolating Software Garden workers from an interactive broker and
 measuring control-plane latency under the intended recipe mix.
 
 For a live daemon, `factory status` also includes `readinessReconcile`. Its
@@ -192,8 +196,8 @@ this record is published on the deployed instance's `/healthz` and is what
 `factory diagnose --deployed` reads — see
 [deployed diagnostics](docs/deployed-diagnostics.md).
 
-Dispatch lifecycle writes are claim-critical. Factory applies the
-`factory:in-progress` label/state before the dispatch comment, confirms the
+Dispatch lifecycle writes are claim-critical. Software Garden applies the
+`garden:in-progress` label/state before the dispatch comment, confirms the
 GitHub label by provider read-back, and retries either write three times. An
 exhausted write is logged at error level as dead-lettered, recorded as a
 degraded claim in the registry, and fails the dispatch instead of reporting a
@@ -213,7 +217,7 @@ GitHub write access. Maintenance commands such as `status`, `loop-status`,
 `kill-loop`, and `reap-orphans` do not preflight connections. `--dry-run`, the
 intrinsically read-only canary, and non-interactive invocations never open an
 OAuth flow; when a required integration is missing they exit with an actionable
-instruction to rerun the Factory command in an interactive terminal instead.
+instruction to rerun the Software Garden command in an interactive terminal instead.
 
 (There are a few more operational commands — `loop-status`, `kill-loop`,
 `reap-orphans`, `close-probe` — for running the daemon in production.)
@@ -221,7 +225,7 @@ instruction to rerun the Factory command in an interactive terminal instead.
 ### Mounted Notion specs
 
 Notion is an intake source, not a lifecycle issue source or writeback surface.
-Factory reads a Relayfile-mounted page, binds it to a stable
+Software Garden reads a Relayfile-mounted page, binds it to a stable
 `notion:<page-id>` identity and digest, then either creates a labeled GitHub
 issue for a repository target or dispatches an exact-path workspace task
 through the fleet. The config field `issueSource` continues to select the
@@ -229,7 +233,7 @@ discovery and lifecycle-writeback adapter (`linear` or `github`); Notion intake
 normalizes into that lifecycle instead of becoming a third adapter.
 
 The absence of Notion writeback is deliberate. Relayfile supplies the mounted
-page as a read-only execution contract, and Factory has no guarded Notion
+page as a read-only execution contract, and Software Garden has no guarded Notion
 property/comment writeback adapter or operator-defined lifecycle mapping.
 Repository targets reconcile accepted, dispatched, PR, blocked, and completed
 state on their generated GitHub issue. Native Notion lifecycle reconciliation
@@ -251,7 +255,7 @@ The full private execution contract starts here.
 Supported destinations are `Repos: owner/name, ...` and
 `Project-Paths: /absolute/path, ...`; `Node:` can pin exact-path work to a fleet
 node. `Recipe:` is `single`, `workflow`, or `team`. For a public repository the
-header must also contain a reviewed `Public-Summary:`. Factory never copies the
+header must also contain a reviewed `Public-Summary:`. Software Garden never copies the
 mounted body into a public issue.
 
 The intake manifest identifies pages and the local mount root. Headerless legacy
@@ -259,12 +263,13 @@ pages can be admitted only with a bootstrap entry containing the exact
 `authorizedPageId`, destination, safe summary, and operator reason. That escape
 hatch is deliberately page-specific; there is no title or content heuristic.
 
-Factory can generate that manifest directly from the **Factory Tasks** Notion
-data source. The generator uses `NOTION_API_KEY` for read-only data-source and
+Software Garden can generate that manifest directly from the **Factory Tasks** Notion
+data source (the data source keeps its original name for compatibility with
+existing workspaces). The generator uses `NOTION_API_KEY` for read-only data-source and
 page-markdown requests, selects only rows whose `Status` is `Ready for Agent`,
 and never updates a row or its status. `Labels` and `Route` values are combined
 for repository issue labels. A repository row can supply a separately reviewed
-`Public Summary`; Factory uses that text for a public lifecycle issue and never
+`Public Summary`; Software Garden uses that text for a public lifecycle issue and never
 copies the private page body. The output order is stable by page ID, so the same
 database state produces the same manifest on every run.
 
@@ -299,14 +304,14 @@ of `Repo` and `Project Path`, or Notion returns a truncated page body.
 
 `mountRoot` and `statePath` resolve relative to the manifest file. `statePath`
 is a local receipt cache, not the dispatch authority: before creating an issue
-or spawning an agent, Factory creates one immutable, digest-bound claim in the
+or spawning an agent, Software Garden creates one immutable, digest-bound claim in the
 active Agent Relay workspace. Workspace-global claim-channel uniqueness stops
 two machines with independent caches from dispatching the same source key. A
 failed or ambiguous claim write blocks dispatch. All non-dry-run Notion intake
 therefore requires a resolvable active Agent Relay workspace key.
 
 `workerMountRoot` is the repo-relative read-only mount workers receive. With the recommended
-`relay-channel` transport, Factory base64-chunks the digest-bound mounted bytes
+`relay-channel` transport, Software Garden base64-chunks the digest-bound mounted bytes
 into a workspace-private Agent Relay channel. A worker on any fleet machine can
 reconstruct the exact file at `workerMountRoot`, set it to mode `0444`, and
 apply the source SHA-256 gate without exposing the page in a public issue.
@@ -335,9 +340,11 @@ factory intake notion ./ops/notion-intake.json --dry-run
 factory intake notion ./ops/notion-intake.json --backend relay
 ```
 
-Repository targets require the `factory-ready` and matching
-`agent:<recipe>` labels to already exist. Factory automatically prefixes their
-issue titles with `[factory]` so the hosted brain's independent safety gate can
+Repository targets require the `garden-ready` and matching
+`agent:<recipe>` labels to already exist (a repository that already provisioned
+the legacy `factory-ready` label keeps working during the transition).
+Software Garden automatically prefixes their
+issue titles with `[garden]` so the hosted brain's independent safety gate can
 accept them. Re-running reconciles the workspace-global claim with the GitHub
 source marker or the running exact-path agent; the local digest-bound receipt is
 only a cache. A changed mounted spec blocks instead of silently mutating
@@ -357,7 +364,7 @@ verification tier, and locations are unchanged. The reviewer must re-confirm
 that metadata; the advisory does not itself fail the command because a covered
 file can change without changing the feature contract.
 
-Factory's agent-facing runbook is `.claude/skills/verify-features.md`. It tells
+Software Garden's agent-facing runbook is `.claude/skills/verify-features.md`. It tells
 an agent how to resolve a manifest category to its named end-to-end procedure,
 run the applicable tier with safe fixtures and cleanup, assert provider/fleet
 state, and report unexercised live tiers explicitly. The deterministic full gate
@@ -365,7 +372,7 @@ is `npm run build && npm run featuremap:check && npm test && npm run verify:e2e`
 `workflows/verify-features.ts` adds opt-in provider, fleet, and cloud checks.
 
 The checked-in `factory-feature-guardian` proactive persona mirrors Relay's
-guardian operating model. Hourly, it reads the catalog from a scoped Factory
+guardian operating model. Hourly, it reads the catalog from a scoped Software Garden
 repository mount, selects one unchecked feature from exact revisioned cycle
 state, posts an idempotent Slack question, requires a provider timestamp, and
 only then checkpoints progress. Manifest/state/delivery ambiguity fails closed
@@ -381,14 +388,14 @@ Agent Workforce cloud-persona path.
 
 ### Cloud progress and trace correlation
 
-Authenticated Cloud progress reporting is enabled by default. Factory persists
+Authenticated Cloud progress reporting is enabled by default. Software Garden persists
 its bounded lifecycle events to a local outbox before delivery; set
 `reporting.enabled` to `false` only when the Cloud dashboard is intentionally
 not part of the deployment.
 
 Every run-scoped event carries the same deterministic, W3C-valid `traceId`,
 derived from the durable opaque run ID. This is a correlation identifier only:
-Factory does **not** currently create or export OpenTelemetry spans, and it does
+Software Garden does **not** currently create or export OpenTelemetry spans, and it does
 not invent span IDs. No task text, prompt, message, path, command, source code,
 or exception stack is used to derive the identifier or admitted by the event
 contract.
@@ -396,7 +403,7 @@ contract.
 The exporter follow-up should add optional OpenTelemetry SDK initialization,
 short spans around dispatch, spawn, writeback, publish, and release operations,
 and W3C context propagation across Cloud requests and remote fleet delivery.
-Persist or rehydrate the run context so replacement Factory processes keep the
+Persist or rehydrate the run context so replacement Software Garden processes keep the
 same trace; do not hold a single span open for the lifetime of a long-running
 run. Export with a batch processor through the standard OTLP environment
 contract (`OTEL_EXPORTER_OTLP_ENDPOINT`, signal-specific overrides, and headers)
@@ -417,7 +424,7 @@ continues on the relay broker and reports completion or access blockers there.
 ### Routed-PR discovery (activation disabled)
 
 This release adds the declarative configuration and read-only discovery surface
-for widening babysitter intake beyond Factory-created PRs. To configure that
+for widening babysitter intake beyond Software Garden-created PRs. To configure that
 discovery surface, set:
 
 ```json
@@ -425,7 +432,7 @@ discovery surface, set:
   "babysitter": {
     "enabled": true,
     "mode": "routed-open-prs",
-    "excludeLabels": ["factory:skip-babysitter"],
+    "excludeLabels": ["garden:skip-babysitter"],
     "excludePullRequests": [],
     "notifyHumans": false
   }
@@ -462,25 +469,25 @@ template.
 ### Slack questions
 
 Set `slack.channel` to the Slack channel name, channel ID, or mounted channel
-directory. For example, `factory`, `C1234567890`, and
-`C1234567890__factory` are all accepted when the channel is present under the
+directory. For example, `garden`, `C1234567890`, and
+`C1234567890__garden` are all accepted when the channel is present under the
 relayfile Slack mount.
 
 ## Tell it what to work on
 
-How an issue enters the factory depends on `issueSource`:
+How an issue enters the garden depends on `issueSource`:
 
 | Source | What you do | Result |
 |---|---|---|
-| **Linear** (`issueSource: "linear"`) | Title it `[factory] <task>`, set the configured team + a repo label, move it to **Ready for Agent** | dispatched directly from Linear |
-| **GitHub native** (`issueSource: "github"`) | Add the configured readiness label (`factory` by default) and a repo route label | dispatched directly from GitHub; lifecycle comments and labels stay on the GitHub issue |
-| **GitHub mirror** (`issueSource: "linear"`) | Add the **`factory`** label to the GitHub issue | mirrored into a `[factory]` Linear issue, then dispatched through the Linear flow |
+| **Linear** (`issueSource: "linear"`) | Title it `[garden] <task>`, set the configured team + a repo label, move it to **Ready for Agent** | dispatched directly from Linear |
+| **GitHub native** (`issueSource: "github"`) | Add the configured readiness label (`garden` by default) and a repo route label | dispatched directly from GitHub; lifecycle comments and labels stay on the GitHub issue |
+| **GitHub mirror** (`issueSource: "linear"`) | Add the **`garden`** label to the GitHub issue | mirrored into a `[garden]` Linear issue, then dispatched through the Linear flow |
 
 The **safety gate** keeps both flows opt-in. Linear dispatch uses the configured
 title prefix and team; GitHub-native dispatch uses `safety.requireLabel` and an
 open issue. Set `safety.requireTitlePrefix` to `null` to disable the title path
 explicitly when a deployment uses its required label as the only issue opt-in;
-omitting the key retains the `[factory-e2e]` default, and an empty string is
+omitting the key retains the `[garden-e2e]` default, and an empty string is
 rejected. Everything else is ignored. Loosen these checks deliberately —
 they're the main guardrail.
 
@@ -491,15 +498,73 @@ description:
 Blocked by: #123, owner/other-repo#456
 ```
 
-A bare number refers to the issue's routed repository. Factory parks the issue
+A bare number refers to the issue's routed repository. Software Garden parks the issue
 and posts a comment naming every open blocker; capacity queuing remains a
 separate hold reason. Closed issues and merged pull requests satisfy blockers,
 and the next discovery cycle promotes newly unblocked work. Dependency cycles
 fail closed and are reported instead of waiting indefinitely. Other prose and
 `Related:` lines are not interpreted as dependencies.
 
-> Tip: `[factory-e2e]` is reserved for the factory's own self-test soak (its PRs
-> auto-close). For real work you want to keep, use the `[factory]` prefix.
+> Tip: `[garden-e2e]` is reserved for the garden's own self-test soak (its PRs
+> auto-close). For real work you want to keep, use the `[garden]` prefix.
+
+## Software Garden naming and Factory compatibility
+
+The product was renamed from **Factory** to **Software Garden**. The canonical
+names for user-facing concepts are now:
+
+| Concept | Canonical name | Legacy name (still accepted on read) |
+|---|---|---|
+| Generic automation label (`safety.requireLabel` default) | `garden` | `factory` |
+| Notion intake readiness label | `garden-ready` | `factory-ready` |
+| GitHub/Linear lifecycle "working" label | `garden:in-progress` | `factory:in-progress` |
+| GitHub/Linear lifecycle "awaiting review" label | `garden:human-review` | `factory:human-review` |
+| Generic title prefix | `[garden]` | `[factory]` |
+| Self-test soak title prefix (`safety.requireTitlePrefix` default) | `[garden-e2e]` | `[factory-e2e]` |
+| Babysitter opt-out label | `garden:skip-babysitter` | `factory:skip-babysitter` |
+
+**Compatibility during the transition.** New writes and documented defaults use
+the garden names only. Read and discovery paths accept the legacy factory
+spellings as aliases, so:
+
+- Existing configs that explicitly set `safety.requireLabel`/`requireTitlePrefix`
+  to a legacy value keep working unchanged, and also accept the garden alias.
+- In-flight GitHub issues carrying `factory`, `factory-ready`,
+  `factory:in-progress`, or `factory:human-review` remain discoverable and
+  recoverable (orphan reconciliation, resume, and completion all read either
+  spelling). The first lifecycle writeback after the upgrade replaces the
+  legacy label on that issue with its canonical garden name.
+- Notion intake keeps publishing into a repository that provisioned
+  `factory-ready` (the legacy label is used until `garden-ready` is created).
+- Issues and probe PRs titled with `[factory]`/`[factory-e2e]` keep matching;
+  new mirrors and soak PRs are titled with the garden prefixes.
+- Durable human-input comments posted under the legacy
+  `### Factory human input request` heading remain parseable; new requests use
+  `### Software Garden human input request`.
+
+**Intentionally retained Factory identifiers** (renaming these would be a
+breaking API or storage migration, so they keep their existing names):
+
+- The npm package `@agent-relay/factory` and the published `factory` CLI binary
+  (all `factory <command>` invocations).
+- `FACTORY_*` environment variables (`FACTORY_EVIDENCE_TOKEN`,
+  `FACTORY_LOG_LEVEL`, `FACTORY_NODE_CONFIG`, `FACTORY_AGENT_EXIT_TIMEOUT_MS`,
+  `FACTORY_CANARY_SLACK_WEBHOOK`, …).
+- Config and state file names: `factory.config.json`, `factory.node.json`,
+  `.factory/` state paths, and the loop registry/heartbeat paths.
+- Implementation branch prefix `factory/<issue>-…` on published PR heads.
+- Notion intake persisted identities: `factory-notion-claim-<sha256>` claim
+  channels, `factory-notion-*` contract channel/idempotency names, and the
+  `<!-- factory-source:… -->` / `<!-- factory-notion-contract:… -->` issue-body
+  markers used to reconcile already-dispatched work.
+- Dispatch agent identity stamps (`factory:dispatch:v1:…`) and the
+  `@factory` relay addressing used by in-flight agents.
+- The **Factory Tasks** Notion data source (a user-workspace database that keeps
+  its existing name; override with `--data-source`).
+- Kubernetes managed-by labels (`app.kubernetes.io/managed-by: factory`) and
+  the `factory-guardrail-workload` service account on in-flight environments.
+- GitHub repository coordinates such as `AgentWorkforce/factory`, telemetry
+  event keys, and internal log component tags (`[factory] …`).
 
 ## Run it as a fleet node
 
@@ -511,7 +576,7 @@ checkouts it owns. Bringing a worker machine online is two steps:
 # once per machine: redeem an enrollment token for durable node credentials
 agent-relay cloud enroll --token ocl_node_enr_…
 
-# each boot: start the node with the factory definition
+# each boot: start the node with the Software Garden node definition
 agent-relay node up --config agent-relay.ts
 ```
 
@@ -531,7 +596,7 @@ repo-scoped spawns to it. Spawns for unadvertised paths are refused on the node.
 
 The default `@agent-relay/factory/node` export is a generic worker-machine
 definition; it does not host a persona and therefore does not publish an agent
-card. An application that intentionally couples a persona to a Factory node
+card. An application that intentionally couples a persona to a Software Garden node
 uses the exported `createFactoryNodeDefinition({ persona })` and
 `startFactoryNode({ cardPublisher })` runtime. `startFactoryNode` owns the
 online-registration edge and publishes the canonical card there; cloud personas
@@ -540,7 +605,7 @@ Workforce cloud-persona deployment path described above.
 
 ### Tailnet live previews
 
-Factory can attach an issue-lifetime [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
+Software Garden can attach an issue-lifetime [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
 route to a repository's local development port. Configure the same service on
 the control plane and execution node (a combined local config needs it only
 once):
@@ -561,18 +626,18 @@ once):
 }
 ```
 
-The node then advertises `preview:tailscale-serve`; Factory places the preview
+The node then advertises `preview:tailscale-serve`; Software Garden places the preview
 first and pins the issue's agents to that node. The URL is included in agent
-tasks, the Slack dispatch root, and the pull-request description. Factory uses
+tasks, the Slack dispatch root, and the pull-request description. Software Garden uses
 Serve—not Funnel—so the URL remains inside the configured tailnet and normal
-tailnet grants/ACLs apply. Factory checks the live Serve status and refuses to
+tailnet grants/ACLs apply. Software Garden checks the live Serve status and refuses to
 surface a route marked as Funnel.
 
-`port` is the preferred node-local app port. Factory reserves the first free
+`port` is the preferred node-local app port. Software Garden reserves the first free
 port in `port..port + portSpan - 1` (the span defaults to 100), places that
 allocated port in every agent task, and reserves a separate HTTPS port from
-`preview.httpsPortRange`. Keep that HTTPS range dedicated to Factory previews.
-Preview provisioning happens immediately after Factory creates the isolated
+`preview.httpsPortRange`. Keep that HTTPS range dedicated to Software Garden previews.
+Preview provisioning happens immediately after Software Garden creates the isolated
 issue worktree, before an agent has had a chance to install ignored dependencies
 such as `node_modules`. `startCommand` must therefore include any bounded,
 non-interactive bootstrap the fresh checkout needs, followed by a foreground
@@ -583,10 +648,10 @@ port to respond, and verifies on Linux or macOS that the listener belongs to the
 supervised process tree before returning the URL. It persists an exact process
 identity so the command survives agent handoffs and can be safely recovered or
 stopped. The command must not daemonize or bind a different port. Active sweeps
-repeat listener ownership verification and disable the exact Factory route if
+repeat listener ownership verification and disable the exact Software Garden route if
 the port is taken over by an unrelated process.
 For safety, preview commands receive only `PORT` plus basic shell, locale, home,
-and temporary-directory variables; they do not inherit arbitrary Factory,
+and temporary-directory variables; they do not inherit arbitrary Software Garden,
 Relay, or provider credentials from the node process. Load intentional
 application settings through a checkout-local environment mechanism. Do not put
 secrets directly in `startCommand`, because lifecycle recovery persists the
@@ -597,7 +662,7 @@ commands have been removed at Human Review or Done. If the source-state
 writeback wins a crash race, startup recovery observes that terminal source
 state and finishes preview teardown before terminalizing the durable lifecycle.
 A startup and periodic sweep reaps only orphaned resources in the current
-Factory workspace whose persisted route and process identities still match.
+Software Garden workspace whose persisted route and process identities still match.
 See the [provider evaluation](planning/preview-provider-evaluation.md)
 for the decision and lifecycle contract.
 
@@ -612,7 +677,7 @@ configuration. Override its dedicated ports with
 
 ### Dispatching to nodes (`--backend relay`)
 
-With `--backend relay`, the factory orchestrator dispatches work through the
+With `--backend relay`, the Software Garden orchestrator dispatches work through the
 hosted engine instead of a local broker: placement picks a live node with the
 required capability (a named `node` target passes through), the node runs the
 agent in its mapped checkout, and the orchestrator detects exits by reconciling
@@ -628,8 +693,8 @@ process on the same control-plane host can take over after a crash. Execution
 nodes never need access to that state file, and remote PIDs are never signalled
 as local processes.
 
-The supported topology for the **CLI control plane** is one Factory host per
-workspace, with any number of relay execution nodes. Multiple Factory processes
+The supported topology for the **CLI control plane** is one Software Garden host per
+workspace, with any number of relay execution nodes. Multiple Software Garden processes
 that open the same state file do not mutate it concurrently: `FileStateStore`
 holds a cross-process filesystem lock around the complete read/modify/write,
 so a second process waits, reloads after it acquires the lock, and then publishes
@@ -677,7 +742,7 @@ await factory.runOnce() // invoke from cron/alarm and safe webhook wakeups
 The optional `reporter` implements the canonical `FactoryEventReporter`.
 Hosted runs persist a deterministic run ID per workspace and issue, then emit
 lifecycle events only after the corresponding fenced state write. Worker hosts
-that only need the Factory-owned wire schema, event creator, and reporter types
+that only need the lifecycle-owned wire schema, event creator, and reporter types
 should import `@agent-relay/factory/telemetry`; unlike the broader
 `@agent-relay/factory/observability` surface, it does not export the
 filesystem-backed outbox or instance identity helpers.
@@ -693,14 +758,14 @@ Tokens involved — set only the first one on the orchestrator host:
 
 | Token | Prefix | Who holds it |
 |---|---|---|
-| Workspace key | `rk_live_` | the orchestrator (`RELAY_WORKSPACE_KEY`); used to mint the factory's own agent identity on first use |
+| Workspace key | `rk_live_` | the orchestrator (`RELAY_WORKSPACE_KEY`); used to mint the garden's own agent identity on first use |
 | Agent token | `at_live_` | optional `RELAY_AGENT_TOKEN` to pin the orchestrator's agent identity; spawned agents get their own automatically |
 | Node token | `nt_live_` | each worker node, minted by `cloud enroll` |
 | Observer token | `ot_live_` | read-only dashboards/streams only — never dispatch |
 
 ## Configuration
 
-Factory resolves exactly one contract: the path passed via `--config`, or
+Software Garden resolves exactly one contract: the path passed via `--config`, or
 `./factory.config.json` in the command's current working directory when the
 flag is omitted. It does not search target repositories, walk to a clone root,
 or merge multiple configs; a config in another repository is inert unless it
@@ -716,7 +781,7 @@ Every successfully placed agent team has a wall-clock release backstop. Configur
 the window with `dispatch.agentHoldTimeoutMs`; it defaults to four hours. The
 clock starts at the first successful agent placement, not while a dispatch waits
 for capacity or while a released team waits for human clarification. If the issue
-has not reached its configured `terminalState` before the deadline, Factory
+has not reached its configured `terminalState` before the deadline, Software Garden
 releases the team with reason `held-past-deadline` and records the lifecycle as
 abandoned so a restart cannot respawn it:
 
@@ -730,7 +795,7 @@ abandoned so a restart cannot respawn it:
 
 ### Recover names created before dispatch identity proofs
 
-Factory stamps every dispatched agent with a stable broker identity derived from
+Software Garden stamps every dispatched agent with a stable broker identity derived from
 the provider-native issue identity and role. For example, the reviewer for
 `AgentWorkforce/factory#244` uses
 `factory:dispatch:v1:github:agentworkforce/factory#244:reviewer`. A retry of that
@@ -757,7 +822,7 @@ RELAY_AGENT_IDENTITY_KEY='factory:dispatch:v1:github:agentworkforce/factory#244:
 Use the matching role suffix (`implementer`, `reviewer`, or `babysitter`) for
 each sibling. Recovery refuses a live record, a record that already has an
 identity stamp, or a concurrent competing claim; it does not weaken ordinary
-collision checks. Once stamped, the next Factory retry presents the same proof
+collision checks. Once stamped, the next Software Garden retry presents the same proof
 and reclaims normally.
 
 The full schema — every field and default — is validated by Zod at load time, so
@@ -766,7 +831,7 @@ an invalid config fails fast with a field-level error. See
 and [`test/fixtures/factory.config.json`](test/fixtures/factory.config.json) for a
 worked example (including offline fixture mode).
 
-Factory GitHub write attribution is controlled explicitly with `github.identity`:
+Software Garden GitHub write attribution is controlled explicitly with `github.identity`:
 
 ```jsonc
 {
@@ -778,9 +843,9 @@ Factory GitHub write attribution is controlled explicitly with `github.identity`
 
 - `"app"` publishes pull requests and performs GitHub issue lifecycle writes
   through the connected workspace GitHub App. Status transitions provision the
-  target Factory label, add only that label, and remove only the prior Factory
-  label, so labels applied by people are never replaced from a stale mount
-  projection. If any required write capability is unavailable, Factory fails
+  target `garden:*` lifecycle label, add only that label, and remove only the prior
+  lifecycle label (in either its `garden` or legacy `factory` spelling), so labels applied by people are never replaced from a stale mount
+  projection. If any required write capability is unavailable, Software Garden fails
   loudly and never falls back to a personal account.
 - `"user"` publishes pull requests and performs issue lifecycle writes with the
   account authenticated by the local `gh` CLI, even when the app path is
@@ -798,7 +863,7 @@ call sites keep their conservative fallback behavior.
 
 #### Writes that still shell out to `gh`
 
-Two Factory GitHub mutations are not represented on the connected App surface
+Two Software Garden GitHub mutations are not represented on the connected App surface
 and therefore cannot be performed as the app today. Under `"app"` they refuse
 rather than writing as the operator, so an explicit app identity never produces
 a human-attributed write:
@@ -811,10 +876,10 @@ a human-attributed write:
 
 The merge refusal names `"user"` or `"auto"` as its local-user recovery path.
 The built-in Notion publisher is stricter: its local-host opt-in is exact
-`github.identity: "user"`, because the production Factory container contains
+`github.identity: "user"`, because the production Software Garden container contains
 no `gh` binary and the App surface has no issue-create or source-marker query.
 
-Notion intake is a separate surface from the Factory lifecycle writeback and
+Notion intake is a separate surface from the lifecycle writeback and
 still requires local `gh` authentication when enabled. Its CLI entry point
 resolves `github.identity` from the selected contract — including a split
 `workspaceConfig`/`nodeConfig` contract, where the node half wins. Only exact
@@ -830,10 +895,10 @@ publishers do not use this adapter and remain available.
 The standalone babysitter reads complete PR metadata from the authenticated
 mounted projection and reports `source: 'mount'`; it does not fall back to
 local `gh`. Review replies and pushes on a babysat PR are performed by the
-dispatched agent under the agent's own credential, not by the Factory process.
+dispatched agent under the agent's own credential, not by the Software Garden process.
 
-Authenticated Factory progress reporting is enabled by default for real CLI
-sessions. Factory sends privacy-bounded lifecycle events, worker ownership,
+Authenticated Software Garden progress reporting is enabled by default for real CLI
+sessions. Software Garden sends privacy-bounded lifecycle events, worker ownership,
 heartbeats, and sanitized failure categories to the active Cloud workspace; it
 never sends task text, prompts, agent output, source code, local paths, command
 lines, tokens, or raw stack traces. Delivery uses a private disk outbox and does
@@ -858,9 +923,9 @@ For a local, single-repository run, the checkout mapping can be omitted:
 }
 ```
 
-Run Factory from that repository (or one of its subdirectories). When exactly
+Run Software Garden from that repository (or one of its subdirectories). When exactly
 one `repos.names` entry is configured and no `cloneRoot` or `clonePaths` field is
-supplied, Factory resolves the checkout's git top-level and uses it only if a
+supplied, Software Garden resolves the checkout's git top-level and uses it only if a
 GitHub remote matches the resolved `org/name`. The inference is logged. Missing,
 unparseable, or mismatched remotes fail with a config-oriented error instead of
 silently dispatching in the wrong directory. Explicit local clone paths are also

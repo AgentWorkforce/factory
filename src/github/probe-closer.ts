@@ -1,8 +1,9 @@
 import { containsIssueKey } from '../issue-key-match'
 import type { GithubConnectionWrite, MountClient } from '../ports'
 import { wrappedPayload } from '../writeback/shared'
+import { GARDEN_E2E_TITLE_PREFIX, hasGardenTitlePrefix } from '../constants/lifecycle-labels'
 
-const FACTORY_E2E_MARKER = '[factory-e2e]'
+const FACTORY_E2E_MARKER = GARDEN_E2E_TITLE_PREFIX
 
 export interface CloseProbePrInput {
   repo: string
@@ -87,13 +88,15 @@ const assertClosableProbe = (live: Record<string, unknown>, input: CloseProbePrI
     throw new Error(`Refusing to close probe PR #${input.prNumber}: missing issue key ${input.expectedIssueKey}`)
   }
   if ((input.requireTitleMarker ?? true) && !hasFactoryE2eMarker(title)) {
-    throw new Error(`Refusing to close probe PR #${input.prNumber}: missing ${FACTORY_E2E_MARKER} probe marker`)
+    throw new Error(`Refusing to close probe PR #${input.prNumber}: missing ${FACTORY_E2E_MARKER} (or legacy [factory-e2e]) probe marker`)
   }
   return normalized
 }
 
+// Either spelling: in-flight soak PRs are titled with the legacy
+// `[factory-e2e]` marker and stay closable during the rename transition.
 const hasFactoryE2eMarker = (title: string): boolean =>
-  title === FACTORY_E2E_MARKER || title.startsWith(`${FACTORY_E2E_MARKER} `)
+  hasGardenTitlePrefix(title, FACTORY_E2E_MARKER)
 
 const normalizeState = (state?: string): string | undefined => state?.toUpperCase()
 

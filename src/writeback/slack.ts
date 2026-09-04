@@ -48,10 +48,10 @@ const assertSlackChannelAllowed = (
   const configured = slackChannelAliases(configuredChannel)
   const target = slackChannelAliases(targetChannel)
   if (configured.size === 0) {
-    throw new Error(`Refusing Slack writeback for ${context}: configured factory-e2e channel is required`)
+    throw new Error(`Refusing Slack writeback for ${context}: configured Slack channel is required`)
   }
   if (target.size === 0 || ![...target].some((alias) => configured.has(alias))) {
-    throw new Error(`Refusing Slack writeback for ${context}: target channel must match configured factory-e2e channel`)
+    throw new Error(`Refusing Slack writeback for ${context}: target channel must match the configured Slack channel`)
   }
 }
 

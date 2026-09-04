@@ -2,6 +2,7 @@ import type { FactoryConfig } from '../config/schema'
 import { resolveRoutedRepo } from '../config/schema'
 import type { MountClient } from '../ports'
 import { asRecord, stableHash, wrappedPayload } from '../writeback/shared'
+import { gardenLabelAliases } from '../constants/lifecycle-labels'
 
 /**
  * Routed-PR activation is deliberately held until the lifecycle design lands.
@@ -73,7 +74,12 @@ export async function discoverRoutedPullRequests(
     candidates: [],
   }
   const seen = new Set<string>()
-  const excludedLabels = new Set(config.babysitter.excludeLabels.map((label) => label.trim().toLowerCase()))
+  // Rename transition: a `garden:skip-babysitter` exclusion also matches the
+  // legacy `factory:skip-babysitter` spelling (and vice versa), so a PR a
+  // human opted out of before the rename stays excluded.
+  const excludedLabels = new Set(
+    config.babysitter.excludeLabels.flatMap((label) => gardenLabelAliases(label)),
+  )
   const excludedPrs = new Set(config.babysitter.excludePullRequests.map((identity) => identity.toLowerCase()))
 
   for (const repo of routedPrRepos(config)) {

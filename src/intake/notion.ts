@@ -8,6 +8,14 @@ import { z } from 'zod'
 
 import { dispatchNotionPageIdentity } from '../dispatch/work-unit-identity'
 import type { GithubWriteIdentity } from '../github/gh-identity'
+import {
+  GARDEN_E2E_TITLE_PREFIX,
+  GARDEN_READY_LABEL,
+  GARDEN_TITLE_PREFIX,
+  LEGACY_FACTORY_E2E_TITLE_PREFIX,
+  LEGACY_FACTORY_READY_LABEL,
+  LEGACY_FACTORY_TITLE_PREFIX,
+} from '../constants/lifecycle-labels'
 
 const INTAKE_LOCK_STALE_MS = 60_000
 
@@ -291,7 +299,7 @@ async function runNotionIntakeUnlocked(
   }
 }
 
-/** Read mounted page bodies and normalize strict headers or exact bootstrap mappings into Factory tasks. */
+/** Read mounted page bodies and normalize strict headers or exact bootstrap mappings into intake tasks. */
 export async function normalizeNotionManifest(manifest: NotionIntakeManifest): Promise<NormalizedNotionTask[]> {
   const normalized: NormalizedNotionTask[] = []
   const seen = new Set<string>()
@@ -396,7 +404,7 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
 
   /**
    * @param identity the GitHub write identity this publisher may use. Notion
-   *   intake is a separate surface from the Factory lifecycle writeback and
+   *   intake is a separate surface from the lifecycle writeback and
    *   still creates and edits issues through the local `gh` CLI, so its
    *   issues are authored by the operator. That is an explicit local-host
    *   mode, not a production fallback: the caller must select exact `user`.
@@ -465,7 +473,7 @@ export class GhCliIssuePublisher implements GithubIssuePublisher {
     if (this.#identity === 'user') return
     throw new Error(
       `GitHub identity "${this.#identity}" refuses Notion intake ${operation} through local gh. ` +
-      'This adapter is local-only and requires explicit github.identity "user"; the production Factory container does not contain gh, ' +
+      'This adapter is local-only and requires explicit github.identity "user"; the production Software Garden container does not contain gh, ' +
       'and the connected GitHub App surface does not expose issue creation or source-marker reconciliation.',
     )
   }
@@ -536,7 +544,7 @@ async function publishRepoTask(
       return { ...base, status: 'blocked', issue: existing, reason: 'public repository requires an explicit publicSummary; mounted content was not copied' }
     }
     const summary = visibility === 'public' ? target.publicSummary! : task.summary
-    const bodyWasEdited = existing.body !== renderIssueBody(task, summary, bodyDelivery)
+    const bodyWasEdited = !isGeneratedIssueBody(existing.body, task, summary, bodyDelivery)
     if (bodyWasEdited) {
       return {
         ...base,
@@ -586,7 +594,23 @@ async function publishRepoTask(
   if (visibility === 'public' && !target.publicSummary) {
     return { ...base, status: 'blocked', reason: 'public repository requires an explicit publicSummary; mounted content was not copied' }
   }
-  const labels = [...new Set(['factory-ready', `agent:${task.recipe}`, ...target.labels])]
+  // Readiness label: new issues carry the canonical `garden-ready` label.
+  // During the rename transition a repository that already provisioned the
+  // legacy `factory-ready` label keeps working — the legacy label is used
+  // when (and only when) the canonical one has not been created yet.
+  const readinessCandidates = [GARDEN_READY_LABEL, LEGACY_FACTORY_READY_LABEL]
+  const readinessMissing = await input.github.missingLabels(target.repo, readinessCandidates)
+  const readinessLabel = readinessMissing.includes(GARDEN_READY_LABEL)
+    ? (readinessMissing.includes(LEGACY_FACTORY_READY_LABEL) ? undefined : LEGACY_FACTORY_READY_LABEL)
+    : GARDEN_READY_LABEL
+  if (!readinessLabel) {
+    return {
+      ...base,
+      status: 'blocked',
+      reason: `missing required GitHub labels: ${GARDEN_READY_LABEL} (or legacy ${LEGACY_FACTORY_READY_LABEL})`,
+    }
+  }
+  const labels = [...new Set([readinessLabel, `agent:${task.recipe}`, ...target.labels])]
   const missing = await input.github.missingLabels(target.repo, labels)
   if (missing.length > 0) {
     return { ...base, status: 'blocked', reason: `missing required GitHub labels: ${missing.join(', ')}` }
@@ -629,7 +653,38 @@ async function publishRepoTask(
 }
 
 function factoryIssueTitle(title: string): string {
-  return title.toLowerCase().startsWith('[factory]') ? title : `[factory] ${title}`
+  // New issues carry a canonical marker. A title that already carries one --
+  // canonical or legacy, in any casing -- has that marker REPLACED by its
+  // canonical spelling rather than being passed through: a new write must not
+  // mint legacy naming, and a marker discovery cannot read is worse than no
+  // marker at all. No branch can double-prefix.
+  //
+  // The boundary test is the one `hasGardenTitlePrefix` uses, exactly: the
+  // marker alone, or the marker followed by a space. That agreement is the
+  // whole point. `[garden]Ship it` carries no marker by that rule, so it must
+  // GET one rather than be trusted to have one; `[GARDEN] Ship it` carries one
+  // in the wrong casing, so it is re-emitted canonically. Either title left
+  // untouched would create an issue the discovery that has to find it again
+  // cannot see, stranding the Notion intake behind an invisible issue.
+  //
+  // The e2e pair is checked FIRST. `[factory-e2e]` does not start with
+  // `[factory]` (the `]` differs), so the plain legacy branch would not have
+  // mangled it -- but it would have prepended a second `[garden] ` marker in
+  // front of a prefix that already scopes the issue.
+  const normalized = title.toLowerCase()
+  const carriesMarker = (marker: string): boolean => {
+    const lowered = marker.toLowerCase()
+    return normalized === lowered || normalized.startsWith(`${lowered} `)
+  }
+  for (const [canonical, legacy] of [
+    [GARDEN_E2E_TITLE_PREFIX, LEGACY_FACTORY_E2E_TITLE_PREFIX],
+    [GARDEN_TITLE_PREFIX, LEGACY_FACTORY_TITLE_PREFIX],
+  ] as const) {
+    for (const marker of [canonical, legacy]) {
+      if (carriesMarker(marker)) return `${canonical}${title.slice(marker.length)}`
+    }
+  }
+  return `${GARDEN_TITLE_PREFIX} ${title}`
 }
 
 async function dispatchWorkspaceTask(
@@ -877,13 +932,37 @@ function normalizedBootstrapSpec(bootstrap: z.infer<typeof bootstrapSchema>, pag
   return { ...bootstrap, authorizedPageId }
 }
 
+const GARDEN_INTAKE_HEADING = '## Software Garden intake'
+/** The heading this body carried before the Software Garden rename. */
+const LEGACY_FACTORY_INTAKE_HEADING = '## Factory intake'
+
+/**
+ * Whether `body` is still exactly one of the bodies this intake generates.
+ *
+ * An issue filed before the rename carries the legacy heading, so comparing it
+ * against the canonical render alone would read an untouched generated body as
+ * a manual edit and block the portable-mount migration it needs. Accept either
+ * heading here; the migration itself always writes the canonical one.
+ */
+function isGeneratedIssueBody(
+  body: string,
+  task: NormalizedNotionTask,
+  summary: string,
+  delivery?: NotionContractDelivery,
+): boolean {
+  return [GARDEN_INTAKE_HEADING, LEGACY_FACTORY_INTAKE_HEADING].some(
+    (heading) => body === renderIssueBody(task, summary, delivery, heading),
+  )
+}
+
 function renderIssueBody(
   task: NormalizedNotionTask,
   summary: string,
   delivery?: NotionContractDelivery,
+  heading: string = GARDEN_INTAKE_HEADING,
 ): string {
   return [
-    '## Factory intake',
+    heading,
     '',
     summary,
     '',
@@ -908,7 +987,7 @@ function renderWorkspaceTask(task: NormalizedNotionTask, delivery?: NotionContra
     ...renderWorkerMountInstructions(task, delivery),
     `Before executing, SHA-256 hash that file's UTF-8 bytes and refuse the task unless it matches ${task.contentDigest}.`,
     'Preserve every safety gate in that page. Do not write back to Notion.',
-    `Factory source: ${task.sourceKey}`,
+    `Software Garden source: ${task.sourceKey}`,
     `Source digest: ${task.digest}`,
   ].join('\n')
 }

@@ -2344,8 +2344,8 @@ describe('fleet CLI runtime', () => {
           const existing = this.files.get(githubPath)
           const content = existing?.content as ReturnType<typeof githubIssueFile>
           const labels = content.payload.labels
-            .filter((label) => label.name !== 'factory:in-progress')
-          labels.push({ name: 'factory:human-review' })
+            .filter((label) => label.name !== 'garden:in-progress')
+          labels.push({ name: 'garden:human-review' })
           this.files.set(githubPath, {
             ...existing,
             content: {
@@ -2393,7 +2393,7 @@ describe('fleet CLI runtime', () => {
       const githubWriteback = new GhCliGithubWriteback({
         runner: async (args) => {
           if (args[0] === 'label' && args[1] === 'create') {
-            terminalLabelProvisioned = args[2] === 'factory:human-review'
+            terminalLabelProvisioned = args[2] === 'garden:human-review'
             return { stdout: '' }
           }
           if (args[0] === 'issue' && args[1] === 'view') {
@@ -2403,8 +2403,8 @@ describe('fleet CLI runtime', () => {
                 // The third party wins before the adapter's first read. The
                 // target is present and the previous label absent, so the CLI
                 // must skip `gh issue edit` and report already-matched.
-                providerLabels.delete('factory:in-progress')
-                providerLabels.add('factory:human-review')
+                providerLabels.delete('garden:in-progress')
+                providerLabels.add('garden:human-review')
                 mount.parkAsThirdParty()
               } else if (terminalViews === 2 && !releaseConfirmation) {
                 await new Promise<void>((resolve) => {
@@ -2713,8 +2713,9 @@ describe('fleet CLI runtime', () => {
         const existing = mount.files.get(githubPath)
         const content = existing?.content as ReturnType<typeof githubIssueFile>
         const labels = content.payload.labels.filter((label) =>
+          label.name !== 'garden:in-progress' && label.name !== 'garden:human-review' &&
           label.name !== 'factory:in-progress' && label.name !== 'factory:human-review')
-        labels.push({ name: `factory:${status}` })
+        labels.push({ name: `garden:${status}` })
         mount.files.set(githubPath, {
           ...existing,
           content: { ...content, payload: { ...content.payload, labels } },
@@ -2789,7 +2790,7 @@ describe('fleet CLI runtime', () => {
       ])
       expect(code).toBe(0)
       expect((mount.files.get(githubPath)?.content as ReturnType<typeof githubIssueFile>).payload.labels)
-        .toContainEqual({ name: 'factory:human-review' })
+        .toContainEqual({ name: 'garden:human-review' })
       expect(fleet.releases.map((release) => release.reason)).toContain('issue-human-review')
     } finally {
       releaseClaim?.()
@@ -4812,13 +4813,13 @@ describe('fleet CLI runtime', () => {
       // rejects the shape the claim never reaches the provider.
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221.json',
-        { labels: ['factory', 'bug', 'factory:in-progress'] },
+        { labels: ['factory', 'bug', 'garden:in-progress'] },
         { guarded: true },
       )).resolves.toBe(true)
       // One write must not assert two contradictory Factory claims, in any casing.
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221.json',
-        { labels: ['factory', 'factory:in-progress', 'Factory:Human-Review'] },
+        { labels: ['factory', 'garden:in-progress', 'Factory:Human-Review'] },
         { guarded: true },
       )).resolves.toBe(false)
       await expect(predicate(
@@ -4828,7 +4829,7 @@ describe('fleet CLI runtime', () => {
       )).resolves.toBe(false)
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221.json',
-        { labels: 'factory:in-progress' },
+        { labels: 'garden:in-progress' },
         { guarded: true },
       )).resolves.toBe(false)
       await expect(predicate(
@@ -4846,7 +4847,7 @@ describe('fleet CLI runtime', () => {
       )).resolves.toBe(false)
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221.json',
-        { labels: ['bug', 'factory:in-progress'] },
+        { labels: ['bug', 'garden:in-progress'] },
         { guarded: true },
       )).resolves.toBe(false)
       // Casing is the provider's for labels Factory did not author.
@@ -4882,7 +4883,7 @@ describe('fleet CLI runtime', () => {
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/labels/factory-11111111-1111-4111-8111-111111111111.json',
         {
-          name: 'factory:in-progress',
+          name: 'garden:in-progress',
           color: '1d76db',
           description: 'Factory agents are working on this issue.',
         },
@@ -4890,7 +4891,7 @@ describe('fleet CLI runtime', () => {
       )).resolves.toBe(false)
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221/labels/factory-22222222-2222-4222-8222-222222222222.json',
-        { operation: 'add', labels: ['factory:in-progress'] },
+        { operation: 'add', labels: ['garden:in-progress'] },
         { guarded: true },
       )).resolves.toBe(false)
       // Still rejected, but for a sharper reason than before: the guard now
@@ -4900,7 +4901,7 @@ describe('fleet CLI runtime', () => {
       // label, so it never authors a set like this.
       await expect(predicate(
         '/github/repos/AgentWorkforce/pear/issues/221.json',
-        { labels: ['factory:in-progress'] },
+        { labels: ['garden:in-progress'] },
         { guarded: true },
       )).resolves.toBe(false)
       await expect(predicate(
@@ -6137,7 +6138,7 @@ describe('fleet CLI exit-code contract', () => {
       const stale = await runWithMirror('stale', new Date(Date.now() - 30 * 60 * 1000).toISOString())
       expect(stale.code).toBe(2)
       // Refused, said so, and kept the promise.
-      expect(stale.emitted).toContain('Factory will not spawn agents against a read-denied mirror')
+      expect(stale.emitted).toContain('Software Garden will not spawn agents against a read-denied mirror')
       expect(stale.spawns).toEqual([])
 
       const fresh = await runWithMirror('fresh', new Date().toISOString())
@@ -6146,7 +6147,7 @@ describe('fleet CLI exit-code contract', () => {
       expect(fresh.emitted).toContain('continuing')
       // The defect this splits: a branch that spawns must not print the
       // sentence promising it will not.
-      expect(fresh.emitted).not.toContain('Factory will not spawn agents against a read-denied mirror')
+      expect(fresh.emitted).not.toContain('Software Garden will not spawn agents against a read-denied mirror')
       expect(fresh.spawns).toHaveLength(1)
     } finally {
       // This file installs no global mock restoration, so an un-restored spy on

@@ -57,7 +57,7 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
       const branch = (await this.#git(worktree.worktreePath, ['symbolic-ref', '--short', 'HEAD'])).trim()
       if (branch !== worktree.branch) {
         throw new Error(
-          `Factory worktree branch mismatch for ${worktree.issueKey}: expected ${worktree.branch}, found ${branch}`,
+          `Software Garden worktree branch mismatch for ${worktree.issueKey}: expected ${worktree.branch}, found ${branch}`,
         )
       }
       return
@@ -76,7 +76,7 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
         const checkedOutAt = await this.#branchCheckoutPath(worktree.baseClonePath, worktree.branch)
         if (checkedOutAt) {
           throw new Error(
-            `Refusing to adopt existing PR branch ${worktree.branch}: it is already checked out at ${checkedOutAt}; Factory will not reuse or remove a checkout outside ${worktree.worktreePath}`,
+            `Refusing to adopt existing PR branch ${worktree.branch}: it is already checked out at ${checkedOutAt}; Software Garden will not reuse or remove a checkout outside ${worktree.worktreePath}`,
           )
         }
         const [localHead, remoteHead] = await Promise.all([
@@ -225,11 +225,11 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
     await assertNonSymlinkFactoryRoot(expectedRootPath)
     const expectedRoot = await realpath(expectedRootPath)
     if (wanted === expectedRoot || !wanted.startsWith(`${expectedRoot}/`)) {
-      throw new Error(`Refusing Factory worktree operation outside ${expectedRoot}: resolved target is ${wanted}`)
+      throw new Error(`Refusing Software Garden worktree operation outside ${expectedRoot}: resolved target is ${wanted}`)
     }
     const root = await realpath((await this.#git(worktree.worktreePath, ['rev-parse', '--show-toplevel'])).trim())
     if (root !== wanted) {
-      throw new Error(`Refusing Factory worktree operation outside ${wanted}: git root is ${root}`)
+      throw new Error(`Refusing Software Garden worktree operation outside ${wanted}: git root is ${root}`)
     }
     const registeredPaths = (await this.#git(worktree.baseClonePath, ['worktree', 'list', '--porcelain']))
       .split(/\r?\n/u)
@@ -239,7 +239,7 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
       registeredPaths.map(async (path) => await realpath(path)),
     )).flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
     if (!registered.includes(wanted)) {
-      throw new Error(`Refusing Factory worktree operation for unregistered checkout ${wanted}`)
+      throw new Error(`Refusing Software Garden worktree operation for unregistered checkout ${wanted}`)
     }
   }
 
@@ -318,15 +318,15 @@ const assertSafeWorktree = (worktree: AgentWorktree): void => {
   const target = resolve(worktree.worktreePath)
   const expectedRoot = factoryWorktreeRoot(base)
   if (target === base || !target.startsWith(`${expectedRoot}/`)) {
-    throw new Error(`Refusing unsafe Factory worktree path ${target}; expected a child of ${expectedRoot}`)
+    throw new Error(`Refusing unsafe Software Garden worktree path ${target}; expected a child of ${expectedRoot}`)
   }
   if (worktree.branch.startsWith('factory/') && !factoryBranchBelongsToIssue(worktree.branch, worktree.issueKey)) {
     throw new Error(
-      `Refusing Factory worktree branch ${worktree.branch}: it does not belong to dispatched issue ${worktree.issueKey}`,
+      `Refusing Software Garden worktree branch ${worktree.branch}: it does not belong to dispatched issue ${worktree.issueKey}`,
     )
   }
   if (!worktree.branch.startsWith('factory/') && !isAuthorizedExistingPrBranch(worktree)) {
-    throw new Error(`Refusing unsafe Factory worktree branch ${worktree.branch}`)
+    throw new Error(`Refusing unsafe Software Garden worktree branch ${worktree.branch}`)
   }
 }
 
@@ -381,7 +381,7 @@ const assertNonSymlinkFactoryRoot = async (expectedRoot: string): Promise<void> 
   for (const path of [dirname(expectedRoot), expectedRoot]) {
     try {
       if ((await lstat(path)).isSymbolicLink()) {
-        throw new Error(`Refusing Factory worktree operation through symbolic-link root ${path}`)
+        throw new Error(`Refusing Software Garden worktree operation through symbolic-link root ${path}`)
       }
     } catch (error) {
       if (errorCode(error) === 'ENOENT') return

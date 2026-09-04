@@ -18,6 +18,18 @@ import {
   withRelayfileCallDeadline,
 } from '../mount/relayfile-operation-timeout'
 import { linearByStatePath, linearByIdPath, linearByUuidPath } from '../constants/linear'
+import {
+  GARDEN_AUTOMATION_LABEL,
+  GARDEN_E2E_TITLE_PREFIX,
+  GARDEN_IN_PROGRESS_LABEL,
+  GARDEN_LIFECYCLE_LABEL_NAMES,
+  GARDEN_TITLE_PREFIX,
+  gardenLabelAliases,
+  hasGardenLifecycleLabel,
+  hasGardenTitlePrefix,
+  isGardenLifecycleLabelName,
+  matchesGardenLabelAlias,
+} from '../constants/lifecycle-labels'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GhCliGithubMergeGate, MountedGithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
 import {
@@ -133,7 +145,7 @@ import type {
   WorkUnitOrigin,
 } from '../types'
 import { DispatchLifecycleMigrationConflictError } from '../ports/state'
-import { AppGithubWriteback, FACTORY_GITHUB_STATUS_LABELS, GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
+import { AppGithubWriteback, GhCliGithubWriteback, MountGithubRead, MountLinearWriteback, MountSlackWriteback, slackChannelAliases, slackChannelSegment } from '../writeback'
 import { parseSlackThreadReply, slackThreadReplyGlob, type SlackThreadReply } from '../subscriptions/slack-filter'
 import { asRecord, parseJsonContent, stableHash, wrappedPayload } from '../writeback/shared'
 import {
@@ -379,7 +391,10 @@ const GITHUB_ESCALATION_MARKER_PREFIX = 'factory-escalation:'
 // Legacy compatibility marker for agents launched before durable lifecycle
 // actions. New prompts report readiness through the Relay action surface.
 const AGENT_PR_READY_MARKER = '[factory-pr-ready]'
-const FACTORY_E2E_MARKER = '[factory-e2e]'
+// Self-test soak marker. Renamed with the product (`[garden-e2e]`); read
+// paths accept the legacy `[factory-e2e]` spelling so in-flight soak issues
+// and probe PRs remain recognizable during the rename transition.
+const FACTORY_E2E_MARKER = GARDEN_E2E_TITLE_PREFIX
 const INJECTION_CONFIRMATION_TIMEOUT_MS = 90_000
 const INJECTION_RETRY_DELAY_MS = 1_000
 const INJECTION_RETRY_ATTEMPT_TIMEOUT_MS = 15_000
@@ -699,9 +714,15 @@ const DISCOVERY_OVERLOAD_ADVERTISED_BACKOFF_MAX_MS = 30_000
  * ratchet do its job.
  */
 const DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT = 5
-const GITHUB_FACTORY_LABEL = 'factory'
-const GITHUB_LIFECYCLE_LABELS = new Set(['factory:in-progress', 'factory:human-review'])
-const GITHUB_MIRROR_TITLE_PREFIX = '[factory]'
+// Canonical Software Garden naming (see src/constants/lifecycle-labels.ts).
+// GITHUB_LIFECYCLE_LABELS deliberately contains the legacy factory names too:
+// it filters lifecycle labels out of routing candidates, and an in-flight
+// issue can still carry either spelling.
+const GITHUB_FACTORY_LABEL = GARDEN_AUTOMATION_LABEL
+const GITHUB_LIFECYCLE_LABELS = new Set(GARDEN_LIFECYCLE_LABEL_NAMES)
+// New GitHub -> Linear mirror drafts are titled with the garden prefix; the
+// safety scope accepts the legacy `[factory]` spelling on read.
+const GITHUB_MIRROR_TITLE_PREFIX = GARDEN_TITLE_PREFIX
 const GITHUB_MIRROR_SOURCE_PREFIX = 'Source: '
 const STALE_LOCAL_AGENT_RECLAIM_MAX_ATTEMPTS = 3
 const STALE_LOCAL_AGENT_RECLAIM_BACKOFF_MS = 500
@@ -1603,7 +1624,7 @@ export class FactoryLoop implements Factory {
     // half-live daemon; refuse rather than let a future caller reintroduce the
     // side effect this mode exists to remove.
     if (this.#readOnly) {
-      throw new Error('Factory was constructed read-only and cannot be started')
+      throw new Error('Software Garden was constructed read-only and cannot be started')
     }
     if (this.#started) {
       return
@@ -3322,7 +3343,7 @@ export class FactoryLoop implements Factory {
         retryAtMs: health.retryAtMs,
         error: health.lastError ?? 'unknown control-plane failure',
       })
-      throw contextualError('Factory dispatch paused because the fleet control plane is unavailable', error)
+      throw contextualError('Software Garden dispatch paused because the fleet control plane is unavailable', error)
     }
   }
 
@@ -3940,12 +3961,13 @@ export class FactoryLoop implements Factory {
         // Must stay the same scope test as dispatch and as
         // #reconcileOrphanedGithubInProgress. Gating on the scope label alone
         // left every title-scoped issue stuck in `factory:in-progress` forever.
+        // Either lifecycle spelling is admitted (rename transition).
         const mayRecoverGithubOrphan = !wasReady &&
           !dryRun &&
           issueSource === 'github' &&
           isInFactoryScope(issue, this.#config.safety) &&
-          Boolean(labels?.has('factory:in-progress')) &&
-          !labels?.has('factory:human-review')
+          Boolean(labels && hasGardenLifecycleLabel(labels, 'in-progress')) &&
+          !(labels && hasGardenLifecycleLabel(labels, 'human-review'))
         if (!mayRecoverGithubOrphan) {
           const dispatchBlock = await this.#dispatchBlockReason(issue)
           if (dispatchBlock) {
@@ -4649,11 +4671,12 @@ export class FactoryLoop implements Factory {
     // gate used to demand the label alone — so an issue admitted by its title
     // could be dispatched and then never un-stuck, keeping `factory:in-progress`
     // forever once its dispatch died. factory#139 is the live instance: title
-    // `[factory] ...`, and its only label is `factory:in-progress`.
+    // `[factory] ...`, and its only label is `factory:in-progress`. Either
+    // lifecycle spelling is admitted (rename transition).
     if (
       !isInFactoryScope(issue, this.#config.safety) ||
-      !labels.has('factory:in-progress') ||
-      labels.has('factory:human-review')
+      !hasGardenLifecycleLabel(labels, 'in-progress') ||
+      hasGardenLifecycleLabel(labels, 'human-review')
     ) return { recovered: false, reason: 'issue is not an orphan-recovery candidate' }
 
     const identity = githubIssueRefIdentity(issueRef(issue))
@@ -8850,15 +8873,16 @@ export class FactoryLoop implements Factory {
     const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
     const required = this.#config.safety.requireLabel.trim().toLowerCase()
     return Boolean(required) &&
-      labels.has(required) &&
-      labels.has('factory:in-progress') &&
-      !labels.has('factory:human-review')
+      matchesGardenLabelAlias(labels, required) &&
+      hasGardenLifecycleLabel(labels, 'in-progress') &&
+      !hasGardenLifecycleLabel(labels, 'human-review')
   }
 
   #isIssueExternallyTerminal(issue: LinearIssue): boolean {
     if (isGithubIssue(issue)) {
       if (githubFactoryIssueIsClosed(issue)) return true
-      return issue.labels.some((label) => label.trim().toLowerCase() === 'factory:human-review')
+      const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
+      return hasGardenLifecycleLabel(labels, 'human-review')
     }
     const role = this.#states.roleOf(issue.stateId)
     return role === 'humanReview' || role === 'done'
@@ -9149,11 +9173,14 @@ export class FactoryLoop implements Factory {
       return false
     }
     const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
-    if (labels.has('factory:human-review')) return false
+    if (hasGardenLifecycleLabel(labels, 'human-review')) return false
     const identity = githubIssueRefIdentity(issueRef(issue))
-    if (labels.has('factory:in-progress') && (!identity || !this.#reconciledGithubInProgress.has(identity))) return false
+    if (hasGardenLifecycleLabel(labels, 'in-progress') && (!identity || !this.#reconciledGithubInProgress.has(identity))) return false
     const required = this.#config.safety.requireLabel.trim().toLowerCase()
-    return Boolean(required) && labels.has(required)
+    // The required label matches its legacy rename alias too, so an in-flight
+    // issue labeled `factory` (or `factory-ready`) by an older build stays
+    // discoverable after the config default moved to `garden`.
+    return Boolean(required) && matchesGardenLabelAlias(labels, required)
   }
 
   async #postIssueComment(issue: LinearIssue, body: string): Promise<void> {
@@ -9184,7 +9211,7 @@ export class FactoryLoop implements Factory {
       const statusClaim: { value: Awaited<ReturnType<NonNullable<GithubWriteback['claimStatus']>>> } = {
         value: { result: undefined },
       }
-      await this.#retryDispatchWriteback(record, issue, 'GitHub label factory:in-progress', async () => {
+      await this.#retryDispatchWriteback(record, issue, `GitHub label ${GARDEN_IN_PROGRESS_LABEL}`, async () => {
         statusClaim.value = this.#githubWriteback.claimStatus
           ? await this.#githubWriteback.claimStatus(issue, 'in-progress')
           : { result: await this.#githubWriteback.setStatus(issue, 'in-progress') }
@@ -9655,13 +9682,16 @@ export class FactoryLoop implements Factory {
       // Retain Factory's own lifecycle rows even when they lack the scope
       // label. The index carries no title, so a title-scoped issue cannot be
       // recognised here — and dropping it means its file is never read and the
-      // orphan-recovery sweep never sees it. `factory:in-progress` is a label
-      // only Factory applies, so a row carrying it is by definition
-      // Factory-touched and worth reading; `isInFactoryScope` downstream
+      // orphan-recovery sweep never sees it. `garden:in-progress` (or its
+      // legacy `factory:in-progress` spelling) is a label only this software
+      // garden applies, so a row carrying it is by definition
+      // garden-touched and worth reading; `isInFactoryScope` downstream
       // remains the authority on whether anything may be done with it.
       const rowLabels = labels.map((label) => label.trim().toLowerCase())
+      const requiredAliases = gardenLabelAliases(requiredLabel)
       if (state !== 'open' ||
-        !(rowLabels.includes(requiredLabel) || rowLabels.includes('factory:in-progress'))) {
+        !(rowLabels.some((label) => requiredAliases.includes(label)) ||
+          hasGardenLifecycleLabel(new Set(rowLabels), 'in-progress'))) {
         continue
       }
       paths.push(`${GITHUB_ISSUE_ROOT}/${owner}__${repo}/issues/by-id/${number}.json`)
@@ -10174,13 +10204,13 @@ export class FactoryLoop implements Factory {
     const comment = parked.cycle
       ? [
         marker,
-        'Factory refused dispatch because it detected a dependency cycle.',
+        'Software Garden refused dispatch because it detected a dependency cycle.',
         `Cycle: ${cycle}`,
         blockers.length > 0 ? `Unresolved blockers: ${blockers.join(', ')}` : undefined,
       ].filter((line): line is string => Boolean(line)).join('\n')
       : [
         marker,
-        'Factory parked this issue because declared dependencies are unresolved.',
+        'Software Garden parked this issue because declared dependencies are unresolved.',
         `Blocked by: ${blockers.join(', ')}`,
         parked.capacityBlocked ? 'Capacity is also currently unavailable.' : undefined,
       ].filter((line): line is string => Boolean(line)).join('\n')
@@ -10324,9 +10354,9 @@ export class FactoryLoop implements Factory {
     if (!isGithubIssue(issue)) return this.#states.roleOf(issue.stateId)
     if (githubFactoryIssueIsClosed(issue)) return 'done'
     const labels = new Set(issue.labels.map((label) => label.trim().toLowerCase()))
-    if (labels.has('factory:human-review')) return 'humanReview'
+    if (hasGardenLifecycleLabel(labels, 'human-review')) return 'humanReview'
     if (this.#isIssueReady(issue)) return 'readyForAgent'
-    if (labels.has('factory:in-progress')) return 'agentImplementing'
+    if (hasGardenLifecycleLabel(labels, 'in-progress')) return 'agentImplementing'
     return undefined
   }
 
@@ -12448,7 +12478,7 @@ export class FactoryLoop implements Factory {
       }
     }
     if (failures.length > 0) {
-      throw new Error(`Factory worktree cleanup incomplete for ${record.issue.key}: ${failures.join('; ')}`)
+      throw new Error(`Software Garden worktree cleanup incomplete for ${record.issue.key}: ${failures.join('; ')}`)
     }
   }
 
@@ -13094,7 +13124,7 @@ export class FactoryLoop implements Factory {
     // and Factory restarted.
     if (this.#mount.isLocalMountAuthDegraded?.()) {
       this.#increment('resumeSkippedMountAuthDegraded')
-      this.#logger.warn?.('[factory] tracked agent resume skipped: local mount is auth-degraded (cloud session missing relayfile fs scope); re-authenticate and restart Factory', {
+      this.#logger.warn?.('[factory] tracked agent resume skipped: local mount is auth-degraded (cloud session missing relayfile fs scope); re-authenticate and restart Software Garden', {
         issue: record.issue.key,
         name,
         role: tracked.spec.role,
@@ -16530,7 +16560,7 @@ export class FactoryLoop implements Factory {
           tracked,
           snapshot,
           repo,
-          `it carries the \`${trackedBlockingLabel}\` label, which Factory never auto-closes`,
+          `it carries the \`${trackedBlockingLabel}\` label, which Software Garden never auto-closes`,
           'label',
         )
         return
@@ -16578,7 +16608,7 @@ export class FactoryLoop implements Factory {
     const blockingLabel = this.#neverAutoCloseLabel(issue)
     if (!authority.authorised || blockingLabel) {
       const reason = blockingLabel
-        ? `it carries the \`${blockingLabel}\` label, which Factory never auto-closes`
+        ? `it carries the \`${blockingLabel}\` label, which Software Garden never auto-closes`
         : authority.evidence
       await this.#declineMergeClosure(issue, snapshot, repo, reason, blockingLabel ? 'label' : 'authority')
       return
@@ -16592,7 +16622,7 @@ export class FactoryLoop implements Factory {
       if (githubIssue) {
         const closeWrite = await this.#githubWriteback.closeIssue(
           issue,
-          `Factory observed pull request #${snapshot.number} merge and completed this issue.\n\nClosing authority: ${authority.evidence}.`,
+          `Software Garden observed pull request #${snapshot.number} merge and completed this issue.\n\nClosing authority: ${authority.evidence}.`,
         )
         if (closeWrite === undefined) this.#recordMissingGithubWritebackReceipt('closeIssue')
         terminalStateObserved = closeWrite !== undefined
@@ -16681,7 +16711,7 @@ export class FactoryLoop implements Factory {
     })
     const marker = `factory-merge-close-declined:${repo}#${snapshot.number}`
     const body = [
-      `Factory observed pull request ${repo}#${snapshot.number} merge, and did **not** close this issue.`,
+      `Software Garden observed pull request ${repo}#${snapshot.number} merge, and did **not** close this issue.`,
       '',
       `Reason: ${reason}.`,
       '',
@@ -17438,12 +17468,12 @@ export class FactoryLoop implements Factory {
             settleIssueWritebackOnce()
             await this.#githubWriteback.postComment(
               issue,
-              `Factory agents completed; this issue is awaiting human review. The pull request remains open.\n\nMerge policy: ${this.#config.mergePolicy}`,
+              `Software Garden agents completed; this issue is awaiting human review. The pull request remains open.\n\nMerge policy: ${this.#config.mergePolicy}`,
             )
           } else {
             const closeWrite = await this.#githubWriteback.closeIssue(
               issue,
-              'Factory observed the linked pull request merge and completed this issue.',
+              'Software Garden observed the linked pull request merge and completed this issue.',
             )
             if (closeWrite === undefined) this.#recordMissingGithubWritebackReceipt('closeIssue')
             // A provider-confirmed, actor-attributed close is the only safe
@@ -18570,7 +18600,7 @@ export class FactoryLoop implements Factory {
 
     try {
       await this.#githubWriteback.postComment(issue, [
-        `@${authorizedAuthor}, Factory needs clarification before dispatching ${decision.issue.key}.`,
+        `@${authorizedAuthor}, Software Garden needs clarification before dispatching ${decision.issue.key}.`,
         `Reason: ${reason}`,
         `Question: ${question}`,
         `Authorized responder: @${authorizedAuthor} (the issue reporter).`,
@@ -18650,8 +18680,8 @@ export class FactoryLoop implements Factory {
       .filter((part): part is string => Boolean(part))
       .join(' ')
     const replyInstruction = source?.url
-      ? 'Reply on the linked GitHub issue so Factory can resume.'
-      : 'Reply on the source GitHub issue so Factory can resume.'
+      ? 'Reply on the linked GitHub issue so Software Garden can resume.'
+      : 'Reply on the source GitHub issue so Software Garden can resume.'
     const root = await this.#slack.postThread({
       channel: await this.#slackChannelDir() ?? this.#config.slack.channel,
       text: [
@@ -19479,7 +19509,7 @@ export class FactoryLoop implements Factory {
         ),
         () => slack.reply(
           threadId,
-          `Factory could not deliver ${pendingCount} queued ${noun} because this work unit no longer has an active agent. Please continue on the linked issue or pull request.`,
+          `Software Garden could not deliver ${pendingCount} queued ${noun} because this work unit no longer has an active agent. Please continue on the linked issue or pull request.`,
         ),
       )
     } catch (error) {
@@ -19833,8 +19863,8 @@ export class FactoryLoop implements Factory {
                 ? 'the issue implementer'
                 : 'an issue agent'
             const receipt = durable.agent
-              ? `Factory received this reply and durably queued it for ${owner}.`
-              : 'Factory received and durably stored this reply; it will route when an issue agent is resumable.'
+              ? `Software Garden received this reply and durably queued it for ${owner}.`
+              : 'Software Garden received and durably stored this reply; it will route when an issue agent is resumable.'
             const slack = this.#slack
             // Same lease scope as the terminal receipt: this claim covers a
             // provider write that can outrun any fixed duration, so it is
@@ -19906,7 +19936,7 @@ export class FactoryLoop implements Factory {
     if (this.#slack) {
       await this.#slack.reply(
         reply.threadTs,
-        'Factory received this reply but could not create a durable agent route. It will remain replayable; please also continue on the linked issue or pull request.',
+        'Software Garden received this reply but could not create a durable agent route. It will remain replayable; please also continue on the linked issue or pull request.',
       )
       this.#increment('slackAnswersUnroutableVisible')
     }
@@ -19917,7 +19947,7 @@ export class FactoryLoop implements Factory {
     if (!this.#slack) return
     await this.#slack.reply(
       threadId,
-      'Factory received this reply but could not route it because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
+      'Software Garden received this reply but could not route it because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
     )
     this.#increment('slackAnswersUnroutableVisible')
   }
@@ -20201,9 +20231,9 @@ export class FactoryLoop implements Factory {
       const required = this.#config.safety.requireLabel.trim().toLowerCase()
       const active = state !== 'closed' &&
         Boolean(required) &&
-        labels.has(required) &&
-        labels.has('factory:in-progress') &&
-        !labels.has('factory:human-review')
+        matchesGardenLabelAlias(labels, required) &&
+        hasGardenLifecycleLabel(labels, 'in-progress') &&
+        !hasGardenLifecycleLabel(labels, 'human-review')
       if (!active) this.#logger.info?.('[factory] clarification wake cancelled because GitHub issue is no longer active', {
         issue: issueRef.key,
         state,
@@ -20618,7 +20648,9 @@ export class FactoryLoop implements Factory {
   }
 
   #isSyntheticProbeIssue(issue: LinearIssue): boolean {
-    return hasTitlePrefix(issue.title, FACTORY_E2E_MARKER)
+    // Either spelling: in-flight soak issues are titled `[factory-e2e] ...`
+    // and new ones `[garden-e2e] ...`.
+    return hasGardenTitlePrefix(issue.title, FACTORY_E2E_MARKER)
   }
 }
 
@@ -20656,7 +20688,7 @@ const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): Gith
   if (identity === 'user') {
     if (cloudContainer) {
       throw new Error(
-        'GitHub identity "user" requires lifecycle writes through local gh, but the Factory cloud container does not contain gh. ' +
+        'GitHub identity "user" requires lifecycle writes through local gh, but the Software Garden cloud container does not contain gh. ' +
         'Use identity "auto" or "app" with a connected workspace GitHub App lifecycle write path.',
       )
     }
@@ -20672,7 +20704,7 @@ const defaultGithubWriteback = (config: FactoryConfig, mount: MountClient): Gith
   }
   if (cloudContainer) {
     throw new Error(
-      'GitHub identity "auto" cannot select lifecycle writeback in the Factory cloud container: no connected workspace GitHub App lifecycle write path is available, ' +
+      'GitHub identity "auto" cannot select lifecycle writeback in the Software Garden cloud container: no connected workspace GitHub App lifecycle write path is available, ' +
       'and the container does not contain gh.',
     )
   }
@@ -21104,7 +21136,7 @@ const pidsFromSpawnResult = (result: { pid?: number; pids?: number[] } | undefin
 // `source`, a closed enum, rather than trying to scrub paths out of free
 // text; free text is not a safe thing to scrub, only a safe thing to omit.
 export const dispatchComment = (decision: TriageDecision, agents: DispatchResult['agents']): string => [
-  `Factory dispatch for ${decision.issue.key}`,
+  `Software Garden dispatch for ${decision.issue.key}`,
   decision.issueResolution
     ? `Issue resolution: ${decision.issueResolution.source}`
     : undefined,
@@ -21608,10 +21640,20 @@ function labelRoutesForIssue(
   routes: Array<{ slug: string; route: TriageDecision['routes'][number] }>
 } {
   const githubIssue = isGithubIssue(issue)
-  const githubReadinessLabel = githubIssue ? config.safety.requireLabel.trim().toLowerCase() : undefined
+  const githubReadinessLabel = githubIssue ? config.safety.requireLabel.trim() : undefined
+  // The readiness opt-in is never a routing label, and it must be excluded
+  // through its rename alias rather than by bare equality. `repos.byLabel`
+  // derives an entry per repository NAME, so the repository called `factory`
+  // maps the label `factory`; with the configured default now `garden`, an
+  // in-flight issue still carrying the legacy `factory` opt-in would otherwise
+  // have that opt-in read as a repository route.
+  const isReadinessOptIn = (label: string): boolean =>
+    githubReadinessLabel !== undefined &&
+    githubReadinessLabel.length > 0 &&
+    matchesGardenLabelAlias([label], githubReadinessLabel)
   const candidateLabels = uniqueNormalizedLabels(issue.labels).filter((label) =>
     !isShapeLabel(label) &&
-    label.toLowerCase() !== githubReadinessLabel &&
+    !isReadinessOptIn(label) &&
     (!githubIssue || !GITHUB_LIFECYCLE_LABELS.has(label.toLowerCase())),
   )
   const labels: string[] = []
@@ -21785,7 +21827,7 @@ function labelDispatchFailureSignature(resolution: Exclude<LabelDispatchResoluti
 }
 
 function labelDispatchFailureComment(issue: IssueRef, resolution: Exclude<LabelDispatchResolution, { ok: true }>): string {
-  const lines = [`Factory dispatch for ${issue.key} skipped`]
+  const lines = [`Software Garden dispatch for ${issue.key} skipped`]
   if (resolution.reason === 'no-labels') {
     lines.push('No Linear labels were present.')
     lines.push('Add one repo label from factory.config.json repos.byLabel, then move the issue back to Ready for Agent.')
@@ -22137,8 +22179,13 @@ const githubIssueDirectoryPathParts = (path: string): { owner: string; repo: str
   }
 }
 
-const githubIssueHasFactoryLabel = (issue: GithubIssueSource, requiredLabel = GITHUB_FACTORY_LABEL): boolean =>
-  issue.labels.some((label) => label.trim().toLowerCase() === requiredLabel.trim().toLowerCase())
+// The required automation label matches its legacy rename alias (`garden`
+// also admits `factory`, and vice versa) so issues labeled by an older build
+// stay discoverable after the default moved to `garden`.
+const githubIssueHasFactoryLabel = (issue: GithubIssueSource, requiredLabel = GITHUB_FACTORY_LABEL): boolean => {
+  const aliases = new Set(gardenLabelAliases(requiredLabel))
+  return issue.labels.some((label) => aliases.has(label.trim().toLowerCase()))
+}
 
 const githubIssueIsClosed = (issue: GithubIssueSource): boolean =>
   issue.state === 'closed'
@@ -22770,7 +22817,9 @@ const issuePrMatchScore = (
   marker: string,
   opts: { requireTitleMarker?: boolean; titleMarker?: string; allowLegacyGithubBranch?: boolean } = {},
 ): number => {
-  if (opts.requireTitleMarker && !hasTitlePrefix(pr.title, marker)) return 0
+  // Alias-aware so a `[garden-e2e]` requirement still matches an in-flight
+  // probe PR titled with the legacy `[factory-e2e]` marker.
+  if (opts.requireTitleMarker && !hasGardenTitlePrefix(pr.title, marker)) return 0
 
   if (factoryBranchMatchesIssue(pr.headRef, issue.key)) return 30
   if (opts.allowLegacyGithubBranch && legacyGithubBranchMatchesIssue(pr.headRef, issue)) return 30
@@ -22778,9 +22827,6 @@ const issuePrMatchScore = (
   if (containsExplicitIssueReference(pr.body, issue.key)) return 10
   return 0
 }
-
-const hasTitlePrefix = (title: string, marker: string): boolean =>
-  title === marker || title.startsWith(`${marker} `)
 
 // Single definition shared with closure authority, so the branch rule that
 // grants a score-30 association and the one that authorises a close can never
@@ -23171,7 +23217,7 @@ const renderBabysitterWake = (
   mountRoot: string,
 ): string => [
   '<integration-event source="github" trust="validated-metadata-only">',
-  `Factory observed coalesced PR activity for ${repo}#${prNumber}.`,
+  `Software Garden observed coalesced PR activity for ${repo}#${prNumber}.`,
   `Event categories: ${kinds.join(', ')}.`,
   'No provider-authored title, body, comment, check name, URL, or other free text is included in this wake.',
   `Re-read the current PR head, checks, review threads, and merge state via ${mountRoot}/github/repos before acting.`,
@@ -23354,14 +23400,15 @@ const factoryGithubIssueWriteTarget = (
 }
 
 /**
- * Case-insensitive lifecycle-label match. A complete-label-set PATCH carries
- * the provider's own casing for labels Factory did not author, so an
- * exact-name test would let a cased variant slip past the one-claim bound.
+ * Case-insensitive lifecycle-label match, admitting both the canonical garden
+ * names and the legacy factory spellings. A complete-label-set PATCH carries
+ * the provider's own casing for labels this software garden did not author,
+ * so an exact-name test would let a cased variant slip past the one-claim
+ * bound.
  */
 const githubLifecycleLabelName = (name: unknown) =>
-  typeof name === 'string'
-    ? Object.values(FACTORY_GITHUB_STATUS_LABELS)
-      .find((label) => label.name.toLowerCase() === name.trim().toLowerCase())
+  typeof name === 'string' && isGardenLifecycleLabelName(name)
+    ? name.trim().toLowerCase()
     : undefined
 
 const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean => {
@@ -23386,33 +23433,37 @@ const isAllowedFactoryGithubIssueWriteContent = (
     if (hasExactKeys(value, ['labels']) || hasExactKeys(value, ['labels', 'state'])) {
       if (!Array.isArray(value.labels)) return false
       if (!value.labels.every((label) => typeof label === 'string' && label.trim().length > 0)) return false
-      // One write must never assert two contradictory Factory claims.
+      // One write must never assert two contradictory lifecycle claims.
       const lifecycle = value.labels.filter((label) => githubLifecycleLabelName(label))
       if (lifecycle.length > 1) return false
       // A complete-set PATCH can drop labels as well as add them, and the
       // safety opt-in is the label that made this issue eligible at all. A set
-      // that omits it would silently remove the issue from Factory's scope, so
-      // require it to survive. `setStatus` preserves every non-Factory label,
+      // that omits it would silently remove the issue from scope, so
+      // require it to survive. `setStatus` preserves every non-lifecycle label,
       // so its own payloads always carry it; nothing legitimate is rejected.
+      // The opt-in may survive under its legacy rename alias (`garden`
+      // configured, `factory` on the issue) — that keeps the issue in scope
+      // exactly as discovery read it.
       //
       // Unless the opt-in IS a lifecycle label, which a status transition is
       // supposed to change. That configuration is already self-contradictory
-      // (`#isIssueReady` refuses an issue carrying `factory:in-progress`, so
-      // such an issue could never be dispatched to begin with) and this guard
-      // is not the place to litigate it — skip the survival check rather than
-      // add a second, more confusing way for the same config to fail.
+      // (`#isIssueReady` refuses an issue carrying an in-progress lifecycle
+      // label, so such an issue could never be dispatched to begin with) and
+      // this guard is not the place to litigate it — skip the survival check
+      // rather than add a second, more confusing way for the same config to
+      // fail.
       //
       // The empty set is refused unconditionally, before the exemption below
       // can apply to it: stripping every label from an in-scope open issue is
       // never a status transition, whatever `requireLabel` is configured to
-      // be. `factoryStatusLabelSet` preserves every non-Factory label and an
+      // be. `factoryStatusLabelSet` preserves every non-lifecycle label and an
       // in-scope issue always carries at least the opt-in, so `setStatus`
       // cannot author an empty set.
       if (value.labels.length === 0) return false
       const required = requireLabel.trim().toLowerCase()
       const requiredIsLifecycle = Boolean(githubLifecycleLabelName(required))
       if (required && !requiredIsLifecycle &&
-        !value.labels.some((label) => label.trim().toLowerCase() === required)) {
+        !matchesGardenLabelAlias(value.labels as string[], required)) {
         return false
       }
       return value.state === undefined || value.state === 'closed'
@@ -23820,7 +23871,7 @@ const githubPullRequestBody = (
   '',
   isGithubIssue(issue) && /^\d+$/u.test(issue.key)
     ? `Fixes #${issue.key}`
-    : `Factory issue ${issue.key}`,
+    : `Software Garden issue ${issue.key}`,
   ...(preview ? [
     '',
     `Live preview: ${preview.url}`,
@@ -24455,14 +24506,14 @@ const perItemDispatchFailureCode = (
 const triageEscalationQuestion = (decision: TriageDecision, issue?: { title?: string }): string => {
   const routedRepos = decision.routes.map((route) => route.repo).filter(Boolean)
   const subject = issue?.title?.trim() || decision.issue.key
-  const details = `For "${subject}", please reply with: (1) the exact user flow—where it starts, required inputs/actions, and the successful result; (2) permissions, validation, failure behavior, important edge cases, and anything out of scope; and (3) observable acceptance checks or tests. Say "use reasonable product defaults" for anything Factory may decide. After an authorized GitHub reply, Factory will dispatch agents; successful work will be opened as a pull request.`
+  const details = `For "${subject}", please reply with: (1) the exact user flow—where it starts, required inputs/actions, and the successful result; (2) permissions, validation, failure behavior, important edge cases, and anything out of scope; and (3) observable acceptance checks or tests. Say "use reasonable product defaults" for anything Software Garden may decide. After an authorized GitHub reply, Software Garden will dispatch agents; successful work will be opened as a pull request.`
   if (routedRepos.length === 0) {
     return `Which repository or repositories should handle this issue? ${details}`
   }
   if (decision.thin) {
-    return `Factory matched ${routedRepos.join(', ')}. ${details}`
+    return `Software Garden matched ${routedRepos.join(', ')}. ${details}`
   }
-  return `Factory matched ${routedRepos.join(', ')}, but triage confidence is low. Please confirm that repository and intended approach, or provide the correct route. ${details}`
+  return `Software Garden matched ${routedRepos.join(', ')}, but triage confidence is low. Please confirm that repository and intended approach, or provide the correct route. ${details}`
 }
 
 const isTerminalDeliveryFailure = (reason?: string): boolean =>
@@ -24519,7 +24570,7 @@ const clarificationResumeTask = (baseTask: string, waiting: WaitingClarification
   return [
     baseTask,
     '',
-    'Factory released this team while waiting for human input and is now starting a fresh task after the durable issue-comment response.',
+    'Software Garden released this team while waiting for human input and is now starting a fresh task after the durable issue-comment response.',
     `The blocked question was: ${waiting.question}`,
     `The human answered${reply?.author ? ` as @${reply.author}` : ''}: ${reply?.text ?? ''}`,
     'Re-hydrate from the issue, branch, worktree, and any open PR, then continue the task. Do not repeat completed work.',
@@ -24550,7 +24601,9 @@ const slackConversationResumeTask = (session: ConversationSessionState): string 
 
 const isFactoryQuestionTarget = (target: string): boolean => {
   const normalized = target.trim().replace(/^@/u, '').toLowerCase()
-  return normalized === 'broker' || normalized === 'factory'
+  // `factory` is the historical relay addressing name kept for in-flight
+  // agents; `garden` is the canonical post-rename alias.
+  return normalized === 'broker' || normalized === 'factory' || normalized === 'garden'
 }
 
 const parseAgentQuestion = (message: AgentMessage): AgentQuestion | undefined => {

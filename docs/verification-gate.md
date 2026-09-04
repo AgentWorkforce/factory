@@ -1,6 +1,6 @@
 # Verification merge gate
 
-Factory's `on-green-with-review` merge policy requires two independent green
+Software Garden's `on-green-with-review` merge policy requires two independent green
 decisions: GitHub checks/review and a live-stack verification verdict. The
 verification gate is enabled by default and reads
 `.factory/verification-stack.yaml` from the feature worktree.
@@ -43,9 +43,9 @@ verification:
   teardownTimeoutSeconds: 120
 ```
 
-Factory archives the exact reviewed Git `HEAD` and executes the declared E2E
+Software Garden archives the exact reviewed Git `HEAD` and executes the declared E2E
 command in a short-lived, non-root pod inside the leased namespace. The pod has
-a read-only root filesystem, no service-account token, no inherited Factory
+a read-only root filesystem, no service-account token, no inherited Software Garden
 host environment or credentials, and only the descriptor's explicit `e2e.env`
 entries. Both E2E and k6 images must be pinned by OCI sha256 digest.
 
@@ -58,7 +58,7 @@ load jobs use the same service DNS names.
 
 The deployment portion is the shared repository-owned descriptor documented in
 `docs/verification-stack.md`; the `verification` section makes that stack
-eligible for the required merge gate. Factory creates a leased, managed
+eligible for the required merge gate. Software Garden creates a leased, managed
 namespace, caps active environments, runs readiness/E2E/load, evaluates the
 verdict, closes deployment tunnels, and deletes the namespace on every return.
 Expired leases can be reclaimed with `reapFactoryEnvironmentsOnce()` or the
