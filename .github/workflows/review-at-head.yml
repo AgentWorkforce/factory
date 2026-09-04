@@ -18,9 +18,13 @@ name: Review at head
 # configuration and are tracked on #432 for the principal.
 
 on:
-  # Runs from the trusted base branch and never checks out or executes
-  # contributor code — it reads PR metadata over the API only.
-  pull_request_target:
+  # `pull_request`, not `pull_request_target`, so the predicate that runs on a
+  # PR is the PR's own copy of it. This workflow exists to change the merge
+  # rule, and a rule change has to be exercised by the PR that makes it —
+  # under `pull_request_target` the run would silently use `main`'s copy and
+  # test the wrong code. The job builds and runs repository source, which is
+  # the same trust model `ci.yml` already applies.
+  pull_request:
     types:
       - opened
       - reopened
@@ -62,9 +66,18 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      # Always the predicate's own repository, never the caller's, so a
-      # reusable invocation applies the same rule as a local one.
+      # This repository's own PR: use the PR's copy of the predicate, so a
+      # change to the rule is tested by the change that makes it.
+      - name: Check out the pull request under test
+        if: ${{ !inputs.pr_number }}
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Called from another repository: the caller has no copy of the
+      # predicate, so fetch it here and apply the same rule a local run would.
       - name: Check out the shared predicate
+        if: ${{ inputs.pr_number }}
         uses: actions/checkout@v6
         with:
           repository: AgentWorkforce/software-garden
