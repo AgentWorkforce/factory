@@ -3,6 +3,13 @@ import type { FleetClient, RosterEntry, SpawnInput, SpawnResult } from '../ports
 export const DEFAULT_FLEET_ROSTER_TIMEOUT_MS = 5_000
 export const DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD = 2
 export const DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS = 60_000
+/**
+ * A completed placement is stronger evidence than another read-only roster
+ * round-trip: the control plane selected a node and observed the mutation
+ * finish. Reuse that evidence briefly so a multi-agent dispatch does not ask
+ * the expensive fleet-node inventory the same question before every member.
+ */
+export const DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS = 15_000
 
 export type FleetControlPlaneState = 'closed' | 'open' | 'half-open'
 
@@ -173,18 +180,40 @@ export class FleetControlPlaneCircuit {
 export function guardFleetControlPlane(
   fleet: FleetClient,
   circuit: FleetControlPlaneCircuit,
+  options: { admissionLeaseMs?: number; now?: () => number } = {},
 ): FleetClient {
+  const admissionLeaseMs = options.admissionLeaseMs ?? DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS
+  const now = options.now ?? Date.now
+  let lastSuccessfulEvidenceAtMs: number | undefined
+
+  const recordSuccessfulEvidence = <T>(result: T): T => {
+    lastSuccessfulEvidenceAtMs = now()
+    return result
+  }
+
+  const probeRoster = (): Promise<RosterEntry> =>
+    circuit.probe(() => fleet.roster()).then(recordSuccessfulEvidence)
+
+  const hasFreshAdmissionEvidence = (): boolean =>
+    lastSuccessfulEvidenceAtMs !== undefined &&
+    now() - lastSuccessfulEvidenceAtMs <= admissionLeaseMs
+
   const guardedMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
     // A fresh Factory instance starts with a closed circuit, so checking state
     // alone would let resume/cold-start paths that did not run discovery bypass
-    // admission. Probe the same roster path before every spawn/resume.
-    // Concurrent mutations coalesce onto one in-flight probe, and an open
-    // circuit rejects here without calling either roster or the mutation.
-    await circuit.probe(() => fleet.roster())
+    // admission. Require recent successful control-plane evidence before each
+    // spawn/resume. Concurrent first mutations coalesce onto one in-flight
+    // roster probe, while adjacent successful placements share a short lease.
+    // An open circuit rejects here without calling roster or the mutation.
+    circuit.assertMutationAllowed()
+    if (!hasFreshAdmissionEvidence()) await probeRoster()
     circuit.assertMutationAllowed()
     try {
-      return await operation()
+      return recordSuccessfulEvidence(await operation())
     } catch (error) {
+      // Never let evidence from an earlier success admit work after any newer
+      // mutation failed. The next attempt must establish health for itself.
+      lastSuccessfulEvidenceAtMs = undefined
       if (isFleetControlPlaneFailure(error)) circuit.recordFailure(error)
       throw error
     }
@@ -193,7 +222,7 @@ export function guardFleetControlPlane(
   return new Proxy(fleet, {
     get(target, property) {
       if (property === 'roster') {
-        return (): Promise<RosterEntry> => circuit.probe(() => target.roster())
+        return (): Promise<RosterEntry> => probeRoster()
       }
       if (property === 'spawn') {
         return (input: SpawnInput): Promise<SpawnResult> => guardedMutation(() => target.spawn(input))

@@ -4,6 +4,7 @@ import type { RosterEntry } from '../ports/fleet'
 import { FakeFleetClient } from '../testing/fakes'
 import {
   DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD,
+  DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS,
   DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS,
   DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
   FleetControlPlaneCircuit,
@@ -232,6 +233,44 @@ describe('FleetControlPlaneCircuit', () => {
     resolveProbe?.(roster)
     await expect(spawning).resolves.toMatchObject({ name: 'pending-worker' })
     expect(fleet.spawns).toHaveLength(1)
+  })
+
+  it('reuses a successful placement as admission evidence for the adjacent team member', async () => {
+    let now = 1_000
+    const fleet = new FakeFleetClient()
+    const rosterProbe = vi.spyOn(fleet, 'roster')
+      .mockResolvedValueOnce(roster)
+      // This is the production failure shape: the first worker placed, then a
+      // repeated fleet-node inventory exceeded the 5s roster boundary before
+      // the reviewer could start.
+      .mockImplementationOnce(() => new Promise<RosterEntry>(() => undefined))
+    const circuit = new FleetControlPlaneCircuit({
+      timeoutMs: DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
+      failureThreshold: DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD,
+      resetTimeoutMs: DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS,
+      now: () => now,
+    })
+    const guarded = guardFleetControlPlane(fleet, circuit, { now: () => now })
+
+    await expect(guarded.spawn({ name: 'implementer', capability: 'spawn:codex' }))
+      .resolves.toMatchObject({ name: 'implementer' })
+    await expect(guarded.spawn({ name: 'reviewer', capability: 'spawn:codex' }))
+      .resolves.toMatchObject({ name: 'reviewer' })
+
+    expect(rosterProbe).toHaveBeenCalledTimes(1)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['implementer', 'reviewer'])
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
+
+    // The lease is deliberately finite. Once it expires, the very same next
+    // mutation must run its own roster admission and surface the stalled read.
+    vi.useFakeTimers()
+    now += DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS + 1
+    const expired = guarded.spawn({ name: 'later-worker', capability: 'spawn:codex' })
+    const expiredFailure = expect(expired).rejects.toMatchObject({ name: 'TimeoutError' })
+    await vi.advanceTimersByTimeAsync(DEFAULT_FLEET_ROSTER_TIMEOUT_MS)
+    await expiredFailure
+    expect(rosterProbe).toHaveBeenCalledTimes(2)
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['implementer', 'reviewer'])
   })
 
   it('MUST FIRE at mutation admission: two wedged rosters open the circuit and the next spawn fails fast', async () => {

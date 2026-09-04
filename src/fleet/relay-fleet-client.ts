@@ -523,12 +523,22 @@ export class RelayFleetClient implements FleetClient {
     // An unbounded release is how the reaper's own teardown wedges.
     const deadlineAtMs = this.#operationDeadline()
     const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())
-    const ack = await this.#withinDeadline('release invoke', deadlineAtMs, () => messaging.commands.invoke('release', {
+    // Factory worker names are deterministic per work unit. A plain release
+    // stops the runtime but deliberately retains its Relay identity, so the
+    // next retry collides with the create-only registration under the exact
+    // same name. Ask the workspace release surface to remove that ephemeral
+    // identity once the node teardown completes.
+    const ack = await this.#withinDeadline('release invoke', deadlineAtMs, () => messaging.agents.release({
       name,
-      agent: name,
       ...(reason ? { reason } : {}),
+      deleteAgent: true,
     }))
-    await this.#awaitInvocation(ack.actionName || 'release', ack, deadlineAtMs)
+    const invocationId = ack.invocationId
+    if (!invocationId) {
+      throw new Error(`Relay release for ${name} returned no invocation id; identity deletion is unconfirmed`)
+    }
+    const actionName = ack.actionName || 'release'
+    await this.#awaitInvocation(actionName, { ...ack, invocationId, actionName }, deadlineAtMs)
     this.#tracked.delete(name)
     this.#syncExitWatcher()
   }
