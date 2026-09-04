@@ -173,9 +173,12 @@ export class FleetControlPlaneCircuit {
 }
 
 /**
- * Gates spawn and resume with a bounded read-only roster admission. Transport
- * failures from admitted mutations also count toward the circuit without
- * abandoning or timing the mutation; domain rejections remain uncounted.
+ * Gates spawn and resume with a bounded read-only roster admission. Successful
+ * admission probes and mutations refresh the short evidence lease; unrelated
+ * roster reads cannot extend it, while any failed read invalidates it.
+ * Transport failures from admitted mutations also count toward the circuit
+ * without abandoning or timing the mutation; domain rejections remain
+ * uncounted.
  */
 export function guardFleetControlPlane(
   fleet: FleetClient,
@@ -191,8 +194,15 @@ export function guardFleetControlPlane(
     return result
   }
 
-  const probeRoster = (): Promise<RosterEntry> =>
-    circuit.probe(() => fleet.roster()).then(recordSuccessfulEvidence)
+  const probeRoster = (recordAdmissionEvidence: boolean): Promise<RosterEntry> =>
+    circuit.probe(() => fleet.roster())
+      .then((result) => recordAdmissionEvidence ? recordSuccessfulEvidence(result) : result)
+      .catch((error: unknown) => {
+        // A newer failed read supersedes any older success even when it is the
+        // first failure and the circuit remains closed.
+        lastSuccessfulEvidenceAtMs = undefined
+        throw error
+      })
 
   const hasFreshAdmissionEvidence = (): boolean =>
     lastSuccessfulEvidenceAtMs !== undefined &&
@@ -204,9 +214,11 @@ export function guardFleetControlPlane(
     // admission. Require recent successful control-plane evidence before each
     // spawn/resume. Concurrent first mutations coalesce onto one in-flight
     // roster probe, while adjacent successful placements share a short lease.
-    // An open circuit rejects here without calling roster or the mutation.
-    circuit.assertMutationAllowed()
-    if (!hasFreshAdmissionEvidence()) await probeRoster()
+    // An open circuit rejects here without calling roster or the mutation;
+    // half-open must run the recovery probe even if older evidence exists.
+    const admissionState = circuit.status().state
+    if (admissionState === 'open') circuit.assertMutationAllowed()
+    if (admissionState === 'half-open' || !hasFreshAdmissionEvidence()) await probeRoster(true)
     circuit.assertMutationAllowed()
     try {
       return recordSuccessfulEvidence(await operation())
@@ -222,7 +234,7 @@ export function guardFleetControlPlane(
   return new Proxy(fleet, {
     get(target, property) {
       if (property === 'roster') {
-        return (): Promise<RosterEntry> => probeRoster()
+        return (): Promise<RosterEntry> => probeRoster(false)
       }
       if (property === 'spawn') {
         return (input: SpawnInput): Promise<SpawnResult> => guardedMutation(() => target.spawn(input))

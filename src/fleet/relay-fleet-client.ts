@@ -518,8 +518,8 @@ export class RelayFleetClient implements FleetClient {
   }
 
   async release(name: string, reason?: string): Promise<void> {
-    // `release` goes through `commands.invoke`, not `placement.spawn`, so the
-    // SDK's `confirm` cannot bound it — it needs the explicit budget (#306).
+    // `agents.release` is separate from `placement.spawn`, so the SDK's
+    // placement `confirm` cannot bound it — it needs the explicit budget (#306).
     // An unbounded release is how the reaper's own teardown wedges.
     const deadlineAtMs = this.#operationDeadline()
     const messaging = await this.#withinDeadline('messaging bootstrap', deadlineAtMs, () => this.#ensureMessaging())

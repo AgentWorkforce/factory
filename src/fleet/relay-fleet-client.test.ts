@@ -27,6 +27,7 @@ function relayMessage(overrides: Partial<RelayMessage> & { text: string }): Rela
 class FakeMessaging {
   readonly placements: RelaySpawnPlacementInput[] = []
   readonly invokes: Array<{ name: string; input?: Record<string, unknown> }> = []
+  readonly agentReleases: Array<{ name: string; reason?: string; deleteAgent?: boolean }> = []
   readonly directs: Array<{ to: string; text: string; mode?: 'wait' | 'steer' }> = []
   readonly channelSends: Array<{ channel: string; text: string; mode?: 'wait' | 'steer' }> = []
   readonly commandRegistrations: Array<{ command: string; handlerAgent: string }> = []
@@ -63,8 +64,10 @@ class FakeMessaging {
       }))
     },
     me: async () => ({ name: this.meName }),
-    release: async (input: { name: string; reason?: string; deleteAgent?: boolean }) =>
-      await this.commands.invoke('release', { ...input, agent: input.name }),
+    release: async (input: { name: string; reason?: string; deleteAgent?: boolean }) => {
+      this.agentReleases.push(input)
+      return await this.commands.invoke('release', { ...input, agent: input.name })
+    },
   }
 
   readonly nodes = {
@@ -936,6 +939,9 @@ describe('RelayFleetClient', () => {
 
     await fleet.release('ar-4-impl', 'issue-done')
 
+    expect(messaging.agentReleases).toEqual([
+      { name: 'ar-4-impl', reason: 'issue-done', deleteAgent: true },
+    ])
     expect(messaging.invokes).toEqual([
       {
         name: 'release',
