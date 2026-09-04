@@ -56,8 +56,9 @@ export async function comparePackageTrees(leftRoot, rightRoot, { notes } = {}) {
 }
 
 /**
- * @returns `true` when the two stamps describe the same build of the same code,
- * `false` when they differ in any way a payload comparison must reject.
+ * @returns `true` when THIS FILE's difference is provenance and may be
+ * tolerated, `false` when it is a payload mismatch. It says nothing about the
+ * rest of the tree — that verdict is the traversal's.
  */
 function compareBuildStamps(leftBytes, rightBytes, relativePath, differences, notes) {
   let left
