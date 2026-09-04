@@ -5,11 +5,11 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AgentWorkforce/factory.git"
+    "url": "git+https://github.com/AgentWorkforce/software-garden.git"
   },
-  "homepage": "https://github.com/AgentWorkforce/factory#readme",
+  "homepage": "https://github.com/AgentWorkforce/software-garden#readme",
   "bugs": {
-    "url": "https://github.com/AgentWorkforce/factory/issues"
+    "url": "https://github.com/AgentWorkforce/software-garden/issues"
   },
   "type": "module",
   "engines": {
