@@ -147,11 +147,17 @@ const issueFile = {
 /**
  * Remote fleet whose implementer exit is emitted by the test, not by a timer.
  *
- * Kept separate from `CompletingRemoteFleetClient`: that one races completion
- * against dispatch on a timer, while every user of this class drives the exit
- * from a specific point in its own mount fixture. Collapsing the two behind a
- * flag would put the timer in scope for tests whose whole point is that no
- * timer decides the ordering (#346 review, cubic).
+ * Kept separate from `CompletingRemoteFleetClient`: that one completes itself,
+ * asynchronously and without the test body saying when, while every user of
+ * this class drives the exit from a specific point in its own mount fixture.
+ * Collapsing the two behind a flag would put that self-completion in scope for
+ * tests whose whole point is that no timer decides the ordering (#346 review,
+ * cubic).
+ *
+ * Note that `CompletingRemoteFleetClient` no longer *races* dispatch: its exit
+ * is armed at spawn and released by the registration probe. It used to fire on
+ * a bare `setTimeout(..., 0)`, which raced the roster read and was the bug
+ * behind #442 — do not restore that.
  */
 class CompletingRemoteFleetBase extends FakeFleetClient {
   override readonly placementLocality = 'remote' as const
