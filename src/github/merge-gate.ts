@@ -369,20 +369,48 @@ const VACUOUS_REVIEW_MARKERS: RegExp[] = [
   /usage limits?/i, // codex
 ]
 
-const checkDescription = (record: Record<string, unknown>): string | undefined =>
-  stringValue(record.description) ??
-  stringValue(record.summary) ??
-  stringValue(record.title) ??
-  stringValue(record.text)
-
-const classifyCheckKind = (state: string, description: string | undefined): CheckSignal['kind'] => {
-  if (description && VACUOUS_REVIEW_MARKERS.some((marker) => marker.test(description))) {
-    return 'VACUOUS'
-  }
-  return nonBlockingCheckStates.has(state) ? 'REAL' : 'BLOCKING'
+/**
+ * Every string on a rollup entry that can carry the bot's own account of what
+ * it did. A legacy commit status (`/commits/{sha}/status`) says it in
+ * `description`; a check run (`/commits/{sha}/check-runs`) says it in the
+ * nested `output.title` / `output.summary` — cubic reports
+ * `AI review skipped: seat author not assigned` as `output.title`, which a
+ * top-level-only read never sees, so the check classifies as a real pass.
+ */
+const checkDescriptions = (record: Record<string, unknown>): string[] => {
+  const output = asRecord(record.output)
+  return [
+    record.description,
+    record.summary,
+    record.title,
+    record.text,
+    output.title,
+    output.summary,
+    output.text,
+  ].flatMap((value) => {
+    const text = stringValue(value)?.trim()
+    return text ? [text] : []
+  })
 }
 
-const checkSignalsFromRollup = (value: unknown): CheckSignal[] => {
+/**
+ * GitHub reports the same state in two casings: GraphQL's `statusCheckRollup`
+ * uppercases it, REST's `/commits/{sha}/status` and `/commits/{sha}/check-runs`
+ * return `success` / `failure` lowercase. Comparing an unnormalized state
+ * against an uppercase set made every REST-shaped passing check read as
+ * BLOCKING, so the gate refused real greens while reporting
+ * `checks not merge-ready: success, success, ...`.
+ */
+const normalizeCheckState = (state: string): string => state.trim().toUpperCase()
+
+const classifyCheckKind = (state: string, descriptions: string[]): CheckSignal['kind'] => {
+  if (descriptions.some((text) => VACUOUS_REVIEW_MARKERS.some((marker) => marker.test(text)))) {
+    return 'VACUOUS'
+  }
+  return nonBlockingCheckStates.has(normalizeCheckState(state)) ? 'REAL' : 'BLOCKING'
+}
+
+export const checkSignalsFromRollup = (value: unknown): CheckSignal[] => {
   if (!Array.isArray(value)) {
     return []
   }
@@ -390,9 +418,14 @@ const checkSignalsFromRollup = (value: unknown): CheckSignal[] => {
   return value.map((entry) => {
     const record = asRecord(entry)
     const context = stringValue(record.context) ?? stringValue(record.name) ?? 'unknown'
-    const state = stringValue(record.conclusion) ?? stringValue(record.state) ?? stringValue(record.status) ?? 'UNKNOWN'
-    const description = checkDescription(record)
-    return { context, state, description, kind: classifyCheckKind(state, description) }
+    const raw = stringValue(record.conclusion) ?? stringValue(record.state) ?? stringValue(record.status) ?? 'UNKNOWN'
+    const descriptions = checkDescriptions(record)
+    return {
+      context,
+      state: normalizeCheckState(raw),
+      description: descriptions[0],
+      kind: classifyCheckKind(raw, descriptions),
+    }
   })
 }
 
@@ -421,7 +454,7 @@ const reviewInlineComments = (record: Record<string, unknown>): number => {
 }
 
 /** Parses raw `reviews` entries (GraphQL- or REST-shaped) into `ReviewAtHead`s, dropping any without an identifiable author, commit, or state. */
-const reviewsFromPayload = (value: unknown[]): ReviewAtHead[] =>
+export const reviewsFromPayload = (value: unknown[]): ReviewAtHead[] =>
   value.flatMap((entry) => {
     const record = asRecord(entry)
     const login = reviewAuthorLogin(record)
@@ -445,7 +478,7 @@ const reviewsFromPayload = (value: unknown[]): ReviewAtHead[] =>
  * requires a review actually anchored to `head`, from someone other than the
  * PR author, carrying a body or inline comments.
  */
-const reviewAtHeadRefusal = (
+export const reviewAtHeadRefusal = (
   reviews: ReviewAtHead[],
   head: string,
   author: string | undefined,

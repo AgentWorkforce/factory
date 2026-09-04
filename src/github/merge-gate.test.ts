@@ -347,6 +347,109 @@ describe('GithubMergeGate', () => {
     })
   })
 
+  // Both of these are shapes GitHub really returns, captured from
+  // AgentWorkforce/software-garden. `/commits/{sha}/status` (Devin,
+  // CodeRabbit) reports a lowercase state and a top-level `description`;
+  // `/commits/{sha}/check-runs` (cubic) reports a lowercase conclusion and
+  // puts its account of itself in the nested `output.title`. The classifier
+  // has to read both, and the two defects below have to be fixed together:
+  // fixing the casing alone promotes an unread nested description straight
+  // from BLOCKING to REAL, which is a vacuous green.
+  describe('rollup shapes GitHub actually returns (factory#432)', () => {
+    it('classifies a cubic check run as VACUOUS when its account is in the nested output.title', () => {
+      const verdict = evaluateGithubMergeGate(input, live({
+        statusCheckRollup: [
+          {
+            name: 'cubic · AI code reviewer',
+            status: 'completed',
+            conclusion: 'success',
+            output: { title: 'AI review skipped: seat author not assigned', summary: '' },
+          },
+        ],
+      }))
+
+      expect(verdict.live.checkSignals).toEqual([
+        expect.objectContaining({ context: 'cubic · AI code reviewer', kind: 'VACUOUS' }),
+      ])
+      expect(verdict).toMatchObject({ verdict: 'REFUSE', ready: false })
+      expect(verdict.reason).toMatch(/all vacuous/)
+    })
+
+    it('reads a vacuous marker out of output.summary as well as output.title', () => {
+      const verdict = evaluateGithubMergeGate(input, live({
+        statusCheckRollup: [
+          {
+            name: 'cubic · AI code reviewer',
+            conclusion: 'success',
+            output: { title: 'AI review', summary: 'AI review line limit reached for this month' },
+          },
+        ],
+      }))
+
+      expect(verdict.live.checkSignals).toEqual([
+        expect.objectContaining({ kind: 'VACUOUS' }),
+      ])
+    })
+
+    it('treats a lowercase REST success as a real pass rather than a blocking check', () => {
+      const verdict = evaluateGithubMergeGate(input, live({
+        statusCheckRollup: [{ context: 'ci/build', state: 'success', description: 'Build passed' }],
+      }))
+
+      expect(verdict.live.checkSignals).toEqual([
+        expect.objectContaining({ context: 'ci/build', state: 'SUCCESS', kind: 'REAL' }),
+      ])
+      expect(verdict).toMatchObject({ verdict: 'READY', ready: true })
+    })
+
+    it('still blocks on a lowercase REST failure', () => {
+      const verdict = evaluateGithubMergeGate(input, live({
+        statusCheckRollup: [
+          { context: 'ci/build', state: 'success', description: 'Build passed' },
+          { name: 'package', status: 'completed', conclusion: 'failure' },
+        ],
+      }))
+
+      expect(verdict).toMatchObject({ verdict: 'REFUSE', ready: false })
+      expect(verdict.reason).toMatch(/checks not merge-ready: FAILURE/)
+    })
+
+    it('classifies a real mixed rollup of legacy statuses and check runs the way GitHub returns it', () => {
+      const verdict = evaluateGithubMergeGate(input, live({
+        statusCheckRollup: [
+          // GET /commits/{sha}/status — legacy commit statuses. Devin is only
+          // ever visible here, never in /check-runs.
+          { context: 'Devin Review', state: 'success', description: 'Full review skipped: trial expired and no credits remaining' },
+          { context: 'CodeRabbit', state: 'success', description: 'Review rate limited' },
+          // GET /commits/{sha}/check-runs
+          { name: 'package', status: 'completed', conclusion: 'success', output: { title: null, summary: '' } },
+          { name: 'cubic · AI code reviewer', status: 'completed', conclusion: 'success', output: { title: 'AI review completed', summary: 'AI review completed with 1 review.' } },
+        ],
+      }))
+
+      expect(verdict.live.checkSignals.map((signal) => `${signal.context}=${signal.kind}`)).toEqual([
+        'Devin Review=VACUOUS',
+        'CodeRabbit=VACUOUS',
+        'package=REAL',
+        'cubic · AI code reviewer=REAL',
+      ])
+      expect(verdict).toMatchObject({ verdict: 'READY', ready: true })
+      expect(verdict.reason).toMatch(/2 real, 2 vacuous/)
+    })
+
+    it('refuses when every legacy status is vacuous and no check run accompanies them', () => {
+      const verdict = evaluateGithubMergeGate(input, live({
+        statusCheckRollup: [
+          { context: 'Devin Review', state: 'success', description: 'Full review skipped: trial expired and no credits remaining' },
+          { context: 'CodeRabbit', state: 'success', description: 'Review rate limited' },
+        ],
+      }))
+
+      expect(verdict).toMatchObject({ verdict: 'REFUSE', ready: false })
+      expect(verdict.reason).toMatch(/all vacuous \(Devin Review, CodeRabbit\)/)
+    })
+  })
+
   it('merges through gh with squash, delete-branch, and match-head-commit', async () => {
     const calls: string[][] = []
     const gate = new GhCliGithubMergeGate(async (args) => {
