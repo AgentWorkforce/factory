@@ -128,9 +128,9 @@ describe('mountAuthDegradedWarning', () => {
     expect(mountAuthDegradedWarning()).not.toContain(REFUSAL_PROMISE)
   })
 
-  it('says Factory is continuing, and is distinguishable from the refusal', () => {
+  it('says Software Garden is continuing, and is distinguishable from the refusal', () => {
     const warning = mountAuthDegradedWarning(details)
-    expect(warning).toContain('continuing')
+    expect(warning).toContain('Software Garden is continuing')
     expect(warning).not.toBe(mountAuthRemediation(details))
   })
 

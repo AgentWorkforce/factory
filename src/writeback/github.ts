@@ -529,7 +529,14 @@ export class GhCliGithubWriteback implements GithubWriteback {
         : { result: 'acknowledged' }
     }
     const target = FACTORY_GITHUB_STATUS_LABELS[status]
-    const previousNames = statusLabelNames(status === 'in-progress' ? 'human-review' : 'in-progress')
+    // Every lifecycle label except the canonical target comes off — the other
+    // status under both spellings AND the target status's own legacy alias.
+    // Removing only the other status would leave `factory:in-progress` sitting
+    // beside a freshly added `garden:in-progress`, so a same-status write would
+    // never complete the rename migration and the issue would carry two
+    // lifecycle labels for the same state. This matches `factoryStatusLabelSet`,
+    // which the mount writeback path already computes the same way.
+    const previousNames = allStatusLabelNames().filter((name) => name !== target.name.toLowerCase())
     await this.#run([
       'label',
       'create',

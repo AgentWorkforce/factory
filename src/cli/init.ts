@@ -97,7 +97,7 @@ export async function initializeFactory(options: FactoryInitOptions = {}): Promi
   }
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
   out.write(`Software Garden is ready for ${repo}. Created ${configPath}.\n`)
-  out.write('Add the `factory` label to an open GitHub issue, then run `factory run-once --dry-run`.\n')
+  out.write('Add the `garden` label to an open GitHub issue, then run `factory run-once --dry-run`.\n')
   return { configPath, repo, workspaceId }
 }
 

@@ -542,7 +542,7 @@ async function publishRepoTask(
       return { ...base, status: 'blocked', issue: existing, reason: 'public repository requires an explicit publicSummary; mounted content was not copied' }
     }
     const summary = visibility === 'public' ? target.publicSummary! : task.summary
-    const bodyWasEdited = existing.body !== renderIssueBody(task, summary, bodyDelivery)
+    const bodyWasEdited = !isGeneratedIssueBody(existing.body, task, summary, bodyDelivery)
     if (bodyWasEdited) {
       return {
         ...base,
@@ -651,13 +651,18 @@ async function publishRepoTask(
 }
 
 function factoryIssueTitle(title: string): string {
-  // New issues are prefixed with the canonical `[garden]` marker. A title
-  // already carrying either the garden or the legacy factory prefix is left
-  // untouched, so a re-rendered legacy page cannot end up double-prefixed.
+  // New issues are prefixed with the canonical `[garden]` marker. A title that
+  // already carries it is left untouched, and a title carrying the legacy
+  // `[factory]` prefix is REWRITTEN to the canonical one rather than passed
+  // through: a new write must not mint legacy naming, and discovery accepts
+  // both spellings (`hasGardenTitlePrefix`) so the rewrite cannot make an
+  // issue unrecognizable. Neither branch can double-prefix.
   const normalized = title.toLowerCase()
-  if (normalized.startsWith(`${GARDEN_TITLE_PREFIX.toLowerCase()}`) ||
-    normalized.startsWith(`${LEGACY_FACTORY_TITLE_PREFIX.toLowerCase()}`)) {
+  if (normalized.startsWith(GARDEN_TITLE_PREFIX.toLowerCase())) {
     return title
+  }
+  if (normalized.startsWith(LEGACY_FACTORY_TITLE_PREFIX.toLowerCase())) {
+    return `${GARDEN_TITLE_PREFIX}${title.slice(LEGACY_FACTORY_TITLE_PREFIX.length)}`
   }
   return `${GARDEN_TITLE_PREFIX} ${title}`
 }
@@ -907,13 +912,37 @@ function normalizedBootstrapSpec(bootstrap: z.infer<typeof bootstrapSchema>, pag
   return { ...bootstrap, authorizedPageId }
 }
 
+const GARDEN_INTAKE_HEADING = '## Software Garden intake'
+/** The heading this body carried before the Software Garden rename. */
+const LEGACY_FACTORY_INTAKE_HEADING = '## Factory intake'
+
+/**
+ * Whether `body` is still exactly one of the bodies this intake generates.
+ *
+ * An issue filed before the rename carries the legacy heading, so comparing it
+ * against the canonical render alone would read an untouched generated body as
+ * a manual edit and block the portable-mount migration it needs. Accept either
+ * heading here; the migration itself always writes the canonical one.
+ */
+function isGeneratedIssueBody(
+  body: string,
+  task: NormalizedNotionTask,
+  summary: string,
+  delivery?: NotionContractDelivery,
+): boolean {
+  return [GARDEN_INTAKE_HEADING, LEGACY_FACTORY_INTAKE_HEADING].some(
+    (heading) => body === renderIssueBody(task, summary, delivery, heading),
+  )
+}
+
 function renderIssueBody(
   task: NormalizedNotionTask,
   summary: string,
   delivery?: NotionContractDelivery,
+  heading: string = GARDEN_INTAKE_HEADING,
 ): string {
   return [
-    '## Software Garden intake',
+    heading,
     '',
     summary,
     '',

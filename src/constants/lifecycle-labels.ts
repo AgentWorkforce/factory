@@ -77,16 +77,24 @@ export const gardenLabelAliases = (label: string): readonly string[] => {
   return [normalized]
 }
 
-/** Whether any label in `labels` is the configured label or its rename alias. */
+/**
+ * Whether any label in `labels` is the configured label or its rename alias.
+ *
+ * Every entry is normalized on the way in, whatever collection it arrives in.
+ * A `Set` used to be probed with `has` directly, so a provider-cased label such
+ * as `Factory` matched through the array form and missed through the set form —
+ * dual-read behavior must not depend on the shape of the collection.
+ */
 export const matchesGardenLabelAlias = (
   labels: ReadonlySet<string> | readonly string[],
   label: string,
 ): boolean => {
   const aliases = gardenLabelAliases(label)
   if (aliases.length === 0) return false
-  if (labels instanceof Set) return aliases.some((alias) => labels.has(alias))
-  const normalized = new Set([...labels].map((entry) => normalizeLabel(entry)))
-  return aliases.some((alias) => normalized.has(alias))
+  for (const entry of labels) {
+    if (aliases.includes(normalizeLabel(entry))) return true
+  }
+  return false
 }
 
 /** Whether `labels` carries the lifecycle status label, under either name. */
@@ -128,13 +136,3 @@ export const hasGardenTitlePrefix = (title: string, prefix: string): boolean =>
   titlePrefixAliases(prefix).some(
     (candidate) => title === candidate || title.startsWith(`${candidate} `),
   )
-
-/**
- * The legacy title prefix a garden prefix replaced, for callers that must
- * surface both during transition. Returns `undefined` for custom prefixes.
- */
-export const legacyTitlePrefixOf = (prefix: string): string | undefined => {
-  if (prefix === GARDEN_TITLE_PREFIX) return LEGACY_FACTORY_TITLE_PREFIX
-  if (prefix === GARDEN_E2E_TITLE_PREFIX) return LEGACY_FACTORY_E2E_TITLE_PREFIX
-  return undefined
-}

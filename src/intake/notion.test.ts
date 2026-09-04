@@ -294,7 +294,7 @@ describe('Notion spec intake', () => {
     expect(refusing.updateIssue).not.toHaveBeenCalled()
   })
 
-  it('preserves an explicit Factory title prefix without duplicating it', async () => {
+  it('preserves an explicit canonical title prefix without duplicating it', async () => {
     const { root, manifest } = await fixtureManifest('private mounted body', {
       bootstrap: {
         ...bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
@@ -307,6 +307,70 @@ describe('Notion spec intake', () => {
     await runNotionIntake({ manifest, dispatch: true, claims, github })
 
     expect(vi.mocked(github.createIssue).mock.calls[0]![0].title).toBe('[garden] Resume the checkpoint')
+  })
+
+  // The legacy branch of `factoryIssueTitle`, which the canonical case above
+  // cannot reach. A new write must not mint the pre-rename `[factory]`
+  // spelling, and it must not stack a second prefix on top of it either.
+  it('rewrites a legacy Factory title prefix to the canonical one without duplicating it', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: {
+        ...bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+        title: '[factory] Resume the checkpoint',
+      },
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+
+    await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    const title = vi.mocked(github.createIssue).mock.calls[0]![0].title
+    expect(title).toBe('[garden] Resume the checkpoint')
+    expect(title).not.toContain('[factory]')
+  })
+
+  // A pre-rename issue carries the `## Factory intake` heading. Comparing it
+  // against the canonical render alone reads an untouched generated body as a
+  // manual edit, which blocks the very migration it needs.
+  it('migrates a pre-rename issue body instead of reading its legacy heading as a manual edit', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+    })
+    roots.push(root)
+
+    const created = fakeGithub({ visibility: 'private' })
+    expect((await runNotionIntake({ manifest, dispatch: true, claims, github: created })).ok).toBe(true)
+    const issue = await vi.mocked(created.createIssue).mock.results[0]!.value as { number: number; url: string }
+    const canonicalBody = vi.mocked(created.createIssue).mock.calls[0]![0].body
+    const legacyBody = canonicalBody.replace('## Software Garden intake', '## Factory intake')
+    expect(legacyBody).not.toBe(canonicalBody)
+
+    manifest.workerMountTransport = { kind: 'relay-channel' }
+    const reconciling = fakeGithub({ visibility: 'private' })
+    reconciling.findBySource = vi.fn(async () => ({ ...issue, body: legacyBody }))
+    const contracts: NotionContractPublisher = {
+      publish: vi.fn(async () => ({
+        kind: 'relay-channel',
+        channel: 'factory-notion-e1cff7cf-aabbccddee',
+        messageIds: ['message-1'],
+        encoding: 'base64-chunks-v1',
+      })),
+    }
+
+    const reconciled = await runNotionIntake({
+      manifest,
+      dispatch: true,
+      claims,
+      github: reconciling,
+      contracts,
+    })
+
+    expect(reconciled.results[0]).toMatchObject({ status: 'already-dispatched' })
+    expect(reconciling.updateIssue).toHaveBeenCalledTimes(1)
+    // The migration writes the canonical heading back, so the legacy spelling
+    // is read once and never re-authored.
+    expect(vi.mocked(reconciling.updateIssue).mock.calls[0]![0].body)
+      .toContain('## Software Garden intake')
   })
 
   it('delivers private mounted bytes through a portable Relay channel without copying them to GitHub', async () => {

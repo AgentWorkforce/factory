@@ -486,6 +486,12 @@ const safetySchema = z.object({
   // default label is now `garden`. Discovery still accepts the legacy
   // `[factory-e2e]` prefix and `factory` label as aliases during the
   // transition, so in-flight issues remain dispatchable.
+  // Flipping this default moved the opt-in name while in-flight issues keep
+  // the legacy one, so every consumer must compare through
+  // `matchesGardenLabelAlias` rather than by equality — including the routing
+  // filter in `labelRoutesForIssue`, which excludes the opt-in from
+  // `repos.byLabel` lookup and would otherwise route on a legacy `factory`
+  // opt-in that collides with the repository of the same name.
   requireTitlePrefix: z.string().min(1).nullable().default(GARDEN_E2E_TITLE_PREFIX),
   requireLabel: z.string().default(GARDEN_AUTOMATION_LABEL),
   requireTeamKey: z.string().min(1).default('AR'),

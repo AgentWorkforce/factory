@@ -185,6 +185,21 @@ jobs:
           wait window. Any green here proves the P0 path is really working;
           any red demands operator attention.
           EOF
+          # `gh issue create --label` does NOT create a missing label -- it
+          # fails the whole call. The canonical `garden`/`garden-ready` names
+          # arrived with the Software Garden rename, so a target repository
+          # provisioned before it carries only the legacy `factory` spellings
+          # and the canary could never be filed at all. Provision the dispatch
+          # labels first. Deliberately WITHOUT `--force`: a label that already
+          # exists must keep the colour and description the repository chose
+          # for it, so the create is allowed to fail and `gh issue create`
+          # below stays the real verification.
+          gh label create garden --repo "${TARGET_REPO}" --color 0e8a16 \
+            --description "Software Garden may act on this issue." 2>/dev/null || true
+          gh label create garden-ready --repo "${TARGET_REPO}" --color 0e8a16 \
+            --description "Software Garden may dispatch this issue." 2>/dev/null || true
+          gh label create agent:single --repo "${TARGET_REPO}" --color ededed \
+            --description "Dispatch shape: a single implementer agent." 2>/dev/null || true
           URL="$(gh issue create --repo "${TARGET_REPO}" --title "${TITLE}" --body-file "${BODY_FILE}" \
             --label garden --label garden-ready --label agent:single)"
           NUM="${URL##*/}"
@@ -370,8 +385,18 @@ jobs:
           echo "Disarming unproven canary #${NUM}"
 
           for attempt in 1 2 3; do
-            gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
-              --remove-label garden-ready --remove-label agent:single --remove-label garden >/dev/null 2>&1 || true
+            # The ARMED check below treats the legacy `factory`/`factory-ready`
+            # spellings as dispatchable too, so they must come off here as
+            # well; otherwise a canary filed by an older build can never
+            # verify as disarmed, every retry fails, and the issue stays
+            # ingestible. Remove them ONE AT A TIME: a single `gh issue edit`
+            # carrying a label the target repository has never provisioned can
+            # fail as a whole, which would drop the removals that would have
+            # succeeded and leave the canary armed.
+            for LABEL in garden-ready factory-ready agent:single garden factory; do
+              gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
+                --remove-label "${LABEL}" >/dev/null 2>&1 || true
+            done
             gh issue close "${NUM}" --repo "${TARGET_REPO}" --reason "not planned" \
               --comment "P0 canary was not proven inside the wait window (${RUN_URL}). Dispatch labels removed and issue closed so the sweep does not later ingest an abandoned canary and consume a batch slot. Re-run verify-p0-canary to retry." >/dev/null 2>&1 || true
 

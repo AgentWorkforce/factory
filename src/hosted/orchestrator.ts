@@ -656,7 +656,7 @@ function defaultMergeGate(
       }
     : {
         status: 'ready',
-        reason: 'All hosted Factory invocations completed successfully.',
+        reason: 'All hosted Software Garden invocations completed successfully.',
         decidedAt,
       }
 }

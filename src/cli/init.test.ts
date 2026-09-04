@@ -33,7 +33,7 @@ describe('factory init', () => {
           clonePaths: { 'Acme/widgets': cwd },
         },
       })
-      expect(output.text()).toContain('Add the `factory` label')
+      expect(output.text()).toContain('Add the `garden` label')
     } finally {
       await rm(cwd, { recursive: true, force: true })
     }

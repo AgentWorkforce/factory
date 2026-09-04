@@ -21640,10 +21640,20 @@ function labelRoutesForIssue(
   routes: Array<{ slug: string; route: TriageDecision['routes'][number] }>
 } {
   const githubIssue = isGithubIssue(issue)
-  const githubReadinessLabel = githubIssue ? config.safety.requireLabel.trim().toLowerCase() : undefined
+  const githubReadinessLabel = githubIssue ? config.safety.requireLabel.trim() : undefined
+  // The readiness opt-in is never a routing label, and it must be excluded
+  // through its rename alias rather than by bare equality. `repos.byLabel`
+  // derives an entry per repository NAME, so the repository called `factory`
+  // maps the label `factory`; with the configured default now `garden`, an
+  // in-flight issue still carrying the legacy `factory` opt-in would otherwise
+  // have that opt-in read as a repository route.
+  const isReadinessOptIn = (label: string): boolean =>
+    githubReadinessLabel !== undefined &&
+    githubReadinessLabel.length > 0 &&
+    matchesGardenLabelAlias([label], githubReadinessLabel)
   const candidateLabels = uniqueNormalizedLabels(issue.labels).filter((label) =>
     !isShapeLabel(label) &&
-    label.toLowerCase() !== githubReadinessLabel &&
+    !isReadinessOptIn(label) &&
     (!githubIssue || !GITHUB_LIFECYCLE_LABELS.has(label.toLowerCase())),
   )
   const labels: string[] = []

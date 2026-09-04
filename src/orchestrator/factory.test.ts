@@ -19325,6 +19325,44 @@ describe('FactoryLoop', () => {
     expect(result.comments[0]).toContain('ar-729-impl-factory-in-progress')
   })
 
+  // The readiness opt-in is never a route. `repos.byLabel` derives an entry per
+  // repository NAME, so a repository literally called `factory` maps the label
+  // `factory` -- and once the configured default moved to `garden`, an in-flight
+  // issue still carrying the legacy opt-in had that opt-in read as a second
+  // repository route. The exclusion must go through the rename alias, not
+  // through equality with the configured name.
+  it('never routes a GitHub issue on the readiness opt-in under its legacy spelling', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 731)
+    const issue = githubIssueFile(731, { labels: ['factory', 'pear'] })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({
+      issueSource: 'github',
+      repos: {
+        byLabel: {
+          // The opt-in label collides with a real repository name.
+          factory: 'AgentWorkforce/factory',
+          pear: 'AgentWorkforce/pear',
+        },
+        clonePaths: {
+          'AgentWorkforce/factory': '/work/factory',
+          'AgentWorkforce/pear': '/work/pear',
+        },
+        default: 'AgentWorkforce/pear',
+      },
+    }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+
+    const result = await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+
+    expect(result.agents.map((agent) => agent.name)).toEqual(['ar-731-impl-pear', 'ar-731-review-pear'])
+    expect(fleet.spawns.map((spawn) => spawn.cwd)).toEqual(['/work/pear', '/work/pear'])
+  })
+
   it('filters non-repo labels when repo labels are present', async () => {
     const routedIssue = realIssueFile(721, ready, {
       labels: [{ name: 'factory' }, { name: 'pear' }],

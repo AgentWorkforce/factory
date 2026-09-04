@@ -2906,7 +2906,7 @@ Commands:
   featuremap check      Validate .agentworkforce/features/manifest.yaml
   intake notion <file>  Normalize mounted Notion specs into Software Garden work
   intake notion generate
-                        Emit a manifest for Ready for Agent Factory Tasks rows
+                        Emit a manifest from the Factory Tasks rows marked Ready for Agent
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:

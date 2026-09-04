@@ -1839,6 +1839,57 @@ describe('GhCliGithubWriteback', () => {
     ])
   })
 
+  // The rename migration only completes if the target status's OWN legacy
+  // alias comes off. Removing just the other status leaves `factory:in-progress`
+  // beside a freshly added `garden:in-progress`, and every later identical call
+  // is a no-op, so the issue carries two lifecycle labels for one state forever.
+  it('removes the target status legacy alias on a same-status write', async () => {
+    const calls: string[][] = []
+    const labels = new Set(['factory', 'factory:in-progress'])
+    const events: string[] = []
+    let nextEventId = 1
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit') {
+          args.forEach((arg, index) => {
+            const value = args[index + 1]!
+            if (arg === '--add-label' && !labels.has(value)) {
+              labels.add(value)
+              events.push(`${nextEventId++}\tlabeled\t${value}\tfactory-bot`)
+            }
+            if (arg === '--remove-label' && labels.delete(value)) {
+              events.push(`${nextEventId++}\tunlabeled\t${value}\tfactory-bot`)
+            }
+          })
+        }
+        return { stdout: '' }
+      },
+    })
+
+    // The effective status never changed, so no ownership is claimed -- but the
+    // label set is still migrated to the canonical name.
+    await expect(github.setStatus(githubIssue, 'in-progress')).resolves.toBe('already-matched')
+
+    expect(labels).toEqual(new Set(['factory', 'garden:in-progress']))
+    expect(calls).toContainEqual([
+      'issue',
+      'edit',
+      '48',
+      '--repo',
+      'AgentWorkforce/factory',
+      '--add-label',
+      'garden:in-progress',
+      '--remove-label',
+      'factory:in-progress',
+    ])
+  })
+
   it('does not attribute a label add won by another actor between read and edit', async () => {
     const labels = new Set(['garden:in-progress'])
     const events: string[] = []

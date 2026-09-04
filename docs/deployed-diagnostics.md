@@ -1,6 +1,6 @@
 # Diagnosing a deployed Software Garden instance
 
-> Issue: [#295](https://github.com/AgentWorkforce/factory/issues/295) · companion: AgentWorkforce/factory-cloud `fix/295-healthz-diagnostics` — a deployed Factory had no
+> Issue: [#295](https://github.com/AgentWorkforce/factory/issues/295) · companion: AgentWorkforce/factory-cloud `fix/295-healthz-diagnostics` — a deployed Software Garden had no
 > operator-reachable diagnostics. The field naming the 2026-08-19/20 outage existed the whole time
 > and was unreachable for ~10 hours.
 
