@@ -1,6 +1,6 @@
 # Pull-request end-to-end verification
 
-Factory changes are merged and published only from a tested Git object. The required `package`
+Software Garden changes are merged and published only from a tested Git object. The required `package`
 check is the enforcement point: it builds and tests the checkout, installs the resulting npm
 tarball into a clean consumer, runs the packaged CLI, and drives the public hosted control plane
 through a complete lifecycle.

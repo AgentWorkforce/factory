@@ -1,5 +1,10 @@
 # Prove the P0 end-to-end path still works after every live deploy:
-# file a fresh [factory]-labeled canary issue in THIS repo, wait up to 45 min
+# file a fresh [garden]-labeled canary issue in THIS repo, wait up to 45 min
+#
+# NOTE (Software Garden rename): new automation writes are canonical — the
+# canary files with the `garden` / `garden-ready` labels and `[garden]` title
+# prefix. The post-rename sweep ingests garden names natively (and still
+# accepts the legacy `factory` spellings on read for in-flight issues).
 # for the deployed container to dispatch it (JIT-provisioned sandbox, impl
 # agent, branch push, PR create), and fail if nothing appears.
 #
@@ -159,12 +164,12 @@ jobs:
         run: |
           set -euo pipefail
           TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          TITLE="[factory] Canary — P0 verify ${TS}"
+          TITLE="[garden] Canary — P0 verify ${TS}"
           BODY_FILE="$(mktemp)"
           cat > "${BODY_FILE}" <<'EOF'
           ## Canary probe
 
-          Filed by `verify-p0-canary.yml` to prove the factory dispatch pipeline
+          Filed by `verify-p0-canary.yml` to prove the Software Garden dispatch pipeline
           works end-to-end after the latest deploy. Deliberately trivial so the
           impl agent's work is fast and unambiguous.
 
@@ -181,7 +186,7 @@ jobs:
           any red demands operator attention.
           EOF
           URL="$(gh issue create --repo "${TARGET_REPO}" --title "${TITLE}" --body-file "${BODY_FILE}" \
-            --label factory --label factory-ready --label agent:single)"
+            --label garden --label garden-ready --label agent:single)"
           NUM="${URL##*/}"
           echo "Filed canary ${URL}"
           echo "issue_number=${NUM}" >> "${GITHUB_OUTPUT}"
@@ -366,7 +371,7 @@ jobs:
 
           for attempt in 1 2 3; do
             gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
-              --remove-label factory-ready --remove-label agent:single --remove-label factory >/dev/null 2>&1 || true
+              --remove-label garden-ready --remove-label agent:single --remove-label garden >/dev/null 2>&1 || true
             gh issue close "${NUM}" --repo "${TARGET_REPO}" --reason "not planned" \
               --comment "P0 canary was not proven inside the wait window (${RUN_URL}). Dispatch labels removed and issue closed so the sweep does not later ingest an abandoned canary and consume a batch slot. Re-run verify-p0-canary to retry." >/dev/null 2>&1 || true
 
@@ -375,7 +380,7 @@ jobs:
             LABELS="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo UNKNOWN)"
             ARMED=0
             case ",${LABELS}," in
-              *,factory-ready,*|*,agent:single,*|*,factory,*) ARMED=1 ;;
+              *,garden-ready,*|*,agent:single,*|*,garden,*|*,factory-ready,*|*,factory,*) ARMED=1 ;;
             esac
             if [ "${STATE}" = "CLOSED" ] && [ "${ARMED}" = "0" ]; then
               echo "Disarmed on attempt ${attempt}: state=${STATE} labels=[${LABELS}]"
@@ -395,7 +400,7 @@ jobs:
             echo "- state: \`${STATE}\`  labels: \`${LABELS}\`"
             echo ""
             echo "This canary is still dispatchable and will consume a batch slot."
-            echo "Remove the \`factory\`, \`factory-ready\` and \`agent:single\` labels and close it by hand."
+            echo "Remove the \`garden\`, \`garden-ready\` and \`agent:single\` labels (or their legacy \`factory\` spellings) and close it by hand."
           } >> "${GITHUB_STEP_SUMMARY}"
           echo "::error::Could not disarm canary #${NUM} after 3 attempts (state=${STATE}, labels=[${LABELS}]); it remains dispatchable and needs manual cleanup"
           exit 1

@@ -92,3 +92,49 @@ describe('isInFactoryScope', () => {
     }), safety)).toBe(true)
   })
 })
+
+describe('isInFactoryScope rename transition', () => {
+  const gardenSafety = {
+    requireTitlePrefix: '[garden-e2e]',
+    requireLabel: 'garden',
+    requireTeamKey: 'AR',
+  }
+
+  it('keeps the legacy factory label acceptable when garden is configured', () => {
+    expect(isInFactoryScope(issue({ labels: ['factory'] }), gardenSafety)).toBe(true)
+    expect(isInFactoryScope(issue({ labels: ['garden'] }), gardenSafety)).toBe(true)
+  })
+
+  it('keeps legacy-titled issues acceptable when the garden prefix is configured', () => {
+    expect(isInFactoryScope(issue({ title: '[factory-e2e] Soak issue' }), gardenSafety)).toBe(true)
+    expect(isInFactoryScope(issue({ title: '[garden-e2e] Soak issue' }), gardenSafety)).toBe(true)
+  })
+
+  it('defaults to the garden prefix and label when no safety is configured', () => {
+    expect(isInFactoryScope(issue({ title: '[garden-e2e] Untitled soak' }))).toBe(true)
+    expect(isInFactoryScope(issue({ labels: ['garden'] }))).toBe(true)
+    expect(isInFactoryScope(issue({ labels: ['factory'] }))).toBe(true)
+    expect(isInFactoryScope(issue())).toBe(false)
+  })
+
+  it('accepts both mirror title spellings for GitHub mirror payloads only', () => {
+    const mirror = (title: string) => issue({ title, labels: [] })
+    const withGithubSource = (title: string) => {
+      const base = mirror(title)
+      return {
+        ...base,
+        raw: {
+          payload: {
+            ...base.raw.payload,
+            source: { provider: 'github', owner: 'AgentWorkforce', repo: 'pear', number: 9, url: 'https://github.com/AgentWorkforce/pear/issues/9' },
+          },
+        },
+      }
+    }
+    expect(isInFactoryScope(withGithubSource('[garden] Mirrored issue'), gardenSafety)).toBe(true)
+    expect(isInFactoryScope(withGithubSource('[factory] Mirrored issue'), gardenSafety)).toBe(true)
+    // A human-authored Linear issue merely titled with the mirror marker is
+    // still rejected under the stricter configured prefix.
+    expect(isInFactoryScope(mirror('[factory] Human-authored issue'), gardenSafety)).toBe(false)
+  })
+})

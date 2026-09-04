@@ -12,7 +12,7 @@ import {
 } from './mount-auth-error'
 
 /** The sentence that promises no agents will run. Only a refusal may say it. */
-const REFUSAL_PROMISE = 'Factory will not spawn agents against a read-denied mirror'
+const REFUSAL_PROMISE = 'Software Garden will not spawn agents against a read-denied mirror'
 
 async function withTempStateFile(
   lastError: unknown,

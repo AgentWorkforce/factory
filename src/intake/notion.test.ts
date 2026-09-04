@@ -167,11 +167,11 @@ describe('Notion spec intake', () => {
     expect(body).toContain("SHA-256 hash the mounted file's UTF-8 bytes")
     expect(body).not.toContain('private mounted implementation detail')
     expect(vi.mocked(github.createIssue).mock.calls[0]![0].labels).toEqual([
-      'factory-ready',
+      'garden-ready',
       'agent:team',
       'relay',
     ])
-    expect(vi.mocked(github.createIssue).mock.calls[0]![0].title).toBe('[factory] Resume the checkpoint')
+    expect(vi.mocked(github.createIssue).mock.calls[0]![0].title).toBe('[garden] Resume the checkpoint')
     const stored = JSON.parse(await readFile(manifest.statePath, 'utf8'))
     expect(stored.receipts[`notion:${pageId}:repo:agentworkforce/relay`]).toMatchObject({
       kind: 'github',
@@ -182,6 +182,50 @@ describe('Notion spec intake', () => {
     const second = await runNotionIntake({ manifest, dispatch: true, claims, github })
     expect(second.results[0]).toMatchObject({ status: 'already-dispatched', issue: { number: 42 } })
     expect(github.createIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls back to the legacy factory-ready label for repositories provisioned before the rename', async () => {
+    // Rename transition: `garden-ready` is the canonical readiness label, but
+    // a repository that already provisioned `factory-ready` keeps dispatching
+    // instead of blocking on a missing label.
+    const { root, manifest } = await fixtureManifest('legacy label body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/relay', labels: [] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    // Only `garden-ready` is missing; the legacy `factory-ready` and the
+    // recipe label are already provisioned.
+    github.missingLabels = vi.fn(async (_repo: string, labels: readonly string[]) =>
+      labels.filter((label) => label === 'garden-ready'))
+
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    expect(report.ok).toBe(true)
+    expect(vi.mocked(github.createIssue).mock.calls[0]![0].labels).toEqual([
+      'factory-ready',
+      'agent:team',
+    ])
+  })
+
+  it('blocks with an actionable reason when neither readiness label exists on the repository', async () => {
+    const { root, manifest } = await fixtureManifest('unprovisioned body', {
+      bootstrap: bootstrap({ repo: 'AgentWorkforce/relay', labels: [] }),
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+    github.missingLabels = vi.fn(async (_repo: string, labels: readonly string[]) => [...labels])
+
+    const report = await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    expect(report.ok).toBe(false)
+    expect(report.results[0]).toMatchObject({
+      status: 'blocked',
+      reason: expect.stringContaining('garden-ready'),
+    })
+    expect(report.results[0]).toMatchObject({
+      reason: expect.stringContaining('factory-ready'),
+    })
+    expect(github.createIssue).not.toHaveBeenCalled()
   })
 
   it('refuses an app-identity intake WITHOUT consuming the exactly-once delivery claim', async () => {
@@ -254,7 +298,7 @@ describe('Notion spec intake', () => {
     const { root, manifest } = await fixtureManifest('private mounted body', {
       bootstrap: {
         ...bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
-        title: '[factory] Resume the checkpoint',
+        title: '[garden] Resume the checkpoint',
       },
     })
     roots.push(root)
@@ -262,7 +306,7 @@ describe('Notion spec intake', () => {
 
     await runNotionIntake({ manifest, dispatch: true, claims, github })
 
-    expect(vi.mocked(github.createIssue).mock.calls[0]![0].title).toBe('[factory] Resume the checkpoint')
+    expect(vi.mocked(github.createIssue).mock.calls[0]![0].title).toBe('[garden] Resume the checkpoint')
   })
 
   it('delivers private mounted bytes through a portable Relay channel without copying them to GitHub', async () => {

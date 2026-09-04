@@ -60,12 +60,12 @@ the stack source is applied. Inline values are rejected by the typed loader.
 `resolveVerificationStackDescriptor({ repoPath, ref?, descriptorPath? })`
 selects the default descriptor or a repository-relative override. Passing `ref`
 loads the descriptor committed at that branch or SHA instead of the working
-tree version. On deployment, Factory materializes stack assets from that same
+tree version. On deployment, Software Garden materializes stack assets from that same
 commit so a dirty or differently checked-out working tree cannot change the
 selected stack.
 
 The optional `verification` section declares the E2E command, load profile,
-environment lease, and run/teardown limits used by Factory's required merge
+environment lease, and run/teardown limits used by Software Garden's required merge
 gate. The descriptor/deployer APIs may be used without it; the merge gate fails
 closed when the section or all exposed endpoints are absent.
 
@@ -73,7 +73,7 @@ closed when the section or all exposed endpoints are absent.
 OCI/HTTP Helm charts, kustomize directories, raw Kubernetes manifests, and
 Docker Compose through `kompose`. Every source is rendered before it reaches
 the cluster and passes the same namespace, RBAC, network, secret, pod-security,
-and cluster-scope policy checks. Helm is rendered with `helm template`; Factory
+and cluster-scope policy checks. Helm is rendered with `helm template`; Software Garden
 does not let Helm or repository code apply resources directly. It waits for Deployment, StatefulSet, or
 DaemonSet rollout plus each HTTP, TCP, or exec probe. All waits and seed steps
 have descriptor-bounded timeouts. The returned deployment owns any local

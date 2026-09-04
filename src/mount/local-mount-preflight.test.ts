@@ -307,7 +307,7 @@ describe('ensureLocalMount', () => {
       const text = printed(stderr)
       expect(text).toContain('continuing')
       // The load-bearing half: it must NOT claim to be refusing.
-      expect(text).not.toContain('Factory will not spawn agents against a read-denied mirror')
+      expect(text).not.toContain('Software Garden will not spawn agents against a read-denied mirror')
     })
   })
 
@@ -321,7 +321,7 @@ describe('ensureLocalMount', () => {
 
       // Refuses: the thrown error is what the CLI maps to a non-zero code.
       await expect(ensureLocalMount('rw_test', dir, { startMount: vi.fn(async () => {}) }))
-        .rejects.toThrow(/Factory will not spawn agents against a read-denied mirror/u)
+        .rejects.toThrow(/Software Garden will not spawn agents against a read-denied mirror/u)
     })
   })
 

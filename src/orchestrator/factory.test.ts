@@ -148,7 +148,7 @@ describe('fleet control-plane admission', () => {
 
       const first = factory.runOnce()
       const firstFailure = expect(first).rejects.toThrow(
-        'Factory dispatch paused because the fleet control plane is unavailable',
+        'Software Garden dispatch paused because the fleet control plane is unavailable',
       )
       await vi.advanceTimersByTimeAsync(DEFAULT_FLEET_ROSTER_TIMEOUT_MS)
       await firstFailure
@@ -160,7 +160,7 @@ describe('fleet control-plane admission', () => {
 
       const second = factory.runOnce()
       const secondFailure = expect(second).rejects.toThrow(
-        'Factory dispatch paused because the fleet control plane is unavailable',
+        'Software Garden dispatch paused because the fleet control plane is unavailable',
       )
       await vi.advanceTimersByTimeAsync(DEFAULT_FLEET_ROSTER_TIMEOUT_MS)
       await secondFailure
@@ -174,7 +174,7 @@ describe('fleet control-plane admission', () => {
       })
 
       await expect(factory.runOnce()).rejects.toThrow(
-        'Factory dispatch paused because the fleet control plane is unavailable',
+        'Software Garden dispatch paused because the fleet control plane is unavailable',
       )
       expect(fleet.rosterCalls).toBe(2)
     } finally {
@@ -200,7 +200,7 @@ describe('fleet control-plane admission', () => {
     const decision = await factory.triageIssue(parseLinearIssue(path, file))
 
     await expect(factory.dispatch(decision)).rejects.toThrow(
-      'Factory dispatch paused because the fleet control plane is unavailable',
+      'Software Garden dispatch paused because the fleet control plane is unavailable',
     )
 
     expect(fleet.rosterCalls).toBe(1)
@@ -224,7 +224,7 @@ describe('fleet control-plane admission', () => {
     })
 
     await expect(factory.runOnce()).rejects.toThrow(
-      'Factory dispatch paused because the fleet control plane is unavailable',
+      'Software Garden dispatch paused because the fleet control plane is unavailable',
     )
     expect(error).toHaveBeenCalledWith(
       '[factory] fleet control plane unavailable; dispatch paused',
@@ -297,7 +297,7 @@ describe('fleet control-plane admission', () => {
     }), { mount, fleet, triage: new StaticTriage(), logger: {} })
 
     await expect(factory.runOnce()).rejects.toThrow(
-      'Factory dispatch paused because the fleet control plane is unavailable',
+      'Software Garden dispatch paused because the fleet control plane is unavailable',
     )
     expect(fleet.spawns).toEqual([])
     expect(mount.reads).toEqual([])
@@ -562,8 +562,8 @@ class RecordingGithubWriteback implements GithubWriteback {
     _opts?: { requireFresh?: boolean; freshAfterMs?: number },
   ): Promise<GithubIssueStatus> {
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()))
-    if (labels.has('factory:human-review')) return 'human-review'
-    if (labels.has('factory:in-progress')) return 'in-progress'
+    if (labels.has('factory:human-review') || labels.has('garden:human-review')) return 'human-review'
+    if (labels.has('factory:in-progress') || labels.has('garden:in-progress')) return 'in-progress'
     return 'ready'
   }
 
@@ -657,7 +657,7 @@ class ProviderHumanReviewGithubWriteback extends RecordingGithubWriteback {
 
 class FailingGithubCommentWriteback extends RecordingGithubWriteback {
   override async postComment(issue: LinearIssue, body: string): Promise<void> {
-    if (body.startsWith('Factory dispatch for ')) {
+    if (body.startsWith('Software Garden dispatch for ')) {
       await super.postComment(issue, body)
       return
     }
@@ -2656,7 +2656,7 @@ class BlockingUnroutableReplyMountClient extends ConfirmRecordingSlackMountClien
   }
 
   override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
-    if (!this.#blocked && slackWriteText(content).startsWith('Factory received this reply but could not route it')) {
+    if (!this.#blocked && slackWriteText(content).startsWith('Software Garden received this reply but could not route it')) {
       this.#blocked = true
       this.#signalUnroutableWriteStarted()
       await this.#unroutableWriteReleased
@@ -2671,7 +2671,7 @@ class FailingUndeliveredReceiptMountClient extends ConfirmRecordingSlackMountCli
   receiptAttempts = 0
 
   override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
-    if (this.failReceipts && slackWriteText(content).startsWith('Factory could not deliver')) {
+    if (this.failReceipts && slackWriteText(content).startsWith('Software Garden could not deliver')) {
       this.receiptAttempts += 1
       throw new Error('Slack writeback is unavailable')
     }
@@ -2765,7 +2765,7 @@ class FailingFencedReceiptMountClient extends ConfirmRecordingSlackMountClient {
   }
 
   override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
-    if (slackWriteText(content).startsWith('Factory received this reply but could not route it')) {
+    if (slackWriteText(content).startsWith('Software Garden received this reply but could not route it')) {
       if (!this.#parked) {
         this.#parked = true
         this.#signalUnroutableWriteStarted()
@@ -2810,7 +2810,7 @@ class ParkedTerminalReceiptMountClient extends ConfirmRecordingSlackMountClient 
   }
 
   override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
-    if (!this.receiptWriteEntered && slackWriteText(content).startsWith('Factory could not deliver')) {
+    if (!this.receiptWriteEntered && slackWriteText(content).startsWith('Software Garden could not deliver')) {
       this.receiptWriteEntered = true
       await this.#receiptWriteReleased
     }
@@ -2834,7 +2834,7 @@ class ParkedReplyReceiptMountClient extends ConfirmRecordingSlackMountClient {
   }
 
   override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
-    if (!this.receiptWriteEntered && slackWriteText(content).startsWith('Factory received this reply and durably queued it')) {
+    if (!this.receiptWriteEntered && slackWriteText(content).startsWith('Software Garden received this reply and durably queued it')) {
       this.receiptWriteEntered = true
       await this.#receiptWriteReleased
     }
@@ -2862,7 +2862,7 @@ class RejectingUnroutableReplyMountClient extends ConfirmRecordingSlackMountClie
   }
 
   override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
-    if (slackWriteText(content).startsWith('Factory received this reply but could not route it')) {
+    if (slackWriteText(content).startsWith('Software Garden received this reply but could not route it')) {
       if (!this.#blocked) {
         this.#blocked = true
         this.#signalUnroutableWriteStarted()
@@ -3605,7 +3605,7 @@ describe('FactoryLoop', () => {
     expect(report.dispatched.map((result) => result.issue.key)).toEqual(['48'])
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-48-impl-pear', 'ar-48-review-pear'])
     expect(githubWriteback.statuses).toEqual([{ key: '48', status: 'in-progress' }])
-    expect(githubWriteback.comments[0]?.body).toContain('Factory dispatch for 48')
+    expect(githubWriteback.comments[0]?.body).toContain('Software Garden dispatch for 48')
     expect(mount.writes.filter((write) => write.path.startsWith('/linear/'))).toEqual([])
     expect(factory.status().counters.githubIssueMirrorsCreated).toBeUndefined()
 
@@ -3671,14 +3671,14 @@ describe('FactoryLoop', () => {
       expect(updateIssue).toHaveBeenCalledWith({
         repo: 'AgentWorkforce/pear',
         number,
-        labels: ['factory', 'bug', 'factory:in-progress'],
+        labels: ['factory', 'bug', 'garden:in-progress'],
         author: 'app',
       })
       expect(postIssueComment).toHaveBeenCalledWith(expect.objectContaining({
         repo: 'AgentWorkforce/pear',
         number,
         author: 'app',
-        body: expect.stringContaining('Factory dispatch for 221'),
+        body: expect.stringContaining('Software Garden dispatch for 221'),
       }))
 
       fleet.emitAgentExit('ar-221-impl-pear', 'issue-done')
@@ -3738,7 +3738,7 @@ describe('FactoryLoop', () => {
       expect(appUpdateIssue).toHaveBeenCalledWith(expect.objectContaining({
         repo: 'AgentWorkforce/pear',
         number,
-        labels: expect.arrayContaining(['factory:in-progress']),
+        labels: expect.arrayContaining(['garden:in-progress']),
         author: 'app',
       }))
       expect(appPostIssueComment).toHaveBeenCalledWith(expect.objectContaining({
@@ -3800,7 +3800,7 @@ describe('FactoryLoop', () => {
         '[factory] dispatch writeback dead-lettered after retries exhausted',
         expect.objectContaining({
           issue: '242',
-          write: 'GitHub label factory:in-progress',
+          write: 'GitHub label garden:in-progress',
           attempts: 3,
           error: 'GitHub label write unavailable',
         }),
@@ -3817,7 +3817,7 @@ describe('FactoryLoop', () => {
           issue: '242',
           claim: expect.objectContaining({
             state: 'degraded',
-            write: 'GitHub label factory:in-progress',
+            write: 'GitHub label garden:in-progress',
             attempts: 3,
             maxAttempts: 3,
             deadLettered: true,
@@ -3870,7 +3870,7 @@ describe('FactoryLoop', () => {
     expect(commentAttempts).toBe(3)
     expect(githubWriteback.statuses).toEqual([{ key: '243', status: 'in-progress' }])
     expect(githubWriteback.comments).toEqual([
-      { key: '243', body: expect.stringContaining('Factory dispatch for 243') },
+      { key: '243', body: expect.stringContaining('Software Garden dispatch for 243') },
     ])
     expect(errors.filter(([message]) => message === '[factory] dispatch writeback failed; retrying'))
       .toHaveLength(2)
@@ -4024,8 +4024,8 @@ describe('FactoryLoop', () => {
     ])
     expect(factory.status().parked).toHaveLength(2)
     expect(githubWriteback.comments.map((comment) => comment.body)).toEqual([
-      expect.stringContaining('Factory refused dispatch because it detected a dependency cycle.'),
-      expect.stringContaining('Factory refused dispatch because it detected a dependency cycle.'),
+      expect.stringContaining('Software Garden refused dispatch because it detected a dependency cycle.'),
+      expect.stringContaining('Software Garden refused dispatch because it detected a dependency cycle.'),
     ])
     expect(fleet.spawns).toEqual([])
   })
@@ -4179,7 +4179,7 @@ describe('FactoryLoop', () => {
     mount.files.set(dependentPath, { content: blockedDependent })
     expect((await factory.dispatch(decision)).hold?.kind).toBe('dependency')
     expect(githubWriteback.comments.filter((comment) =>
-      comment.key === '40' && comment.body.includes('Factory parked this issue'))).toHaveLength(2)
+      comment.key === '40' && comment.body.includes('Software Garden parked this issue'))).toHaveLength(2)
   })
 
   it('spawns the reviewer with maxRestarts:0 so a torn-down reviewer is not re-registered as a broker orphan', async () => {
@@ -7754,7 +7754,7 @@ describe('FactoryLoop', () => {
     expect(mount.writes).toHaveLength(1)
     expect(mount.writes[0]?.path).toMatch(/^\/linear\/issues\/factory-create-github-[a-z0-9]+\.json$/u)
     expect(mount.writes[0]?.content).toEqual({
-      title: '[factory] Route GitHub factory issues',
+      title: '[garden] Route GitHub factory issues',
       stateId: ready,
       description: 'Use the synced GitHub mount, not the GitHub API.\n\nSource: https://github.com/AgentWorkforce/pear/issues/1116',
       labels: [{ name: 'pear' }],
@@ -7902,7 +7902,7 @@ describe('FactoryLoop', () => {
     })
     expect(mount.writes).toHaveLength(1)
     expect(mount.writes[0]?.content).toEqual(expect.objectContaining({
-      title: '[factory] Telegram helper parity',
+      title: '[garden] Telegram helper parity',
       labels: [{ name: 'relayfile-adapters' }],
       source: expect.objectContaining({
         provider: 'github',
@@ -7953,7 +7953,7 @@ describe('FactoryLoop', () => {
     expect(mount.listTreePrefixes).not.toContain('/github/repos')
     expect(mount.writes).toHaveLength(1)
     expect(mount.writes[0]?.content).toEqual(expect.objectContaining({
-      title: '[factory] Export shared mount-path parser',
+      title: '[garden] Export shared mount-path parser',
       teamId: 'team-ar',
       labels: [{ name: 'relayfile-adapters' }],
       source: expect.objectContaining({
@@ -7990,7 +7990,7 @@ describe('FactoryLoop', () => {
     await factory.runOnce()
 
     expect(mount.writes[0]?.content).toEqual(expect.objectContaining({
-      title: '[factory] Route sparse GitHub factory issues',
+      title: '[garden] Route sparse GitHub factory issues',
       source: expect.objectContaining({
         provider: 'github',
         owner: 'AgentWorkforce',
@@ -8987,7 +8987,7 @@ describe('FactoryLoop', () => {
     expect(mount.writes).toHaveLength(1)
     expect(mount.writes[0]?.path).toMatch(/^\/linear\/issues\/factory-create-github-[a-z0-9]+\.json$/u)
     expect(mount.writes[0]?.content).toEqual({
-      title: '[factory] Relay issue should dispatch',
+      title: '[garden] Relay issue should dispatch',
       stateId: ready,
       description: 'Implement the relay fix.\n\nAcceptance: add tests.\n\nSource: https://github.com/AgentWorkforce/pear/issues/1116',
       labels: [{ name: 'pear' }],
@@ -9096,7 +9096,7 @@ describe('FactoryLoop', () => {
     expect(mount.writes).toHaveLength(1)
     expect(mount.writes[0]?.path).toMatch(/^\/linear\/issues\/factory-create-github-[a-z0-9]+\.json$/u)
     expect(mount.writes[0]?.content).toMatchObject({
-      title: '[factory] Live mount shape issue',
+      title: '[garden] Live mount shape issue',
       source: expect.objectContaining({ provider: 'github', path: ghPath, number: 1116 }),
     })
     expect(factory.status().counters.githubIssueMirrorsCreated).toBe(1)
@@ -9224,7 +9224,7 @@ describe('FactoryLoop', () => {
 
     expect(mount.writes).toHaveLength(1)
     expect(mount.writes[0]?.content).toMatchObject({
-      title: '[factory] Directory event issue',
+      title: '[garden] Directory event issue',
       source: expect.objectContaining({ provider: 'github', path: metaPath, number: 1126 }),
     })
     expect(factory.status().counters.githubIssueMirrorsCreated).toBe(1)
@@ -9588,7 +9588,7 @@ describe('FactoryLoop', () => {
     const implementerTask = lifecycle?.decision.implementers[0]?.task
     const reviewerTask = lifecycle?.decision.reviewer.task
     expect(implementerTask).toContain('Full Linear issue description:')
-    expect(implementerTask).toContain('Factory will hand the opened PR to reviewer `ar-584-review`.')
+    expect(implementerTask).toContain('Software Garden will hand the opened PR to reviewer `ar-584-review`.')
     expect(implementerTask).toContain('"kind":"blocked","issueKey":"AR-584","role":"implementer"')
     expect(implementerTask).toMatch(/exact branch `factory\/ar-584-agentworkforce-pear-[0-9a-f]{8}`/u)
     expect(reviewerTask).toContain('Wait for a DM from the implementer(s): ar-584-impl-pear.')
@@ -12285,7 +12285,7 @@ describe('FactoryLoop', () => {
       expect(fleet.messages).toEqual([])
       expect(fleet.spawns).toHaveLength(4)
       expect(fleet.spawns.filter((spawn) => spawn.name.includes('-impl-'))
-        .every((spawn) => spawn.task?.includes('Factory will hand the opened PR'))).toBe(true)
+        .every((spawn) => spawn.task?.includes('Software Garden will hand the opened PR'))).toBe(true)
       expect(fleet.spawns.filter((spawn) => spawn.name.includes('-review'))
         .every((spawn) => spawn.task?.includes('Use the existing issue checkout'))).toBe(true)
       expect(factory.status().counters.loopDispatchFailureHandoffsReaped).toBeUndefined()
@@ -13785,13 +13785,14 @@ describe('FactoryLoop', () => {
         await commentWriteGate.promise
       },
       // The status claim is a replace PATCH of the whole label set, so the
-      // fake provider derives its status from the set it is handed.
+      // fake provider derives its status from the set it is handed (either
+      // the canonical garden or legacy factory spelling).
       updateIssue: async ({ labels }) => {
         if (!labels) return
         const names = new Set(labels.map((label) => label.toLowerCase()))
-        providerStatus = names.has('factory:human-review')
+        providerStatus = names.has('garden:human-review') || names.has('factory:human-review')
           ? 'human-review'
-          : names.has('factory:in-progress')
+          : names.has('garden:in-progress') || names.has('factory:in-progress')
             ? 'in-progress'
             : 'ready'
       },
@@ -13807,7 +13808,7 @@ describe('FactoryLoop', () => {
             payload: {
               labels: providerStatus === 'ready'
                 ? [{ name: 'factory' }]
-                : [{ name: 'factory' }, { name: `factory:${providerStatus}` }],
+                : [{ name: 'factory' }, { name: `garden:${providerStatus}` }],
             },
           },
         },
@@ -20334,7 +20335,7 @@ describe('FactoryLoop', () => {
       preferredHttpsPort: 10_052,
     })])
     expect(fleet.spawns[0]?.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10052/')
-    expect(fleet.spawns[0]?.task).toContain('Factory is supervising `npm run dev -- --host 127.0.0.1`')
+    expect(fleet.spawns[0]?.task).toContain('Software Garden is supervising `npm run dev -- --host 127.0.0.1`')
     expect(fleet.spawns[1]?.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10052/')
     fleet.emitAgentExit('ar-52-impl-pear', 'issue-done')
     await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
@@ -21669,7 +21670,7 @@ describe('FactoryLoop', () => {
     expect(implementerTask).toContain('Linear issue: AR-62 - [factory-e2e] Fix factory issue 62')
     expect(implementerTask).toContain('Full Linear issue description:')
     expect(implementerTask).toContain('Implement the requested fix in src/orchestrator/factory.ts')
-    expect(implementerTask).toContain('Factory will hand the opened PR to reviewer `ar-62-review`.')
+    expect(implementerTask).toContain('Software Garden will hand the opened PR to reviewer `ar-62-review`.')
     expect(implementerTask).toContain('report one concrete question in your final outcome')
     expect(reviewerTask).toContain('Wait for a DM from the implementer(s): ar-62-impl-pear.')
     expect(reviewerTask).toContain('Post review comments via the GitHub writeback path.')
@@ -24039,7 +24040,7 @@ describe('FactoryLoop', () => {
     )
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('Triage blocked · Reason:')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('Reason: low-confidence triage and thin issue context: Matched repository from Linear label.')
-    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Question: Factory matched AgentWorkforce/pear.')
+    expect((slackRoots[0]?.content as { text?: string }).text).toContain('Question: Software Garden matched AgentWorkforce/pear.')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('For "[factory-e2e] Fix factory issue 20", please reply with:')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('(1) the exact user flow—where it starts, required inputs/actions, and the successful result;')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('(3) observable acceptance checks or tests.')
@@ -24115,9 +24116,9 @@ describe('FactoryLoop', () => {
 
     expect(report.dispatched).toEqual([])
     expect(githubWriteback.comments).toHaveLength(1)
-    expect(githubWriteback.comments[0]?.body).toContain('Factory needs clarification before dispatching 55.')
+    expect(githubWriteback.comments[0]?.body).toContain('Software Garden needs clarification before dispatching 55.')
     expect(githubWriteback.comments[0]?.body).toContain('Reason: low-confidence triage and thin issue context: Issue lacks acceptance criteria.')
-    expect(githubWriteback.comments[0]?.body).toContain('Question: Factory matched AgentWorkforce/pear.')
+    expect(githubWriteback.comments[0]?.body).toContain('Question: Software Garden matched AgentWorkforce/pear.')
     expect(githubWriteback.comments[0]?.body).toContain('For "GitHub factory issue 55", please reply with:')
     expect(githubWriteback.comments[0]?.body).toContain('(2) permissions, validation, failure behavior, important edge cases, and anything out of scope;')
     expect(githubWriteback.comments[0]?.body).toContain('successful work will be opened as a pull request.')
@@ -24209,7 +24210,7 @@ describe('FactoryLoop', () => {
     expect(report.dispatched).toEqual([])
     expect(githubWriteback.comments).toHaveLength(1)
     expect(githubWriteback.comments[0]).toMatchObject({ key: 'AR-64' })
-    expect(githubWriteback.comments[0]?.body).toContain('@github-reporter, Factory needs clarification')
+    expect(githubWriteback.comments[0]?.body).toContain('@github-reporter, Software Garden needs clarification')
     expect(githubWriteback.comments[0]?.body).toContain('Authorized responder: @github-reporter (the issue reporter).')
     const prefix = githubReplyPrefixFromComment(githubWriteback.comments[0]?.body)
     expect(githubWriteback.comments[0]?.body).toContain(`Reply with a comment that starts with \`${prefix}\`.`)
@@ -24265,13 +24266,13 @@ describe('FactoryLoop', () => {
     await factory.runOnce()
 
     expect(githubWriteback.comments).toHaveLength(1)
-    expect(githubWriteback.comments[0]?.body).toContain('@issue-author, Factory needs clarification')
+    expect(githubWriteback.comments[0]?.body).toContain('@issue-author, Software Garden needs clarification')
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('<@UOWNER> <@ULEAD>')
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: <@UISSUEAUTHOR>.')
     expect((slackRoots[0]?.content as { text?: string }).text)
-      .toContain('Reply on the linked GitHub issue so Factory can resume.')
+      .toContain('Reply on the linked GitHub issue so Software Garden can resume.')
     expect(factory.status().counters.triageEscalationsPostedToGithub).toBe(1)
     expect(factory.status().counters.triageEscalationsMirroredToSlack).toBe(1)
     expect(factory.status().counters.triageEscalationSlackMirrorDuplicatesSuppressed).toBe(1)
@@ -24299,7 +24300,7 @@ describe('FactoryLoop', () => {
 
     expect(githubWriteback.authorLookups).toEqual(['59'])
     expect(githubWriteback.comments).toHaveLength(1)
-    expect(githubWriteback.comments[0]?.body).toContain('@provider-reporter, Factory needs clarification')
+    expect(githubWriteback.comments[0]?.body).toContain('@provider-reporter, Software Garden needs clarification')
     const slackRoots = mount.writes.filter((write) => isSlackRootWritePath(write.path))
     expect(slackRoots).toHaveLength(1)
     expect((slackRoots[0]?.content as { text?: string }).text).toContain('GitHub reporter: provider-reporter (GitHub).')
@@ -24385,7 +24386,7 @@ describe('FactoryLoop', () => {
 
     await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, githubIssueFile(58, { labels: ['factory'] }))))
     expect(fleet.spawns).toEqual([])
-    expect(githubWriteback.comments[0]?.body).toContain('Factory needs clarification')
+    expect(githubWriteback.comments[0]?.body).toContain('Software Garden needs clarification')
 
     const triageReplyPrefix = githubReplyPrefixFromComment(githubWriteback.comments[0]?.body)
     emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 58, 9001, {
@@ -24722,7 +24723,7 @@ describe('FactoryLoop', () => {
     await vi.waitFor(() => expect(factory.status().counters.slackAnswersIgnoredNoInFlight).toBe(1))
     await vi.waitFor(() => expect(factory.status().counters.slackAnswersUnroutableVisible).toBe(1))
     await vi.waitFor(() => expect(slackReplyWrites(mount).map((write) => write.content.text)).toContain(
-      'Factory received this reply but could not route it because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
+      'Software Garden received this reply but could not route it because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
     ))
 
     expect(factory.status().inFlight).toEqual([])
@@ -26305,7 +26306,7 @@ describe('FactoryLoop', () => {
     expect(fleet.spawns).toHaveLength(4)
     for (const spawn of fleet.spawns.slice(2)) {
       expect(spawn.repo).toBe('AgentWorkforce/pear')
-      expect(spawn.task).toContain('Factory released this team while waiting for human input')
+      expect(spawn.task).toContain('Software Garden released this team while waiting for human input')
       expect(spawn.task).toContain('Which retry helper should I use?')
       expect(spawn.task).toContain('Use retryOnTimeout from factory.ts.')
       expect(spawn.task).toContain('Re-hydrate from the issue, branch, worktree, and any open PR')
@@ -28163,7 +28164,7 @@ describe('FactoryLoop PR babysitter', () => {
           number,
           state: 'open',
           head_ref: `factory/${number}`,
-          title: `Factory issue ${number}`,
+          title: `Software Garden issue ${number}`,
           body: 'A malicious cross-reference says fixes 28 in every repository.',
           draft: false,
           url: `https://github.com/${repo}/pull/${number}`,
@@ -28318,7 +28319,7 @@ describe('FactoryLoop PR babysitter', () => {
     expect(babysitter.node).toBe('preview-node')
     expect(babysitter.task).toContain('Live preview: https://factory-node.tailnet.ts.net:10000/')
     expect(fleet.spawns.find((spawn) => spawn.name === 'ar-402-impl-pear')?.task)
-      .toContain('Factory is supervising `npm run dev` in this checkout on local port 3000')
+      .toContain('Software Garden is supervising `npm run dev` in this checkout on local port 3000')
   })
 
   it('retargets an owned Slack conversation session onto the babysitter once it takes over from the implementer', async () => {
@@ -28364,7 +28365,7 @@ describe('FactoryLoop PR babysitter', () => {
       sessionRef: 'session-ar-404-babysit',
     })
     expect(slackReplyWrites(mount).map((write) => write.content.text)).toEqual([
-      'Factory received this reply and durably queued it for the PR babysitter.',
+      'Software Garden received this reply and durably queued it for the PR babysitter.',
     ])
   })
 
@@ -28542,7 +28543,7 @@ describe('FactoryLoop PR babysitter', () => {
       await restarted.start({ mode: 'dispatch-owner' })
 
       await vi.waitFor(() => expect(slackReplyWrites(mount).map((write) => write.content.text)).toContain(
-        'Factory received this reply but could not route it because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
+        'Software Garden received this reply but could not route it because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
       ))
       expect(slackConversationResumes(restartedFleet)).toEqual([])
       expect(restarted.status().counters.slackAnswersUnroutableVisible).toBe(1)
@@ -28777,7 +28778,7 @@ describe('FactoryLoop PR babysitter', () => {
         restarted?.status().counters.slackTerminalWatchReceiptsRecovered,
       ).toBe(1), { timeout: 15_000, interval: 25 })
       expect(slackReplyWrites(mount).map((write) => write.content.text)).toContain(
-        'Factory could not deliver 1 queued reply because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
+        'Software Garden could not deliver 1 queued reply because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
       )
       expect(await state().getConversationSession(
         'factory-test', `slack:${mount.threadTs}`,
@@ -28847,7 +28848,7 @@ describe('FactoryLoop PR babysitter', () => {
         factory.status().counters.slackTerminalWatchReceiptsRecovered,
       ).toBe(1), { timeout: 15_000, interval: 25 })
       expect(slackReplyWrites(mount).map((write) => write.content.text)).toContain(
-        'Factory could not deliver 1 queued reply because this work unit no longer has an active agent. ' +
+        'Software Garden could not deliver 1 queued reply because this work unit no longer has an active agent. ' +
         'Please continue on the linked issue or pull request.',
       )
     } finally {
@@ -28899,7 +28900,7 @@ describe('FactoryLoop PR babysitter', () => {
       stateStore,
       clock,
     })
-    const terminalNotice = 'Factory could not deliver 1 queued reply because this work unit no longer ' +
+    const terminalNotice = 'Software Garden could not deliver 1 queued reply because this work unit no longer ' +
       'has an active agent. Please continue on the linked issue or pull request.'
     const starting = factory.start({ mode: 'dispatch-owner' })
     try {
@@ -29185,7 +29186,7 @@ describe('FactoryLoop PR babysitter', () => {
       stateStore,
       clock,
     })
-    const terminalNotice = 'Factory could not deliver 1 queued reply because this work unit no longer ' +
+    const terminalNotice = 'Software Garden could not deliver 1 queued reply because this work unit no longer ' +
       'has an active agent. Please continue on the linked issue or pull request.'
     try {
       await factory.start({ mode: 'dispatch-owner' })
@@ -29241,7 +29242,7 @@ describe('FactoryLoop PR babysitter', () => {
       fleet.emitAgentExit('ar-408-impl-pear', 'issue-done')
 
       await vi.waitFor(() => expect(slackReplyWrites(mount).map((write) => write.content.text)).toContain(
-        'Factory could not deliver 1 queued reply because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
+        'Software Garden could not deliver 1 queued reply because this work unit no longer has an active agent. Please continue on the linked issue or pull request.',
       ))
       await expect(stateStore.getConversationSession(
         'factory-test', `slack:${mount.threadTs}`,
@@ -29766,7 +29767,7 @@ describe('FactoryLoop PR babysitter', () => {
     expect(isolatedCwds.size).toBe(1)
     expect([...isolatedCwds][0]).toMatch(/^\/work\/\.factory-worktrees\/pear\/ar-402-pear-/u)
     expect(fleet.spawns.find((spawn) => spawn.name === 'ar-402-impl-pear')?.task)
-      .toContain('Factory already prepared this isolated checkout')
+      .toContain('Software Garden already prepared this isolated checkout')
     expect(fleet.spawns.find((spawn) => spawn.name === 'ar-402-review')?.task)
       .toContain('Use the existing isolated issue worktree')
     expect(fleet.spawns.find((spawn) => spawn.name === 'ar-402-babysit')?.task)
@@ -32226,7 +32227,7 @@ describe('FactoryLoop PR babysitter', () => {
       expect(githubWriteback.closes).toEqual([
         {
           key: '222',
-          body: 'Factory observed pull request #250 merge and completed this issue.\n\n'
+          body: 'Software Garden observed pull request #250 merge and completed this issue.\n\n'
             + 'Closing authority: pull request body closes 222 via "Fixes #222".',
         },
       ])
@@ -32621,7 +32622,7 @@ const slackReplyWrites = (mount: FakeMountClient): Array<{ path: string; content
     .filter((write) => write.path.includes('/replies/'))
     .map((write) => ({ path: write.path, content: record(write.content) as { text?: string; thread_ts?: string } }))
 
-const slackImplementerReceipt = 'Factory received this reply and durably queued it for the issue implementer.'
+const slackImplementerReceipt = 'Software Garden received this reply and durably queued it for the issue implementer.'
 
 const slackAnswerInputs = (fleet: FakeFleetClient): Array<{ name: string; data: string }> =>
   fleet.inputs.filter((input) => input.data !== '\r')

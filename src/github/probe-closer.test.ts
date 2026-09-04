@@ -6,7 +6,7 @@ import type { GithubConnectionWrite, MountClient } from '../ports'
 const openProbe = {
   state: 'OPEN',
   headRefName: 'factory-e2e/ar-42-probe',
-  title: '[factory-e2e] AR-42 probe',
+  title: '[garden-e2e] AR-42 probe',
   body: 'Closes AR-42',
 }
 
@@ -47,6 +47,23 @@ describe('closeProbePr', () => {
     expect(closes).toEqual([{ repo: 'AgentWorkforce/pear', number: 123 }])
   })
 
+  it('still closes an in-flight soak PR titled with the legacy factory-e2e marker', async () => {
+    // Rename transition: probe PRs created before the rename carry the
+    // legacy title marker and must remain recoverable.
+    const reads: string[] = []
+    const closes: Array<{ repo: string; number: number }> = []
+
+    await expect(closeProbePr({
+      repo: 'AgentWorkforce/pear',
+      prNumber: 125,
+      expectedIssueKey: 'AR-42',
+      githubWrite: githubWrite(closes),
+      mount: prMount(125, { payload: { number: 125, ...openProbe, title: '[factory-e2e] AR-42 probe' } }, reads),
+    })).resolves.toEqual({ repo: 'AgentWorkforce/pear', prNumber: 125, state: 'CLOSED' })
+
+    expect(closes).toEqual([{ repo: 'AgentWorkforce/pear', number: 125 }])
+  })
+
   it('refuses a mounted record for a different PR before closing', async () => {
     const reads: string[] = []
     const closes: Array<{ repo: string; number: number }> = []
@@ -79,11 +96,11 @@ describe('closeProbePr', () => {
       expectedIssueKey: 'AR-42',
       githubWrite: githubWrite(),
       mount,
-    })).rejects.toThrow(/missing \[factory-e2e\] probe marker/)
+    })).rejects.toThrow(/missing \[garden-e2e\] \(or legacy \[factory-e2e\]\) probe marker/)
     expect(reads).toEqual([prPath(124)])
   })
 
-  it('requires the factory-e2e marker as a title prefix, not only body or branch text', async () => {
+  it('requires the e2e marker as a title prefix, not only body or branch text', async () => {
     const reads: string[] = []
     const mount = prMount(128, { payload: {
       number: 128,
@@ -99,7 +116,7 @@ describe('closeProbePr', () => {
       expectedIssueKey: 'AR-42',
       githubWrite: githubWrite(),
       mount,
-    })).rejects.toThrow(/missing \[factory-e2e\] probe marker/)
+    })).rejects.toThrow(/missing \[garden-e2e\] \(or legacy \[factory-e2e\]\) probe marker/)
     expect(reads).toEqual([prPath(128)])
   })
 

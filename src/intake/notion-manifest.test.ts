@@ -133,7 +133,7 @@ describe('Factory Tasks Notion manifest generator', () => {
     })
     expect(github.createIssue).toHaveBeenCalledOnce()
     expect(github.createIssue).toHaveBeenCalledWith(expect.objectContaining({
-      labels: ['factory-ready', 'agent:team', 'intake', 'shared', 'implementer'],
+      labels: ['garden-ready', 'agent:team', 'intake', 'shared', 'implementer'],
       body: expect.stringContaining('Implement the reviewed repository change without exposing the private brief.'),
     }))
     expect(vi.mocked(github.createIssue).mock.calls[0]![0].body).not.toContain(

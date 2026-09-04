@@ -1,4 +1,4 @@
-# Notion as a first-class Factory ticket feeder
+# Notion as a first-class Software Garden ticket feeder
 
 Date: 2026-08-06
 
@@ -6,7 +6,7 @@ Date: 2026-08-06
 
 Notion should remain a separate, explicit intake command that normalizes
 repository tasks into GitHub lifecycle issues or dispatches exact-path fleet
-work. It should not become a third `issueSource` until Factory has both native
+work. It should not become a third `issueSource` until Software Garden has both native
 Notion discovery semantics and a guarded lifecycle-writeback adapter. The
 immediate correctness gap is cross-dispatcher claim durability.
 
@@ -37,10 +37,10 @@ workspace-global channel uniqueness supplies the required durable exclusion.
 ## 2. Lifecycle reconciliation to Notion
 
 **Assessment:** deliberate boundary worth keeping now, not a defect to paper
-over in Factory.
+over in Software Garden.
 
 Relayfile currently presents the Notion page as a read-only execution contract.
-Factory has guarded writeback adapters and lifecycle mappings for Linear,
+Software Garden has guarded writeback adapters and lifecycle mappings for Linear,
 Slack, and GitHub, but no Notion property/comment writeback contract. A native
 Notion lifecycle would also need an operator-selected mapping for accepted,
 dispatched, PR opened, blocked, and completed states. Inventing that mapping or
@@ -70,7 +70,7 @@ can extend the enum only when it satisfies the whole lifecycle port.
 
 ## Contract resolution
 
-Factory resolves exactly one config: the path supplied with `--config`, or
+Software Garden resolves exactly one config: the path supplied with `--config`, or
 `./factory.config.json` in the command's current working directory. It does not
 search the target repository, walk to a clone root, or merge configs. Notion
 intake does not create an implicit fallback layer.

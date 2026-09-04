@@ -2888,8 +2888,8 @@ function helpText(): string {
 Commands:
   init [owner/repo]     Set up this checkout for GitHub-native issue dispatch
   run-once              Run one discovery -> triage -> dispatch cycle
-  start                 Run the live factory daemon
-  status                Print current factory status as JSON
+  start                 Run the live Software Garden daemon
+  status                Print current Software Garden status as JSON
   loop                  Run the bounded loop configured in factory.config.json
   loop-status           Print heartbeat/liveness status for the loop
   diagnose --deployed <url>
@@ -2904,20 +2904,20 @@ Commands:
   babysit <PR|URL>      Shepherd an existing open PR to green
   close-probe <PR>      Probe/close a PR for an issue
   featuremap check      Validate .agentworkforce/features/manifest.yaml
-  intake notion <file>  Normalize mounted Notion specs into Factory work
+  intake notion <file>  Normalize mounted Notion specs into Software Garden work
   intake notion generate
-                        Emit a manifest for Ready for Agent Factory Tasks
+                        Emit a manifest for Ready for Agent Factory Tasks rows
   fleet <command>       Low-level fleet commands: spawn, roster, release
 
 Options:
   --workspace <id>      Relay workspace to use with init (otherwise active workspace)
-  --config <path>       Factory config JSON path (default: ./factory.config.json)
+  --config <path>       Software Garden config JSON path (default: ./factory.config.json)
   --dry-run             Discover and triage without writes or agent spawns
   --backend <backend>   Fleet backend: internal or relay
   --agent-exit-timeout <ms>
                         Max owned-broker wait for task-exit agents (default: 1800000;
                         env: FACTORY_AGENT_EXIT_TIMEOUT_MS)
-  -V, --version         Show the installed Factory version
+  -V, --version         Show the installed Software Garden version
   -h, --help            Show this help
 `
 }

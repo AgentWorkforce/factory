@@ -14,22 +14,22 @@ const workspaceId = 'factory-e2e-workspace'
 const issue = {
   uuid: 'factory-e2e-issue-1',
   key: 'AR-E2E-1',
-  title: '[factory-e2e] Verify the packaged control plane',
+  title: '[garden-e2e] Verify the packaged control plane',
   description: [
-    'Implement and verify the complete packaged Factory lifecycle from ready-issue discovery',
+    'Implement and verify the complete packaged Software Garden lifecycle from ready-issue discovery',
     'through deterministic fleet dispatch, duplicate suppression, terminal completion reconciliation,',
     'merge-gate evaluation, and idempotent provider writeback using only public package exports.',
   ].join(' '),
   stateId: 'ready-for-agent',
   state: { name: 'Ready for Agent' },
-  labels: ['factory', 'cloud', 'agent:single'],
+  labels: ['garden', 'cloud', 'agent:single'],
   team: 'AR',
   path: '/linear/issues/AR-E2E-1__factory-e2e-issue-1.json',
   raw: {
     id: 'factory-e2e-issue-1',
     identifier: 'AR-E2E-1',
-    title: '[factory-e2e] Verify the packaged control plane',
-    labels: ['factory', 'cloud', 'agent:single'],
+    title: '[garden-e2e] Verify the packaged control plane',
+    labels: ['garden', 'cloud', 'agent:single'],
     team: { key: 'AR' },
   },
 }
@@ -47,8 +47,8 @@ const config = FactoryConfigSchema.parse({
     babysitter: 'spawn:codex',
   },
   safety: {
-    requireTitlePrefix: '[factory-e2e]',
-    requireLabel: 'factory',
+    requireTitlePrefix: '[garden-e2e]',
+    requireLabel: 'garden',
     requireTeamKey: 'AR',
   },
 })

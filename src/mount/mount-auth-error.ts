@@ -113,7 +113,7 @@ function mountAuthDiagnosis(details?: MountAuthErrorDetails): string {
 export function mountAuthRemediation(details?: MountAuthErrorDetails): string {
   return (
     `[factory] ${mountAuthDiagnosis(details)} ` +
-    'Factory will not spawn agents against a read-denied mirror.'
+    'Software Garden will not spawn agents against a read-denied mirror.'
   )
 }
 

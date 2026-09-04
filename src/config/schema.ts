@@ -8,6 +8,11 @@ import {
   DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
 } from '../fleet/control-plane-circuit'
 import { DEFAULT_RELAYFILE_OPERATION_TIMEOUT_MS } from '../mount/relayfile-operation-timeout'
+import {
+  GARDEN_AUTOMATION_LABEL,
+  GARDEN_E2E_TITLE_PREFIX,
+  GARDEN_SKIP_BABYSITTER_LABEL,
+} from '../constants/lifecycle-labels'
 
 import { KubernetesEnvironmentConfigSchema } from '../environments/connection-registry.js'
 
@@ -321,7 +326,9 @@ const babysitterSchema = z.object({
   // lifecycle design lands, so this value cannot spawn a routed worker yet.
   mode: z.enum(['factory-created', 'routed-open-prs']).default('factory-created'),
   // Discovery excludes candidates carrying an author-controlled stop label.
-  excludeLabels: z.array(z.string().trim().min(1)).default(['factory:skip-babysitter']),
+  // The legacy `factory:skip-babysitter` name remains honored as an alias on
+  // the discovery read path during the rename transition.
+  excludeLabels: z.array(z.string().trim().min(1)).default([GARDEN_SKIP_BABYSITTER_LABEL]),
   excludePullRequests: z.array(z.string().regex(
     /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})#[1-9]\d*$/u,
     'expected owner/repo#number',
@@ -474,8 +481,13 @@ const stateIdsSchema = z.object({
 const safetySchema = z.object({
   // `null` explicitly disables the title path while leaving the label path in
   // force. This is distinct from omission, which keeps the safe default.
-  requireTitlePrefix: z.string().min(1).nullable().default('[factory-e2e]'),
-  requireLabel: z.string().default('factory'),
+  // Renamed with the Factory -> Software Garden product rename: the default
+  // prefix is now `[garden-e2e]` (reserved for the self-test soak) and the
+  // default label is now `garden`. Discovery still accepts the legacy
+  // `[factory-e2e]` prefix and `factory` label as aliases during the
+  // transition, so in-flight issues remain dispatchable.
+  requireTitlePrefix: z.string().min(1).nullable().default(GARDEN_E2E_TITLE_PREFIX),
+  requireLabel: z.string().default(GARDEN_AUTOMATION_LABEL),
   requireTeamKey: z.string().min(1).default('AR'),
   // Issues carrying one of these labels are never closed by an observed PR
   // merge, however strong the closing evidence. An incident stays open until a

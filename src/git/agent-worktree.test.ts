@@ -72,7 +72,7 @@ describe('GitAgentWorktreeManager', () => {
         worktreePath,
         branch: 'factory/3022-chief-org-live-population',
       })).rejects.toThrow(
-        'Refusing Factory worktree branch factory/3022-chief-org-live-population: it does not belong to dispatched issue 3021',
+        'Refusing Software Garden worktree branch factory/3022-chief-org-live-population: it does not belong to dispatched issue 3021',
       )
       await expect(stat(worktreePath)).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
@@ -80,7 +80,7 @@ describe('GitAgentWorktreeManager', () => {
     }
   })
 
-  it('refuses cleanup outside the Factory worktree root', async () => {
+  it('refuses cleanup outside the Software Garden worktree root', async () => {
     const manager = new GitAgentWorktreeManager()
     const unsafe = {
       repo: 'AgentWorkforce/pear',
@@ -89,8 +89,8 @@ describe('GitAgentWorktreeManager', () => {
       worktreePath: '/work/pear',
       branch: 'factory/ar-33-pear',
     }
-    await expect(manager.cleanup(unsafe)).rejects.toThrow(/unsafe Factory worktree path/u)
-    await expect(manager.inspectForCleanup(unsafe)).rejects.toThrow(/unsafe Factory worktree path/u)
+    await expect(manager.cleanup(unsafe)).rejects.toThrow(/unsafe Software Garden worktree path/u)
+    await expect(manager.inspectForCleanup(unsafe)).rejects.toThrow(/unsafe Software Garden worktree path/u)
   })
 
   it('refuses a Factory-root symlink that resolves to a registered checkout outside the root', async () => {
@@ -296,7 +296,7 @@ describe('GitAgentWorktreeManager', () => {
       await git(base, ['worktree', 'add', manualWorktree, '26-league-schedule-timezone'])
 
       await expect(manager.prepare(worktree)).rejects.toThrow(
-        /already checked out.*Factory will not reuse or remove a checkout outside/u,
+        /already checked out.*Software Garden will not reuse or remove a checkout outside/u,
       )
       expect(await git(manualWorktree, ['branch', '--show-current']))
         .toBe('26-league-schedule-timezone\n')
@@ -334,7 +334,7 @@ describe('GitAgentWorktreeManager', () => {
       baseClonePath: base,
       worktreePath,
       branch: '26-league-schedule-timezone',
-    })).rejects.toThrow(/unsafe Factory worktree branch/u)
+    })).rejects.toThrow(/unsafe Software Garden worktree branch/u)
 
     await expect(manager.prepare({
       repo: 'AgentWorkforce/hoopsheet',
@@ -343,7 +343,7 @@ describe('GitAgentWorktreeManager', () => {
       worktreePath,
       branch: '26-league-schedule-timezone',
       existingPullRequestBranch: true,
-    })).rejects.toThrow(/unsafe Factory worktree branch/u)
+    })).rejects.toThrow(/unsafe Software Garden worktree branch/u)
   })
 
   it('ignores an unrelated deleted locked registration when validating an existing checkout', async () => {

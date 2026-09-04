@@ -48,7 +48,7 @@ export async function initializeFactory(options: FactoryInitOptions = {}): Promi
     await commandExists(command) ? undefined : command
   )))).filter((command): command is string => command !== undefined)
   if (missing.length > 0) {
-    err.write('Factory needs a couple of local tools before it can run:\n')
+    err.write('Software Garden needs a couple of local tools before it can run:\n')
     for (const command of missing) {
       err.write(`  - ${command} is not installed or is not on PATH\n`)
     }
@@ -96,7 +96,7 @@ export async function initializeFactory(options: FactoryInitOptions = {}): Promi
     },
   }
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
-  out.write(`Factory is ready for ${repo}. Created ${configPath}.\n`)
+  out.write(`Software Garden is ready for ${repo}. Created ${configPath}.\n`)
   out.write('Add the `factory` label to an open GitHub issue, then run `factory run-once --dry-run`.\n')
   return { configPath, repo, workspaceId }
 }

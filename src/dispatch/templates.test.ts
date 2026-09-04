@@ -48,12 +48,12 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Create a branch for this issue before editing.')
     expect(task).toContain('Commit the implementation and tests.')
     expect(task).toContain('Push the branch to origin.')
-    expect(task).toContain('Factory will open the PR targeting the repository default branch through the connected GitHub workspace.')
+    expect(task).toContain('Software Garden will open the PR targeting the repository default branch through the connected GitHub workspace.')
     expect(task).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
-    expect(task).toContain('Factory will hand the opened PR to reviewer `ar-123-review`.')
+    expect(task).toContain('Software Garden will hand the opened PR to reviewer `ar-123-review`.')
     expect(task).toContain('post one comment on AgentWorkforce/factory#123')
     expect(task).toContain('/github/repos/AgentWorkforce/factory/issues/123')
-    expect(task).toContain('### Factory human input request')
+    expect(task).toContain('### Software Garden human input request')
     expect(task).toContain('Agent: ar-123-impl-pear')
     expect(task).toContain('Issue: AR-123')
     expect(task).toContain('exit cleanly')
@@ -110,7 +110,7 @@ describe('renderAgentTask', () => {
     // open the PR, and must not be asked to DM the reviewer (the lead owns
     // publication and reviewer handoff).
     expect(task).not.toContain('Push the branch to origin')
-    expect(task).not.toContain('Factory will open the PR')
+    expect(task).not.toContain('Software Garden will open the PR')
     expect(task).not.toMatch(/Send reviewer .* a concise branch and commit summary/)
   })
 
@@ -128,7 +128,7 @@ describe('renderAgentTask', () => {
     // still receive the full commit/push/PR pipeline. Only role=worker in a
     // swarm is stripped.
     expect(task).toContain('Push the branch to origin')
-    expect(task).toContain('Factory will open the PR')
+    expect(task).toContain('Software Garden will open the PR')
   })
 
   it('omits swarm clauses entirely for non-swarm dispatch', () => {
@@ -314,7 +314,7 @@ describe('renderAgentTask', () => {
 
     expect(task).toContain('move the issue to Done')
     expect(task).not.toContain('Human Review')
-    expect(task).toContain('the factory moves the issue to Done once you signal ready')
+    expect(task).toContain('Software Garden moves the issue to Done once you signal ready')
   })
 
   it('renders clone/worktree instructions and on-green merge policy for cross-repo routes', () => {
@@ -366,7 +366,7 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Live preview: https://factory-node.tailnet.ts.net:10000/')
     expect(task).toContain('Tailscale Serve keeps this URL inside the configured tailnet')
     expect(task).toContain('tailnet grants/ACLs apply')
-    expect(task).toContain('Factory is supervising `npm run dev -- --host 127.0.0.1`')
+    expect(task).toContain('Software Garden is supervising `npm run dev -- --host 127.0.0.1`')
     expect(task).toContain('local port 3000')
     expect(task).toContain('confirm the live preview URL responds and shows this issue\'s checkout')
   })
@@ -597,7 +597,7 @@ describe('renderAgentTask', () => {
     expect(task).toContain('Do not send the request to a named control agent or shared channel.')
     expect(task).toContain('route the question through the issue Slack thread')
     expect(task).toContain('keep the session available')
-    expect(task).not.toContain('### Factory human input request')
+    expect(task).not.toContain('### Software Garden human input request')
     expect(task).not.toContain('exit cleanly')
   })
 })
@@ -662,7 +662,20 @@ describe('GitHub human input request comments', () => {
   it('ignores ordinary comments and incomplete request records', () => {
     expect(parseGithubHumanInputRequest('Please use the shared retry helper.')).toBeUndefined()
     expect(parseGithubHumanInputRequest(
-      '### Factory human input request\nAgent: ar-123-review\nIssue: AR-123',
+      '### Software Garden human input request\nAgent: ar-123-review\nIssue: AR-123',
     )).toBeUndefined()
+  })
+
+  it('still parses the legacy Factory heading posted by agents from older builds', () => {
+    // Rename transition: agents spawned before the Software Garden rename
+    // post the durable request under the legacy heading; those in-flight
+    // requests must stay parseable.
+    expect(parseGithubHumanInputRequest(
+      '### Factory human input request\nAgent: ar-123-review\nIssue: AR-123\nQuestion: Which retry helper?',
+    )).toEqual({
+      agentName: 'ar-123-review',
+      issueKey: 'AR-123',
+      question: 'Which retry helper?',
+    })
   })
 })

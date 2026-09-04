@@ -540,14 +540,14 @@ describe('MountLinearWriteback', () => {
     })).rejects.toThrow(/read-back never confirmed it landed/u)
   })
 
-  it('refuses setState and postComment on an issue without factory-e2e before writing', async () => {
+  it('refuses setState and postComment on an issue without the title prefix before writing', async () => {
     const mount = new FakeMountClient({
       [issuePath]: wrappedIssueRecord({ title: 'Real production work' }),
     })
     const linear = MountLinearWriteback(mount)
 
-    await expect(linear.setState(issue, 'implementing-state')).rejects.toThrow(/title must start with \[factory-e2e\] boundary/)
-    await expect(linear.postComment(issue, 'dispatch comment')).rejects.toThrow(/title must start with \[factory-e2e\] boundary/)
+    await expect(linear.setState(issue, 'implementing-state')).rejects.toThrow(/title must start with \[garden-e2e\] boundary/)
+    await expect(linear.postComment(issue, 'dispatch comment')).rejects.toThrow(/title must start with \[garden-e2e\] boundary/)
     expect(mount.writes).toEqual([])
   })
 
@@ -556,7 +556,7 @@ describe('MountLinearWriteback', () => {
       [issuePath]: wrappedIssueRecord({ title: undefined }),
     })
     await expect(MountLinearWriteback(missingTitle).setState(issue, 'implementing-state'))
-      .rejects.toThrow(/title must start with \[factory-e2e\] boundary/)
+      .rejects.toThrow(/title must start with \[garden-e2e\] boundary/)
 
     const unreadable = new FakeMountClient()
     await expect(MountLinearWriteback(unreadable).postComment(issue, 'dispatch comment'))
@@ -577,7 +577,7 @@ describe('MountLinearWriteback', () => {
     })
 
     await expect(MountLinearWriteback(mount).setState(issue, 'implementing-state'))
-      .rejects.toThrow(/title must start with \[factory-e2e\] boundary/)
+      .rejects.toThrow(/title must start with \[garden-e2e\] boundary/)
     expect(mount.writes).toEqual([])
   })
 
@@ -611,7 +611,7 @@ describe('MountLinearWriteback', () => {
     expect(mount.writes).toEqual([])
   })
 
-  it('refuses createIssue when the create payload lacks factory-e2e', async () => {
+  it('refuses createIssue when the create payload lacks the title prefix', async () => {
     const mount = new FakeMountClient()
 
     await expect(MountLinearWriteback(mount).createIssue({
@@ -619,7 +619,7 @@ describe('MountLinearWriteback', () => {
       identifier: 'AR-NEW',
       title: 'marker missing from title',
       team: { key: 'AR' },
-    })).rejects.toThrow(/title must start with \[factory-e2e\] boundary/)
+    })).rejects.toThrow(/title must start with \[garden-e2e\] boundary/)
     expect(mount.writes).toEqual([])
   })
 
@@ -922,7 +922,7 @@ describe('MountSlackWriteback', () => {
     await expect(timeoutMount.readFile(timeoutMount.writes[0]?.path ?? '')).resolves.toBeTruthy()
   })
 
-  it('refuses thread roots and replies outside the configured factory-e2e channel before writing', async () => {
+  it('refuses thread roots and replies outside the configured Slack channel before writing', async () => {
     const postMount = new FakeMountClient()
     const postSlack = MountSlackWriteback(postMount, {
       channel: 'C0FACTORY__factory-e2e',
@@ -932,7 +932,7 @@ describe('MountSlackWriteback', () => {
     await expect(postSlack.postThread({
       channel: 'C0PROD__product-alerts',
       text: 'Wrong channel',
-    })).rejects.toThrow(/target channel must match configured factory-e2e channel/)
+    })).rejects.toThrow(/target channel must match the configured Slack channel/)
     expect(postMount.writes).toEqual([])
 
     const channelDirBypassMount = new FakeMountClient()
@@ -944,7 +944,7 @@ describe('MountSlackWriteback', () => {
     await expect(channelDirBypassSlack.postThread({
       channel: 'C0FACTORY__factory-e2e',
       text: 'Wrong effective channel',
-    })).rejects.toThrow(/target channel must match configured factory-e2e channel/)
+    })).rejects.toThrow(/target channel must match the configured Slack channel/)
     expect(channelDirBypassMount.writes).toEqual([])
 
     const replyMount = new FakeMountClient()
@@ -954,11 +954,11 @@ describe('MountSlackWriteback', () => {
     })
 
     await expect(replySlack.reply('1780751612.176219', 'Wrong channel reply'))
-      .rejects.toThrow(/target channel must match configured factory-e2e channel/)
+      .rejects.toThrow(/target channel must match the configured Slack channel/)
     expect(replyMount.writes).toEqual([])
   })
 
-  it('allows thread roots and replies to the configured factory-e2e channel by name', async () => {
+  it('allows thread roots and replies to the configured Slack channel by name', async () => {
     const mount = new FakeMountClient()
     const slack = MountSlackWriteback(mount, {
       channel: 'factory-e2e',
@@ -977,7 +977,7 @@ describe('MountSlackWriteback', () => {
     expect(mount.writes[1]?.path).toContain(`/slack/channels/C0FACTORY__factory-e2e/messages/${root.threadId}/replies/`)
   })
 
-  it('fails closed when the configured factory-e2e channel is unset', async () => {
+  it('fails closed when the configured Slack channel is unset', async () => {
     const mount = new FakeMountClient()
     const slack = MountSlackWriteback(mount, {
       channelDir: 'C0FACTORY__factory-e2e',
@@ -986,9 +986,9 @@ describe('MountSlackWriteback', () => {
     await expect(slack.postThread({
       channel: 'C0FACTORY__factory-e2e',
       text: 'Factory update',
-    })).rejects.toThrow(/configured factory-e2e channel is required/)
+    })).rejects.toThrow(/configured Slack channel is required/)
     await expect(slack.reply('1780751612.176219', 'Factory reply'))
-      .rejects.toThrow(/configured factory-e2e channel is required/)
+      .rejects.toThrow(/configured Slack channel is required/)
     expect(mount.writes).toEqual([])
   })
 })
@@ -1035,7 +1035,7 @@ describe('AppGithubWriteback', () => {
     key: '221',
     title: 'GitHub-native app writeback',
     stateId: '',
-    labels: ['factory', 'bug', 'factory:in-progress'],
+    labels: ['factory', 'bug', 'garden:in-progress'],
     path: '/github/repos/AgentWorkforce/factory/issues/by-id/221.json',
     raw: {
       payload: {
@@ -1102,11 +1102,11 @@ describe('AppGithubWriteback', () => {
       [{
         repo: 'AgentWorkforce/factory',
         number: 221,
-        labels: ['factory', 'bug', 'factory:human-review'],
+        labels: ['factory', 'bug', 'garden:human-review'],
         author: 'app',
       }],
       // ready: both Factory status labels go. The dispatched projection still
-      // reads `factory:in-progress`, so this is computed from that set.
+      // reads `garden:in-progress`, so this is computed from that set.
       [{
         repo: 'AgentWorkforce/factory',
         number: 221,
@@ -1163,7 +1163,7 @@ describe('AppGithubWriteback', () => {
           content: {
             // `triage` landed after the dispatched projection was read, and
             // the casing here is the provider's, not ours.
-            labels: [{ name: 'Factory' }, { name: 'triage' }, { name: 'factory:in-progress' }],
+            labels: [{ name: 'Factory' }, { name: 'triage' }, { name: 'garden:in-progress' }],
           },
         },
       }),
@@ -1173,7 +1173,7 @@ describe('AppGithubWriteback', () => {
     expect(updateIssue).toHaveBeenCalledWith({
       repo: 'AgentWorkforce/factory',
       number: 221,
-      labels: ['Factory', 'triage', 'factory:human-review'],
+      labels: ['Factory', 'triage', 'garden:human-review'],
       author: 'app',
     })
   })
@@ -1187,7 +1187,7 @@ describe('AppGithubWriteback', () => {
       updateIssue,
     })
 
-    // appIssue.labels is ['factory', 'bug', 'factory:in-progress'].
+    // appIssue.labels is ['factory', 'bug', 'garden:in-progress'].
     await expect(app.setStatus(appIssue, 'in-progress')).resolves.toBe('acknowledged')
     expect(updateIssue).not.toHaveBeenCalled()
   })
@@ -1212,8 +1212,8 @@ describe('AppGithubWriteback', () => {
       expect(updateIssue).toHaveBeenCalledWith({
         repo: 'AgentWorkforce/factory',
         number: 221,
-        // The dispatched set, transitioned — not the bare ['factory:human-review'].
-        labels: ['factory', 'bug', 'factory:human-review'],
+        // The dispatched set, transitioned — not the bare ['garden:human-review'].
+        labels: ['factory', 'bug', 'garden:human-review'],
         author: 'app',
       })
     }
@@ -1232,7 +1232,7 @@ describe('AppGithubWriteback', () => {
       // `bug` was removed on GitHub after dispatch; the connected read sees it.
       getIssue: async () => ({
         outcome: 'found' as const,
-        issue: { content: { labels: [{ name: 'factory' }, { name: 'factory:in-progress' }] } },
+        issue: { content: { labels: [{ name: 'factory' }, { name: 'garden:in-progress' }] } },
       }),
     })
 
@@ -1240,7 +1240,7 @@ describe('AppGithubWriteback', () => {
     expect(updateIssue).toHaveBeenCalledWith({
       repo: 'AgentWorkforce/factory',
       number: 221,
-      labels: ['factory', 'factory:human-review'],
+      labels: ['factory', 'garden:human-review'],
       author: 'app',
     })
   })
@@ -1306,7 +1306,7 @@ describe('AppGithubWriteback', () => {
         repo: 'AgentWorkforce/factory',
         number: 221,
         path: appIssue.path,
-        content: { payload: { labels: [{ name: 'factory:human-review' }] } },
+        content: { payload: { labels: [{ name: 'garden:human-review' }] } },
       },
     }))
     const fallbackGetIssue = vi.fn(async () => ({
@@ -1337,7 +1337,7 @@ describe('AppGithubWriteback', () => {
         repo: 'AgentWorkforce/factory',
         number: 221,
         path: appIssue.path,
-        content: { payload: { labels: [{ name: 'factory:human-review' }] } },
+        content: { payload: { labels: [{ name: 'garden:human-review' }] } },
       },
     }))
     const app = new AppGithubWriteback({
@@ -1399,7 +1399,7 @@ describe('AppGithubWriteback', () => {
     content = {
       payload: {
         updated_at: '2026-08-24T06:00:00.000Z',
-        labels: [{ name: 'factory:human-review' }],
+        labels: [{ name: 'garden:human-review' }],
       },
     }
     await expect(app.getIssueStatus(privateIssue, opts)).resolves.toBe('human-review')
@@ -1412,7 +1412,7 @@ describe('AppGithubWriteback', () => {
     // local claim-start instant is NOT proof the claim mutation has landed —
     // it is equally what "the claim write has not reached this projection yet"
     // looks like. Releasing on it strands the issue with no lifecycle once the
-    // real `factory:in-progress` projection arrives.
+    // real `garden:in-progress` projection arrives.
     const content: unknown = {
       payload: {
         updated_at: '2026-08-24T06:00:00.000Z',
@@ -1465,7 +1465,7 @@ describe('AppGithubWriteback', () => {
     let content: unknown = {
       payload: {
         updated_at: '2026-08-24T05:45:00.000Z',
-        labels: [{ name: 'factory' }, { name: 'factory:in-progress' }],
+        labels: [{ name: 'factory' }, { name: 'garden:in-progress' }],
       },
     }
     const connectedGetIssue = vi.fn(async () => ({
@@ -1546,7 +1546,7 @@ describe('AppGithubWriteback', () => {
           repo: 'AgentWorkforce/factory',
           number: 221,
           path: appIssue.path,
-          content: { payload: { labels: [{ name: 'factory' }, { name: 'factory:in-progress' }] } },
+          content: { payload: { labels: [{ name: 'factory' }, { name: 'garden:in-progress' }] } },
         },
       }),
     }
@@ -1575,7 +1575,7 @@ describe('AppGithubWriteback', () => {
           path: appIssue.path,
           content: {
             payload: {
-              labels: [{ name: 'factory:in-progress' }, { name: 'factory:human-review' }],
+              labels: [{ name: 'garden:in-progress' }, { name: 'garden:human-review' }],
             },
           },
         },
@@ -1773,18 +1773,18 @@ describe('GhCliGithubWriteback', () => {
 
     expect(calls).toEqual([
       ['issue', 'comment', '48', '--repo', 'AgentWorkforce/factory', '--body', 'Factory dispatch for 48'],
-      ['label', 'create', 'factory:in-progress', '--repo', 'AgentWorkforce/factory', '--color', '1d76db', '--description', 'Factory agents are working on this issue.', '--force'],
+      ['label', 'create', 'garden:in-progress', '--repo', 'AgentWorkforce/factory', '--color', '1d76db', '--description', 'Software Garden agents are working on this issue.', '--force'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       authenticatedActorCall,
       issueLabelEventsCall,
-      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:in-progress'],
+      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'garden:in-progress'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       issueLabelEventsCall,
-      ['label', 'create', 'factory:human-review', '--repo', 'AgentWorkforce/factory', '--color', 'fbca04', '--description', 'Factory work is ready for human review.', '--force'],
+      ['label', 'create', 'garden:human-review', '--repo', 'AgentWorkforce/factory', '--color', 'fbca04', '--description', 'Software Garden work is ready for human review.', '--force'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       authenticatedActorCall,
       issueLabelEventsCall,
-      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'factory:human-review', '--remove-label', 'factory:in-progress'],
+      ['issue', 'edit', '48', '--repo', 'AgentWorkforce/factory', '--add-label', 'garden:human-review', '--remove-label', 'garden:in-progress'],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       issueLabelEventsCall,
     ])
@@ -1792,7 +1792,7 @@ describe('GhCliGithubWriteback', () => {
 
   it('clears stale lifecycle labels when returning an orphaned issue to ready', async () => {
     const calls: string[][] = []
-    const labels = new Set(['factory-ready', 'factory:in-progress', 'factory:human-review'])
+    const labels = new Set(['factory-ready', 'garden:in-progress', 'garden:human-review'])
     const events: string[] = []
     let nextEventId = 1
     const github = new GhCliGithubWriteback({
@@ -1830,9 +1830,9 @@ describe('GhCliGithubWriteback', () => {
         '--repo',
         'AgentWorkforce/factory',
         '--remove-label',
-        'factory:in-progress',
+        'garden:in-progress',
         '--remove-label',
-        'factory:human-review',
+        'garden:human-review',
       ],
       ['issue', 'view', '48', '--repo', 'AgentWorkforce/factory', '--json', 'labels'],
       issueLabelEventsCall,
@@ -1840,7 +1840,7 @@ describe('GhCliGithubWriteback', () => {
   })
 
   it('does not attribute a label add won by another actor between read and edit', async () => {
-    const labels = new Set(['factory:in-progress'])
+    const labels = new Set(['garden:in-progress'])
     const events: string[] = []
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
@@ -1850,10 +1850,10 @@ describe('GhCliGithubWriteback', () => {
           return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
         }
         if (args[0] === 'issue' && args[1] === 'edit') {
-          labels.delete('factory:in-progress')
-          labels.add('factory:human-review')
-          events.push('1\tunlabeled\tfactory:in-progress\tother-user')
-          events.push('2\tlabeled\tfactory:human-review\tother-user')
+          labels.delete('garden:in-progress')
+          labels.add('garden:human-review')
+          events.push('1\tunlabeled\tgarden:in-progress\tother-user')
+          events.push('2\tlabeled\tgarden:human-review\tother-user')
         }
         return { stdout: '' }
       },
@@ -1863,7 +1863,7 @@ describe('GhCliGithubWriteback', () => {
   })
 
   it('does not attribute a label removal won by another actor between read and edit', async () => {
-    const labels = new Set(['factory:human-review'])
+    const labels = new Set(['garden:human-review'])
     const events: string[] = []
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
@@ -1873,8 +1873,8 @@ describe('GhCliGithubWriteback', () => {
           return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
         }
         if (args[0] === 'issue' && args[1] === 'edit') {
-          labels.delete('factory:human-review')
-          events.push('1\tunlabeled\tfactory:human-review\tother-user')
+          labels.delete('garden:human-review')
+          events.push('1\tunlabeled\tgarden:human-review\tother-user')
         }
         return { stdout: '' }
       },
@@ -1884,7 +1884,7 @@ describe('GhCliGithubWriteback', () => {
   })
 
   it('does not attribute a park that another actor removes and recreates after the edit', async () => {
-    const labels = new Set(['factory:in-progress'])
+    const labels = new Set(['garden:in-progress'])
     const events: string[] = []
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
@@ -1894,14 +1894,14 @@ describe('GhCliGithubWriteback', () => {
           return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
         }
         if (args[0] === 'issue' && args[1] === 'edit') {
-          labels.delete('factory:in-progress')
-          labels.add('factory:human-review')
-          events.push('1\tlabeled\tfactory:human-review\tfactory-bot')
-          events.push('2\tunlabeled\tfactory:in-progress\tfactory-bot')
-          labels.delete('factory:human-review')
-          labels.add('factory:human-review')
-          events.push('3\tunlabeled\tfactory:human-review\tother-user')
-          events.push('4\tlabeled\tfactory:human-review\tother-user')
+          labels.delete('garden:in-progress')
+          labels.add('garden:human-review')
+          events.push('1\tlabeled\tgarden:human-review\tfactory-bot')
+          events.push('2\tunlabeled\tgarden:in-progress\tfactory-bot')
+          labels.delete('garden:human-review')
+          labels.add('garden:human-review')
+          events.push('3\tunlabeled\tgarden:human-review\tother-user')
+          events.push('4\tlabeled\tgarden:human-review\tother-user')
         }
         return { stdout: '' }
       },
@@ -1911,7 +1911,7 @@ describe('GhCliGithubWriteback', () => {
   })
 
   it('returns the immutable defining event when another actor only removes a stale label', async () => {
-    const labels = new Set(['factory:in-progress'])
+    const labels = new Set(['garden:in-progress'])
     const events: string[] = []
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
@@ -1921,10 +1921,10 @@ describe('GhCliGithubWriteback', () => {
           return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
         }
         if (args[0] === 'issue' && args[1] === 'edit') {
-          labels.add('factory:human-review')
-          events.push('1\tlabeled\tfactory:human-review\tfactory-bot')
-          labels.delete('factory:in-progress')
-          events.push('2\tunlabeled\tfactory:in-progress\tother-user')
+          labels.add('garden:human-review')
+          events.push('1\tlabeled\tgarden:human-review\tfactory-bot')
+          labels.delete('garden:in-progress')
+          events.push('2\tunlabeled\tgarden:in-progress\tother-user')
         }
         return { stdout: '' }
       },
@@ -1937,7 +1937,7 @@ describe('GhCliGithubWriteback', () => {
   })
 
   it('does not attribute ready when another actor recreates the final removal', async () => {
-    const labels = new Set(['factory:human-review'])
+    const labels = new Set(['garden:human-review'])
     const events: string[] = []
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
@@ -1947,12 +1947,12 @@ describe('GhCliGithubWriteback', () => {
           return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
         }
         if (args[0] === 'issue' && args[1] === 'edit') {
-          labels.delete('factory:human-review')
-          events.push('1\tunlabeled\tfactory:human-review\tfactory-bot')
-          labels.add('factory:human-review')
-          labels.delete('factory:human-review')
-          events.push('2\tlabeled\tfactory:human-review\tother-user')
-          events.push('3\tunlabeled\tfactory:human-review\tother-user')
+          labels.delete('garden:human-review')
+          events.push('1\tunlabeled\tgarden:human-review\tfactory-bot')
+          labels.add('garden:human-review')
+          labels.delete('garden:human-review')
+          events.push('2\tlabeled\tgarden:human-review\tother-user')
+          events.push('3\tunlabeled\tgarden:human-review\tother-user')
         }
         return { stdout: '' }
       },
@@ -1963,7 +1963,7 @@ describe('GhCliGithubWriteback', () => {
 
   it.each([
     { status: 'ready' as const, labels: [] },
-    { status: 'in-progress' as const, labels: ['factory:in-progress'] },
+    { status: 'in-progress' as const, labels: ['garden:in-progress'] },
   ])('does not issue a $status lifecycle edit when the state already matches', async ({ status, labels: initialLabels }) => {
     const calls: string[][] = []
     const labels = new Set(initialLabels)
@@ -1983,7 +1983,7 @@ describe('GhCliGithubWriteback', () => {
 
   it('does not claim a status transition for cleanup after human-review already won', async () => {
     const calls: string[][] = []
-    const labels = new Set(['factory:in-progress', 'factory:human-review'])
+    const labels = new Set(['garden:in-progress', 'garden:human-review'])
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
         calls.push(args)
@@ -1991,7 +1991,7 @@ describe('GhCliGithubWriteback', () => {
           return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
         }
         if (args[0] === 'issue' && args[1] === 'edit' && args.includes('--remove-label')) {
-          labels.delete('factory:in-progress')
+          labels.delete('garden:in-progress')
         }
         return { stdout: '' }
       },
@@ -2003,8 +2003,8 @@ describe('GhCliGithubWriteback', () => {
 
   it('fails closed when GitHub cannot atomically qualify label removal by the claim event', async () => {
     const calls: string[][] = []
-    const labels = new Set(['factory', 'factory:in-progress'])
-    const events = ['claim-1\tlabeled\tfactory:in-progress\tfactory-bot']
+    const labels = new Set(['factory', 'garden:in-progress'])
+    const events = ['claim-1\tlabeled\tgarden:in-progress\tfactory-bot']
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
         calls.push(args)
@@ -2019,16 +2019,16 @@ describe('GhCliGithubWriteback', () => {
     await expect(github.rollbackStatusClaim(githubIssue, 'in-progress', 'claim-1'))
       .resolves.toBe('unproven')
     expect(calls.some((args) => args[0] === 'issue' && args[1] === 'edit')).toBe(false)
-    expect(labels).toEqual(new Set(['factory', 'factory:in-progress']))
+    expect(labels).toEqual(new Set(['factory', 'garden:in-progress']))
   })
 
   it('preserves an identical newer GitHub claim with a different defining event', async () => {
     const calls: string[][] = []
-    const labels = new Set(['factory:in-progress'])
+    const labels = new Set(['garden:in-progress'])
     const events = [
-      'claim-1\tlabeled\tfactory:in-progress\tfactory-bot',
-      '2\tunlabeled\tfactory:in-progress\tother-user',
-      'claim-2\tlabeled\tfactory:in-progress\tother-user',
+      'claim-1\tlabeled\tgarden:in-progress\tfactory-bot',
+      '2\tunlabeled\tgarden:in-progress\tother-user',
+      'claim-2\tlabeled\tgarden:in-progress\tother-user',
     ]
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
@@ -2048,7 +2048,7 @@ describe('GhCliGithubWriteback', () => {
 
   it('does not roll back a GitHub claim after human review supersedes it', async () => {
     const calls: string[][] = []
-    const labels = new Set(['factory:in-progress', 'factory:human-review'])
+    const labels = new Set(['garden:in-progress', 'garden:human-review'])
     const github = new GhCliGithubWriteback({
       runner: async (args) => {
         calls.push(args)
@@ -2077,7 +2077,7 @@ describe('GhCliGithubWriteback', () => {
     })
 
     await expect(github.setStatus(githubIssue, 'in-progress')).rejects.toThrow(
-      'GitHub writeback did not confirm factory:in-progress on AgentWorkforce/factory#48',
+      'GitHub writeback did not confirm garden:in-progress on AgentWorkforce/factory#48',
     )
     expect(edits).toBe(1)
   })
@@ -2086,7 +2086,7 @@ describe('GhCliGithubWriteback', () => {
     const github = new GhCliGithubWriteback({
       runner: async () => ({
         stdout: JSON.stringify({
-          labels: [{ name: 'factory:in-progress' }, { name: 'factory:human-review' }],
+          labels: [{ name: 'garden:in-progress' }, { name: 'garden:human-review' }],
         }),
       }),
     })
@@ -2441,18 +2441,18 @@ describe('isAllowedFactoryGithubDraft complete-label-set PATCH', () => {
     )
 
   it('admits the exact payload setStatus authors', async () => {
-    await expect(allows({ labels: ['factory', 'bug', 'factory:in-progress'] })).resolves.toBe(true)
+    await expect(allows({ labels: ['factory', 'bug', 'garden:in-progress'] })).resolves.toBe(true)
     await expect(allows({ labels: ['factory', 'bug'] })).resolves.toBe(true)
   })
 
   it('refuses a set that drops the safety opt-in, including the empty set', async () => {
     await expect(allows({ labels: [] })).resolves.toBe(false)
-    await expect(allows({ labels: ['bug', 'factory:in-progress'] })).resolves.toBe(false)
+    await expect(allows({ labels: ['bug', 'garden:in-progress'] })).resolves.toBe(false)
   })
 
   it('refuses two contradictory Factory claims in one write, in any casing', async () => {
     await expect(allows({
-      labels: ['factory', 'factory:in-progress', 'Factory:Human-Review'],
+      labels: ['factory', 'garden:in-progress', 'Factory:Human-Review'],
     })).resolves.toBe(false)
   })
 
@@ -2471,8 +2471,8 @@ describe('isAllowedFactoryGithubDraft complete-label-set PATCH', () => {
   it('refuses the empty set even when the opt-in is exempt', async () => {
     // The exemption below must not reopen the hole the survival check closed:
     // stripping every label off an in-scope open issue is never a transition.
-    await expect(allows({ labels: [] }, 'factory:in-progress')).resolves.toBe(false)
-    await expect(allows({ labels: [] }, 'factory:human-review')).resolves.toBe(false)
+    await expect(allows({ labels: [] }, 'garden:in-progress')).resolves.toBe(false)
+    await expect(allows({ labels: [] }, 'garden:human-review')).resolves.toBe(false)
   })
 
   it('admits the payload setStatus authors from an empty connected projection', async () => {
@@ -2512,17 +2512,152 @@ describe('isAllowedFactoryGithubDraft complete-label-set PATCH', () => {
 
     await app.setStatus(pearIssue, 'in-progress')
 
-    expect(authored).toEqual([{ labels: ['factory', 'bug', 'factory:in-progress'] }])
+    expect(authored).toEqual([{ labels: ['factory', 'bug', 'garden:in-progress'] }])
     await expect(allows(authored[0])).resolves.toBe(true)
     // And the set the unfixed read would have authored is exactly what the
     // guard refuses — the stall this fallback removes.
-    await expect(allows({ labels: ['factory:in-progress'] })).resolves.toBe(false)
+    await expect(allows({ labels: ['garden:in-progress'] })).resolves.toBe(false)
   })
 
   it('exempts a lifecycle opt-in from the survival check', async () => {
     // A self-contradictory configuration, but the survival rule must not add a
     // second way for it to fail: a status transition is supposed to change a
     // lifecycle label, so requiring it to survive would reject every claim.
-    await expect(allows({ labels: ['factory', 'bug'] }, 'factory:in-progress')).resolves.toBe(true)
+    await expect(allows({ labels: ['factory', 'bug'] }, 'garden:in-progress')).resolves.toBe(true)
+  })
+})
+
+describe('Factory -> Software Garden rename transition', () => {
+  const legacyIssue: LinearIssue = {
+    ...issue,
+    uuid: 'github-77',
+    key: '77',
+    title: 'GitHub-native work labeled by an older build',
+    stateId: '',
+    labels: ['factory', 'factory:in-progress'],
+    path: '/github/repos/AgentWorkforce/factory/issues/by-id/77.json',
+    raw: {
+      payload: {
+        source: {
+          provider: 'github',
+          id: 'github-77',
+          owner: 'AgentWorkforce',
+          repo: 'factory',
+          number: 77,
+          url: 'https://github.com/AgentWorkforce/factory/issues/77',
+        },
+      },
+    },
+  }
+
+  it('GhCli getIssueStatus reads legacy factory lifecycle labels', async () => {
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [{ name: 'factory:human-review' }] }) }
+        }
+        return { stdout: '' }
+      },
+    })
+    await expect(github.getIssueStatus(legacyIssue)).resolves.toBe('human-review')
+  })
+
+  it('GhCli transitions a legacy-labeled issue onto canonical garden labels', async () => {
+    const calls: string[][] = []
+    const labels = new Set(['factory', 'factory:in-progress'])
+    const events: string[] = []
+    let nextEventId = 1
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit') {
+          const added = args[args.indexOf('--add-label') + 1]
+          const removedIndex = args.indexOf('--remove-label')
+          if (added && !labels.has(added)) {
+            labels.add(added)
+            events.push(`${nextEventId++}\tlabeled\t${added}\tfactory-bot`)
+          }
+          if (removedIndex >= 0) {
+            const removed = args[removedIndex + 1]!
+            if (labels.delete(removed)) {
+              events.push(`${nextEventId++}\tunlabeled\t${removed}\tfactory-bot`)
+            }
+          }
+        }
+        return { stdout: '' }
+      },
+    })
+
+    // The legacy label claims in-progress; the write migrates it to the
+    // canonical garden name instead of treating the issue as already-matched.
+    await expect(github.setStatus(legacyIssue, 'human-review')).resolves.toBe('applied')
+
+    expect(calls).toContainEqual([
+      'issue', 'edit', '77', '--repo', 'AgentWorkforce/factory',
+      '--add-label', 'garden:human-review',
+      '--remove-label', 'factory:in-progress',
+    ])
+    expect([...labels]).toEqual(['factory', 'garden:human-review'])
+  })
+
+  it('GhCli returns a legacy-labeled orphan to ready by removing the legacy label', async () => {
+    const calls: string[][] = []
+    const labels = new Set(['factory', 'factory:in-progress'])
+    const events: string[] = []
+    let nextEventId = 1
+    const github = new GhCliGithubWriteback({
+      runner: async (args) => {
+        calls.push(args)
+        if (args[0] === 'api' && args[1] === 'user') return { stdout: 'factory-bot\n' }
+        if (args[0] === 'api' && args[1] === '--paginate') return { stdout: events.join('\n') }
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return { stdout: JSON.stringify({ labels: [...labels].map((name) => ({ name })) }) }
+        }
+        if (args[0] === 'issue' && args[1] === 'edit' && args.includes('--remove-label')) {
+          args.forEach((arg, index) => {
+            const removed = args[index + 1]!
+            if (arg === '--remove-label' && labels.delete(removed)) {
+              events.push(`${nextEventId++}\tunlabeled\t${removed}\tfactory-bot`)
+            }
+          })
+        }
+        return { stdout: '' }
+      },
+    })
+
+    await expect(github.setStatus(legacyIssue, 'ready')).resolves.toBe('applied')
+    expect(labels).toEqual(new Set(['factory']))
+  })
+
+  it('App writeback reads legacy labels and migrates them in the replace set', async () => {
+    const updateIssue = vi.fn(async () => undefined)
+    const app = new AppGithubWriteback({
+      publishPullRequest: async () => { throw new Error('not used') },
+      closePullRequest: async () => undefined,
+      postIssueComment: async () => undefined,
+      updateIssue,
+      getIssue: async () => ({
+        outcome: 'found' as const,
+        issue: { content: { payload: { labels: [{ name: 'factory' }, { name: 'factory:in-progress' }] } } },
+      }),
+    })
+
+    // Dual-read: the legacy label still derives the provider status.
+    await expect(app.getIssueStatus(legacyIssue)).resolves.toBe('in-progress')
+
+    // The complete-set PATCH drops the legacy lifecycle label, adds the
+    // canonical garden one, and preserves the legacy `factory` safety opt-in.
+    await expect(app.setStatus(legacyIssue, 'human-review')).resolves.toBe('acknowledged')
+    expect(updateIssue).toHaveBeenCalledWith({
+      repo: 'AgentWorkforce/factory',
+      number: 77,
+      labels: ['factory', 'garden:human-review'],
+      author: 'app',
+    })
   })
 })

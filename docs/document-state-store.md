@@ -1,6 +1,6 @@
 # Document state-store port
 
-`DocumentStateStore` owns Factory's existing claim, lease, lifecycle,
+`DocumentStateStore` owns Software Garden's existing claim, lease, lifecycle,
 conversation, babysitter, and discovery behavior. It delegates only persistence
 and serialization to `WatchStateDocumentStore`:
 
@@ -41,6 +41,6 @@ const exitCode = await runFleetCli(process.argv.slice(2), {
 ```
 
 The CLI invokes `assertReady()` on every injected store before it constructs
-`Factory`. A failed readiness check exits nonzero and prevents discovery and
+`Software Garden`. A failed readiness check exits nonzero and prevents discovery and
 dispatch. If the adapter supplies a `backend` identifier, status JSON exposes
-it as `stateStore.backend`; Factory does not interpret that host-defined value.
+it as `stateStore.backend`; Software Garden does not interpret that host-defined value.

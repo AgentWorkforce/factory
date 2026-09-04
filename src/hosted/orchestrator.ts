@@ -31,7 +31,7 @@ const ACTIVE_ISSUE_PHASES = new Set(['dispatching', 'running', 'merge-gate'])
 
 class HostedFactoryLeaseLostError extends Error {
   constructor() {
-    super('hosted Factory workspace lease was lost')
+    super('hosted Software Garden workspace lease was lost')
     this.name = 'HostedFactoryLeaseLostError'
   }
 }
@@ -44,10 +44,10 @@ export class HostedFactoryLoop implements HostedFactory {
   #operationSequence = 0
 
   constructor(options: HostedFactoryOptions, ports: HostedFactoryPorts) {
-    if (!options.workspaceId.trim()) throw new Error('hosted Factory requires a workspaceId')
-    if (!options.ownerId.trim()) throw new Error('hosted Factory requires a unique ownerId')
+    if (!options.workspaceId.trim()) throw new Error('hosted Software Garden requires a workspaceId')
+    if (!options.ownerId.trim()) throw new Error('hosted Software Garden requires a unique ownerId')
     if (options.config.workspaceId && options.config.workspaceId !== options.workspaceId) {
-      throw new Error('hosted Factory workspaceId must match config.workspaceId')
+      throw new Error('hosted Software Garden workspaceId must match config.workspaceId')
     }
     this.#options = {
       ...options,
@@ -90,7 +90,7 @@ export class HostedFactoryLoop implements HostedFactory {
           continue
         }
         if (!isInFactoryScope(issue, this.#options.config.safety)) {
-          report.skipped.push({ issueKey: issue.key, reason: 'outside configured Factory safety scope' })
+          report.skipped.push({ issueKey: issue.key, reason: 'outside configured Software Garden safety scope' })
           continue
         }
 
@@ -103,7 +103,7 @@ export class HostedFactoryLoop implements HostedFactory {
           }
 
           if (!record && activeCount >= this.#options.config.batchSize) {
-            report.skipped.push({ issueKey: issue.key, reason: 'hosted Factory batch is full' })
+            report.skipped.push({ issueKey: issue.key, reason: 'hosted Software Garden batch is full' })
             continue
           }
 
@@ -167,7 +167,7 @@ export class HostedFactoryLoop implements HostedFactory {
               ...record,
               decision: structuredClone(decision),
               phase: 'awaiting-clarification',
-              clarificationReason: 'Factory triage produced no dispatchable agent or workflow.',
+              clarificationReason: 'Software Garden triage produced no dispatchable agent or workflow.',
               invocations,
               updatedAt: this.#timestamp(),
             }
@@ -460,7 +460,7 @@ export class HostedFactoryLoop implements HostedFactory {
       if (kind === 'clarification') {
         await this.#ports.writeback.requestClarification({
           ...input,
-          reason: record.clarificationReason ?? 'Factory needs more issue context.',
+          reason: record.clarificationReason ?? 'Software Garden needs more issue context.',
         })
       } else if (kind === 'dispatch') {
         await this.#ports.writeback.dispatched(input)

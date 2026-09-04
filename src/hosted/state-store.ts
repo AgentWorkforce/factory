@@ -287,7 +287,7 @@ function matchesLiveLease(
 
 function validTtl(ttlMs: number): number {
   if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
-    throw new Error('hosted Factory lease TTL must be greater than zero')
+    throw new Error('hosted Software Garden lease TTL must be greater than zero')
   }
   return Math.trunc(ttlMs)
 }
