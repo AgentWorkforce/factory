@@ -29,11 +29,20 @@
  * release-recovery worktree rebuild, a developer checkout — has a resolvable
  * HEAD, and a consumer installing the published package never runs the build at
  * all (there is no `prepare` script; `dist/` ships prebuilt).
+ *
+ * A DIRTY working tree still stamps HEAD, which is knowingly approximate for a
+ * developer build and exact for every build that can reach an operator: CI and
+ * the publish workflow build a fresh checkout, and the release already binds
+ * the packed payload to the commit under test twice over
+ * (`scripts/verify-packed-e2e.mjs`, `scripts/verify-release-payload.sh`).
+ * Refusing to build on a dirty tree would break the ordinary edit-build loop to
+ * guard an artifact that is never published.
  */
 
 import { execFileSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 export const BUILD_INFO_SCHEMA_VERSION = 1
 export const FULL_COMMIT_SHA = /^[0-9a-f]{40}$/u
@@ -83,7 +92,7 @@ export function writeBuildInfo({ outPath, env = process.env, cwd = process.cwd()
   return document
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const root = resolve(import.meta.dirname, '..')
   const outPath = process.argv[2]
     ? resolve(process.argv[2])
