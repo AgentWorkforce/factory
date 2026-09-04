@@ -160,6 +160,34 @@ describe('build stamp in the packed payload (#446)', () => {
     })
   })
 
+  it('validates the stamp even when the two are byte-identical', async () => {
+    // Review follow-up (#468, P1, cubic). Equality is not validity. A
+    // short-circuit on equal bytes would exempt a stamp that is malformed on
+    // BOTH sides, letting release recovery certify an artifact whose runtime
+    // loader reports `commit: "unknown"` — every other file in the payload is
+    // safe to skip on equal bytes, but this one is validated, not just diffed.
+    await withTrees(async (left, right) => {
+      for (const identical of [
+        JSON.stringify({ schemaVersion: 1, commit: 'HEAD' }),
+        JSON.stringify({ schemaVersion: 1 }),
+        JSON.stringify({ schemaVersion: 1, commit: a.slice(0, 12) }),
+        'not json',
+      ]) {
+        await writeFile(stampPath(left), identical)
+        await writeFile(stampPath(right), identical)
+        expect(await comparePackageTrees(left, right)).not.toEqual([])
+      }
+
+      // …and an identical WELL-FORMED stamp still passes silently.
+      const good = JSON.stringify({ schemaVersion: 1, commit: a })
+      await writeFile(stampPath(left), good)
+      await writeFile(stampPath(right), good)
+      const notes: string[] = []
+      expect(await comparePackageTrees(left, right, { notes })).toEqual([])
+      expect(notes).toEqual([])
+    })
+  })
+
   it('exempts the commit and nothing else', async () => {
     await withTrees(async (left, right) => {
       // A second field that differs is a real payload difference. The exemption

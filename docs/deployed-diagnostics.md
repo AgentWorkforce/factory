@@ -36,8 +36,9 @@ curl -fsS https://<factory-host>/healthz | jq '.heartbeat.health.build'
 # { "version": "0.1.86", "commit": "23e97cadc24f3e239879671975a962b577cf4979" }
 ```
 
-`factory diagnose --deployed <url>` renders the same pair as its first line, and
-`--json` carries it at `.health.build`.
+`factory diagnose --deployed <url>` renders the same pair as the first line of its health
+block — after the `factory diagnose — <url>` header, `reachable`, and any `phase` /
+`instance liveness` lines — and `--json` carries it at `.health.build`.
 
 That answers the first question of every outage — *is the fix I merged actually running?* — as a
 lookup. It used to be an argument: compare `heartbeat.startedAt` against a merge time and infer that

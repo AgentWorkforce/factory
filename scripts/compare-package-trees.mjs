@@ -138,11 +138,16 @@ async function compareEntry(leftPath, rightPath, relativePath, differences, note
     }
   } else if (left.isFile()) {
     const [leftBytes, rightBytes] = await Promise.all([readFile(leftPath), readFile(rightPath)])
-    if (leftBytes.equals(rightBytes)) return
     if (relativePath === BUILD_STAMP_PATH) {
+      // Checked even when the two are byte-identical (#468 review, P1, cubic).
+      // A short-circuit on equal bytes would exempt a stamp that is malformed
+      // on BOTH sides, so release recovery could still certify an artifact
+      // whose runtime loader reports `commit: "unknown"`. Equality is not
+      // validity: this file gets validated, not merely diffed.
       compareBuildStamps(leftBytes, rightBytes, relativePath, differences, notes)
       return
     }
+    if (leftBytes.equals(rightBytes)) return
     differences.push(`${relativePath}: content differs`)
   }
 }
