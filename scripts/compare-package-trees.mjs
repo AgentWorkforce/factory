@@ -22,9 +22,17 @@ import { pathToFileURL } from 'node:url'
  *
  * So this file is compared as a build stamp rather than as bytes: every field
  * except `commit` must match exactly, both sides must parse, and a differing
- * commit is reported as a NOTE naming both SHAs. The check keeps its meaning
- * ("the code is identical") and the reader gains the fact it was missing
- * ("...and here are the two commits that produced it").
+ * commit is reported as a NOTE naming both SHAs.
+ *
+ * The note states a fact about the STAMP and never a verdict about the payload
+ * (#468 review, P2, codex). This function has seen one file; whether the rest
+ * of the tree matches is decided by a traversal that has not finished yet, so
+ * wording like "same code" would print immediately before `package.json:
+ * content differs` and certify an equivalence the comparison went on to
+ * refute. The verdict belongs to the caller — the empty/non-empty
+ * `differences` list, and the process exit code. Notes are still printed when
+ * the comparison FAILS, because a release-recovery failure is exactly when a
+ * reader needs to know which two builds were being compared.
  */
 const BUILD_STAMP_PATH = 'dist/build-info.json'
 const BUILD_STAMP_PROVENANCE_FIELD = 'commit'
@@ -86,7 +94,10 @@ function compareBuildStamps(leftBytes, rightBytes, relativePath, differences, no
     }
   }
   if (leftCommit !== rightCommit) {
-    notes?.push(`${relativePath}: same code, built from ${leftCommit} and ${rightCommit}`)
+    notes?.push(
+      `${relativePath}: build commit differs (${leftCommit} vs ${rightCommit}); ` +
+        'exempt from byte comparison',
+    )
   }
   return true
 }

@@ -146,7 +146,36 @@ describe('build stamp in the packed payload (#446)', () => {
       const notes: string[] = []
       expect(await comparePackageTrees(left, right, { notes })).toEqual([])
       // Tolerated, not silent: the recovery reader gets the provenance fact.
-      expect(notes).toEqual([`dist/build-info.json: same code, built from ${a} and ${b}`])
+      expect(notes).toEqual([
+        `dist/build-info.json: build commit differs (${a} vs ${b}); exempt from byte comparison`,
+      ])
+    })
+  })
+
+  it('never lets the note claim an equivalence the comparison refutes', async () => {
+    // Review follow-up (#468, P2, codex). The note is emitted mid-traversal, by
+    // a function that has seen ONE file. Wording like "same code" would print
+    // immediately above `package.json: content differs` and certify an
+    // equivalence the comparison goes on to refute. It states a fact about the
+    // stamp; the verdict is the caller's.
+    await withTrees(async (left, right) => {
+      await writeFile(stampPath(left), JSON.stringify({ schemaVersion: 1, commit: a }))
+      await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1, commit: b }))
+      await writeFile(join(left, 'package.json'), JSON.stringify({ version: '0.1.86' }))
+      await writeFile(join(right, 'package.json'), JSON.stringify({ version: '0.1.87' }))
+
+      const notes: string[] = []
+      const differences = await comparePackageTrees(left, right, { notes })
+
+      // The payload does NOT match…
+      expect(differences).toContain('package.json: content differs')
+      // …and the note still names both commits, because a recovery failure is
+      // exactly when a reader needs to know which two builds were compared…
+      expect(notes).toEqual([
+        `dist/build-info.json: build commit differs (${a} vs ${b}); exempt from byte comparison`,
+      ])
+      // …while claiming nothing about the tree it has not finished walking.
+      expect(notes.join('\n')).not.toMatch(/same code|identical|equivalent|matches/u)
     })
   })
 
