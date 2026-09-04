@@ -1,0 +1,88 @@
+name: Review at head
+
+# AgentWorkforce/factory#432 part (c). Factory's merge gate protects Factory's
+# own merges, but most merges are performed by a human reading the PR page, so
+# the "was the commit that merges actually reviewed?" signal has to be visible
+# there too.
+#
+# The check applies the same predicate as `evaluateGithubMergeGate` by importing
+# it, so the PR-page signal and Factory's gate cannot drift apart. It reads both
+# `/commits/{sha}/status` (legacy commit statuses — Devin posts one of these and
+# never a check run) and `/commits/{sha}/check-runs`, so a vacuous bot green is
+# reported as vacuous from either source.
+#
+# ROLLOUT: land non-required and measure for a week before requiring it. On the
+# audited data the correct predicate blocks the large majority of recent merges,
+# so making it required before the cubic seat, CodeRabbit public-repo and Devin
+# trial repairs land would only train people to bypass it. Those repairs are
+# configuration and are tracked on #432 for the principal.
+
+on:
+  # Runs from the trusted base branch and never checks out or executes
+  # contributor code — it reads PR metadata over the API only.
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
+  workflow_call:
+    inputs:
+      repository:
+        description: Repository owning the pull request, as owner/name.
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number to evaluate.
+        required: true
+        type: number
+      predicate_ref:
+        description: Ref of AgentWorkforce/software-garden supplying the shared predicate.
+        required: false
+        default: main
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: review-at-head-${{ inputs.pr_number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review-at-head:
+    # A draft is not claiming to be mergeable yet.
+    if: ${{ inputs.pr_number || !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # Always the predicate's own repository, never the caller's, so a
+      # reusable invocation applies the same rule as a local one.
+      - name: Check out the shared predicate
+        uses: actions/checkout@v6
+        with:
+          repository: AgentWorkforce/software-garden
+          ref: ${{ inputs.predicate_ref || 'main' }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Require a substantive review of the commit that would merge
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ inputs.repository || github.repository }}
+          TARGET_PR: ${{ inputs.pr_number || github.event.pull_request.number }}
+        run: npx tsx src/github/review-at-head-cli.ts "$TARGET_REPO" "$TARGET_PR"
