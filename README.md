@@ -875,3 +875,5 @@ relay-backend paths are left for their worker nodes to validate.
   and importable by ESM consumers.
 - For production operation (the live-daemon + reaper backstop model, heartbeats,
   and connected-workspace prerequisites), see the operations notes alongside the config schema.
+
+<!-- canary 2026-09-01T11:00:45Z -->
