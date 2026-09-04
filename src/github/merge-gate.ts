@@ -28,6 +28,28 @@ export interface GithubMergeInput {
   expectedHeadSha: string
 }
 
+/**
+ * One `statusCheckRollup` entry, retaining the fields a bare state string
+ * throws away. `description` is what lets a vacuous bot check (expired
+ * trial, rate limit, unassigned seat) be told apart from a real pass — both
+ * report a non-blocking state.
+ */
+export interface CheckSignal {
+  context: string
+  state: string
+  description?: string
+  kind: 'REAL' | 'VACUOUS' | 'BLOCKING'
+}
+
+/** A PR review, anchored to the commit it was actually submitted against. */
+export interface ReviewAtHead {
+  login: string
+  state: string
+  commitId: string
+  bodyLength: number
+  inlineCommentsAtHead: number
+}
+
 export interface GithubMergeGateVerdict {
   verdict: 'READY' | 'REFUSE'
   ready: boolean
@@ -37,6 +59,8 @@ export interface GithubMergeGateVerdict {
     mergeStateStatus?: string
     headRefOid?: string
     reviewDecision?: string
+    checkSignals: CheckSignal[]
+    /** @deprecated derived from `checkSignals`; retained for one release. */
     checkStates: string[]
   }
 }
@@ -167,58 +191,68 @@ export function evaluateGithubMergeGate(
   const headRefOid = stringValue(record.headRefOid)
   const reviewDecision = stringValue(record.reviewDecision)
   const statusCheckRollup = Array.isArray(record.statusCheckRollup) ? record.statusCheckRollup : undefined
-  const checkStates = statusCheckRollup ? checkStatesFromRollup(statusCheckRollup) : []
+  const checkSignals = statusCheckRollup ? checkSignalsFromRollup(statusCheckRollup) : []
+  const checkStates = checkSignals.map((signal) => signal.state)
+  const reviewsRaw = Array.isArray(record.reviews) ? record.reviews : undefined
+  const reviewsAtHead = reviewsRaw ? reviewsFromPayload(reviewsRaw) : []
+  const prAuthor = prAuthorLogin(record)
 
-  if (!mergeable || !mergeStateStatus || !headRefOid || !reviewDecision || !statusCheckRollup) {
-    return refuse('missing required live GitHub merge fields', {
-      mergeable,
-      mergeStateStatus,
-      headRefOid,
-      reviewDecision,
-      checkStates,
-    })
+  const refuseWith = (reason: string): GithubMergeGateVerdict =>
+    refuse(reason, { mergeable, mergeStateStatus, headRefOid, reviewDecision, checkSignals, checkStates })
+
+  if (!mergeable || !mergeStateStatus || !headRefOid || !reviewDecision || !statusCheckRollup || !reviewsRaw || !prAuthor) {
+    return refuseWith('missing required live GitHub merge fields')
   }
 
   if (mergeable === 'UNKNOWN' || mergeStateStatus === 'UNKNOWN') {
-    return refuse('GitHub mergeability is still unknown', { mergeable, mergeStateStatus, headRefOid, reviewDecision, checkStates })
+    return refuseWith('GitHub mergeability is still unknown')
   }
 
   if (input.expectedHeadSha && headRefOid !== input.expectedHeadSha) {
-    return refuse(`head moved: expected ${input.expectedHeadSha}, live ${headRefOid ?? 'unknown'}`, {
-      mergeable,
-      mergeStateStatus,
-      headRefOid,
-      reviewDecision,
-      checkStates,
-    })
+    return refuseWith(`head moved: expected ${input.expectedHeadSha}, live ${headRefOid ?? 'unknown'}`)
   }
 
   if (mergeable !== 'MERGEABLE') {
-    return refuse(`mergeable is ${mergeable ?? 'unknown'}`, { mergeable, mergeStateStatus, headRefOid, reviewDecision, checkStates })
+    return refuseWith(`mergeable is ${mergeable ?? 'unknown'}`)
   }
 
   if (mergeStateStatus !== 'CLEAN') {
-    return refuse(`merge state is ${mergeStateStatus ?? 'unknown'}`, { mergeable, mergeStateStatus, headRefOid, reviewDecision, checkStates })
+    return refuseWith(`merge state is ${mergeStateStatus ?? 'unknown'}`)
   }
 
   if (reviewDecision !== 'APPROVED') {
-    return refuse(`review decision is ${reviewDecision ?? 'unknown'}`, { mergeable, mergeStateStatus, headRefOid, reviewDecision, checkStates })
+    return refuseWith(`review decision is ${reviewDecision ?? 'unknown'}`)
   }
 
-  if (checkStates.length === 0) {
-    return refuse('no successful status checks observed', { mergeable, mergeStateStatus, headRefOid, reviewDecision, checkStates })
+  const reviewRefusal = reviewAtHeadRefusal(reviewsAtHead, headRefOid, prAuthor)
+  if (reviewRefusal) {
+    return refuseWith(reviewRefusal)
   }
 
-  const blocking = checkStates.filter(isBlockingCheckState)
+  const nonVacuous = checkSignals.filter((signal) => signal.kind !== 'VACUOUS')
+  if (nonVacuous.length === 0) {
+    const vacuousContexts = checkSignals.map((signal) => signal.context)
+    return refuseWith(
+      checkSignals.length === 0
+        ? 'no successful status checks observed'
+        : `no successful status checks observed: ${checkSignals.length} check(s) present but all vacuous (${vacuousContexts.join(', ')})`,
+    )
+  }
+
+  const blocking = nonVacuous.filter((signal) => signal.kind === 'BLOCKING')
   if (blocking.length > 0) {
-    return refuse(`checks not merge-ready: ${blocking.join(', ')}`, { mergeable, mergeStateStatus, headRefOid, reviewDecision, checkStates })
+    return refuseWith(`checks not merge-ready: ${blocking.map((signal) => signal.state).join(', ')}`)
   }
+
+  const vacuousCount = checkSignals.length - nonVacuous.length
+  const realCount = nonVacuous.filter((signal) => signal.kind === 'REAL').length
 
   return {
     verdict: 'READY',
     ready: true,
-    reason: 'MERGEABLE+CLEAN with APPROVED review, matching head when supplied, and no blocking checks',
-    live: { mergeable, mergeStateStatus, headRefOid, reviewDecision, checkStates },
+    reason: `MERGEABLE+CLEAN with APPROVED review substantiated at head, matching head when supplied, and no blocking checks ` +
+      `(${realCount} real, ${vacuousCount} vacuous)`,
+    live: { mergeable, mergeStateStatus, headRefOid, reviewDecision, checkSignals, checkStates },
   }
 }
 
@@ -270,12 +304,16 @@ const mountedMergeGateFields = (
   const headRefOid = stringValue(payload.headRefOid) ?? stringValue(head.sha)
   const reviewDecision = normalizedString(payload.reviewDecision ?? payload.review_decision)
   const statusCheckRollup = payload.statusCheckRollup ?? payload.status_check_rollup
+  const reviews = payload.reviews
+  const author = prAuthorLogin(payload)
   const missing = [
     ['mergeable', mergeable],
     ['mergeStateStatus', mergeStateStatus],
     ['headRefOid', headRefOid],
     ['reviewDecision', reviewDecision],
     ['statusCheckRollup', Array.isArray(statusCheckRollup) ? statusCheckRollup : undefined],
+    ['reviews', Array.isArray(reviews) ? reviews : undefined],
+    ['author', author],
   ].flatMap(([name, value]) => value === undefined ? [name] : [])
   if (missing.length > 0) {
     throw mountedMergeGateCapabilityError(
@@ -284,7 +322,7 @@ const mountedMergeGateFields = (
     )
   }
 
-  return { mergeable, mergeStateStatus, headRefOid, reviewDecision, statusCheckRollup }
+  return { mergeable, mergeStateStatus, headRefOid, reviewDecision, statusCheckRollup, reviews, author }
 }
 
 const mountedMergeGateCapabilityError = (input: GithubMergeGateInput, detail: string): Error =>
@@ -311,31 +349,127 @@ const refuse = (reason: string, live: GithubMergeGateVerdict['live']): GithubMer
   live,
 })
 
-const checkStatesFromRollup = (value: unknown): string[] => {
+const nonBlockingCheckStates = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED', 'EXPECTED'])
+
+/**
+ * Description-string markers a vacuous bot check reports instead of an actual
+ * review: an expired trial, a rate limit, an unassigned seat, a line-count
+ * cap. Each one currently lands on a non-blocking rollup state, so without
+ * this classifier it is indistinguishable from a real pass. See
+ * AgentWorkforce/factory#432.
+ */
+const VACUOUS_REVIEW_MARKERS: RegExp[] = [
+  /full review skipped/i, // Devin: trial expired and no credits remaining
+  /review rate limited/i, // CodeRabbit
+  /review skipped/i, // CodeRabbit: OSS / draft
+  /ai review skipped/i, // cubic: seat unassigned
+  /review line limit reached/i, // cubic: monthly cap
+  /review cancelled/i, // cubic
+  /review not started/i, // cubic: branch rewrite
+  /usage limits?/i, // codex
+]
+
+const checkDescription = (record: Record<string, unknown>): string | undefined =>
+  stringValue(record.description) ??
+  stringValue(record.summary) ??
+  stringValue(record.title) ??
+  stringValue(record.text)
+
+const classifyCheckKind = (state: string, description: string | undefined): CheckSignal['kind'] => {
+  if (description && VACUOUS_REVIEW_MARKERS.some((marker) => marker.test(description))) {
+    return 'VACUOUS'
+  }
+  return nonBlockingCheckStates.has(state) ? 'REAL' : 'BLOCKING'
+}
+
+const checkSignalsFromRollup = (value: unknown): CheckSignal[] => {
   if (!Array.isArray(value)) {
     return []
   }
 
   return value.map((entry) => {
     const record = asRecord(entry)
-    const conclusion = stringValue(record.conclusion)
-    if (conclusion) {
-      return conclusion
-    }
-
-    const state = stringValue(record.state)
-    if (state) {
-      return state
-    }
-
-    const status = stringValue(record.status)
-    return status ?? 'UNKNOWN'
+    const context = stringValue(record.context) ?? stringValue(record.name) ?? 'unknown'
+    const state = stringValue(record.conclusion) ?? stringValue(record.state) ?? stringValue(record.status) ?? 'UNKNOWN'
+    const description = checkDescription(record)
+    return { context, state, description, kind: classifyCheckKind(state, description) }
   })
 }
 
-const nonBlockingCheckStates = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED', 'EXPECTED'])
+const prAuthorLogin = (record: Record<string, unknown>): string | undefined =>
+  stringValue(record.author) ??
+  stringValue(asRecord(record.author).login) ??
+  stringValue(asRecord(record.user).login)
 
-const isBlockingCheckState = (state: string): boolean => !nonBlockingCheckStates.has(state)
+const reviewAuthorLogin = (record: Record<string, unknown>): string | undefined =>
+  stringValue(asRecord(record.author).login) ?? stringValue(asRecord(record.user).login) ?? stringValue(record.login)
+
+const reviewCommitId = (record: Record<string, unknown>): string | undefined =>
+  stringValue(record.commitId) ??
+  stringValue(record.commit_id) ??
+  stringValue(asRecord(record.commit).oid) ??
+  stringValue(asRecord(record.commit).sha)
+
+const finiteNumber = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) ? value : undefined
+
+const reviewInlineComments = (record: Record<string, unknown>): number => {
+  const direct = finiteNumber(record.inlineComments) ?? finiteNumber(record.inline_comments)
+  if (direct !== undefined) return direct
+  if (typeof record.comments === 'number') return record.comments
+  return finiteNumber(asRecord(record.comments).totalCount) ?? 0
+}
+
+/** Parses raw `reviews` entries (GraphQL- or REST-shaped) into `ReviewAtHead`s, dropping any without an identifiable author, commit, or state. */
+const reviewsFromPayload = (value: unknown[]): ReviewAtHead[] =>
+  value.flatMap((entry) => {
+    const record = asRecord(entry)
+    const login = reviewAuthorLogin(record)
+    const commitId = reviewCommitId(record)
+    const state = stringValue(record.state)
+    if (!login || !commitId || !state) return []
+    return [{
+      login,
+      state: state.toUpperCase(),
+      commitId,
+      bodyLength: (stringValue(record.body) ?? '').length,
+      inlineCommentsAtHead: reviewInlineComments(record),
+    }]
+  })
+
+/**
+ * Returns a refusal reason when no review at `head` is substantive, or
+ * `undefined` when at least one qualifies. `reviewDecision === 'APPROVED'` is
+ * a repo-level rollup unbound to the head commit or to content (relay#1638:
+ * a stale-commit approval with an empty body satisfies it); this predicate
+ * requires a review actually anchored to `head`, from someone other than the
+ * PR author, carrying a body or inline comments.
+ */
+const reviewAtHeadRefusal = (
+  reviews: ReviewAtHead[],
+  head: string,
+  author: string | undefined,
+): string | undefined => {
+  const atHead = reviews.filter((review) => review.commitId === head)
+  if (atHead.length === 0) {
+    return reviews.length === 0
+      ? `no review at head: no reviews exist (head is ${head})`
+      : `no review at head: ${reviews.length} review(s) exist, newest pinned to ${reviews[reviews.length - 1]!.commitId} (head is ${head})`
+  }
+
+  const fromOthers = atHead.filter((review) => review.login !== author)
+  if (fromOthers.length === 0) {
+    return 'only review at head is by the PR author'
+  }
+
+  const substantive = fromOthers.filter((review) => review.bodyLength > 0 || review.inlineCommentsAtHead > 0)
+  if (substantive.length === 0) {
+    const vacuous = fromOthers[0]!
+    return `review at head has no content: ${vacuous.login} ${vacuous.state} with empty body and no inline comments`
+  }
+
+  return undefined
+}
 
 const asRecord = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
