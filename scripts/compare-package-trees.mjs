@@ -28,6 +28,18 @@ import { pathToFileURL } from 'node:url'
  */
 const BUILD_STAMP_PATH = 'dist/build-info.json'
 const BUILD_STAMP_PROVENANCE_FIELD = 'commit'
+/**
+ * The exemption is granted to a COMMIT, not to a string in the commit slot.
+ *
+ * Kept identical to `scripts/write-build-info.mjs` and
+ * `src/orchestrator/build-identity.ts`: the generator emits nothing but a full
+ * 40-hex SHA, so anything else in a packed payload is corruption, not
+ * provenance. Accepting it would let the release-recovery and
+ * final-consistency steps in `publish.yml` certify an artifact whose runtime
+ * loader will report `commit: "unknown"` — the silent lie this whole change
+ * exists to remove, re-entering through the check that is supposed to catch it.
+ */
+const FULL_COMMIT_SHA = /^[0-9a-f]{40}$/u
 
 export async function comparePackageTrees(leftRoot, rightRoot, { notes } = {}) {
   const differences = []
@@ -65,9 +77,13 @@ function compareBuildStamps(leftBytes, rightBytes, relativePath, differences, no
   }
   const leftCommit = left[BUILD_STAMP_PROVENANCE_FIELD]
   const rightCommit = right[BUILD_STAMP_PROVENANCE_FIELD]
-  if (typeof leftCommit !== 'string' || typeof rightCommit !== 'string') {
-    differences.push(`${relativePath}: build stamp carries no commit`)
-    return false
+  for (const [side, commit] of [['left', leftCommit], ['right', rightCommit]]) {
+    if (typeof commit !== 'string' || !FULL_COMMIT_SHA.test(commit)) {
+      differences.push(
+        `${relativePath}: ${side} build stamp carries no full commit SHA (${JSON.stringify(commit)})`,
+      )
+      return false
+    }
   }
   if (leftCommit !== rightCommit) {
     notes?.push(`${relativePath}: same code, built from ${leftCommit} and ${rightCommit}`)

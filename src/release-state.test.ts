@@ -190,7 +190,34 @@ describe('build stamp in the packed payload (#446)', () => {
 
       await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1 }))
       expect(await comparePackageTrees(left, right))
-        .toContain('dist/build-info.json: build stamp carries no commit')
+        .toContain('dist/build-info.json: right build stamp carries no full commit SHA (undefined)')
+    })
+  })
+
+  it('grants the exemption to a commit, not to a string in the commit slot', async () => {
+    // Review follow-up (#468, P2, codex). A type-only check would let a
+    // CORRUPT registry stamp — `"HEAD"`, `"corrupt"`, an abbreviated SHA —
+    // pass as a provenance difference, so `verify-release-payload.sh` would
+    // return success for an artifact whose runtime loader reports
+    // `commit: "unknown"`. That is the silent lie this change exists to
+    // remove, re-entering through the check meant to catch it.
+    await withTrees(async (left, right) => {
+      await writeFile(stampPath(left), JSON.stringify({ schemaVersion: 1, commit: a }))
+      for (const corrupt of ['HEAD', 'corrupt', a.slice(0, 12), a.toUpperCase(), '', 42, null]) {
+        await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1, commit: corrupt }))
+        const notes: string[] = []
+        expect(await comparePackageTrees(left, right, { notes })).toContain(
+          `dist/build-info.json: right build stamp carries no full commit SHA (${JSON.stringify(corrupt)})`,
+        )
+        // …and it is never reported as a tolerated provenance difference.
+        expect(notes).toEqual([])
+      }
+
+      // The same rule applies to the locally rebuilt side, not just the registry's.
+      await writeFile(stampPath(left), JSON.stringify({ schemaVersion: 1, commit: 'HEAD' }))
+      await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1, commit: b }))
+      expect(await comparePackageTrees(left, right))
+        .toContain('dist/build-info.json: left build stamp carries no full commit SHA ("HEAD")')
     })
   })
 
