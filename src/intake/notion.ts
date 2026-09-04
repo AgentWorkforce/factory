@@ -9,8 +9,10 @@ import { z } from 'zod'
 import { dispatchNotionPageIdentity } from '../dispatch/work-unit-identity'
 import type { GithubWriteIdentity } from '../github/gh-identity'
 import {
+  GARDEN_E2E_TITLE_PREFIX,
   GARDEN_READY_LABEL,
   GARDEN_TITLE_PREFIX,
+  LEGACY_FACTORY_E2E_TITLE_PREFIX,
   LEGACY_FACTORY_READY_LABEL,
   LEGACY_FACTORY_TITLE_PREFIX,
 } from '../constants/lifecycle-labels'
@@ -652,17 +654,25 @@ async function publishRepoTask(
 
 function factoryIssueTitle(title: string): string {
   // New issues are prefixed with the canonical `[garden]` marker. A title that
-  // already carries it is left untouched, and a title carrying the legacy
-  // `[factory]` prefix is REWRITTEN to the canonical one rather than passed
+  // already carries a canonical prefix is left untouched, and a title carrying
+  // a legacy one is REWRITTEN to its canonical successor rather than passed
   // through: a new write must not mint legacy naming, and discovery accepts
   // both spellings (`hasGardenTitlePrefix`) so the rewrite cannot make an
-  // issue unrecognizable. Neither branch can double-prefix.
+  // issue unrecognizable. No branch can double-prefix.
+  //
+  // The e2e pair is checked FIRST. `[factory-e2e]` does not start with
+  // `[factory]` (the `]` differs), so the plain legacy branch would not have
+  // mangled it -- but it would have prepended a second `[garden] ` marker in
+  // front of a prefix that already scopes the issue.
   const normalized = title.toLowerCase()
-  if (normalized.startsWith(GARDEN_TITLE_PREFIX.toLowerCase())) {
-    return title
-  }
-  if (normalized.startsWith(LEGACY_FACTORY_TITLE_PREFIX.toLowerCase())) {
-    return `${GARDEN_TITLE_PREFIX}${title.slice(LEGACY_FACTORY_TITLE_PREFIX.length)}`
+  for (const [canonical, legacy] of [
+    [GARDEN_E2E_TITLE_PREFIX, LEGACY_FACTORY_E2E_TITLE_PREFIX],
+    [GARDEN_TITLE_PREFIX, LEGACY_FACTORY_TITLE_PREFIX],
+  ] as const) {
+    if (normalized.startsWith(canonical.toLowerCase())) return title
+    if (normalized.startsWith(legacy.toLowerCase())) {
+      return `${canonical}${title.slice(legacy.length)}`
+    }
   }
   return `${GARDEN_TITLE_PREFIX} ${title}`
 }

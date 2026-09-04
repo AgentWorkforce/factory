@@ -389,14 +389,28 @@ jobs:
             # spellings as dispatchable too, so they must come off here as
             # well; otherwise a canary filed by an older build can never
             # verify as disarmed, every retry fails, and the issue stays
-            # ingestible. Remove them ONE AT A TIME: a single `gh issue edit`
-            # carrying a label the target repository has never provisioned can
-            # fail as a whole, which would drop the removals that would have
-            # succeeded and leave the canary armed.
+            # ingestible.
+            #
+            # ONE edit removes all of them. Readiness needs only the `garden`
+            # opt-in -- `garden-ready` is not part of the test -- so a
+            # label-at-a-time loop would leave the canary dispatchable in the
+            # gap after `garden-ready` came off, and the sweep could claim it
+            # mid-cleanup. Naming only the labels the issue actually carries
+            # keeps that single edit safe: a label the issue has necessarily
+            # exists in the repository, so the edit cannot fail as a whole over
+            # a name the target repo never provisioned.
+            ARMED_LABELS="$(gh issue view "${NUM}" --repo "${TARGET_REPO}" \
+              --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo '')"
+            REMOVE_ARGS=()
             for LABEL in garden-ready factory-ready agent:single garden factory; do
-              gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
-                --remove-label "${LABEL}" >/dev/null 2>&1 || true
+              case ",${ARMED_LABELS}," in
+                *",${LABEL},"*) REMOVE_ARGS+=(--remove-label "${LABEL}") ;;
+              esac
             done
+            if [ "${#REMOVE_ARGS[@]}" -gt 0 ]; then
+              gh issue edit "${NUM}" --repo "${TARGET_REPO}" \
+                "${REMOVE_ARGS[@]}" >/dev/null 2>&1 || true
+            fi
             gh issue close "${NUM}" --repo "${TARGET_REPO}" --reason "not planned" \
               --comment "P0 canary was not proven inside the wait window (${RUN_URL}). Dispatch labels removed and issue closed so the sweep does not later ingest an abandoned canary and consume a batch slot. Re-run verify-p0-canary to retry." >/dev/null 2>&1 || true
 

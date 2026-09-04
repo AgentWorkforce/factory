@@ -329,6 +329,41 @@ describe('Notion spec intake', () => {
     expect(title).not.toContain('[factory]')
   })
 
+  // `[factory-e2e]` does not start with `[factory]`, so it never reached the
+  // legacy branch -- it fell through and collected a second, redundant
+  // `[garden] ` marker in front of a prefix that already scopes the issue.
+  it('rewrites the legacy e2e prefix to its own canonical successor', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: {
+        ...bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+        title: '[factory-e2e] Resume the checkpoint',
+      },
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+
+    await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    expect(vi.mocked(github.createIssue).mock.calls[0]![0].title)
+      .toBe('[garden-e2e] Resume the checkpoint')
+  })
+
+  it('leaves a canonical e2e prefix untouched rather than stacking a second marker', async () => {
+    const { root, manifest } = await fixtureManifest('private mounted body', {
+      bootstrap: {
+        ...bootstrap({ repo: 'AgentWorkforce/cloud', labels: [] }),
+        title: '[garden-e2e] Resume the checkpoint',
+      },
+    })
+    roots.push(root)
+    const github = fakeGithub({ visibility: 'private' })
+
+    await runNotionIntake({ manifest, dispatch: true, claims, github })
+
+    expect(vi.mocked(github.createIssue).mock.calls[0]![0].title)
+      .toBe('[garden-e2e] Resume the checkpoint')
+  })
+
   // A pre-rename issue carries the `## Factory intake` heading. Comparing it
   // against the canonical render alone reads an untouched generated body as a
   // manual edit, which blocks the very migration it needs.
