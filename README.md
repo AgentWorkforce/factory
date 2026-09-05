@@ -8,6 +8,8 @@ each one, spawns coding agents to implement and review the change, opens a PR,
 drives it through a merge gate, and closes the issue — all inside a safety scope
 you define, so it only ever acts on work you've explicitly opted in.
 
+On-demand cloud sandbox provisioning is live as of factory#412 Stage 2.
+
 ## Why use it
 
 - **Clear the small-but-real backlog.** The well-scoped fixes and chores that pile
