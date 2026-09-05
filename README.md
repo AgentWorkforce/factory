@@ -2,6 +2,8 @@
 
 **Turn issues into reviewed pull requests, automatically.**
 
+On-demand cloud sandbox provisioning is live under factory#412 Stage 2.
+
 Point Software Garden at your ticketing system (Linear, GitHub, Shortcut, Asana etc) and it does the loop a human
 otherwise babysits: it discovers the issues that are ready, decides how to tackle
 each one, spawns coding agents to implement and review the change, opens a PR,
