@@ -528,7 +528,21 @@ const WorkspaceConfigObjectSchema = z.object({
   loop: loopSchema,
   triage: triageSchema,
   repos: workspaceReposSchema,
-  batchSize: z.number().int().min(1).max(5).default(1),
+  /**
+   * Concurrent dispatch slots. Raised from 5 to 25 on 2026-09-05 (Khaliq).
+   *
+   * The previous ceiling of 5 carried no rationale — no comment here, and the
+   * only test pinning it merely restated the number. It became a real
+   * constraint when the deployed garden saturated at 3/3 slots with 8 issues
+   * queued and a longest wait growing past 13 minutes, while every health
+   * surface read green: `dispatch failures: 0`, breaker closed, no lastError.
+   * Saturated, not wedged.
+   *
+   * 25 is still a bound, not an opening: each slot is a real agent on a real
+   * sandbox, and idle sandboxes were only just made reclaimable (cloud#3341).
+   * Raise it further only alongside evidence that reclaim keeps pace.
+   */
+  batchSize: z.number().int().min(1).max(25).default(1),
   models: modelsSchema,
   agentCapabilities: agentCapabilitiesSchema,
   slack: slackSchema,

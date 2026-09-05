@@ -746,7 +746,7 @@ describe('FactoryConfigSchema', () => {
     expect(parsed.repos.clonePaths).toEqual({ 'AgentWorkforce/pear': '/work/pear' })
   })
 
-  it('rejects batch sizes over five', () => {
+  it('rejects batch sizes over the ceiling', () => {
     expect(() => FactoryConfigSchema.parse({
       workspaceId: 'ws_123',
       repos: {
@@ -754,7 +754,7 @@ describe('FactoryConfigSchema', () => {
           pear: 'AgentWorkforce/pear',
         },
       },
-      batchSize: 6,
+      batchSize: 26,
     })).toThrow()
   })
 })
