@@ -7,6 +7,7 @@ import {
   DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS,
   DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS,
   DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
+  describeControlPlaneError,
   FleetControlPlaneCircuit,
   FleetControlPlaneCircuitOpenError,
   guardFleetControlPlane,
@@ -14,6 +15,34 @@ import {
 } from './control-plane-circuit'
 
 const roster: RosterEntry = { agents: [], nodes: [] }
+
+describe('describeControlPlaneError', () => {
+  it.each([
+    'request failed for https://broker.invalid/fleet?credential=redacted',
+    'authorization failed: Bearer placeholder-token-value',
+    'unable to connect to postgres://example.invalid/factory',
+  ])('redacts transport message text: %s', (message) => {
+    const error = new TypeError(message)
+
+    expect(describeControlPlaneError(error)).toBe('TypeError')
+  })
+
+  it('appends a well-formed error code', () => {
+    const error = Object.assign(new Error('transport detail'), { code: 'ECONNREFUSED_2' })
+
+    expect(describeControlPlaneError(error)).toBe('Error (ECONNREFUSED_2)')
+  })
+
+  it.each([
+    'econnrefused',
+    'ECONN-REFUSED',
+    'A'.repeat(81),
+  ])('drops malformed error code: %s', (code) => {
+    const error = Object.assign(new Error('transport detail'), { code })
+
+    expect(describeControlPlaneError(error)).toBe('Error')
+  })
+})
 
 describe('FleetControlPlaneCircuit', () => {
   afterEach(() => {
