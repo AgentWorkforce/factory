@@ -430,11 +430,16 @@ const isGithubReferenceAlreadyExistsError = (error: unknown): boolean =>
  * retry budget instead.
  */
 const isMountFileNotFound = (error: unknown): boolean => {
-  const errorRecord = record(error)
-  const response = record(errorRecord.response)
-  const status = errorRecord.status ?? errorRecord.statusCode ?? response.status ?? response.statusCode
-  const code = typeof errorRecord.code === 'string' ? errorRecord.code.toLowerCase() : undefined
-  return status === 404 || status === '404' ||
-    code === 'not_found' || code === 'file_not_found' ||
-    /(?:file|ref(?:erence)?|branch|resource)\s+not\s+found|\b404\s+not\s+found\b/iu.test(errorMessage(error))
+  const seen = new Set<unknown>()
+  let candidate: unknown = error
+  while (candidate !== undefined && candidate !== null && !seen.has(candidate)) {
+    seen.add(candidate)
+    const errorRecord = record(candidate)
+    const response = record(errorRecord.response)
+    const status = errorRecord.status ?? errorRecord.statusCode ?? response.status ?? response.statusCode
+    const code = typeof errorRecord.code === 'string' ? errorRecord.code.toLowerCase() : undefined
+    if (status === 404 || status === '404' || code === 'not_found' || code === 'file_not_found') return true
+    candidate = errorRecord.cause
+  }
+  return /(?:file|ref(?:erence)?|branch|resource)\s+not\s+found|\b404\s+not\s+found\b/iu.test(errorMessage(error))
 }
