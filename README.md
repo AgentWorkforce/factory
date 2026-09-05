@@ -940,3 +940,4 @@ relay-backend paths are left for their worker nodes to validate.
   and importable by ESM consumers.
 - For production operation (the live-daemon + reaper backstop model, heartbeats,
   and connected-workspace prerequisites), see the operations notes alongside the config schema.
+<!-- canary probe by factory-lead-r5 2026-08-31T17:55:37Z -->
