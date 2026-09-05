@@ -150,6 +150,29 @@ describe('RelayfileGithubConnectionWrite', () => {
     expect(mount.writes).toEqual([])
   })
 
+  it('recognizes a confirmed 404 carried by a wrapped mount error cause', async () => {
+    class WrappedNotFoundMount extends FakeMountClient {
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        throw new Error('connected projection read failed', {
+          cause: Object.assign(new Error('provider rejected the read'), { statusCode: 404 }),
+        })
+      }
+    }
+    const mount = new WrappedNotFoundMount()
+    const write = new RelayfileGithubConnectionWrite({ mount })
+
+    await expect(write.publishPullRequest({
+      repo: 'AgentWorkforce/factory',
+      headRef: 'factory/ar-907-agentworkforce-factory',
+      baseRef: 'main',
+      title: 'Issue 907',
+      body: 'Fixes #907',
+    })).rejects.toThrow(
+      'Refusing to publish GitHub PR: implementer branch factory/ar-907-agentworkforce-factory was never pushed',
+    )
+    expect(mount.writes).toEqual([])
+  })
+
   it.each([
     ['ref not found', 'ref not found'],
     ['branch not found', 'branch not found: refs/heads/factory/ar-906-agentworkforce-factory'],
