@@ -100,6 +100,7 @@ describe('RelayfileGithubConnectionWrite', () => {
     )
     // The real fix, not merely a thrown error: no PR draft is ever authored
     // against a head GitHub has never seen, so no 422 is ever provoked.
+    expect(git).not.toHaveBeenCalled()
     expect(mount.writes).toEqual([])
   })
 
