@@ -34564,7 +34564,10 @@ describe('the publish bound survives its own failure modes (#440)', () => {
 describe('a non-retryable writeback status abandons on the first attempt (#430)', () => {
   const RETRY_MS = 5
 
-  it('MUST FIRE: releases the slot on attempt 1 instead of spending the retry budget', async () => {
+  it.each([
+    ['directly', ''],
+    ['when wrapped by the writeback transport', 'Writeback operation failed for pull-request publication: '],
+  ])('MUST FIRE: releases the slot on attempt 1 %s instead of spending the retry budget', async (_label, prefix) => {
     const root = await mkdtemp(join(tmpdir(), 'factory-publish-nonretryable-fire-'))
     const watchStatePath = join(root, 'state.json')
     let attempts = 0
@@ -34576,7 +34579,7 @@ describe('a non-retryable writeback status abandons on the first attempt (#430)'
         // that was never pushed, named as the cause rather than surfaced as
         // a bare 422.
         throw new Error(
-          'Refusing to publish GitHub PR: implementer branch factory/factory-910-agentworkforce-pear ' +
+          prefix + 'Refusing to publish GitHub PR: implementer branch factory/factory-910-agentworkforce-pear ' +
           'was never pushed to AgentWorkforce/pear (refs/heads/factory/factory-910-agentworkforce-pear ' +
           'does not exist: File not found)',
         )

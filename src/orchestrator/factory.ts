@@ -583,9 +583,14 @@ const PUBLISH_NON_RETRYABLE_RELEASE_REASON = 'publish-non-retryable'
  *   pushed does not appear on a retry either (an indeterminate ref read is
  *   propagated as a different, retryable error - see
  *   `RelayfileGithubConnectionWrite#assertHeadRefPushed`).
+ *
+ * A transport may preserve the provider reason by prefixing it with its own
+ * context (`Writeback operation failed ...: Refusing to publish ...`). Match
+ * the refusal at the start of the message or after that error boundary so the
+ * wrapper cannot turn a deterministic rejection back into a retry loop.
  */
 const NON_RETRYABLE_WRITEBACK_ERROR_PATTERN =
-  /GitHub writeback failed with status (?:400|404|422)\b|^Refusing to (?:author an unroutable GitHub writeback path|publish)\b/u
+  /GitHub writeback failed with status (?:400|404|422)\b|(?:^|:\s)Refusing to (?:author an unroutable GitHub writeback path|publish)\b/u
 const isNonRetryablePublishError = (error: unknown): boolean =>
   NON_RETRYABLE_WRITEBACK_ERROR_PATTERN.test(describeError(error).errorMessage)
 /**
@@ -8106,7 +8111,8 @@ export class FactoryLoop implements Factory {
    *
    * A NON-RETRYABLE failure (#430) skips the budget entirely and abandons on
    * the first attempt. `isNonRetryablePublishError` only matches a failure
-   * whose payload GitHub (or the adapter) rejects for what it IS - a 4xx
+   * whose payload GitHub (or the adapter) rejects for what it IS - a
+   * payload-invalid 400/404/422
    * response, an unroutable draft, one of this surface's own pre-publish
    * guards - and retrying ten times at the 1 Hz floor changes nothing about
    * that; it only holds the slot ~10s longer and reports a generic
