@@ -234,11 +234,15 @@ describe('TailscalePreviewManager', () => {
 
   it('bounds a slow readiness probe by one wall-clock deadline', async () => {
     const fake = fakeTailscale()
+    let probes = 0
     const previewManager = manager(
       fake.run,
       join(mkdtempSync(join(tmpdir(), 'factory-preview-')), 'registry.json'),
       {
-        isReady: async () => await new Promise((resolve) => setTimeout(() => resolve(false), 100)),
+        isReady: async () => {
+          probes += 1
+          return await new Promise((resolve) => setTimeout(() => resolve(false), 100))
+        },
         readyTimeoutMs: 20,
         readyPollIntervalMs: 1,
       },
@@ -250,7 +254,16 @@ describe('TailscalePreviewManager', () => {
       owner: 'owner-1', issueKey: 'AR-129', service: 'factory', repo: 'factory', targetPort: 3_000,
     })).rejects.toThrow('Unable to allocate a Tailscale Serve HTTPS port')
 
-    expect(Date.now() - startedAt).toBeLessThan(250)
+    // The invariant is "one deadline, not one deadline per poll". Assert that
+    // directly: a probe that outlives `readyTimeoutMs` is awaited once and not
+    // re-polled. The previous wall-clock bound of 250ms measured this only
+    // indirectly, and budgeted 250ms for an unavoidable 100ms probe -- a 2.5x
+    // margin a loaded runner eats, which is exactly how it failed in CI
+    // (`expected 371 to be less than 250`).
+    expect(probes).toBeLessThanOrEqual(1)
+    // Kept as a smoke bound, but generous enough that runner load alone cannot
+    // trip it: polling would cost 100ms per extra probe.
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
   })
 
   it('removes only an exact live route identity', async () => {
