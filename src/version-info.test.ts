@@ -42,7 +42,10 @@ describe('Factory version information', () => {
     }) as unknown as typeof globalThis.fetch
 
     await expect(readFactoryVersionInfo({ fetch, registryTimeoutMs: 10 })).resolves.toMatchObject({
-      version: expect.stringMatching(/^\d+\.\d+\.\d+$/u),
+      // Accept an optional prerelease suffix. Releases now ship on the `next`
+      // dist-tag (e.g. 0.1.88-rc.0) so `latest` does not move, and a
+      // plain-semver-only pattern fails every prerelease build.
+      version: expect.stringMatching(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u),
       installedAt: expect.any(String),
     })
     expect(fetch).toHaveBeenCalledTimes(1)
