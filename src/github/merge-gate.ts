@@ -369,20 +369,66 @@ const VACUOUS_REVIEW_MARKERS: RegExp[] = [
   /usage limits?/i, // codex
 ]
 
-const checkDescription = (record: Record<string, unknown>): string | undefined =>
-  stringValue(record.description) ??
-  stringValue(record.summary) ??
-  stringValue(record.title) ??
-  stringValue(record.text)
-
-const classifyCheckKind = (state: string, description: string | undefined): CheckSignal['kind'] => {
-  if (description && VACUOUS_REVIEW_MARKERS.some((marker) => marker.test(description))) {
-    return 'VACUOUS'
-  }
-  return nonBlockingCheckStates.has(state) ? 'REAL' : 'BLOCKING'
+/**
+ * Every string on a rollup entry that can carry the bot's own account of what
+ * it did. A legacy commit status (`/commits/{sha}/status`) says it in
+ * `description`; a check run (`/commits/{sha}/check-runs`) says it in the
+ * nested `output.title` / `output.summary` — cubic reports
+ * `AI review skipped: seat author not assigned` as `output.title`, which a
+ * top-level-only read never sees, so the check classifies as a real pass.
+ */
+const checkDescriptions = (record: Record<string, unknown>): string[] => {
+  const output = asRecord(record.output)
+  return [
+    record.description,
+    record.summary,
+    record.title,
+    record.text,
+    output.title,
+    output.summary,
+    output.text,
+  ].flatMap((value) => {
+    const text = stringValue(value)?.trim()
+    return text ? [text] : []
+  })
 }
 
-const checkSignalsFromRollup = (value: unknown): CheckSignal[] => {
+/**
+ * GitHub reports the same state in two casings: GraphQL's `statusCheckRollup`
+ * uppercases it, REST's `/commits/{sha}/status` and `/commits/{sha}/check-runs`
+ * return `success` / `failure` lowercase. Comparing an unnormalized state
+ * against an uppercase set made every REST-shaped passing check read as
+ * BLOCKING, so the gate refused real greens while reporting
+ * `checks not merge-ready: success, success, ...`.
+ */
+const normalizeCheckState = (state: string): string => state.trim().toUpperCase()
+
+const isVacuousDescription = (text: string): boolean =>
+  VACUOUS_REVIEW_MARKERS.some((marker) => marker.test(text))
+
+/**
+ * State decides blocking first, and nothing downgrades it.
+ *
+ * `VACUOUS` is the *non-blocking* bucket: `evaluateGithubMergeGate` filters
+ * vacuous signals out before it looks for blocking ones, so a failing check
+ * classified vacuous is not merely mislabelled — it is invisible, and the gate
+ * returns READY reporting "no blocking checks".
+ *
+ * That matters because the descriptions fed in here now include a check run's
+ * nested `output.summary` and `output.text`, which carry free-form CI log
+ * text. A genuinely failing job whose log happens to contain "review skipped"
+ * or "usage limit" would otherwise be downgraded out of BLOCKING. Vacuousness
+ * is a claim about a bot that declined to review, and a bot that declined
+ * reports a non-blocking state; a failing check is never making that claim.
+ */
+const classifyCheckKind = (state: string, descriptions: string[]): CheckSignal['kind'] => {
+  if (!nonBlockingCheckStates.has(normalizeCheckState(state))) {
+    return 'BLOCKING'
+  }
+  return descriptions.some(isVacuousDescription) ? 'VACUOUS' : 'REAL'
+}
+
+export const checkSignalsFromRollup = (value: unknown): CheckSignal[] => {
   if (!Array.isArray(value)) {
     return []
   }
@@ -390,9 +436,18 @@ const checkSignalsFromRollup = (value: unknown): CheckSignal[] => {
   return value.map((entry) => {
     const record = asRecord(entry)
     const context = stringValue(record.context) ?? stringValue(record.name) ?? 'unknown'
-    const state = stringValue(record.conclusion) ?? stringValue(record.state) ?? stringValue(record.status) ?? 'UNKNOWN'
-    const description = checkDescription(record)
-    return { context, state, description, kind: classifyCheckKind(state, description) }
+    const raw = stringValue(record.conclusion) ?? stringValue(record.state) ?? stringValue(record.status) ?? 'UNKNOWN'
+    const descriptions = checkDescriptions(record)
+    return {
+      context,
+      state: normalizeCheckState(raw),
+      // Report the string that made the call. A check run whose `output.title`
+      // is a generic "AI review" while the reason sits in `output.summary`
+      // would otherwise be surfaced by its title, hiding why it was ruled
+      // vacuous in the very message meant to explain the refusal.
+      description: descriptions.find(isVacuousDescription) ?? descriptions[0],
+      kind: classifyCheckKind(raw, descriptions),
+    }
   })
 }
 
@@ -421,7 +476,7 @@ const reviewInlineComments = (record: Record<string, unknown>): number => {
 }
 
 /** Parses raw `reviews` entries (GraphQL- or REST-shaped) into `ReviewAtHead`s, dropping any without an identifiable author, commit, or state. */
-const reviewsFromPayload = (value: unknown[]): ReviewAtHead[] =>
+export const reviewsFromPayload = (value: unknown[]): ReviewAtHead[] =>
   value.flatMap((entry) => {
     const record = asRecord(entry)
     const login = reviewAuthorLogin(record)
@@ -445,7 +500,7 @@ const reviewsFromPayload = (value: unknown[]): ReviewAtHead[] =>
  * requires a review actually anchored to `head`, from someone other than the
  * PR author, carrying a body or inline comments.
  */
-const reviewAtHeadRefusal = (
+export const reviewAtHeadRefusal = (
   reviews: ReviewAtHead[],
   head: string,
   author: string | undefined,

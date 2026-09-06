@@ -1,0 +1,122 @@
+name: Review at head
+
+# AgentWorkforce/factory#432 part (c). Factory's merge gate protects Factory's
+# own merges, but most merges are performed by a human reading the PR page, so
+# the "was the commit that merges actually reviewed?" signal has to be visible
+# there too.
+#
+# The check applies the same predicate as `evaluateGithubMergeGate` by importing
+# it, so the PR-page signal and Factory's gate cannot drift apart. It reads both
+# `/commits/{sha}/status` (legacy commit statuses — Devin posts one of these and
+# never a check run) and `/commits/{sha}/check-runs`, so a vacuous bot green is
+# reported as vacuous from either source.
+#
+# ADVISORY ONLY — never make this a required check.
+#
+# It runs the PULL REQUEST'S copy of the predicate, so a change to the merge
+# rule is exercised by the change that makes it. That is exactly why it cannot
+# be the enforcement point: a pull request can rewrite the rule it is judged
+# by. The trusted counterpart lives in `review-at-head-enforced.yml`, runs the
+# base branch's copy, and is the one to require.
+#
+# These are separate FILES, not two jobs in one file. A job skipped by an `if`
+# is reported to branch protection as a SUCCESS, so an `enforced` job sitting
+# in this file would report green on every advisory event without the trusted
+# predicate ever running — a vacuous green in the very gate meant to remove
+# them.
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
+  # Inline comments count toward the predicate, so a comment-only change has
+  # to re-evaluate or the verdict goes stale.
+  pull_request_review_comment:
+    types:
+      - created
+      - edited
+      - deleted
+  workflow_call:
+    inputs:
+      repository:
+        description: Repository owning the pull request, as owner/name.
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number to evaluate.
+        required: true
+        type: number
+      predicate_ref:
+        description: Ref of AgentWorkforce/software-garden supplying the shared predicate.
+        required: false
+        default: main
+        type: string
+
+permissions: {}
+
+concurrency:
+  # One group for every advisory trigger — push, review, inline comment — so a
+  # review arriving as a burst of comment events collapses to a single run
+  # instead of queueing one per comment. The repository is part of the key
+  # because a reusable caller can evaluate the same PR number in two different
+  # repositories.
+  group: >-
+    review-at-head-advisory-${{ inputs.repository || github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # Advisory. Runs the PR's own copy of the predicate — never require this.
+  advisory:
+    if: ${{ inputs.pr_number || !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      # `/commits/{sha}/status` and `/commits/{sha}/check-runs` are gated by
+      # their own scopes. They are readable without these on a public
+      # repository, which is why this workflow passed before they were
+      # declared — a reusable call against a private repository would 403.
+      checks: read
+      statuses: read
+    steps:
+      # This repository's own PR: use the PR's copy, so a change to the rule is
+      # tested by the change that makes it.
+      - name: Check out the pull request under test
+        if: ${{ !inputs.pr_number }}
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Called from another repository: the caller has no copy of the
+      # predicate, so fetch it here and apply the same rule a local run would.
+      - name: Check out the shared predicate
+        if: ${{ inputs.pr_number }}
+        uses: actions/checkout@v6
+        with:
+          repository: AgentWorkforce/software-garden
+          ref: ${{ inputs.predicate_ref || 'main' }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Require a substantive review of the commit that would merge
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ inputs.repository || github.repository }}
+          TARGET_PR: ${{ inputs.pr_number || github.event.pull_request.number }}
+        run: npx tsx src/github/review-at-head-cli.ts "$TARGET_REPO" "$TARGET_PR"
