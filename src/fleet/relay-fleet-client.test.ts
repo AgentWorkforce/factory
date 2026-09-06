@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { FleetSpawnNotCreatedError } from '../ports/fleet'
 
 import { describeControlPlaneError } from './control-plane-circuit'
 import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, ReadOnlyFleetIdentityError, RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
@@ -332,7 +333,7 @@ describe('RelayFleetClient', () => {
       name: 'ar-6-impl',
       capability: 'spawn:codex',
       repo: 'AgentWorkforce/factory',
-    })).rejects.toThrow(/provisionSandbox returned no nodeName/)
+    })).rejects.toBeInstanceOf(FleetSpawnNotCreatedError)
 
     expect(messaging.placements).toHaveLength(0)
   })

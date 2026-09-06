@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { FleetSpawnNotCreatedError } from '../ports/fleet'
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -288,6 +289,15 @@ describe('InternalFleetClient', () => {
     )
   })
 
+  it('preserves uncertainty when the broker rejects a spawn without placement evidence', async () => {
+    const client = new FakeHarnessDriverClient()
+    const error = new Error('spawn acknowledgement unavailable')
+    vi.spyOn(client, 'spawnPty').mockRejectedValueOnce(error)
+    const fleet = new InternalFleetClient({ client, resolveAgentRelayMcpCommand: () => undefined })
+    await expect(fleet.spawn({ name: 'ar-1-impl', capability: 'spawn:codex' })).rejects.toBe(error)
+    await fleet.dispose()
+  })
+
   it('fails closed when an identity proof cannot be installed', async () => {
     const fleet = new InternalFleetClient({
       client: new FakeHarnessDriverClient(),
@@ -298,7 +308,7 @@ describe('InternalFleetClient', () => {
       name: 'ar-1-impl',
       capability: 'spawn:codex',
       identityKey: 'factory:dispatch:v1:github:agentworkforce/factory#1:implementer',
-    })).rejects.toThrow(/identity proof cannot be installed/)
+    })).rejects.toBeInstanceOf(FleetSpawnNotCreatedError)
   })
 
   it('resolves the Factory-extended Agent Relay MCP command from the packed entrypoint', async () => {

@@ -81,6 +81,7 @@ import type {
   TerminalDispatchLifecyclePhase,
   WaitingClarification,
 } from '../ports/state'
+import { FleetSpawnNotCreatedError } from '../ports/fleet'
 import type { Clock, Logger } from '../ports/system'
 import type { AgentWorktree, AgentWorktreeManager, AgentWorktreeRepository } from '../ports/worktree'
 import { factoryWorktreeIssueSlug, factoryWorktreePath } from '../git/agent-worktree'
@@ -9029,6 +9030,18 @@ export class FactoryLoop implements Factory {
       specs.push(tracked.spec)
     }
     for (const spec of specs) {
+      if (spec.role === 'babysitter' && spec.ownedPullRequest) {
+        // A persisted plan is not placement evidence. Recovery must pass the
+        // same PR snapshot and generation gates as the original handoff.
+        const owned = spec.ownedPullRequest
+        // A live roster entry can close the lost-ack gap without placement.
+        // A missing entry cannot authorize replay of the persisted intent.
+        await this.#spawnAgent(record, spec, record.dryRun, undefined, true)
+        await this.#ensureBabysitter(record, { repo: owned.repo, prNumber: owned.number, path: owned.path })
+        const tracked = record.agents.get(spec.name)
+        if (tracked?.result) agents.push({ name: tracked.result.name, role: spec.role })
+        continue
+      }
       const spawned = await this.#spawnAgent(record, spec, record.dryRun)
       agents.push({ name: spawned.name, role: spec.role })
     }
@@ -11583,7 +11596,10 @@ export class FactoryLoop implements Factory {
     await writeJsonFileAtomically(path, registry)
   }
 
-  async #spawnAgent(record: InFlightIssue, spec: AgentSpec, dryRun: boolean): Promise<{ name: string }> {
+  async #spawnAgent(record: InFlightIssue, spec: AgentSpec, dryRun: boolean,
+    placement?: { status: 'not-created' | 'uncertain' | 'created' },
+    adoptOnly = false,
+  ): Promise<{ name: string }> {
     const batch = await this.#batch()
     const invocationId = batch.invocationIdFor(record.issue, spec)
     const existing = record.agents.get(spec.name)
@@ -11591,11 +11607,13 @@ export class FactoryLoop implements Factory {
     // Answering with its old spawn result here would report a synthetic success
     // for a process that no longer exists.
     if (existing?.result && existing.releasedAtMs === undefined) {
+      if (placement) placement.status = 'created'
       this.#scheduleHeldAgentDeadline(record)
       return { name: existing.result?.name ?? spec.name }
     }
 
     if (!batch.shouldSpawn(record, invocationId)) {
+      if (placement) placement.status = 'created'
       return { name: spec.name }
     }
 
@@ -11612,6 +11630,7 @@ export class FactoryLoop implements Factory {
     }
     const rosterAgent = roster.agents.find((agent) => agent.name === spec.name)
     if (rosterAgent) {
+      if (placement) placement.status = 'created'
       if (this.#fleet.placementLocality === 'remote') {
         const host = rosterAgent.node
           ? roster.nodes.find((node) =>
@@ -11639,6 +11658,8 @@ export class FactoryLoop implements Factory {
       return { name: spec.name }
     }
 
+    if (adoptOnly) return { name: spec.name }
+
     if (this.#fleet.placementLocality === 'remote') {
       const loads = new Map<string, number>()
       for (const agent of roster.agents) {
@@ -11658,6 +11679,9 @@ export class FactoryLoop implements Factory {
     await this.#prepareAgentWorktree(record, spec)
     let result
     try {
+      // Crossing the placement boundary can create a worker even if its ack
+      // never arrives. An ordinary rejection is not evidence of non-placement.
+      if (placement) placement.status = 'uncertain'
       result = await this.#fleet.spawn({
         name: spec.name,
         capability: spec.capability,
@@ -11675,6 +11699,7 @@ export class FactoryLoop implements Factory {
         channel: spec.channel,
       })
     } catch (error) {
+      if (placement && error instanceof FleetSpawnNotCreatedError) placement.status = 'not-created'
       const wrapped = contextualError(
         `Dispatch spawn failed for ${record.issue.key}/${spec.name} (${spec.capability}) cwd=${spec.clonePath ?? 'default'}`,
         error,
@@ -11685,6 +11710,7 @@ export class FactoryLoop implements Factory {
           : 'agent_spawn_failed' as const,
       })
     }
+    if (placement) placement.status = 'created'
     // The never-placed deadline can fire while this spawn is in flight — that
     // is the whole point of arming it before the first await, and it makes a
     // late `spawn` result newly reachable (#303 review, cubic). By now the
@@ -11946,6 +11972,13 @@ export class FactoryLoop implements Factory {
     if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit question replay completed', { issue: record.issue.key, name })
 
     const exiting = record.agents.get(name)
+    if (exiting?.spec.role === 'babysitter' && !exiting.result && exiting.spec.ownedPullRequest) {
+      // Roster reconciliation can report a planned name as missing. That is
+      // not an exited worker and must not enter the ordinary restart path.
+      const owned = exiting.spec.ownedPullRequest
+      await this.#ensureBabysitter(record, { repo: owned.repo, prNumber: owned.number, path: owned.path })
+      return
+    }
     if (exiting) await this.#reportAgent(record, exiting, 'agent.exited', { releaseReason: reason })
     if (tracingReconciledExit) this.#logger.info?.('[factory] reconciled agent exit telemetry completed', { issue: record.issue.key, name })
 
@@ -17407,7 +17440,7 @@ export class FactoryLoop implements Factory {
     }
     const wantedPr = githubPrIdentity(prRef.repo, prRef.prNumber)
     const trackedBabysitter = [...record.agents.entries()].find(([, agent]) =>
-      agent.spec.role === 'babysitter' &&
+      agent.spec.role === 'babysitter' && agent.result && agent.releasedAtMs === undefined &&
       githubPrIdentity(agent.spec.ownedPullRequest?.repo ?? '', agent.spec.ownedPullRequest?.number ?? 0) === wantedPr)
     if (trackedBabysitter) {
       const [trackedName, tracked] = trackedBabysitter
@@ -17436,11 +17469,21 @@ export class FactoryLoop implements Factory {
     const spawnFinished = new Promise<void>((resolve) => { finishSpawn = resolve })
     this.#babysitterSpawnInFlight.set(babysitterKey, spawnFinished)
 
+    const ownershipKey = `factory-created:${prIdentity}`
+    let generationId: string | undefined
+    let claimAttempted = false
+    const placement: { status: 'not-created' | 'uncertain' | 'created' } = { status: 'not-created' }
     try {
-      const snapshot = await this.#readPrSnapshot(prRef)
-      if (snapshot && (this.#babysitterActivationExcluded(prRef.repo, prRef.prNumber, snapshot.labels) ||
-        prMetaShowsMerged(snapshot) || snapshot.draft ||
-        (snapshot.state && snapshot.state.toUpperCase() !== 'OPEN'))) {
+      const snapshot = await this.#readPrSnapshot(prRef, { forActivation: true })
+      if (!snapshot) {
+        this.#increment('babysitterActivationDeferred')
+        if (this.#usesDurableDispatchLifecycle()) this.#scheduleDispatchLifecycleRetry(record)
+        this.#logger.info?.('[factory] babysitter activation deferred until PR metadata is readable', {
+          repo: prRef.repo, prNumber: prRef.prNumber,
+        })
+      }
+      if (!snapshot || this.#babysitterActivationExcluded(prRef.repo, prRef.prNumber, snapshot.labels) ||
+        prMetaShowsMerged(snapshot) || snapshot.draft || snapshot.state?.toUpperCase() !== 'OPEN') {
         this.#babysitterSpawned.delete(babysitterKey)
         this.#babysitterPr.delete(babysitterKey)
         this.#babysitterIssueRefs.delete(babysitterKey)
@@ -17528,9 +17571,9 @@ export class FactoryLoop implements Factory {
       })
 
       // A PR is the work unit, regardless of how many issue records point at it.
-      // Persist before placement and never force/clear this claim on timeout,
-      // exit or failed acknowledgement: none proves that a worker was not
-      // created. Existing tracked placements recover above without re-dispatch.
+      // Persist before placement. Release only with positive evidence that no
+      // worker was created; timeout, exit and missing acknowledgements cannot
+      // establish that. Tracked placements recover above without re-dispatch.
       // An uncertain, untracked placement requires operator reconciliation.
       const priorSessions = await this.#state.listBabysitterSessions(this.#workspaceId)
       if (priorSessions.some(([, session]) =>
@@ -17541,8 +17584,9 @@ export class FactoryLoop implements Factory {
         this.#babysitterIssueRefs.delete(babysitterKey)
         return
       }
+      claimAttempted = true
       const claim = await this.#state.markRunning(
-        this.#workspaceId, `factory-created:${prIdentity}`, spec.name,
+        this.#workspaceId, ownershipKey, spec.name,
         this.#clock.now(), DISPATCH_LIFECYCLE_LEASE_MS,
       )
       if (!claim) {
@@ -17552,11 +17596,12 @@ export class FactoryLoop implements Factory {
         this.#babysitterIssueRefs.delete(babysitterKey)
         return
       }
+      generationId = claim.generationId
       const spawned = await this.#spawnAgent(record, {
         ...spec,
         task,
         ownedPullRequest: { repo: prRef.repo, number: prRef.prNumber, path: prRef.path },
-      }, false)
+      }, false, placement)
       const tracked = record.agents.get(spawned.name)
       this.#babysitterPr.set(babysitterKey, {
         repo: prRef.repo,
@@ -17612,13 +17657,36 @@ export class FactoryLoop implements Factory {
         await this.#state.recordCritical(this.#workspaceId, ack.eventId, { issue: record.issue, input })
       }
     } catch (error) {
-      // Allow a later event to retry the spawn.
+      let claimReleased = false
+      if (generationId && placement.status === 'not-created') {
+        try {
+          // Compare-and-delete only this generation, never another owner's.
+          claimReleased = await this.#state.clearBabysitterGeneration(this.#workspaceId, ownershipKey, generationId)
+        } catch (releaseError) {
+          this.#logger.warn?.('[factory] babysitter activation claim release failed', {
+            repo: prRef.repo, prNumber: prRef.prNumber, ownershipKey, generationId,
+            error: describeError(releaseError).errorMessage,
+          })
+        }
+      }
+      if (claimAttempted && !claimReleased) {
+        this.#logger.warn?.('[factory] babysitter activation claim retained after failure', {
+          repo: prRef.repo, prNumber: prRef.prNumber, ownershipKey, generationId,
+          placement: placement.status,
+          reason: !generationId ? 'claim-acknowledgement-unknown'
+            : placement.status === 'not-created' ? 'claim-release-unconfirmed' : 'worker-may-exist',
+          error: describeError(error).errorMessage,
+        })
+      }
+      // Allow another event to retry admission. The durable claim still fences
+      // uncertain placement; a plan without a result is never an adopted worker.
       this.#babysitterSpawned.delete(babysitterKey)
       this.#babysitterPr.delete(babysitterKey)
       this.#babysitterIssueRefs.delete(babysitterKey)
-      if (await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
+      if (claimReleased && await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
         await this.#state.clearBabysitterSession(this.#workspaceId, babysitterKey)
       }
+      if (claimReleased && this.#usesDurableDispatchLifecycle()) this.#scheduleDispatchLifecycleRetry(record)
       this.#increment('babysitterSpawnFailures')
       this.#error(error, record.issue)
     } finally {
@@ -17824,13 +17892,16 @@ export class FactoryLoop implements Factory {
     return await this.#readPrSnapshot(ref)
   }
 
-  async #readPrSnapshot(ref: Pick<BabysitterPrRef, 'repo' | 'prNumber' | 'path'>): Promise<PullSnapshot | undefined> {
+  async #readPrSnapshot(ref: Pick<BabysitterPrRef, 'repo' | 'prNumber' | 'path'>,
+    options?: { forActivation?: boolean },
+  ): Promise<PullSnapshot | undefined> {
     const discoveredPaths = await this.#pullMetaPathsFor(ref.repo, ref.prNumber)
     const candidatePaths = [...new Set([ref.path, ...discoveredPaths].filter((path): path is string => Boolean(path)))]
     for (const path of candidatePaths) {
       try {
         const snapshot = parsePullSnapshot((await this.#mount.readFile(path)).content, ref.prNumber)
-        if (snapshot) {
+        if (snapshot && (!options?.forActivation ||
+          (snapshot.state !== undefined && snapshot.draft !== undefined && snapshot.labels !== undefined))) {
           return snapshot
         }
       } catch {

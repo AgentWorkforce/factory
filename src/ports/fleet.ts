@@ -151,6 +151,14 @@ export type SendInput = {
   mode?: 'wait' | 'steer'
 }
 
+/** Positive adapter evidence that spawn failed before any worker placement. */
+export class FleetSpawnNotCreatedError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause })
+    this.name = 'FleetSpawnNotCreatedError'
+  }
+}
+
 /**
  * Positive transport evidence that a correlated message cannot be delivered.
  * Unlike a delivery-confirmation timeout, this makes an uncorrelated retry safe.
