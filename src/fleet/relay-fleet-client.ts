@@ -133,6 +133,25 @@ export interface RelayFleetClientOptions {
    * client boundary, so a factory sweep cannot silently fall back to a
    * node whose disk layout will not accept the dispatch.
    *
+   * TWO CONDITIONS, NOT ONE. This used to check only that a hook was
+   * CONFIGURED, which is not the same claim at all. On 2026-09-06 the
+   * deployed factory-cloud hook answered every dispatch with whatever node
+   * its provider's reuse check returned — a workstation with no
+   * `/srv/agent-workforce` tree — and this client placed `spawn:codex`
+   * there with `cwd=/srv/agent-workforce/<repo>`. Every one spent the whole
+   * five-minute budget and died as {@link RelaySpawnAckTimeoutError}. The
+   * guard written to stop exactly that never fired, because a configured
+   * hook says nothing about what the hook returned.
+   *
+   * So the RESULT must also carry a `sandboxId`. A node name proves
+   * nothing: a hook can read one off a roster. A sandbox id is knowable
+   * only for a sandbox the hook itself provisioned, which makes it the
+   * strongest available evidence that this placement has a JIT box behind
+   * it. It remains necessary rather than sufficient — a sandbox provisioned
+   * for some other repo can still lack this dispatch's clone — but it
+   * excludes the case production actually hit. Set this to `false` to allow
+   * a deliberate fall-through.
+   *
    * Ignored for non-`spawn:*` capabilities (workflow runs and preview
    * placements do not need /srv/agent-workforce and often want to land on
    * whatever fleet node has the capability).
@@ -390,12 +409,17 @@ export class RelayFleetClient implements FleetClient {
             'provisionSandbox returned no nodeName; refusing to place on an unbounded node',
           )
         }
-        sandboxTargetNode = proposedName
-        // Retained so the agent's commits can be published later. A hook that
-        // provisions but reports no sandbox id still places fine — the
-        // dispatch runs, it just cannot be published from, which is strictly
-        // better than refusing to dispatch at all.
+        // Retained so the agent's commits can be published later, and — under
+        // `placementSandboxOnly` — the only evidence available here that the
+        // hook actually stood a sandbox up rather than naming a node it found.
         sandboxTargetId = provisioned?.sandboxId?.trim() || undefined
+        if (this.#options.placementSandboxOnly && !sandboxTargetId) {
+          throw new Error(
+            `placementSandboxOnly is set but provisionSandbox named "${proposedName}" with no sandbox id; ` +
+            'refusing to place a spawn on a node it cannot show is a JIT sandbox',
+          )
+        }
+        sandboxTargetNode = proposedName
       } else if (this.#options.placementSandboxOnly) {
         throw new Error(
           'placementSandboxOnly is set but no provisionSandbox hook is configured; ' +

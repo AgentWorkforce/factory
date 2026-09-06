@@ -337,6 +337,63 @@ describe('RelayFleetClient', () => {
     expect(messaging.placements).toHaveLength(0)
   })
 
+  it('refuses to place under placementSandboxOnly when the hook names no sandbox', async () => {
+    // The guard used to be satisfied by the mere PRESENCE of a hook. On
+    // 2026-09-06 a deployed hook answered every dispatch with whatever node
+    // its provider's reuse route returned — a long-lived workstation with no
+    // /srv/agent-workforce tree — and this client placed `spawn:codex` there
+    // with `cwd=/srv/agent-workforce/<repo>`. Every one died as
+    // `RelaySpawnAckTimeoutError` after the full five-minute budget.
+    //
+    // `placementSandboxOnly` says "refuse a spawn that has no JIT sandbox
+    // behind it". A node name alone cannot show there is one; the sandbox id
+    // can, because a hook only knows it for a sandbox it provisioned.
+    const messaging = new FakeMessaging()
+    const provisionSandbox = vi.fn(async () => ({ nodeName: 'mac-mini' }))
+    const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: true })
+
+    await expect(fleet.spawn({
+      name: 'ar-1654-impl-relay',
+      capability: 'spawn:codex',
+      repo: 'AgentWorkforce/relay',
+    })).rejects.toThrow(/placementSandboxOnly.*mac-mini.*no sandbox id/s)
+
+    expect(messaging.placements).toHaveLength(0)
+  })
+
+  it('places under placementSandboxOnly when the hook names a sandbox', async () => {
+    // must-not-fire: the guard keys on the sandbox id, not on the hook being
+    // configured, so a real JIT sandbox still dispatches.
+    const messaging = new FakeMessaging()
+    const provisionSandbox = vi.fn(async () => ({ nodeName: 'fleet-ensure-abc12345', sandboxId: 'sbx_1' }))
+    const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: true })
+
+    const result = await fleet.spawn({
+      name: 'ar-1654-impl-relay',
+      capability: 'spawn:codex',
+      repo: 'AgentWorkforce/relay',
+    })
+
+    expect(messaging.placements[0]?.node).toBe('fleet-ensure-abc12345')
+    expect(result.sandboxId).toBe('sbx_1')
+  })
+
+  it('still places a sandbox-less hook result when placementSandboxOnly is off', async () => {
+    // must-not-fire: the opt-out is what an operator reaches for to allow a
+    // deliberate fall-through, and it must keep working.
+    const messaging = new FakeMessaging()
+    const provisionSandbox = vi.fn(async () => ({ nodeName: 'mac-mini' }))
+    const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: false })
+
+    await fleet.spawn({
+      name: 'ar-1654-impl-relay',
+      capability: 'spawn:codex',
+      repo: 'AgentWorkforce/relay',
+    })
+
+    expect(messaging.placements[0]?.node).toBe('mac-mini')
+  })
+
   it('propagates a hook rejection as the spawn failure', async () => {
     const messaging = new FakeMessaging()
     const provisionSandbox = vi.fn(async () => {
