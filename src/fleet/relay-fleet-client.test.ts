@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { FleetSpawnNotCreatedError } from '../ports/fleet'
 
 import { describeControlPlaneError } from './control-plane-circuit'
-import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, ReadOnlyFleetIdentityError, RelayFleetClient, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
+import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, ReadOnlyFleetIdentityError, RelayFleetClient, RelaySpawnAckTimeoutError, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
 import { runFleetCli } from '../cli/fleet'
+import { telemetryErrorClass } from '../observability/error-class'
+import { factoryDispatchFailureReasonCodeForErrorClass } from '../orchestrator/dispatch-failure-reason'
 
 import type {
   RelayActionInvocation,
@@ -2519,5 +2521,98 @@ describe('registration failures survive redaction with their cause', () => {
     expect(rendered).toBe('FactoryAgentRegistrationError (TAKEOVER_FAILED)')
     expect(rendered).not.toContain('at_live_')
     expect(rendered).not.toContain('https://')
+  })
+})
+
+/**
+ * A pre-placement wrapper must not erase the class that names the failure.
+ *
+ * `FleetSpawnNotCreatedError` exists to carry one extra bit — "no worker was
+ * created" — to the one reader that needs it (`placement.status`, decided by
+ * `instanceof`). Every other reader of a dispatch failure reads the OUTERMOST
+ * error's class name: `perItemDispatchSkipReason` renders
+ * `dispatch failed (<class>)`, the hosted orchestrator publishes
+ * `errorClass: telemetryErrorClass(error)`, and the #355 vocabulary maps five
+ * allowlisted class names onto failure codes.
+ *
+ * Collapsing every pre-placement failure to one class name would make an
+ * enrolment failure indistinguishable from a sandbox-provision refusal on
+ * exactly the surfaces an operator has during an outage. So the wrapper takes
+ * the cause's class name as its own — guarded by the very allowlist that
+ * publishes it, so a dependency-controlled `name` still cannot choose what
+ * crosses the boundary.
+ */
+describe('FleetSpawnNotCreatedError class preservation', () => {
+  const preserved = [
+    {
+      cause: () => new FactoryAgentRegistrationError(
+        'ar-350-impl-factory',
+        'MAX_ATTEMPTS',
+        'Remote agent did not register with the fleet before the startup deadline',
+      ),
+      name: 'FactoryAgentRegistrationError',
+      code: 'agent-registration-failed',
+    },
+    {
+      cause: () => new ReadOnlyFleetIdentityError('factory-cloud'),
+      name: 'ReadOnlyFleetIdentityError',
+      code: 'fleet-identity-read-only',
+    },
+    {
+      cause: () => new RelaySpawnAckTimeoutError('spawn invocation ar-350-impl-factory', 300_000),
+      name: 'RelaySpawnAckTimeoutError',
+      code: 'spawn-ack-timeout',
+    },
+  ] as const
+
+  it.each(preserved)('keeps $name readable on the outermost error', ({ cause, name, code }) => {
+    const wrapped = new FleetSpawnNotCreatedError(cause())
+
+    // The not-created bit still reaches its only reader.
+    expect(wrapped).toBeInstanceOf(FleetSpawnNotCreatedError)
+    // And every class-name reader still sees the failure that actually happened.
+    expect(wrapped.name).toBe(name)
+    expect(wrapped.causeClass).toBe(name)
+    expect(telemetryErrorClass(wrapped)).toBe(name)
+    expect(factoryDispatchFailureReasonCodeForErrorClass(telemetryErrorClass(wrapped))).toBe(code)
+  })
+
+  it('distinguishes the three pre-placement classes from one another', () => {
+    const names = preserved.map(({ cause }) => telemetryErrorClass(new FleetSpawnNotCreatedError(cause())))
+    expect(new Set(names).size).toBe(names.length)
+  })
+
+  it('falls back to its own class name when the cause names no admissible class', () => {
+    const hostile = new Error('placement refused')
+    hostile.name = 'at_live_abcdef0123456789'
+
+    for (const cause of [hostile, 'not an error', undefined]) {
+      const wrapped = new FleetSpawnNotCreatedError(cause)
+      expect(wrapped.name).toBe('FleetSpawnNotCreatedError')
+      expect(wrapped.causeClass).toBe('FleetSpawnNotCreatedError')
+      expect(telemetryErrorClass(wrapped)).toBe('FleetSpawnNotCreatedError')
+    }
+  })
+
+  it('surfaces a read-only identity refusal from spawn under its own class name', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = new RelayFleetClient({
+      workspaceKey: 'rk_live_test',
+      readOnly: true,
+      env: {},
+      sleep: immediateSleep,
+      pollIntervalMs: 0,
+      createRelay: () => ({ messaging: messaging.asMessaging() }),
+    })
+
+    const outcome = await fleet.spawn({
+      name: 'ar-350-impl-factory',
+      capability: 'spawn:codex',
+      repo: 'AgentWorkforce/factory',
+    }).then(() => 'resolved' as const, (error: unknown) => error)
+
+    expect(messaging.placements).toEqual([])
+    expect(outcome).toBeInstanceOf(FleetSpawnNotCreatedError)
+    expect(telemetryErrorClass(outcome)).toBe('ReadOnlyFleetIdentityError')
   })
 })

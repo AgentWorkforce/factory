@@ -518,6 +518,25 @@ const DISPATCH_LIFECYCLE_LEASE_MS = 5 * 60_000
 const DISPATCH_LIFECYCLE_RENEW_MS = 60_000
 const DISPATCH_LIFECYCLE_RETRY_MS = 1_000
 const REMOTE_AGENT_REGISTRATION_TIMEOUT_MS = 30_000
+
+/**
+ * A roster read handed from one admission pass to the next one behind it.
+ *
+ * Mutable on purpose, and for the same reason the `placement` holder threaded
+ * through `#spawnAgent` is: the two passes are separated by an entire gate
+ * chain, so the answer has to travel in something the callee can fill and the
+ * next callee can empty. Read and cleared by `#admissionRoster`.
+ */
+type RosterHandoff = { entry?: RosterEntry; readAtMs?: number }
+
+/**
+ * How stale a handed-over roster read may be before it is re-read.
+ *
+ * Short enough that the snapshot still describes the fleet a placement is
+ * about to be made against, long enough to cover the durable reads and the
+ * claim that sit between the adoption pass and the admission it feeds.
+ */
+const ROSTER_HANDOFF_MAX_AGE_MS = 5_000
 const REMOTE_AGENT_REGISTRATION_POLL_MS = 500
 /**
  * Ceiling on the durable capacity-wait re-arm (#303).
@@ -1333,6 +1352,11 @@ export class FactoryLoop implements Factory {
   // webhooks / agent-exit safety nets don't respawn it while multi-repository issues retain one
   // owner per PR.
   readonly #babysitterSpawned = new Set<string>()
+  /**
+   * Roster reads a recovery adoption pass left for the admission behind it,
+   * keyed by PR identity. Set and cleared around one recovery branch only.
+   */
+  readonly #babysitterAdmissionRoster = new Map<string, RosterHandoff>()
   readonly #babysitterSpawnInFlight = new Map<string, Promise<void>>()
   // Composite issue + PR identity -> the open PR the babysitter is shepherding, including the
   // webhook-fed mount path so readiness can re-read PR meta without a gh call.
@@ -9036,8 +9060,19 @@ export class FactoryLoop implements Factory {
         const owned = spec.ownedPullRequest
         // A live roster entry can close the lost-ack gap without placement.
         // A missing entry cannot authorize replay of the persisted intent.
-        await this.#spawnAgent(record, spec, record.dryRun, undefined, true)
-        await this.#ensureBabysitter(record, { repo: owned.repo, prNumber: owned.number, path: owned.path })
+        // One roster read serves both admission passes. The adoption attempt
+        // fills the hand-off; whichever `#ensureBabysitter` admits this PR next
+        // consumes it. Keyed by the PR rather than threaded through the call,
+        // because a reconciled agent exit can reach that admission first.
+        const roster: RosterHandoff = {}
+        const ownedIdentity = githubPrIdentity(owned.repo, owned.number)
+        if (ownedIdentity) this.#babysitterAdmissionRoster.set(ownedIdentity, roster)
+        try {
+          await this.#spawnAgent(record, spec, record.dryRun, { adoptOnly: true, roster })
+          await this.#ensureBabysitter(record, { repo: owned.repo, prNumber: owned.number, path: owned.path })
+        } finally {
+          if (ownedIdentity) this.#babysitterAdmissionRoster.delete(ownedIdentity)
+        }
         const tracked = record.agents.get(spec.name)
         if (tracked?.result) agents.push({ name: tracked.result.name, role: spec.role })
         continue
@@ -11596,10 +11631,57 @@ export class FactoryLoop implements Factory {
     await writeJsonFileAtomically(path, registry)
   }
 
-  async #spawnAgent(record: InFlightIssue, spec: AgentSpec, dryRun: boolean,
-    placement?: { status: 'not-created' | 'uncertain' | 'created' },
-    adoptOnly = false,
-  ): Promise<{ name: string }> {
+  /**
+   * The roster this admission pass decides on, reusing a handed-over read.
+   *
+   * Durable recovery admits a factory-created babysitter through two
+   * `#spawnAgent` calls in a row — an adoption pass that can only adopt a live
+   * roster entry, then `#ensureBabysitter`'s real admission — and each read
+   * costs a `retryOnTimeout` chain of up to three attempts two seconds apart.
+   * The second call asks the question the first has just answered, so the
+   * first hands its answer forward instead of paying for it again.
+   *
+   * The hand-off is single-use and age-bounded, and both properties matter.
+   * Single-use stops a snapshot leaking into a later, unrelated placement; the
+   * age bound stops a slow gate chain between the two passes from choosing a
+   * node out of a roster that has stopped describing the fleet. When either
+   * says no, this reads the roster exactly as it always did.
+   *
+   * What it does not lean on: adoption is not what keeps one PR to one worker.
+   * The durable `factory-created:<pr>` claim taken between the two passes is,
+   * and reusing a snapshot cannot weaken it.
+   */
+  async #admissionRoster(record: InFlightIssue, handoff?: RosterHandoff): Promise<RosterEntry> {
+    const handed = handoff?.entry
+    const handedAtMs = handoff?.readAtMs
+    if (handoff) {
+      handoff.entry = undefined
+      handoff.readAtMs = undefined
+    }
+    if (handed && handedAtMs !== undefined && this.#clock.now() - handedAtMs <= ROSTER_HANDOFF_MAX_AGE_MS) {
+      return handed
+    }
+    let roster: RosterEntry
+    try {
+      roster = await retryOnTimeout(() => this.#fleet.roster(), { attempts: 3, delayMs: 2000 })
+    } catch (error) {
+      throw contextualError(`Dispatch roster lookup failed for ${record.issue.key}`, error)
+    }
+    if (handoff) {
+      handoff.entry = roster
+      handoff.readAtMs = this.#clock.now()
+    }
+    return roster
+  }
+
+  async #spawnAgent(record: InFlightIssue, spec: AgentSpec, dryRun: boolean, options: {
+    placement?: { status: 'not-created' | 'uncertain' | 'created' }
+    /** Adopt a live roster entry if there is one; never place a new worker. */
+    adoptOnly?: boolean
+    /** Roster read shared with the admission pass that follows this one. */
+    roster?: RosterHandoff
+  } = {}): Promise<{ name: string }> {
+    const { placement, adoptOnly = false } = options
     const batch = await this.#batch()
     const invocationId = batch.invocationIdFor(record.issue, spec)
     const existing = record.agents.get(spec.name)
@@ -11622,12 +11704,7 @@ export class FactoryLoop implements Factory {
       return { name: spec.name }
     }
 
-    let roster
-    try {
-      roster = await retryOnTimeout(() => this.#fleet.roster(), { attempts: 3, delayMs: 2000 })
-    } catch (error) {
-      throw contextualError(`Dispatch roster lookup failed for ${record.issue.key}`, error)
-    }
+    const roster = await this.#admissionRoster(record, options.roster)
     const rosterAgent = roster.agents.find((agent) => agent.name === spec.name)
     if (rosterAgent) {
       if (placement) placement.status = 'created'
@@ -17597,11 +17674,17 @@ export class FactoryLoop implements Factory {
         return
       }
       generationId = claim.generationId
+      const handedRoster = this.#babysitterAdmissionRoster.get(prIdentity)
       const spawned = await this.#spawnAgent(record, {
         ...spec,
         task,
         ownedPullRequest: { repo: prRef.repo, number: prRef.prNumber, path: prRef.path },
-      }, false, placement)
+      }, false, {
+        placement,
+        // Consumed when a recovery adoption pass read the roster for this PR
+        // moments ago; absent, this reads it exactly as it always did.
+        ...(handedRoster ? { roster: handedRoster } : {}),
+      })
       const tracked = record.agents.get(spawned.name)
       this.#babysitterPr.set(babysitterKey, {
         repo: prRef.repo,

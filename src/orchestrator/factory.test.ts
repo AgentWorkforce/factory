@@ -28909,6 +28909,91 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  /**
+   * Recovery admits a factory-created babysitter through TWO calls into
+   * `#spawnAgent`: an adoptOnly pass that can only adopt a live roster entry,
+   * then `#ensureBabysitter`'s real admission. Each of those reads the roster
+   * through `retryOnTimeout(..., { attempts: 3, delayMs: 2000 })`, so a
+   * recovery that has to place a worker used to pay for the same roster read
+   * twice — the second one asking a question the first had just answered.
+   *
+   * Counted rather than asserted structurally, because the cost IS the point:
+   * everything the successor does before the babysitter is placed is fixed,
+   * so one read per admission pass is directly visible in the total.
+   */
+  it('admits a recovered factory-created babysitter with one roster pass', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'babysitter-recovery-roster-'))
+    const issue = realIssueFile(401, ready, { title: 'Real recovery admission cost' })
+    const mount = new FakeMountClient({ [issuePath(401)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 401, { state: 'open', draft: false, labels: [] })
+    class DurableFleet extends FakeFleetClient { readonly durableOwnership = true }
+    const firstFleet = new DurableFleet()
+    const realSpawn = firstFleet.spawn.bind(firstFleet)
+    // Positive non-placement evidence, so the first process releases its claim
+    // and recovery has to re-admit rather than fence itself out.
+    vi.spyOn(firstFleet, 'spawn').mockImplementation(async (input) => {
+      if (input.name.includes('babysit')) throw new FleetSpawnNotCreatedError(new Error('spawn preflight failed'))
+      return realSpawn(input)
+    })
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const first = createFactory(babysitterConfig(), {
+      mount, fleet: firstFleet, stateStore: state(), triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    const nextFleet = new DurableFleet()
+    // Hydration restores observation metadata; it cannot prove a live worker.
+    vi.spyOn(nextFleet, 'hydrateTracked').mockImplementation(() => {})
+    const nextState = state()
+    // Counted up to the placement, because after it the successor's ordinary
+    // loops read the roster on their own schedule and the number stops being
+    // about admission. Everything before it is fixed: the successor's startup
+    // and restore make ROSTER_READS_BEFORE_ADMISSION reads, and the recovery
+    // pass adds one per `#spawnAgent` that reaches the fleet.
+    const ROSTER_READS_BEFORE_ADMISSION = 2
+    const mark = nextState.markRunning.bind(nextState)
+    vi.spyOn(nextState, 'markRunning').mockImplementation(async (...args) => {
+      // Recovery's adoption pass and a reconciled agent exit both reach the
+      // babysitter admission, and either can get there first. Holding the PR
+      // claim back one beat pins the interleaving under test — adoption
+      // finishes, then admission runs — so what is measured is the cost of
+      // that pair, not which of them the event loop happened to schedule.
+      if (args[1] === 'factory-created:agentworkforce/pear#401') {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      return mark(...args)
+    })
+    let counting = true
+    let rosterReads = 0
+    const readRoster = nextFleet.roster.bind(nextFleet)
+    vi.spyOn(nextFleet, 'roster').mockImplementation(async () => {
+      if (counting) rosterReads += 1
+      return readRoster()
+    })
+    const nextSpawn = nextFleet.spawn.bind(nextFleet)
+    vi.spyOn(nextFleet, 'spawn').mockImplementation(async (input) => {
+      if (input.name.includes('babysit')) counting = false
+      return nextSpawn(input)
+    })
+    const next = createFactory(babysitterConfig(), {
+      mount, fleet: nextFleet, stateStore: nextState, triage: new StaticTriage(), dispatchLifecycleRetryMs: 10,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    try {
+      await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(401), issue)))
+      firstFleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(first.status().counters.babysitterSpawnFailures).toBe(1))
+      expect((await state().listDispatchLifecycles('factory-test'))[0]?.[1].phase).toBe('dispatching')
+      await first.stop()
+      await next.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() => expect(nextFleet.spawns.filter((input) => input.name.includes('babysit'))).toHaveLength(1))
+      expect(rosterReads).toBe(ROSTER_READS_BEFORE_ADMISSION + 1)
+    } finally {
+      await first.stop()
+      await next.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it.each(['denied', 'unavailable', 'legacy-session'])('fails closed when the PR claim is %s', async (result) => {
     const issue = realIssueFile(401, ready, { title: 'Real babysitter durable claim' })
     const mount = new FakeMountClient({ [issuePath(401)]: issue })
