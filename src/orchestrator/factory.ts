@@ -14284,7 +14284,13 @@ export class FactoryLoop implements Factory {
     } else {
       await outstanding
     }
-    this.#abandonedClarificationReleases.delete(name)
+    // Identity-checked, like the chained cleanup: a newer fence may have been
+    // registered for this same deterministic name while this call awaited, and
+    // clearing it unconditionally would free the name to a release that is
+    // still armed — the race the chaining exists to close.
+    if (this.#abandonedClarificationReleases.get(name) === outstanding) {
+      this.#abandonedClarificationReleases.delete(name)
+    }
   }
 
   async #releaseAgentsForClarification(key: string, agents: Array<[string, TrackedAgent]>): Promise<void> {
