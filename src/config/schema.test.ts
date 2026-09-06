@@ -249,6 +249,7 @@ describe('FactoryConfigSchema', () => {
       requireLabel: 'garden',
       requireTeamKey: 'AR',
       neverAutoCloseLabels: ['incident', 'outage', 'sev1', 'sev2'],
+      agentQuestionAuthors: [],
     })
     expect(parsed.dryRun).toBe(false)
     expect(parsed.environments).toEqual({})

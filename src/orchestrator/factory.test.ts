@@ -10393,6 +10393,53 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('forces the clarification park when the broker release never settles', async () => {
+    // An agent that has just said it is blocked on a human may never reach a
+    // clean shutdown, so its release invocation can hang. Left unbounded it
+    // inherits the fleet client's placement-sized ack budget (300s), which is
+    // what held the slot open long enough for the orphan reaper to end a
+    // deliberately parked team and re-dispatch the issue (software-garden#417).
+    // The reaper and the placement timeout are untouched; only this explicit
+    // park path stops waiting on a handshake it knows will not come.
+    const root = await mkdtemp(join(tmpdir(), 'factory-clarification-release-grace-'))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 1, watchStatePath })
+    const fleet = new BlockingClarificationReleaseFleetClient()
+    const mount = new ConfirmRecordingSlackMountClient({ [issuePath(993)]: issueFile(993) })
+    const factory = createFactory(config({ batchSize: 1, slack: slackConfig() }), {
+      mount,
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      clarificationReleaseGraceMs: 50,
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(993), issueFile(993)))
+      await factory.dispatch(decision)
+      fleet.emitAgentMessage({
+        from: 'ar-993-impl-pear',
+        target: 'factory',
+        body: '[factory-needs-input] Which mount should the canary use?',
+        eventId: 'agent-question-993',
+      })
+      await fleet.clarificationReleaseStarted
+
+      // No allowClarificationRelease(): the broker never settles this release.
+      // The park must still complete, and the slot must free.
+      await vi.waitFor(async () => {
+        expect(await state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
+          .toMatchObject({ phase: 'waiting-for-human' })
+      }, { timeout: 4_000 })
+      const waiting = (await state().listWaitingClarifications('factory-test'))[0]?.[1]
+      expect(waiting).toMatchObject({ askerName: 'ar-993-impl-pear', parkedAtMs: expect.any(Number) })
+      expect(factory.status().counters.clarificationReleaseGraceExpired).toBe(1)
+    } finally {
+      fleet.allowClarificationRelease()
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('recovers a durable clarification parking phase after the release owner stops', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-clarification-parking-takeover-'))
     const watchStatePath = join(root, 'state.json')
@@ -25806,6 +25853,91 @@ describe('FactoryLoop', () => {
       expect(resume.task).toContain('The human answered as @reporter: Use the shared helper in factory.ts.')
     }
     expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+  })
+
+  it('parks the team when a write-capable human account posts the human-input request', async () => {
+    // software-garden#417. Agents in a JIT sandbox write through a user-scoped
+    // GitHub connection, so every real human-input request arrived as
+    // `"type": "User"` with `"author_association": "MEMBER"`. The bot-only
+    // trust gate ignored all thirteen of them: the team was never parked, the
+    // placement ran out its release-ack budget, the reaper collected the agent,
+    // and the issue was re-dispatched to ask the identical question again.
+    const path = githubIssuePath('AgentWorkforce', 'pear', 417)
+    const issue = githubIssueFile(417, { labels: ['factory'], author: 'reporter' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    mount.files.set(path, {
+      content: githubIssueFile(417, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }),
+    })
+
+    // Still ignored: a drive-by commenter with no write access cannot forge the
+    // structured fields and park a live team.
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 417, 9410, {
+      body: [
+        '### Software Garden human input request',
+        'Agent: ar-417-impl-pear',
+        'Issue: 417',
+        'Question: A drive-by commenter must not be able to park this team.',
+      ].join('\n'),
+      author: { login: 'drive-by', type: 'User' },
+      author_association: 'NONE',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsIgnoredUntrustedAuthor).toBe(1))
+    expect(fleet.releases).toEqual([])
+    expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 417, 9411, {
+      body: [
+        '### Software Garden human input request',
+        'Agent: ar-417-impl-pear',
+        'Issue: 417',
+        'Question: Which mount should the canary use?',
+      ].join('\n'),
+      author: { login: 'garden-operator', type: 'User' },
+      author_association: 'MEMBER',
+    })
+
+    await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
+    expect(factory.status().counters.githubAgentQuestionsTrustedByWriteAccess).toBe(1)
+    expect(factory.status().counters.githubAgentQuestionsIgnoredUntrustedAuthor).toBe(1)
+    // The whole team is released at once; the slot is not held to a timeout.
+    expect(fleet.releases).toEqual([
+      { name: 'ar-417-impl-pear', reason: 'waiting-for-human' },
+      { name: 'ar-417-review-pear', reason: 'waiting-for-human' },
+    ])
+    const waiting = (await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]
+    expect(waiting).toMatchObject({
+      askerName: 'ar-417-impl-pear',
+      question: 'Which mount should the canary use?',
+      questionSource: 'github',
+      parkedAtMs: expect.any(Number),
+    })
+
+    const spawnsBeforeAnswer = fleet.spawns.length
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 417, 9412, {
+      body: 'Point the canary at the real provider mount.',
+      author: { login: 'reporter' },
+    })
+    await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+    const restarted = fleet.spawns.slice(spawnsBeforeAnswer)
+    expect(restarted.length).toBeGreaterThan(0)
+    for (const spawn of restarted) {
+      expect(spawn.task).toContain('Which mount should the canary use?')
+      expect(spawn.task).toContain('Point the canary at the real provider mount.')
+    }
+    expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+    await factory.stop()
   })
 
   it('parks and restarts from GitHub comments even when Slack is stale and has no dispatch thread', async () => {

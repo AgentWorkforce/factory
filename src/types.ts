@@ -57,6 +57,12 @@ export interface FactoryPorts {
   readChildPids?: (pid: number) => Promise<number[]>
   terminationGraceMs?: number
   /**
+   * How long a clarification park waits for the broker's graceful release
+   * before forcing teardown. Test-only override of the built-in 15 s, so a
+   * suite can exercise the forced path without spending it in real time.
+   */
+  clarificationReleaseGraceMs?: number
+  /**
    * How long a babysitter wake may keep failing with a registration-lag
    * (target-unreachable) error before the tight retry loop escalates once and
    * backs off. Test-only override of the built-in default.
