@@ -38,6 +38,7 @@ import {
 } from '../github/writeback-paths'
 import { VerificationPipeline, type VerificationGate } from '../environments/verification-pipeline'
 import type {
+  AllowedDraftPredicateDiagnostics,
   AgentMessage,
   AgentLifecycleSignal,
   AgentPidResolution,
@@ -23325,8 +23326,8 @@ const liveHeartbeatIntervalMs = (staleMs: number): number =>
   Math.min(DEFAULT_LIVE_HEARTBEAT_INTERVAL_MS, Math.max(500, Math.floor(staleMs / 4)))
 
 const installFactoryDraftPredicate = (mount: MountClient, config: FactoryConfig): void => {
-  mount.setDefaultAllowedDraftPredicate?.((path, content, opts) =>
-    isAllowedFactoryDraft(path, content, opts, mount, config))
+  mount.setDefaultAllowedDraftPredicate?.((path, content, opts, diagnostics) =>
+    isAllowedFactoryDraft(path, content, opts, mount, config, diagnostics))
 }
 
 const isAllowedFactoryDraft = async (
@@ -23335,29 +23336,38 @@ const isAllowedFactoryDraft = async (
   opts: { guarded?: boolean } | undefined,
   mount: MountClient,
   config: FactoryConfig,
+  diagnostics?: AllowedDraftPredicateDiagnostics,
 ): Promise<boolean> => {
-  if (!opts?.guarded) return false
+  if (!opts?.guarded) return rejectDraft(diagnostics, 'guarded', 'writeFile opts.guarded must be true')
 
   // Comment writeback nested under its issue: /linear/issues/<ref>/comments/<draft>.json.
   // Scope-check the owning issue (the draft content is a comment, not an issue).
   const nestedComment = /^\/linear\/issues\/([^/]+)\/comments\/[^/]+$/u.exec(path)
   if (nestedComment) {
-    return isIssuePathInFactoryScope(mount, `/linear/issues/${nestedComment[1]}.json`, config)
+    const allowed = await isIssuePathInFactoryScope(mount, `/linear/issues/${nestedComment[1]}.json`, config)
+    return allowed || rejectDraft(diagnostics, 'linear.nested-comment-scope')
   }
 
   if (path.startsWith('/linear/issues/')) {
     if (isInFactoryScope(scopeIssueFromDraftContent(content), config.safety)) return true
-    return isIssuePathInFactoryScope(mount, path, config)
+    const allowed = await isIssuePathInFactoryScope(mount, path, config)
+    return allowed || rejectDraft(diagnostics, 'linear.issue-scope')
   }
 
   if (/^\/slack\/channels\/[^/]+\/messages\/.+/u.test(path)) {
     return true
   }
 
-  if (await isAllowedFactoryGithubDraft(path, content, opts, mount, config)) return true
+  if (await isAllowedFactoryGithubDraft(path, content, opts, mount, config, diagnostics)) return true
 
-  return false
+  return rejectDraft(diagnostics, 'provider-path', 'path is not an allowed Linear, Slack, or GitHub draft')
 }
+
+const rejectDraft = (
+  diagnostics: AllowedDraftPredicateDiagnostics | undefined,
+  branch: string,
+  detail?: string,
+): false => diagnostics?.reject(branch, detail) ?? false
 
 const isFactoryGithubAuthoredArtifactPath = (path: string): boolean =>
   /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)
@@ -23417,25 +23427,29 @@ const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =
   return actual.length === expected.length && actual.every((key, index) => key === expected[index])
 }
 
-const isAllowedFactoryGithubIssueWriteContent = (
+const factoryGithubIssueWriteContentRejection = (
   kind: 'issue-update' | 'comment',
   content: unknown,
   requireLabel: string,
-): boolean => {
+): string | undefined => {
   const value = asRecord(content)
-  if (!value) return false
+  if (!value) return 'content must be a JSON object'
   if (kind === 'issue-update') {
-    if (hasExactKeys(value, ['state'])) return value.state === 'closed'
+    if (hasExactKeys(value, ['state'])) {
+      return value.state === 'closed' ? undefined : 'state-only updates may only close an issue'
+    }
     // A status claim is a complete-label-set PATCH. Relayfile's GitHub adapter
     // routes no label resource, so replacing the set on the issue itself is
     // the only expression of a label change that reaches the provider at all —
     // this guard has to admit it or the claim dies here instead.
     if (hasExactKeys(value, ['labels']) || hasExactKeys(value, ['labels', 'state'])) {
-      if (!Array.isArray(value.labels)) return false
-      if (!value.labels.every((label) => typeof label === 'string' && label.trim().length > 0)) return false
+      if (!Array.isArray(value.labels)) return 'labels must be an array'
+      if (!value.labels.every((label) => typeof label === 'string' && label.trim().length > 0)) {
+        return 'every label must be a non-empty string'
+      }
       // One write must never assert two contradictory lifecycle claims.
       const lifecycle = value.labels.filter((label) => githubLifecycleLabelName(label))
-      if (lifecycle.length > 1) return false
+      if (lifecycle.length > 1) return 'complete label set contains contradictory lifecycle claims'
       // A complete-set PATCH can drop labels as well as add them, and the
       // safety opt-in is the label that made this issue eligible at all. A set
       // that omits it would silently remove the issue from scope, so
@@ -23459,19 +23473,23 @@ const isAllowedFactoryGithubIssueWriteContent = (
       // be. `factoryStatusLabelSet` preserves every non-lifecycle label and an
       // in-scope issue always carries at least the opt-in, so `setStatus`
       // cannot author an empty set.
-      if (value.labels.length === 0) return false
+      if (value.labels.length === 0) return 'complete label set must not be empty'
       const required = requireLabel.trim().toLowerCase()
       const requiredIsLifecycle = Boolean(githubLifecycleLabelName(required))
       if (required && !requiredIsLifecycle &&
         !matchesGardenLabelAlias(value.labels as string[], required)) {
-        return false
+        return `complete label set does not preserve configured safety label "${requireLabel.trim()}"`
       }
       return value.state === undefined || value.state === 'closed'
+        ? undefined
+        : 'combined labels/state updates may only close an issue'
     }
-    return false
+    return 'issue update keys are not an allowed lifecycle/status shape'
   }
   // kind === 'comment'
   return hasExactKeys(value, ['body']) && typeof value.body === 'string' && value.body.trim().length > 0
+    ? undefined
+    : 'issue comments must contain only a non-empty body'
 }
 
 /**
@@ -23485,20 +23503,34 @@ export const isAllowedFactoryGithubDraft = async (
   opts: { guarded?: boolean } | undefined,
   mount: MountClient,
   config: FactoryConfig,
+  diagnostics?: AllowedDraftPredicateDiagnostics,
 ): Promise<boolean> => {
-  if (!opts?.guarded) return false
+  if (!opts?.guarded) return rejectDraft(diagnostics, 'guarded', 'writeFile opts.guarded must be true')
   if (isAllowedFactoryGithubArtifactDraft(path, opts)) return true
 
   const target = factoryGithubIssueWriteTarget(path)
-  if (!target) return false
-  if (!isAllowedFactoryGithubIssueWriteContent(target.kind, content, config.safety.requireLabel)) return false
+  if (!target) return rejectDraft(diagnostics, 'github.target-path', 'path is not a supported GitHub issue draft')
+  const contentRejection = factoryGithubIssueWriteContentRejection(
+    target.kind,
+    content,
+    config.safety.requireLabel,
+  )
+  if (contentRejection) return rejectDraft(diagnostics, 'github.issue-content', contentRejection)
   if (target.kind === 'comment') {
     const body = asRecord(content)?.body
     const draftName = path.slice(path.lastIndexOf('/') + 1)
-    if (typeof body !== 'string' || draftName !== factoryGithubIssueCommentDraftName(body)) return false
+    if (typeof body !== 'string' || draftName !== factoryGithubIssueCommentDraftName(body)) {
+      return rejectDraft(diagnostics, 'github.comment-draft-name', 'comment filename does not match its body digest')
+    }
   }
   const repoPath = `/github/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}`
-  if (!isConfiguredGithubRepoPath(`${repoPath}/`, config)) return false
+  if (!isConfiguredGithubRepoPath(`${repoPath}/`, config)) {
+    return rejectDraft(
+      diagnostics,
+      'github.repo-config',
+      `repository ${target.owner}/${target.repo} is not configured`,
+    )
+  }
 
   const compactRepo = `${encodeURIComponent(target.owner)}__${encodeURIComponent(target.repo)}`
   const candidates = [
@@ -23512,12 +23544,22 @@ export const isAllowedFactoryGithubDraft = async (
   for (const candidate of candidates) {
     try {
       const issue = parseGithubFactoryIssue(candidate, (await mount.readFile(candidate)).content)
-      return issue.state?.name === 'open' && isInFactoryScope(issue, config.safety)
+      if (issue.state?.name !== 'open') {
+        return rejectDraft(diagnostics, 'github.issue-state', `authoritative issue ${candidate} is not open`)
+      }
+      if (!isInFactoryScope(issue, config.safety)) {
+        return rejectDraft(diagnostics, 'github.issue-scope', `authoritative issue ${candidate} is outside the safety scope`)
+      }
+      return true
     } catch {
       // Try the next canonical/alias shape. Any total miss fails closed.
     }
   }
-  return false
+  return rejectDraft(
+    diagnostics,
+    'github.issue-candidate',
+    `no authoritative issue projection was readable at ${candidates.join(', ')}`,
+  )
 }
 
 const isIssuePathInFactoryScope = async (

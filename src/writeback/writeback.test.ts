@@ -2496,6 +2496,133 @@ describe('isAllowedFactoryGithubDraft complete-label-set PATCH', () => {
     await expect(allows({ labels: ['factory', 'bug'] })).resolves.toBe(true)
   })
 
+  it('admits the deployed incident payload across the factory-to-garden gate rename', async () => {
+    const legacyPath = '/github/repos/AgentWorkforce/factory/issues/by-id/186.json'
+    const legacyDraftPath = '/github/repos/AgentWorkforce/factory/issues/186.json'
+    const legacyIssue = {
+      provider: 'github',
+      objectType: 'issue',
+      objectId: 'factory-186',
+      payload: {
+        number: 186,
+        title: '[factory] Enforce a per-run token/cost budget',
+        body: 'body',
+        state: 'open',
+        labels: [{ name: 'factory' }, { name: 'agent:single' }],
+        url: 'https://github.com/AgentWorkforce/software-garden/issues/186',
+        repository: { name: 'factory', owner: { login: 'AgentWorkforce' } },
+      },
+    }
+    const renamedGate = FactoryConfigSchema.parse({
+      workspaceId: 'rw_test',
+      issueSource: 'github',
+      repos: { byLabel: { factory: 'AgentWorkforce/factory' } },
+      safety: { requireLabel: 'garden', requireTitlePrefix: '[garden]' },
+      slack: { channel: 'C0AD7UU0J1G__proj-cloud' },
+    })
+
+    await expect(isAllowedFactoryGithubDraft(
+      legacyDraftPath,
+      { labels: ['factory', 'agent:single', 'factory:in-progress'] },
+      { guarded: true },
+      new FakeMountClient({ [legacyPath]: legacyIssue }),
+      renamedGate,
+    )).resolves.toBe(true)
+  })
+
+  it('reports the exact content check that rejects an unsafe complete label set', async () => {
+    const refusal: { branch?: string; detail?: string } = {}
+    const diagnostics = {
+      reject: (branch: string, detail?: string): false => {
+        refusal.branch ??= branch
+        refusal.detail ??= detail
+        return false
+      },
+    }
+
+    await expect(isAllowedFactoryGithubDraft(
+      draftPath,
+      { labels: ['bug', 'garden:in-progress'] },
+      { guarded: true },
+      new FakeMountClient({ [issuePath]: issueFile }),
+      guardConfig('factory'),
+      diagnostics,
+    )).resolves.toBe(false)
+    expect(refusal).toEqual({
+      branch: 'github.issue-content',
+      detail: 'complete label set does not preserve configured safety label "factory"',
+    })
+  })
+
+  it('names every remaining GitHub predicate exit without weakening fail-closed behavior', async () => {
+    const branchFor = async (
+      path: string,
+      content: unknown,
+      opts: { guarded?: boolean } | undefined,
+      mount: MountClient,
+      config = guardConfig('factory'),
+    ): Promise<string | undefined> => {
+      let branch: string | undefined
+      const allowed = await isAllowedFactoryGithubDraft(path, content, opts, mount, config, {
+        reject: (value): false => {
+          branch ??= value
+          return false
+        },
+      })
+      expect(allowed).toBe(false)
+      return branch
+    }
+    const validContent = { labels: ['factory', 'garden:in-progress'] }
+    const closedIssue = structuredClone(issueFile)
+    closedIssue.payload.state = 'closed'
+    const outOfScopeIssue = structuredClone(issueFile)
+    outOfScopeIssue.payload.title = 'unscoped issue'
+    outOfScopeIssue.payload.labels = [{ name: 'bug' }]
+
+    await expect(branchFor(
+      draftPath,
+      validContent,
+      undefined,
+      new FakeMountClient({ [issuePath]: issueFile }),
+    )).resolves.toBe('guarded')
+    await expect(branchFor(
+      '/github/repos/AgentWorkforce/pear/issues/221/labels/unsafe.json',
+      validContent,
+      { guarded: true },
+      new FakeMountClient({ [issuePath]: issueFile }),
+    )).resolves.toBe('github.target-path')
+    await expect(branchFor(
+      '/github/repos/AgentWorkforce/pear/issues/221/comments/factory-000000000000000000000000.json',
+      { body: 'does not match the filename digest' },
+      { guarded: true },
+      new FakeMountClient({ [issuePath]: issueFile }),
+    )).resolves.toBe('github.comment-draft-name')
+    await expect(branchFor(
+      '/github/repos/OtherOrg/other/issues/221.json',
+      { state: 'closed' },
+      { guarded: true },
+      new FakeMountClient(),
+    )).resolves.toBe('github.repo-config')
+    await expect(branchFor(
+      draftPath,
+      validContent,
+      { guarded: true },
+      new FakeMountClient(),
+    )).resolves.toBe('github.issue-candidate')
+    await expect(branchFor(
+      draftPath,
+      validContent,
+      { guarded: true },
+      new FakeMountClient({ [issuePath]: closedIssue }),
+    )).resolves.toBe('github.issue-state')
+    await expect(branchFor(
+      draftPath,
+      validContent,
+      { guarded: true },
+      new FakeMountClient({ [issuePath]: outOfScopeIssue }),
+    )).resolves.toBe('github.issue-scope')
+  })
+
   it('refuses a set that drops the safety opt-in, including the empty set', async () => {
     await expect(allows({ labels: [] })).resolves.toBe(false)
     await expect(allows({ labels: ['bug', 'garden:in-progress'] })).resolves.toBe(false)

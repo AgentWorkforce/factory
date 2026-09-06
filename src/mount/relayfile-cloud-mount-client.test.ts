@@ -2082,19 +2082,34 @@ describe('RelayfileCloudMountClient', () => {
     expect(fake.getOpCalls).toEqual([])
   })
 
-  it('refuses provider writeback paths when the draft predicate is unset or rejects', async () => {
+  it('distinguishes an unset draft predicate from a named rejection branch', async () => {
     const fake = new FakeRelayFileClient()
     const unset = new RelayfileCloudMountClient({ workspaceId: 'rw_test', client: fake })
     const rejecting = new RelayfileCloudMountClient({
+      workspaceId: 'rw_test',
+      client: fake,
+      isAllowedDraft: (_path, _content, _opts, diagnostics?: {
+        reject: (branch: string, detail?: string) => false
+      }) => diagnostics?.reject(
+        'github.issue-content',
+        'complete label set does not preserve configured safety label "garden"',
+      ) ?? false,
+    })
+    const rejectingWithoutDetail = new RelayfileCloudMountClient({
       workspaceId: 'rw_test',
       client: fake,
       isAllowedDraft: () => false,
     })
 
     await expect(unset.writeFile('/linear/issues/new.json', { title: 'Real work' }))
-      .rejects.toThrow(/draft predicate rejected or is unset/)
+      .rejects.toThrow('draft predicate is unset')
     await expect(rejecting.writeFile('/slack/channels/C123/messages/root.json', { text: 'Wrong channel' }))
-      .rejects.toThrow(/draft predicate rejected or is unset/)
+      .rejects.toThrow(
+        'draft predicate rejected at github.issue-content: ' +
+        'complete label set does not preserve configured safety label "garden"',
+      )
+    await expect(rejectingWithoutDetail.writeFile('/linear/issues/wrong.json', { title: 'Wrong issue' }))
+      .rejects.toThrow('draft predicate rejected without branch detail')
     expect(fake.writeFileCalls).toEqual([])
   })
 

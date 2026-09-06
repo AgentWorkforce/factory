@@ -1,5 +1,7 @@
 export type {
   ChangeEvent,
+  AllowedDraftPredicate,
+  AllowedDraftPredicateDiagnostics,
   EventPage,
   FactoryIntegrationConnectionStatus,
   FactoryIntegrationConnections,
