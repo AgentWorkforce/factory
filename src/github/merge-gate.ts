@@ -406,11 +406,26 @@ const normalizeCheckState = (state: string): string => state.trim().toUpperCase(
 const isVacuousDescription = (text: string): boolean =>
   VACUOUS_REVIEW_MARKERS.some((marker) => marker.test(text))
 
+/**
+ * State decides blocking first, and nothing downgrades it.
+ *
+ * `VACUOUS` is the *non-blocking* bucket: `evaluateGithubMergeGate` filters
+ * vacuous signals out before it looks for blocking ones, so a failing check
+ * classified vacuous is not merely mislabelled — it is invisible, and the gate
+ * returns READY reporting "no blocking checks".
+ *
+ * That matters because the descriptions fed in here now include a check run's
+ * nested `output.summary` and `output.text`, which carry free-form CI log
+ * text. A genuinely failing job whose log happens to contain "review skipped"
+ * or "usage limit" would otherwise be downgraded out of BLOCKING. Vacuousness
+ * is a claim about a bot that declined to review, and a bot that declined
+ * reports a non-blocking state; a failing check is never making that claim.
+ */
 const classifyCheckKind = (state: string, descriptions: string[]): CheckSignal['kind'] => {
-  if (descriptions.some(isVacuousDescription)) {
-    return 'VACUOUS'
+  if (!nonBlockingCheckStates.has(normalizeCheckState(state))) {
+    return 'BLOCKING'
   }
-  return nonBlockingCheckStates.has(normalizeCheckState(state)) ? 'REAL' : 'BLOCKING'
+  return descriptions.some(isVacuousDescription) ? 'VACUOUS' : 'REAL'
 }
 
 export const checkSignalsFromRollup = (value: unknown): CheckSignal[] => {

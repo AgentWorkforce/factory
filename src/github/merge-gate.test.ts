@@ -456,6 +456,67 @@ describe('GithubMergeGate', () => {
       expect(verdict.reason).toMatch(/2 real, 2 vacuous/)
     })
 
+    // Reading `output.summary` / `output.text` feeds free-form CI log text into
+    // the classifier. A failing job whose log happens to contain a marker
+    // phrase must not be downgraded out of BLOCKING: VACUOUS is filtered out
+    // before the blocking check, so a downgraded failure is not merely
+    // mislabelled, it is invisible and the gate can return READY.
+    describe('a failing check is never downgraded to vacuous', () => {
+      it('keeps a FAILURE blocking when its output text contains a vacuous marker', () => {
+        const verdict = evaluateGithubMergeGate(input, live({
+          statusCheckRollup: [
+            { name: 'test', conclusion: 'SUCCESS' },
+            {
+              name: 'package',
+              status: 'completed',
+              conclusion: 'failure',
+              output: {
+                title: 'Build failed',
+                summary: 'integration/review skipped after the bundler crashed',
+              },
+            },
+          ],
+        }))
+
+        expect(verdict.live.checkSignals).toEqual([
+          expect.objectContaining({ context: 'test', kind: 'REAL' }),
+          expect.objectContaining({ context: 'package', kind: 'BLOCKING' }),
+        ])
+        expect(verdict).toMatchObject({ verdict: 'REFUSE', ready: false })
+        expect(verdict.reason).toMatch(/checks not merge-ready: FAILURE/)
+      })
+
+      it('keeps an ERROR legacy status blocking when its description contains a marker', () => {
+        const verdict = evaluateGithubMergeGate(input, live({
+          statusCheckRollup: [
+            { name: 'test', conclusion: 'SUCCESS' },
+            { context: 'deploy', state: 'error', description: 'aborted: usage limit exceeded' },
+          ],
+        }))
+
+        expect(verdict.live.checkSignals).toEqual([
+          expect.objectContaining({ context: 'test', kind: 'REAL' }),
+          expect.objectContaining({ context: 'deploy', kind: 'BLOCKING' }),
+        ])
+        expect(verdict).toMatchObject({ verdict: 'REFUSE', ready: false })
+      })
+
+      it('still classifies a marker on a non-blocking state as vacuous', () => {
+        const verdict = evaluateGithubMergeGate(input, live({
+          statusCheckRollup: [
+            { name: 'test', conclusion: 'SUCCESS' },
+            { context: 'Devin Review', state: 'success', description: 'Full review skipped: trial expired' },
+          ],
+        }))
+
+        expect(verdict.live.checkSignals).toEqual([
+          expect.objectContaining({ context: 'test', kind: 'REAL' }),
+          expect.objectContaining({ context: 'Devin Review', kind: 'VACUOUS' }),
+        ])
+        expect(verdict).toMatchObject({ verdict: 'READY', ready: true })
+      })
+    })
+
     it('refuses when every legacy status is vacuous and no check run accompanies them', () => {
       const verdict = evaluateGithubMergeGate(input, live({
         statusCheckRollup: [
