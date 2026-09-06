@@ -28717,6 +28717,121 @@ describe('FactoryLoop PR babysitter', () => {
     ])
   })
 
+  it.each([
+    { excludeLabels: ['garden:skip-babysitter'], labels: ['factory:skip-babysitter'] },
+    { excludeLabels: ['factory:skip-babysitter'], labels: ['garden:skip-babysitter'] },
+    { excludeLabels: ['hold'], labels: ['HOLD'] },
+    { excludePullRequests: ['agentworkforce/pear#401'], labels: [] },
+  ])('honors factory-created PR opt-outs: %j', async ({ labels, ...exclusions }) => {
+    const issue = realIssueFile(401, ready, { title: 'Real babysitter opt-out' })
+    const mount = new FakeMountClient({ [issuePath(401)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 401, { state: 'open', draft: false, labels })
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(babysitterConfig({ babysitter: { enabled: true, ...exclusions } }), {
+      mount, fleet, triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(401), issue)))
+      fleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(
+        (factory.status().counters.babysitterActivationExcluded ?? 0) +
+        fleet.spawns.filter((spawn) => spawn.name.includes('babysit')).length,
+      ).toBeGreaterThan(0))
+      expect(fleet.spawns.filter((spawn) => spawn.name.includes('babysit'))).toEqual([])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it.each(['denied', 'unavailable', 'legacy-session'])('fails closed when the PR claim is %s', async (result) => {
+    const issue = realIssueFile(401, ready, { title: 'Real babysitter durable claim' })
+    const mount = new FakeMountClient({ [issuePath(401)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 401, { state: 'open', draft: false, labels: [] })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    if (result === 'legacy-session') {
+      await stateStore.setBabysitterSession('factory-test', 'old-owner', {
+        issue: { key: 'AR-999', uuid: 'old-issue', path: issuePath(999) },
+        repo: 'AgentWorkforce/pear', prNumber: 401, agentName: 'legacy-worker',
+        critical: false, pendingKinds: [],
+      })
+    }
+    const claim = vi.spyOn(stateStore, 'markRunning').mockImplementation(async () => {
+      if (result === 'unavailable') throw new Error('claim storage unavailable')
+      return null
+    })
+    const factory = createFactory(babysitterConfig(), {
+      mount, fleet, stateStore, triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(401), issue)))
+      fleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(claim.mock.calls.length +
+        (factory.status().counters.babysitterActivationClaimRejected ?? 0) +
+        fleet.spawns.filter((s) => s.name.includes('babysit')).length).toBeGreaterThan(0))
+      if (result === 'legacy-session') expect(claim).not.toHaveBeenCalled()
+      else expect(claim).toHaveBeenCalledWith(expect.any(String), 'factory-created:agentworkforce/pear#401', expect.any(String), expect.any(Number), expect.any(Number))
+      expect(fleet.spawns.filter((spawn) => spawn.name.includes('babysit'))).toEqual([])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('keeps one durable claim per PR across issue aliases, restarts and lease expiry', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-created-pr-claim-'))
+    const watchStatePath = join(root, 'watch.json')
+    const allSpawns: string[] = []
+    try {
+      for (const n of [401, 402]) {
+        const issue = realIssueFile(n, ready, { title: 'Real shared PR ownership' })
+        const mount = new FakeMountClient({ [issuePath(n)]: issue })
+        seedPrMeta(mount, 'AgentWorkforce/pear', 901, {
+          state: 'open', draft: false, labels: [], head_ref: 'repair/existing-pr-head',
+          statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'FAILURE' }],
+        })
+        const fleet = new FakeFleetClient()
+        const stateStore = new FileStateStore({ batchSize: 2, watchStatePath })
+        const claim = vi.spyOn(stateStore, 'markRunning')
+        const factory = createFactory(babysitterConfig(), {
+          mount, fleet, stateStore, triage: new StaticTriage(),
+          probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 901 }),
+        })
+        try {
+          await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(n), issue)))
+          fleet.emitAgentExit(`ar-${n}-impl-pear`, 'worker_exited')
+          await vi.waitFor(() => expect(claim).toHaveBeenCalled())
+          if (n === 401) {
+            await vi.waitFor(() => expect(fleet.spawns.some((spawn) => spawn.name.includes('babysit'))).toBe(true))
+            const worker = fleet.spawns.find((spawn) => spawn.name.includes('babysit'))!
+            expect(worker.task).toContain('Fix failing CI')
+            expect(worker.task).toContain('existing PR head `repair/existing-pr-head`')
+            expect(worker.task).toContain('review threads')
+            expect(worker.task).toContain('never merge it yourself')
+            fleet.emitAgentExit(`ar-${n}-impl-pear`, 'worker_exited')
+          } else {
+            await vi.waitFor(() => expect(factory.status().counters.babysitterActivationClaimRejected).toBeGreaterThan(0))
+          }
+          allSpawns.push(...fleet.spawns.filter((spawn) => spawn.name.includes('babysit')).map((spawn) => spawn.name))
+        } finally {
+          await factory.stop()
+        }
+        // Reaping may clear the session index. The PR claim must still prevent
+        // a later issue alias from spawning another worker after that cleanup.
+        for (const [key] of await stateStore.listBabysitterSessions('factory-test')) {
+          await stateStore.clearBabysitterSession('factory-test', key)
+        }
+      }
+      expect(allSpawns).toHaveLength(1)
+      const restarted = new FileStateStore({ batchSize: 2, watchStatePath })
+      await expect(restarted.markRunning('factory-test', 'factory-created:agentworkforce/pear#901',
+        'another-worker', Date.now() + 24 * 60 * 60_000, 1_000)).resolves.toBeNull()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('spawns a sonnet babysitter (not done) when an implementer exits with a ready PR', async () => {
     const issue = realIssueFile(401, ready, { title: 'Real babysitter spawn' })
     const mount = new FakeMountClient({ [issuePath(401)]: issue })
@@ -30653,7 +30768,7 @@ describe('FactoryLoop PR babysitter', () => {
   it('ignores a ready signal when the PR meta shows the PR already merged/closed', async () => {
     const issue = realIssueFile(405, ready, { title: 'Real babysitter not ready' })
     const mount = new FakeMountClient({ [issuePath(405)]: issue })
-    seedPrMeta(mount, 'AgentWorkforce/pear', 405, { state: 'closed', merged: true })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 405, { state: 'open', merged: false })
     const fleet = new FakeFleetClient()
     const states: Array<{ key: string; stateId: string }> = []
     const factory = createFactory(babysitterConfig(), {
@@ -30668,6 +30783,7 @@ describe('FactoryLoop PR babysitter', () => {
     fleet.emitAgentExit('ar-405-impl-pear', 'worker_exited')
     await vi.waitFor(() => expect(fleet.spawns.map((s) => s.name)).toContain('ar-405-babysit'))
 
+    seedPrMeta(mount, 'AgentWorkforce/pear', 405, { state: 'closed', merged: true })
     fleet.emitAgentMessage({ from: 'ar-405-babysit', target: 'factory', body: '[factory-pr-ready] AR-405' })
     await flush()
 

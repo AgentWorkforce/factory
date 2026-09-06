@@ -321,13 +321,14 @@ const slackSchema = z.object({
 
 const babysitterSchema = z.object({
   enabled: z.boolean().default(false),
-  // Select the declarative intake/discovery surface. Routed activation is
+  // Factory-created PRs activate from dispatch receipts and issue handoffs.
+  // Select the additional intake/discovery surface. Routed activation is
   // deliberately disabled in src/github/routed-pr-babysitter.ts until the
   // lifecycle design lands, so this value cannot spawn a routed worker yet.
   mode: z.enum(['factory-created', 'routed-open-prs']).default('factory-created'),
-  // Discovery excludes candidates carrying an author-controlled stop label.
+  // Discovery and factory-created activation honor these stop labels.
   // The legacy `factory:skip-babysitter` name remains honored as an alias on
-  // the discovery read path during the rename transition.
+  // the PR read path during the rename transition.
   excludeLabels: z.array(z.string().trim().min(1)).default([GARDEN_SKIP_BABYSITTER_LABEL]),
   excludePullRequests: z.array(z.string().regex(
     /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})#[1-9]\d*$/u,

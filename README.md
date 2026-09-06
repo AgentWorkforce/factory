@@ -423,6 +423,24 @@ existing PR branch, and always leaves the final review and merge to a human.
 The command prints a spawn receipt and returns; the PR-keyed task-exit worker
 continues on the relay broker and reports completion or access blockers there.
 
+### Factory-created PR babysitting
+
+Set `babysitter.enabled: true` (the default mode is `factory-created`) to hand
+published PR receipts and tracked issue PRs to a babysitter. It reads the current
+checks and review threads on startup, fixes the existing PR head, and receives
+later PR activity through the mounted event stream. With `mergePolicy: "never"`,
+the PR stays open for human approval and merging.
+
+Factory-created activation honors `excludePullRequests` (`owner/repo#number`,
+case insensitive) and mounted `excludeLabels`, including both
+`garden:skip-babysitter` and its legacy `factory:skip-babysitter` alias.
+A durable generation claim keyed by repository and PR number must succeed before
+placement. Repeated issue arrivals, process restarts, worker exits and claim lease
+expiry do not permit another automatic placement for that PR. Existing tracked
+workers retain the normal session recovery path. If placement is uncertain and
+no worker receipt is recoverable, operator reconciliation is required; the claim
+is deliberately retained. Use the persistent state store in daemon deployments.
+
 ### Routed-PR discovery (activation disabled)
 
 This release adds the declarative configuration and read-only discovery surface
@@ -451,8 +469,8 @@ deduplicates mount aliases, and reports incomplete or unreadable metadata.
 cannot turn it on. No routed candidate is claimed, spawned, renewed, released,
 interpreted as complete, advanced to Human Review, or used to notify anyone.
 Activation will be implemented separately after the durable lifecycle and
-completion-CAS design is reviewed. The existing issue-created babysitter path
-is unchanged.
+completion-CAS design is reviewed. Factory-created PR handoffs remain available
+independently of this discovery gate.
 
 ### Scheduled sync-fidelity canary
 

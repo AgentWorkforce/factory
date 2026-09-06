@@ -882,7 +882,7 @@ categories:
       - id: pr-babysitter-opt-in
         name: Event-Driven PR Babysitter
         api: babysitter.enabled
-        description: Spawn a Claude babysitter when a non-draft PR opens and let it address CI, conflicts, and review feedback
+        description: Activate factory-created PR handoffs with a durable repository-and-PR claim before placement, suppress replay across issue aliases and restarts, and address CI, conflicts, and review feedback
         location: src/orchestrator/factory.ts, src/triage/heuristic.ts, src/dispatch/templates.ts
         verify_tier: 6
 
@@ -894,10 +894,10 @@ categories:
         verify_tier: 5
 
       - id: pr-routed-babysitter-opt-out
-        name: Routed PR Discovery Opt-Out
+        name: PR Babysitter Opt-Out
         api: babysitter.excludeLabels / babysitter.excludePullRequests
-        description: Exclude configured PR identities or labeled PRs from the read-only routed discovery candidate set
-        location: src/config/schema.ts, src/github/routed-pr-babysitter.ts
+        description: Exclude configured PR identities or labeled PRs from factory-created activation and routed discovery, honoring legacy skip-label aliases
+        location: src/config/schema.ts, src/github/routed-pr-babysitter.ts, src/orchestrator/factory.ts
         verify_tier: 5
 
       - id: pr-standalone-babysitter-validation
