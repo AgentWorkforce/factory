@@ -23,6 +23,7 @@
     "bin/factory.mjs",
     "scripts/factory-canary.sh",
     "scripts/relayfile-flush-failure-canary.sh",
+    "scripts/verify-relayfile-flush-failure-evidence.mjs",
     "scripts/com.agentrelay.factory-canary.plist.example",
     "package.json",
     "README.md"
