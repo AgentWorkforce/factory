@@ -26,13 +26,38 @@ import { MountAuthScopeError, mountAuthRemediation } from '../mount/mount-auth-e
 import { DocumentStateStore, FileStateStore } from '../state/file-state-store'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import { GhCliIssuePublisher } from '../intake/notion'
-import type { GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, GithubWriteback, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
+import type { Capability, GithubConnectionRead, GithubConnectionWrite, GithubIssueLookup, GithubWriteback, LocalMountOptions, SpawnInput, SpawnResult } from '../ports'
 import type { HarnessDriverClientLike } from '../fleet/internal-fleet-client'
 import type { RelayMessaging } from '@agent-relay/sdk'
 import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import { GhCliGithubWriteback } from '../writeback/github'
 import { ensureLocalMount as runLocalMountPreflight } from '../mount/local-mount-preflight'
 import { formatLogArgs, installFactoryStopSignalHandlers, parseFleetCommand, parseGithubIssueSelector, parseGlobalOptions, reportFactoryVersionDrift, resolveBrokerConnectionPath, resolveFactoryBrokerConnectionPath, runFleetCli } from './fleet'
+
+// MITIGATION for this file only, not a fix (#442). Scoped here rather than set
+// in vitest.config.ts because this repo deliberately configures no global
+// `testTimeout` (see the note in sweep-counters.test.ts) and uses per-test
+// budgets instead; a global raise would weaken hung-test detection across all
+// 117 test files.
+//
+// The race that made "keeps relay dispatch ownership…" fail is fixed at its
+// source, in `CompletingRemoteFleetClient`. This covers what is left: these CLI
+// tests each drive a whole dispatch through real filesystem I/O and cost 2-10s
+// apiece, so at Vitest's 5s default a loaded runner fails a rotating cast of
+// them. Measured on 8 cores at load average ~155, one run failed 10 different
+// tests, every one between 4.3s and 10.4s — the "each rerun fails a different
+// test" signature reported on #442.
+//
+// Deliberately ABOVE REMOTE_AGENT_REGISTRATION_TIMEOUT_MS (30s,
+// factory.ts:459). If the registration race ever regresses, the run should
+// reach the production deadline and fail as `expect(code).toBe(0)` with a
+// RemoteAgentRegistrationTimeoutError on stderr — the diagnostic failure. A
+// budget under 30s would truncate that into a bare "Test timed out", which is
+// the exact failure mode that hid this bug in the first place.
+//
+// This buys headroom; it makes no test cheaper. The real cure is for these
+// tests to stop doing seconds of real I/O each.
+vi.setConfig({ testTimeout: 40_000 })
 
 const issuePath = '/linear/issues/AR-77__uuid-77.json'
 
@@ -122,11 +147,17 @@ const issueFile = {
 /**
  * Remote fleet whose implementer exit is emitted by the test, not by a timer.
  *
- * Kept separate from `CompletingRemoteFleetClient`: that one races completion
- * against dispatch on a timer, while every user of this class drives the exit
- * from a specific point in its own mount fixture. Collapsing the two behind a
- * flag would put the timer in scope for tests whose whole point is that no
- * timer decides the ordering (#346 review, cubic).
+ * Kept separate from `CompletingRemoteFleetClient`: that one completes itself,
+ * asynchronously and without the test body saying when, while every user of
+ * this class drives the exit from a specific point in its own mount fixture.
+ * Collapsing the two behind a flag would put that self-completion in scope for
+ * tests whose whole point is that no timer decides the ordering (#346 review,
+ * cubic).
+ *
+ * Note that `CompletingRemoteFleetClient` no longer *races* dispatch: its exit
+ * is armed at spawn and released by the registration probe. It used to fire on
+ * a bare `setTimeout(..., 0)`, which raced the roster read and was the bug
+ * behind #442 — do not restore that.
  */
 class CompletingRemoteFleetBase extends FakeFleetClient {
   override readonly placementLocality = 'remote' as const
@@ -157,13 +188,39 @@ class ControlledCompletingRemoteFleetClient extends CompletingRemoteFleetBase {
 
 class CompletingRemoteFleetClient extends CompletingRemoteFleetBase {
   readonly lifecycleOrder: string[] = []
+  #exitOnRegistration?: string
 
   override async spawn(input: SpawnInput): Promise<SpawnResult> {
     const result = await super.spawn(input)
-    if (input.name.includes('-impl-')) {
+    // Arm the exit here, but let the registration probe below release it. A
+    // bare `setTimeout(..., 0)` raced the remote-registration wait: this is a
+    // `remote` placement, so dispatch polls until the agent is roster-visible,
+    // and `emitAgentExit` *removes* the agent from the fake roster. Whenever
+    // the timer won that race the placement became permanently unobservable,
+    // so dispatch burned the full 30s startup deadline and exited 1. The
+    // scheduler picked the winner, which is why an idle runner passed and a
+    // loaded one failed (#442).
+    if (input.name.includes('-impl-')) this.#exitOnRegistration = input.name
+    return { ...result, node: 'sf-mini', locality: 'remote' }
+  }
+
+  /**
+   * Dispatch prefers this probe over a roster read when it is present. Emitting
+   * the exit only once it has answered `true` keeps the exit on a timer — the
+   * ordering this class exists to provide, rather than one the test body drives
+   * — while making it causally *after* registration instead of a coin flip
+   * against it.
+   */
+  async isAgentRegistered(input: { name: string; node: string; capability: Capability }): Promise<boolean> {
+    const roster = await this.roster()
+    const registered = roster.agents.some((agent) => agent.name === input.name && agent.node === input.node)
+      && roster.nodes.some((node) =>
+        node.name === input.node && node.live && node.capabilities.includes(input.capability))
+    if (registered && this.#exitOnRegistration === input.name) {
+      this.#exitOnRegistration = undefined
       setTimeout(() => this.emitAgentExit(input.name, 'exited'), 0)
     }
-    return { ...result, node: 'sf-mini', locality: 'remote' }
+    return registered
   }
 
   override async release(name: string, reason?: string): Promise<void> {
