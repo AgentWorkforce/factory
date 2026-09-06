@@ -19582,6 +19582,12 @@ export class FactoryLoop implements Factory {
     // that existed when the drain began.
     const nested = this.#slackReplyRouteDrains.has(key)
     this.#slackReplyRouteDrains.add(key)
+    // Published so an observer can tell "the fence is being drained right now"
+    // from "the dispatch has not reached the fence yet". Those two states look
+    // identical from the outside — a reopened dispatch spawns its agents well
+    // before it touches the Slack fence — and only the first one routes a reply
+    // through the fence-during-drain branch above.
+    if (!nested) this.#increment('slackReplyRouteDrainsStarted')
     try {
       for (let pass = 0; pass < SLACK_REPLY_ROUTE_DRAIN_PASSES; pass += 1) {
         const route = this.#slackReplyRoutes.get(key)
