@@ -11725,6 +11725,100 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('question counters preserve authoritative zero through the heartbeat file and reader', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-question-zero-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const clock = new ManualClock()
+    const factory = createFactory(config({
+      loop: { heartbeatPath, registryPath: join(root, 'registry.json'), heartbeatStaleMs: 1_000 },
+    }), { mount: new FakeMountClient(), fleet: new FakeFleetClient(), triage: new StaticTriage(), clock })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      const initial = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(initial?.questionCounters).toEqual({
+        githubAgentQuestionsReceived: 0,
+        githubAgentQuestionsDetected: 0,
+        githubAgentQuestionsIgnoredUntrustedAuthor: 0,
+        githubAgentQuestionsIgnoredNoInFlight: 0,
+        githubAgentQuestionsIgnoredUnknownAgent: 0,
+        githubAgentQuestionsIgnoredMissingAuthorizedAuthor: 0,
+      })
+      expect(initial?.startedAt).toBe(new Date(0).toISOString())
+      clock.advance(500)
+      await factory.stop()
+      const stopped = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(stopped?.questionCounters).toEqual(initial?.questionCounters)
+      expect(stopped?.startedAt).toBe(initial?.startedAt)
+      expect(stopped?.updatedAtMs).toBe(500)
+      expect(JSON.stringify(initial?.health)).not.toContain('questionCounters')
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('question counters remain absent when reading an older heartbeat', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-question-legacy-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    try {
+      await writeFile(heartbeatPath, JSON.stringify({ status: 'running', updatedAtMs: 0 }))
+      const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(heartbeat).toBeDefined()
+      expect(Object.hasOwn(heartbeat!, 'questionCounters')).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['Detected', 'reporter', 'ar-71-impl-pear', '71', 'Bot'],
+    ['IgnoredUntrustedAuthor', 'reporter', 'ar-71-impl-pear', '71', 'User'],
+    ['IgnoredNoInFlight', 'reporter', 'ar-71-impl-pear', '72', 'Bot'],
+    ['IgnoredUnknownAgent', 'reporter', 'unknown-agent', '71', 'Bot'],
+    ['IgnoredMissingAuthorizedAuthor', '', 'ar-71-impl-pear', '71', 'Bot'],
+  ])('question counters record receipt before %s and survive the producer/reader path', async (outcome, reporter, agent, issueKey, authorType) => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-question-counts-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const path = githubIssuePath('AgentWorkforce', 'pear', 71)
+    const issue = githubIssueFile(71, { labels: ['factory'], author: reporter })
+    const mount = new FakeMountClient({ [path]: issue })
+    const factory = createFactory(config({
+      issueSource: 'github',
+      loop: { heartbeatPath, registryPath: join(root, 'registry.json'), heartbeatStaleMs: 1_000 },
+    }), {
+      mount, fleet: new FakeFleetClient(), stateStore: new InMemoryStateStore({ batchSize: 2 }),
+      triage: new StaticTriage(), githubWriteback: new RecordingGithubWriteback(), logger: {},
+    })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await vi.waitFor(() => expect(factory.status().inFlight).toHaveLength(1))
+      mount.files.set(path, { content: githubIssueFile(71, { labels: ['factory', 'factory:in-progress'], author: reporter }) })
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 71, 9101, {
+        body: `### Factory human input request\nAgent: ${agent}\nIssue: ${issueKey}\nQuestion: Which helper?`,
+        author: { login: 'question-author', type: authorType },
+      })
+      const counter = `githubAgentQuestions${outcome}`
+      await vi.waitFor(() => expect(factory.status().counters[counter]).toBe(1))
+      expect(factory.status().counters.githubAgentQuestionsReceived).toBe(1)
+      await vi.waitFor(async () => {
+        const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+        expect(heartbeat?.questionCounters).toEqual({
+          githubAgentQuestionsReceived: 1,
+          githubAgentQuestionsDetected: outcome === 'Detected' ? 1 : 0,
+          githubAgentQuestionsIgnoredUntrustedAuthor: outcome === 'IgnoredUntrustedAuthor' ? 1 : 0,
+          githubAgentQuestionsIgnoredNoInFlight: outcome === 'IgnoredNoInFlight' ? 1 : 0,
+          githubAgentQuestionsIgnoredUnknownAgent: outcome === 'IgnoredUnknownAgent' ? 1 : 0,
+          githubAgentQuestionsIgnoredMissingAuthorizedAuthor: outcome === 'IgnoredMissingAuthorizedAuthor' ? 1 : 0,
+        })
+        expect(heartbeat?.startedAt).toEqual(expect.any(String))
+        expect(JSON.stringify(heartbeat?.health)).not.toContain('questionCounters')
+      }, { timeout: 2_000 })
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('start live writes and refreshes a running loop heartbeat, then marks stopping on stop', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-live-heartbeat-'))
     const heartbeatPath = join(root, 'heartbeat.json')
