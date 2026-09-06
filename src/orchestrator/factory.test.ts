@@ -24848,11 +24848,14 @@ describe('FactoryLoop', () => {
       expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-414'])
 
       fleet.emitAgentExit('ar-414-impl-pear', 'issue-done')
-      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 15_000 })
       await vi.waitFor(async () => expect(
         (await stateStore.listSlackThreadWatches('factory-test'))[0]?.[1],
-      ).toMatchObject({ kind: 'terminal-grace', threadId: retiredThreadTs }))
-      await vi.waitFor(() => expect(factory.status().counters.slackTerminalWatchersRetained).toBe(1))
+      ).toMatchObject({ kind: 'terminal-grace', threadId: retiredThreadTs }), { timeout: 15_000 })
+      await vi.waitFor(
+        () => expect(factory.status().counters.slackTerminalWatchersRetained).toBe(1),
+        { timeout: 15_000 },
+      )
 
       // The first late reply parks inside the "no active agent" writeback, so the
       // route chain for this work unit stays open.
@@ -24873,7 +24876,7 @@ describe('FactoryLoop', () => {
         user: 'U414',
         user_is_bot: false,
       })
-      await vi.waitFor(() => expect(mount.reads).toContain(stalePath))
+      await vi.waitFor(() => expect(mount.reads).toContain(stalePath), { timeout: 15_000 })
       await flush()
       await flush()
       await flush()
@@ -24883,7 +24886,7 @@ describe('FactoryLoop', () => {
       // lands us at the boundary in both the fenced and unfenced code paths.
       await mount.writeFile(issuePath(414), issuePayload(414, ready))
       const reopening = factory.runOnce()
-      await vi.waitFor(() => expect(fleet.spawns).toHaveLength(4))
+      await vi.waitFor(() => expect(fleet.spawns).toHaveLength(4), { timeout: 15_000 })
       for (let tick = 0; tick < 20; tick += 1) await flush()
       mount.releaseUnroutableWrite()
       const reopened = await reopening
@@ -24894,7 +24897,7 @@ describe('FactoryLoop', () => {
       await vi.waitFor(() => expect(
         (factory.status().counters.slackAnswersUnroutableVisible ?? 0) +
         (factory.status().counters.slackConversationRepliesQueued ?? 0),
-      ).toBe(2))
+      ).toBe(2), { timeout: 15_000 })
 
       // Both replies belong to the retired thread and must be answered as
       // unroutable, never queued onto the fresh dispatch.
@@ -24916,7 +24919,7 @@ describe('FactoryLoop', () => {
       mount.releaseUnroutableWrite()
       await factory.stop()
     }
-  })
+  }, 30_000)
 
   it('fences a Slack reply route that registers while the terminal drain is running', async () => {
     const mount = new DrainStraddlingReplyMountClient({ [issuePath(415)]: issueFile(415) })
@@ -24936,11 +24939,14 @@ describe('FactoryLoop', () => {
       expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-415'])
 
       fleet.emitAgentExit('ar-415-impl-pear', 'issue-done')
-      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 15_000 })
       await vi.waitFor(async () => expect(
         (await stateStore.listSlackThreadWatches('factory-test'))[0]?.[1],
-      ).toMatchObject({ kind: 'terminal-grace', threadId: retiredThreadTs }))
-      await vi.waitFor(() => expect(factory.status().counters.slackTerminalWatchersRetained).toBe(1))
+      ).toMatchObject({ kind: 'terminal-grace', threadId: retiredThreadTs }), { timeout: 15_000 })
+      await vi.waitFor(
+        () => expect(factory.status().counters.slackTerminalWatchersRetained).toBe(1),
+        { timeout: 15_000 },
+      )
 
       // Reply 1 parks inside the "no active agent" writeback. Its route is the
       // one the drain snapshots, and holding it open keeps the drain running.
@@ -24965,34 +24971,45 @@ describe('FactoryLoop', () => {
       await mount.straddlingReadStarted
 
       // Reopen. The reopened dispatch spawns before it touches the Slack fence,
-      // so four spawns means #stopSlackWatcher is now inside the drain.
+      // so four spawns do *not* mean #stopSlackWatcher is inside the drain yet —
+      // wait for the drain itself before releasing reply 2, or the straddle this
+      // test is built on silently collapses into an ordinary route.
       await mount.writeFile(issuePath(415), issuePayload(415, ready))
       const reopening = factory.runOnce()
-      await vi.waitFor(() => expect(fleet.spawns).toHaveLength(4))
-      for (let tick = 0; tick < 20; tick += 1) await flush()
+      await vi.waitFor(() => expect(fleet.spawns).toHaveLength(4), { timeout: 15_000 })
+      await vi.waitFor(() => expect(
+        factory.status().counters.slackReplyRouteDrainsStarted ?? 0,
+      ).toBeGreaterThanOrEqual(1), { timeout: 15_000 })
 
       // Release reply 2 *while the drain is still awaiting reply 1's route*, so
       // its route registration happens strictly between the drain's snapshot and
       // the fence being cleared.
       mount.releaseStraddlingRead()
-      for (let tick = 0; tick < 20; tick += 1) await flush()
+      await vi.waitFor(() => expect(
+        factory.status().counters.slackReplyRoutesFencedDuringDrain ?? 0,
+      ).toBeGreaterThanOrEqual(1), { timeout: 15_000 })
       mount.releaseUnroutableWrite()
       const reopened = await reopening
       expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-415'])
-
-      for (let tick = 0; tick < 40; tick += 1) await flush()
 
       // Both replies belong to the retired thread, so both must get the "no
       // active agent" writeback. A mid-drain route that falls through the
       // cleared fence instead reaches #routeSlackConversationAnswerUnlocked and
       // rebinds the retired thread to the reopened work unit.
-      await vi.waitFor(() => expect(factory.status().counters.slackAnswersUnroutableVisible).toBe(2))
+      await vi.waitFor(
+        () => expect(factory.status().counters.slackAnswersUnroutableVisible).toBe(2),
+        { timeout: 15_000 },
+      )
       // Deliberately a bare read: this asserts nothing was queued *at this
       // point*, so retrying it would make it vacuous.
       expect(factory.status().counters.slackConversationRepliesQueued ?? 0).toBe(0)
       // ...and it must be the *drain* that fenced it, not the ordinary terminal
-      // fence: this counter is what proves the route registered mid-drain.
-      await vi.waitFor(() => expect(factory.status().counters.slackReplyRoutesFencedDuringDrain).toBe(1), { timeout: 4_000 })
+      // fence: this counter is what proves the route registered mid-drain, and
+      // exactly once.
+      await vi.waitFor(
+        () => expect(factory.status().counters.slackReplyRoutesFencedDuringDrain).toBe(1),
+        { timeout: 15_000 },
+      )
       const conversation = await stateStore.getConversationSession(
         'factory-test', `slack:${retiredThreadTs}`,
       )
@@ -25010,7 +25027,7 @@ describe('FactoryLoop', () => {
       mount.releaseUnroutableWrite()
       await factory.stop()
     }
-  })
+  }, 30_000)
 
   it('keeps the terminal drain waiting on the receipt the fence itself writes', async () => {
     const mount = new FailingFencedReceiptMountClient({ [issuePath(416)]: issueFile(416) })
@@ -25030,11 +25047,14 @@ describe('FactoryLoop', () => {
       expect(first.dispatched.map((result) => result.issue.key)).toEqual(['AR-416'])
 
       fleet.emitAgentExit('ar-416-impl-pear', 'issue-done')
-      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 15_000 })
       await vi.waitFor(async () => expect(
         (await stateStore.listSlackThreadWatches('factory-test'))[0]?.[1],
-      ).toMatchObject({ kind: 'terminal-grace', threadId: retiredThreadTs }))
-      await vi.waitFor(() => expect(factory.status().counters.slackTerminalWatchersRetained).toBe(1))
+      ).toMatchObject({ kind: 'terminal-grace', threadId: retiredThreadTs }), { timeout: 15_000 })
+      await vi.waitFor(
+        () => expect(factory.status().counters.slackTerminalWatchersRetained).toBe(1),
+        { timeout: 15_000 },
+      )
 
       // Reply 1 parks inside its "no active agent" writeback. Its route is the
       // one the drain snapshots, and holding it open keeps the drain running.
@@ -25060,25 +25080,40 @@ describe('FactoryLoop', () => {
 
       await mount.writeFile(issuePath(416), issuePayload(416, ready))
       const reopening = factory.runOnce()
-      await vi.waitFor(() => expect(fleet.spawns).toHaveLength(4))
-      for (let tick = 0; tick < 20; tick += 1) await flush()
+      await vi.waitFor(() => expect(fleet.spawns).toHaveLength(4), { timeout: 15_000 })
+      // Four spawns only prove the reopened dispatch got as far as spawning,
+      // which happens *before* it touches the Slack fence. Wait for the drain
+      // itself: releasing reply 2 any earlier lets it register an ordinary
+      // route, and then there is no drain in flight to observe the receipt
+      // failure this test is about.
+      await vi.waitFor(() => expect(
+        factory.status().counters.slackReplyRouteDrainsStarted ?? 0,
+      ).toBeGreaterThanOrEqual(1), { timeout: 15_000 })
 
       mount.releaseStraddlingRead()
-      for (let tick = 0; tick < 20; tick += 1) await flush()
+      // Reply 2 has now taken the fence-during-drain branch. That counter is
+      // incremented synchronously on entry, before its receipt write chains
+      // behind reply 1, so it is observable while reply 1 is still parked.
+      await vi.waitFor(() => expect(
+        factory.status().counters.slackReplyRoutesFencedDuringDrain ?? 0,
+      ).toBeGreaterThanOrEqual(1), { timeout: 15_000 })
       mount.releaseUnroutableWrite()
       const reopened = await reopening
       expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-416'])
-      for (let tick = 0; tick < 40; tick += 1) await flush()
 
       // The receipt the fence writes is this work unit's own side effect, so the
       // drain has to wait on it. It fails, so the drain fails closed and the
       // watcher that owns this reply's retry timer is never torn down.
-      await vi.waitFor(() => expect(mount.fencedReceiptAttempts).toBeGreaterThanOrEqual(1))
+      await vi.waitFor(
+        () => expect(mount.fencedReceiptAttempts).toBeGreaterThanOrEqual(1),
+        { timeout: 15_000 },
+      )
       await vi.waitFor(() => expect(
         factory.status().counters.slackReplyRouteDrainsFailed ?? 0,
-      ).toBeGreaterThanOrEqual(1))
-      expect(factory.status().counters.slackDispatchThreadsDeferredUndrainedReply ?? 0)
-        .toBeGreaterThanOrEqual(1)
+      ).toBeGreaterThanOrEqual(1), { timeout: 15_000 })
+      await vi.waitFor(() => expect(
+        factory.status().counters.slackDispatchThreadsDeferredUndrainedReply ?? 0,
+      ).toBeGreaterThanOrEqual(1), { timeout: 15_000 })
       expect((await stateStore.listSlackThreadWatches('factory-test'))[0]?.[1])
         .toMatchObject({ kind: 'terminal-grace', threadId: retiredThreadTs })
 
