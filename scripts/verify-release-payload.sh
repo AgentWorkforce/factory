@@ -15,9 +15,20 @@ tar -xzf "$TMP_DIR/registry"/*.tgz -C "$TMP_DIR/registry-x"
 node "$(dirname "$0")/compare-package-trees.mjs" \
   "$TMP_DIR/local-x/package" "$TMP_DIR/registry-x/package"
 
-PROVENANCE=$(npm view "$PACKAGE_NAME@$VERSION" \
-  dist.attestations.provenance.predicateType 2>/dev/null || true)
+# npm publishes the tarball before its attestation metadata becomes queryable,
+# so a lookup run seconds after publish reads <missing> for a release whose
+# provenance is in fact signed and in the transparency log. That is exactly how
+# 0.1.88 failed this step while `latest`, `next`, the git tag and the signed
+# provenance were all correct. The caller already retries the *version* lookup
+# for the same reason; this field needs the same treatment.
+PROVENANCE=""
+for attempt in 1 2 3 4 5; do
+  PROVENANCE=$(npm view "$PACKAGE_NAME@$VERSION" \
+    dist.attestations.provenance.predicateType 2>/dev/null || true)
+  [ "$PROVENANCE" = "https://slsa.dev/provenance/v1" ] && break
+  sleep $((attempt * 2))
+done
 if [ "$PROVENANCE" != "https://slsa.dev/provenance/v1" ]; then
-  echo "Expected SLSA provenance for $PACKAGE_NAME@$VERSION, got: ${PROVENANCE:-<missing>}" >&2
+  echo "Expected SLSA provenance for $PACKAGE_NAME@$VERSION, got: ${PROVENANCE:-<missing>} (after 5 attempts over ~30s)" >&2
   exit 1
 fi
