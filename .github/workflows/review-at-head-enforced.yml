@@ -23,6 +23,19 @@ name: Review at head (enforced)
 # required check would keep a stale green after the trusted predicate had
 # become false.
 #
+# KNOWN STALENESS, AND A PREREQUISITE FOR REQUIRING THIS CHECK. The job reads
+# the base branch, which is mutable, but no PR event fires when the base branch
+# simply advances — `synchronize` covers head updates only, and `edited` covers
+# retargeting. So a green recorded here can outlive the rule that produced it:
+# if `main` lands a stricter predicate, open PRs keep the verdict computed
+# under the older one until something else re-triggers them.
+#
+# That is tolerable while this check is advisory and is NOT tolerable once it
+# is required. Closing it needs a fan-out on `push` to the default branch that
+# re-dispatches this check for every open PR, which is real machinery and is
+# deliberately not bolted on here. Treat it as a blocker on the "make it
+# required" step, alongside the configuration repairs below.
+#
 # ROLLOUT: keep non-required and measure for a week first. On the audited data
 # the correct predicate blocks the large majority of recent merges, so
 # requiring it before the cubic seat, CodeRabbit public-repo and Devin trial
@@ -36,6 +49,9 @@ on:
       - reopened
       - ready_for_review
       - synchronize
+      # `edited` fires when the PR is retargeted at a different base, which
+      # changes which predicate applies. See the staleness note in the header.
+      - edited
   pull_request_review:
     types:
       - submitted
