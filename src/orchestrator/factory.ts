@@ -322,6 +322,16 @@ type GithubIssueComment = {
   body: string
   author?: string
   isBot: boolean
+  /**
+   * GitHub's `author_association` for the comment, upper-cased, when the
+   * projection carries it (`OWNER` / `MEMBER` / `COLLABORATOR` / `CONTRIBUTOR`
+   * / `NONE`). Absent when the provider record omits it.
+   *
+   * This is the provider's own statement about whether the commenter has write
+   * access to the repository, so it is the honest spelling of "not an arbitrary
+   * repository commenter" that the agent-question trust gate wants.
+   */
+  authorAssociation?: string
   raw: Record<string, unknown>
 }
 type GithubIssueSourceRef = {
@@ -456,10 +466,44 @@ const BABYSITTER_WAKE_UNREACHABLE_RETRY_MS = 60_000
 const CLARIFICATION_WAKE_LEASE_MS = 60_000
 const CLARIFICATION_WAKE_RETRY_MS = 1_000
 const CLARIFICATION_PARK_RETRY_MS = 5_000
+/**
+ * How long a clarification park waits for the broker's graceful release before
+ * it forces teardown and moves on.
+ *
+ * The fleet client bounds a release with the same 5-minute ack budget it gives
+ * a placement, which is correct for a dispatch but wrong here: the agent this
+ * park is releasing has just told us it is blocked on a human, so its harness
+ * may never reach a clean shutdown and the release invocation may never settle.
+ * Spending the full budget on it holds the batch slot open for five minutes per
+ * agent and hands the window to the orphan reaper, which is not the path that
+ * should end a deliberately parked team.
+ *
+ * This does NOT weaken the reaper or the placement timeout — both keep their
+ * own budgets for genuinely wedged agents. It only stops a *deliberate* park
+ * from waiting on a shutdown handshake it already knows will not come.
+ */
+const CLARIFICATION_RELEASE_GRACE_MS = 15_000
+/** The release reason that marks a deliberate park, as opposed to a shutdown or a failed wake. */
+const CLARIFICATION_PARK_RELEASE_REASON = 'waiting-for-human'
 const CLARIFICATION_QUESTION_DELIVERY_LEASE_MS = 2 * 60_000
 const CLARIFICATION_QUESTION_DELIVERY_RETRY_MS = 5_000
 const CLARIFICATION_ESCALATION_LEASE_MS = 2 * 60_000
 const CLARIFICATION_ESCALATION_RETRY_MS = 5_000
+/**
+ * Policy for a question nobody answers: **park indefinitely, escalate once.**
+ *
+ * A parked issue is never re-offered to dispatch — `listWaitingClarifications`
+ * feeds the orphan-recovery safety context's `activeIssueIdentities`, so a
+ * waiting clarification blocks re-dispatch for as long as it exists. It is not
+ * garbage-collected on a timer, because dropping it would put the issue back in
+ * the queue and produce exactly the ask-again loop parking exists to stop.
+ *
+ * After this long without a reply the sweep escalates once (stakeholder ping on
+ * the issue's Slack thread) and then goes quiet again. Known gap: escalation
+ * requires `waiting.threadId`, so a GitHub-only park is silent — it stays
+ * parked, but nobody is nudged. Tracked separately; it is a notification gap,
+ * not a re-dispatch one.
+ */
 const CLARIFICATION_STALE_WARN_MS = 7 * 24 * 60 * 60_000
 const STOP_TEARDOWN_TIMEOUT_MS = 2_500
 // A rejected post-spawn dispatch normally gets a final opportunity to undo an
@@ -914,6 +958,15 @@ export class FactoryLoop implements Factory {
   readonly #kill: (pid: number, signal?: NodeJS.Signals | 0) => boolean
   readonly #readChildPids: ((pid: number) => Promise<number[]>) | undefined
   readonly #terminationGraceMs: number | undefined
+  readonly #agentQuestionAuthors: ReadonlySet<string>
+  readonly #agentQuestionRequireAllowlist: boolean
+  readonly #clarificationReleaseGraceMs: number
+  /**
+   * Clarification releases this process gave up waiting on, by agent name.
+   * Each entry is a promise that never rejects; it settles when the abandoned
+   * `fleet.release` finally lands.
+   */
+  readonly #abandonedClarificationReleases = new Map<string, Promise<unknown>>()
   readonly #babysitterWakeUnreachableEscalateMs: number
   readonly #babysitterWakeUnreachableRetryMs: number
   readonly #startupAgentExitDrainTimeoutMs: number
@@ -1419,6 +1472,11 @@ export class FactoryLoop implements Factory {
     this.#kill = ports.kill ?? process.kill
     this.#readChildPids = ports.readChildPids
     this.#terminationGraceMs = ports.terminationGraceMs
+    this.#agentQuestionAuthors = new Set(
+      (config.safety.agentQuestionAuthors ?? []).map((login) => login.trim().toLowerCase()).filter(Boolean),
+    )
+    this.#agentQuestionRequireAllowlist = config.safety.agentQuestionRequireAllowlist === true
+    this.#clarificationReleaseGraceMs = ports.clarificationReleaseGraceMs ?? CLARIFICATION_RELEASE_GRACE_MS
     this.#babysitterWakeUnreachableEscalateMs = ports.babysitterWakeUnreachableEscalateMs ?? BABYSITTER_WAKE_UNREACHABLE_ESCALATE_MS
     this.#babysitterWakeUnreachableRetryMs = ports.babysitterWakeUnreachableRetryMs ?? BABYSITTER_WAKE_UNREACHABLE_RETRY_MS
     this.#startupAgentExitDrainTimeoutMs = ports.startupAgentExitDrainTimeoutMs ?? STARTUP_AGENT_EXIT_DRAIN_TIMEOUT_MS
@@ -10994,7 +11052,16 @@ export class FactoryLoop implements Factory {
       }
 
       try {
-        await this.#fleet.release(agentName, reason)
+        // A deliberate park is already past its graceful boundary here, so it
+        // must not spend the fleet client's placement-sized ack budget a second
+        // time. Keyed on the reason, not the context: the `clarification`
+        // context is also used by the shutdown (`factory-stopped`) and
+        // wake-recovery (`clarification-wake-failed`) paths, and truncating a
+        // shutdown's state flush at 15s is not what this fix is for. Every
+        // other release keeps the unbounded call it had.
+        await (reason === CLARIFICATION_PARK_RELEASE_REASON
+          ? this.#releaseWithinClarificationGrace(agentName, reason)
+          : this.#fleet.release(agentName, reason))
         // Invalidate the spawn memory the moment the release is confirmed, so a
         // retry for the same deterministic invocation spawns a real worker
         // instead of inheriting this one's claim. Shutdown is excluded on
@@ -14115,6 +14182,117 @@ export class FactoryLoop implements Factory {
     if (next) await this.dispatch(next.decision, { dryRun: next.dryRun })
   }
 
+  /**
+   * `fleet.release` bounded by the clarification grace.
+   *
+   * On expiry the in-flight release is abandoned, not cancelled: the fleet
+   * client keeps its own ack budget on it and its late outcome is swallowed
+   * here so it cannot surface as an unhandled rejection. The caller falls
+   * through to forced teardown, which is the explicit park path — the orphan
+   * reaper stays untouched and keeps its own, longer budget for agents nobody
+   * deliberately parked.
+   */
+  async #releaseWithinClarificationGrace(
+    name: string,
+    reason: string = CLARIFICATION_PARK_RELEASE_REASON,
+  ): Promise<void> {
+    const graceMs = this.#clarificationReleaseGraceMs
+    const released = this.#fleet.release(name, reason)
+    if (!Number.isFinite(graceMs) || graceMs <= 0) return await released
+    const observed = released.then(
+      () => 'released' as const,
+      (error: unknown) => ({ error }),
+    )
+    let expire: ReturnType<typeof setTimeout> | undefined
+    const graceExpired = new Promise<'grace-expired'>((resolve) => {
+      expire = setTimeout(() => resolve('grace-expired'), graceMs)
+      expire.unref?.()
+    })
+    try {
+      const outcome = await Promise.race([observed, graceExpired])
+      if (outcome === 'grace-expired') {
+        this.#increment('clarificationReleaseGraceExpired')
+        // Remember the call we walked away from. Agent names are deterministic
+        // per work unit, so a wake that respawns this name while the abandoned
+        // release is still in flight could have that release tear the *new*
+        // worker down. `#awaitAbandonedClarificationRelease` fences the respawn
+        // on this promise.
+        // Chain rather than overwrite. The forced teardown starts a second
+        // release for the same name, and if that one also expires it must not
+        // replace a fence the first release still owns — clearing on the newer
+        // promise alone would free the name while the older release is still
+        // able to tear down whatever holds it next.
+        const previous = this.#abandonedClarificationReleases.get(name)
+        const outstanding: Promise<unknown> = previous
+          ? Promise.all([previous, observed])
+          : observed
+        this.#abandonedClarificationReleases.set(name, outstanding)
+        void outstanding.then(() => {
+          if (this.#abandonedClarificationReleases.get(name) === outstanding) {
+            this.#abandonedClarificationReleases.delete(name)
+          }
+        })
+        throw new Error(
+          `graceful release for ${name} did not settle within the ${graceMs}ms clarification grace`,
+        )
+      }
+      if (outcome !== 'released') throw outcome.error
+    } finally {
+      if (expire) clearTimeout(expire)
+    }
+  }
+
+  /**
+   * Refuse to reuse an agent name while a release we abandoned is still in
+   * flight for it.
+   *
+   * Relay releases by name and Factory's names are deterministic per work unit,
+   * so a late release landing after a wake respawn would tear down the new
+   * worker. This fails closed: if the abandoned call still has not settled
+   * after another grace, the wake aborts and its durable record schedules a
+   * retry, which is strictly better than respawning into a pending teardown.
+   *
+   * Scope: this is a same-process backstop, not the primary invariant. The
+   * primary invariant is in `#releaseAgentsForClarification` — the park does
+   * not advance, and `markClarificationParked` never opens the wake gate,
+   * until the fleet roster reports every team member absent. A restart drops
+   * this map, so a replacement process leans on the roster gate alone; closing
+   * that last window means persisting the outstanding release invocation in
+   * the durable clarification record, which is deliberately left for its own
+   * change rather than bundled into an outage fix.
+   */
+  async #awaitAbandonedClarificationRelease(name: string): Promise<void> {
+    const outstanding = this.#abandonedClarificationReleases.get(name)
+    if (!outstanding) return
+    const graceMs = this.#clarificationReleaseGraceMs
+    if (Number.isFinite(graceMs) && graceMs > 0) {
+      let expire: ReturnType<typeof setTimeout> | undefined
+      const graceExpired = new Promise<'grace-expired'>((resolve) => {
+        expire = setTimeout(() => resolve('grace-expired'), graceMs)
+        expire.unref?.()
+      })
+      try {
+        if (await Promise.race([outstanding.then(() => 'settled' as const), graceExpired]) === 'grace-expired') {
+          this.#increment('clarificationRespawnsDeferredByAbandonedRelease')
+          throw new Error(
+            `abandoned release for ${name} is still in flight; refusing to respawn the same name`,
+          )
+        }
+      } finally {
+        if (expire) clearTimeout(expire)
+      }
+    } else {
+      await outstanding
+    }
+    // Identity-checked, like the chained cleanup: a newer fence may have been
+    // registered for this same deterministic name while this call awaited, and
+    // clearing it unconditionally would free the name to a release that is
+    // still armed — the race the chaining exists to close.
+    if (this.#abandonedClarificationReleases.get(name) === outstanding) {
+      this.#abandonedClarificationReleases.delete(name)
+    }
+  }
+
   async #releaseAgentsForClarification(key: string, agents: Array<[string, TrackedAgent]>): Promise<void> {
     let waiting = await this.#state.getWaitingClarification(this.#workspaceId, key)
     if (!waiting) return
@@ -14124,13 +14302,26 @@ export class FactoryLoop implements Factory {
       try {
         // Prefer broker release over process termination so the harness gets a
         // graceful shutdown boundary and can flush its latest resumable state.
-        await this.#fleet.release(name, 'waiting-for-human')
+        // Bounded: an agent blocked on a human may never reach a clean
+        // shutdown, and waiting out the fleet client's placement-sized ack
+        // budget would hold this slot for five minutes per agent.
+        await this.#releaseWithinClarificationGrace(name)
       } catch (error) {
+        // On a remote placement there is no local pid to kill, so "forced"
+        // teardown is really one more bounded release attempt. That is
+        // deliberate and sufficient: if the agent is still on the roster after
+        // it, the check below throws, the durable record stays release-pending,
+        // and the sweep retries. The issue is never declared parked while its
+        // team is still online.
         this.#logger.warn?.('[factory] graceful clarification release failed; forcing local teardown', {
           agentName: name,
           error,
         })
-        await this.#releaseAndTerminateAgents([[name, tracked]], 'waiting-for-human', 'clarification')
+        await this.#releaseAndTerminateAgents(
+          [[name, tracked]],
+          CLARIFICATION_PARK_RELEASE_REASON,
+          'clarification',
+        )
       }
       const onlineAfter = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
       if (onlineAfter.has(name)) {
@@ -14704,6 +14895,42 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  /**
+   * Why this comment may park a live team, or `undefined` when it may not.
+   *
+   * Trust is anchored on the repository, never on the request body: every
+   * structured field in a human-input request is public and forgeable, so the
+   * question is only honoured from a commenter GitHub reports as affiliated
+   * with the repository (`OWNER` / `MEMBER` / `COLLABORATOR`), from a provider
+   * bot record, or from an explicitly configured login.
+   *
+   * Known limit: `MEMBER` and `COLLABORATOR` assert affiliation, not write
+   * permission, so an affiliated read-only account can still forge a request.
+   * What that buys an attacker is a parked team a human comment un-parks — a
+   * denial of service, not privilege escalation — against a gate that
+   * previously rejected every genuine request. A deployment that will not take
+   * that trade sets `safety.agentQuestionRequireAllowlist`, which drops
+   * association trust and leaves bots plus `safety.agentQuestionAuthors`.
+   */
+  #agentQuestionAuthorTrust(
+    comment: GithubIssueComment,
+  ): 'githubAgentQuestionsTrustedByBot'
+    | 'githubAgentQuestionsTrustedByAssociation'
+    | 'githubAgentQuestionsTrustedByAllowlist'
+    | undefined {
+    if (comment.isBot) return 'githubAgentQuestionsTrustedByBot'
+    if (
+      !this.#agentQuestionRequireAllowlist
+      && comment.authorAssociation
+      && GITHUB_AFFILIATED_AUTHOR_ASSOCIATIONS.has(comment.authorAssociation)
+    ) return 'githubAgentQuestionsTrustedByAssociation'
+    const author = comment.author?.trim().toLowerCase()
+    if (author && this.#agentQuestionAuthors.has(author)) {
+      return 'githubAgentQuestionsTrustedByAllowlist'
+    }
+    return undefined
+  }
+
   async #handleGithubAgentQuestionComment(
     watch: GithubIssueCommentWatchState,
     comment: GithubIssueComment,
@@ -14719,18 +14946,32 @@ export class FactoryLoop implements Factory {
       this.#increment('githubAgentQuestionsIgnoredUnknownAgent')
       return
     }
-    // Agents write through the connected GitHub App, whose comments are
-    // provider-authored bot records. Never let an arbitrary repository
-    // commenter forge the predictable structured fields and park a live team.
-    if (!comment.isBot) {
+    // Never let an arbitrary repository commenter forge the predictable
+    // structured fields and park a live team.
+    //
+    // This gate used to demand `comment.isBot`, on the assumption that agents
+    // always write through a connected GitHub App. Deployments that connect
+    // GitHub with a user-scoped credential post every agent comment as a plain
+    // `User`, so the gate rejected 100% of real requests: the team was never
+    // parked, the placement ran to its release-ack timeout, the reaper
+    // collected the agent, and the issue was re-dispatched to ask the same
+    // question again (software-garden#417 accumulated 13 identical requests).
+    //
+    // Write access, not bot-ness, is the property the gate actually wanted.
+    // `author_association` is the provider's own statement of it, and the
+    // configured allowlist covers projections that do not carry the field.
+    const authorTrust = this.#agentQuestionAuthorTrust(comment)
+    if (!authorTrust) {
       this.#increment('githubAgentQuestionsIgnoredUntrustedAuthor')
       this.#logger.info?.('[factory] ignored GitHub agent question from an untrusted commenter', {
         issue: watch.issue,
         commentId: comment.commentId,
         author: comment.author,
+        authorAssociation: comment.authorAssociation,
       })
       return
     }
+    this.#increment(authorTrust)
 
     const question: AgentQuestion = {
       agentName: request.agentName,
@@ -20256,6 +20497,7 @@ export class FactoryLoop implements Factory {
     tracked: TrackedAgent,
     waiting: WaitingClarification,
   ): Promise<SpawnResult> {
+    await this.#awaitAbandonedClarificationRelease(name)
     const task = clarificationResumeTask(tracked.spec.task, waiting)
     await this.#prepareAgentWorktree(waitingRecord(waiting), tracked.spec)
     if (tracked.sessionRef) {
@@ -22063,6 +22305,11 @@ const parseGithubIssueComment = (path: string, content: unknown): GithubIssueCom
   const author = asRecord(comment.author) ?? asRecord(comment.user)
   const authorLogin = stringValue(author?.login)
   const authorType = stringValue(author?.type)?.toLowerCase()
+  // Providers spell this either way depending on whether the projection
+  // preserved GitHub's snake_case payload or normalized it.
+  const authorAssociation = stringValue(comment.author_association)
+    ?? stringValue(comment.authorAssociation)
+    ?? stringValue(author?.association)
   return {
     owner: parts.owner,
     repo: parts.repo,
@@ -22071,9 +22318,20 @@ const parseGithubIssueComment = (path: string, content: unknown): GithubIssueCom
     body: stringValue(comment.body) ?? '',
     author: authorLogin,
     isBot: authorType === 'bot' || Boolean(authorLogin?.toLowerCase().endsWith('[bot]')),
+    ...(authorAssociation ? { authorAssociation: authorAssociation.trim().toUpperCase() } : {}),
     raw,
   }
 }
+
+/**
+ * `author_association` values GitHub uses for a commenter affiliated with the
+ * repository or its organization. A `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`,
+ * `MANNEQUIN` or `NONE` is an arbitrary commenter and may not park a live team.
+ *
+ * Affiliation is weaker than write permission — see `#agentQuestionAuthorTrust`
+ * for why that trade is the default and how to opt out of it.
+ */
+const GITHUB_AFFILIATED_AUTHOR_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR'])
 
 const githubIssueSourceKey = (source: GithubIssueSourceRef): string =>
   `${source.owner.toLowerCase()}/${source.repo.toLowerCase()}#${source.number}`
