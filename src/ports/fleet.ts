@@ -100,7 +100,9 @@ export interface SpawnResult {
    * node name is not one, because a sandbox is not labelled with the name the
    * enrollment generates for it. Publishing the agent's commits needs this
    * (see `ports/sandbox-push`), so a placement that omits it can be dispatched
-   * but not published from.
+   * but not published from — and under `placementSandboxOnly` it is not
+   * dispatched either, because its absence is the only signal available that
+   * the hook named a node it found rather than a sandbox it stood up.
    */
   sandboxId?: string
 }
