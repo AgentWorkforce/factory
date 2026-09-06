@@ -10680,6 +10680,15 @@ export class FactoryLoop implements Factory {
       // Optional on the port: a backend with no socket omits it, and an absent
       // value stays absent rather than being invented as healthy.
       ...(this.#fleet.fleetConnectStatus ? { fleetConnect: this.#fleet.fleetConnectStatus() } : {}),
+      // Named explicitly, not `...this.#counters` (that map carries dozens of
+      // other counters nobody has vetted for this surface). Read straight off
+      // `#counters` with no `?? 0`: a key that never incremented is `undefined`
+      // here and JSON.stringify drops it, so it reads as absent on disk rather
+      // than a fabricated 0 (factory-slack-silence-0903, factory-cloud#114).
+      slackWritebacksSkipped: this.#counters.slackWritebacksSkipped,
+      slackDegradedEpisodes: this.#counters.slackDegradedEpisodes,
+      slackGateBypassedByWebhookHealth: this.#counters.slackGateBypassedByWebhookHealth,
+      slackGateBypassedByObservedEvent: this.#counters.slackGateBypassedByObservedEvent,
     }
     // The deployed container serves `/healthz` straight out of this file and
     // has no redaction logic of its own, so publish the already-safe view here

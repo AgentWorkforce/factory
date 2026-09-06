@@ -23563,6 +23563,51 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  it('writes the Slack writeback gate counters into the loop heartbeat once the gate fires, leaving unfired counters absent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-slack-counters-heartbeat-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const registryPath = join(root, 'registry.json')
+    vi.useRealTimers()
+    try {
+      const mount = new SlackSyncStatusMount({
+        [issuePath(960)]: issueFile(960),
+        [issuePath(961)]: issueFile(961),
+      })
+      mount.slackStatus = { provider: 'slack', status: 'lagging' }
+      const factory = createFactory(config({
+        batchSize: 2,
+        slack: slackConfig(),
+        loop: { maxIterations: 1, heartbeatPath, registryPath },
+      }), {
+        mount,
+        fleet: new FakeFleetClient(),
+        triage: new StaticTriage(),
+        logger: {},
+      })
+
+      const reports = await factory.runLoop()
+
+      expect(reports[0]?.dispatched.map((result) => result.issue.key)).toEqual(['AR-960', 'AR-961'])
+
+      const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+      // The degraded-sync skip path fired twice (once per dispatched issue) —
+      // #writeLoopHeartbeat must carry that onto the written record, not just
+      // Factory#status().counters, which passed before this change existed.
+      expect(heartbeat).toMatchObject({
+        slackDegradedEpisodes: 1,
+        slackWritebacksSkipped: 2,
+      })
+      // Never fired in this run. JSON.stringify drops an undefined value, so
+      // an un-incremented counter must be genuinely absent from the written
+      // heartbeat, not a fabricated 0 — the property factory-cloud#114 pins
+      // on the consumer side and this producer must preserve.
+      expect(heartbeat).not.toHaveProperty('slackGateBypassedByWebhookHealth')
+      expect(heartbeat).not.toHaveProperty('slackGateBypassedByObservedEvent')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('keeps hard Slack sync failures blocking even when the Slack event watermark is fresh', async () => {
     for (const status of ['error', 'failed']) {
       const clock = new ManualClock()
