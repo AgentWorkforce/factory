@@ -96,7 +96,6 @@ export const MountGithubRead = (mount: MountClient) => ({
 
 export interface GhCliGithubWritebackConfig {
   runner?: GhRunner
-  gitRunner?: GhRunner
 }
 
 interface GithubLabelEvent {
@@ -345,105 +344,36 @@ export class AppGithubWriteback implements GithubWriteback {
 }
 
 /**
- * Compatibility GitHub issue lifecycle writeback using authenticated `gh`
+ * Compatibility GitHub ISSUE LIFECYCLE writeback using authenticated `gh`
  * primitives. Labels are created idempotently before use so a newly-onboarded
  * repository does not need Software Garden status labels provisioned by hand.
+ *
+ * WHAT THIS CLASS DELIBERATELY CANNOT DO
+ *
+ * It has no `publishPullRequest`. It used to: the method ran
+ * `git push origin HEAD:refs/heads/<branch>` and then `gh pr create`, both
+ * authenticated as whatever GitHub account happened to be logged in on the
+ * host. That made it the one path in the product that could publish an agent's
+ * work under a human being's name, and factory's `auto` identity selected it
+ * silently whenever no connected App write path was available.
+ *
+ * relay#1654 is what that costs: five `factory/1654-agentworkforce-relay-*`
+ * branches pushed as the operator, zero pull requests, and no signal anywhere
+ * that the App was never involved. Publishing agent work — the branch push AND
+ * the pull request — is App-only now (`RelayfileGithubConnectionWrite`), and
+ * the capability is absent here rather than merely unused so there is nothing
+ * left for a future caller to fall back to.
+ *
+ * Issue lifecycle writes (comments, status labels, closure, author lookups)
+ * stay: they are not publication of agent work, they are already gated by
+ * `github.identity` in `defaultGithubWriteback`, and the connected App surface
+ * exposes no replacement for some of them.
  */
 export class GhCliGithubWriteback implements GithubWriteback {
   readonly #run: GhRunner
-  readonly #git: GhRunner
 
   constructor(config: GhCliGithubWritebackConfig = {}) {
     this.#run = config.runner ?? defaultGhRunner
-    this.#git = config.gitRunner ?? defaultGitRunner
-  }
-
-  /** Publish a PR as the GitHub user authenticated by the local `gh` CLI. */
-  async publishPullRequest(input: GithubPublishPullRequestInput): Promise<GithubPublishPullRequestResult> {
-    const headRef = input.headRef ?? (input.clonePath
-      ? await this.#gitValue(['-C', input.clonePath, 'symbolic-ref', '--short', 'HEAD'], 'current branch')
-      : undefined)
-    if (!headRef) {
-      throw new Error('GitHub user PR publication requires headRef or clonePath')
-    }
-    if (input.expectedHeadRef && headRef !== input.expectedHeadRef) {
-      throw new Error(
-        `Refusing to publish GitHub PR: expected head branch ${input.expectedHeadRef}, found ${headRef}`,
-      )
-    }
-    if (headRef === input.baseRef) {
-      throw new Error(`Refusing to publish GitHub PR with head equal to base branch: ${headRef}`)
-    }
-    const headSha = input.headSha ?? (input.clonePath
-      ? await this.#gitValue(['-C', input.clonePath, 'rev-parse', 'HEAD'], 'HEAD commit')
-      : undefined)
-
-    // A local exit-recovery branch may only exist in Factory's checkout. Push
-    // it without force before asking GitHub to create the PR as the gh user.
-    if (input.clonePath && !input.headRef) {
-      await this.#git([
-        '-C',
-        input.clonePath,
-        'push',
-        'origin',
-        `HEAD:refs/heads/${headRef}`,
-      ])
-    }
-
-    // Best-effort: record a late attestation grant so the session reference
-    // rides through to the attestation ledger. Silently omits when the relay
-    // auth env vars are absent (operator key path, no workspace token).
-    // Prefer the per-agent sessionRef over the process-wide env var so that
-    // concurrent implementers each record their own session.
-    const sessionRef = input.sessionRef ?? (process.env.RELAY_ATTEST_SESSION_ID || undefined)
-    await postAttestationGrant(input.repo, sessionRef).catch(() => undefined)
-
-    const created = await this.#run([
-      'pr',
-      'create',
-      '--repo',
-      input.repo,
-      '--head',
-      headRef,
-      '--base',
-      input.baseRef,
-      '--title',
-      input.title,
-      '--body',
-      input.body,
-    ])
-    const createdUrl = githubPullRequestUrl(`${created.stdout}\n${created.stderr ?? ''}`, input.repo)
-    if (!createdUrl) {
-      throw new Error(`gh PR publication returned no pull request URL for ${input.repo}/${headRef}`)
-    }
-
-    const viewed = await this.#run([
-      'pr',
-      'view',
-      createdUrl,
-      '--repo',
-      input.repo,
-      '--json',
-      'number,url,headRefName,headRefOid,author',
-    ])
-    const receipt = asRecord(JSON.parse(viewed.stdout))
-    const number = numberValue(receipt?.number)
-    const url = stringValue(receipt?.url)
-    const confirmedHeadRef = stringValue(receipt?.headRefName)
-    const confirmedHeadSha = stringValue(receipt?.headRefOid)
-    const author = stringValue(asRecord(receipt?.author)?.login) ?? stringValue(receipt?.author)
-    if (!number || !url || confirmedHeadRef !== headRef || !author) {
-      throw new Error(`gh PR publication returned an incomplete receipt for ${input.repo}/${headRef}`)
-    }
-
-    return {
-      repo: input.repo,
-      number,
-      url,
-      headRef: confirmedHeadRef,
-      ...(confirmedHeadSha ?? headSha ? { headSha: confirmedHeadSha ?? headSha } : {}),
-      author,
-    }
   }
 
   async getIssueAuthor(issue: LinearIssue): Promise<string | undefined> {
@@ -784,15 +714,6 @@ export class GhCliGithubWriteback implements GithubWriteback {
       })
   }
 
-  async #gitValue(args: string[], description: string): Promise<string> {
-    try {
-      const value = (await this.#git(args)).stdout.trim()
-      if (value) return value
-    } catch (error) {
-      throw new Error(`Unable to resolve ${description} for GitHub user PR publication: ${errorMessage(error)}`)
-    }
-    throw new Error(`Unable to resolve ${description} for GitHub user PR publication`)
-  }
 }
 
 const githubStatusFromLabels = (labels: Set<string>): GithubIssueStatus =>
@@ -874,49 +795,6 @@ const githubStatusTransitionEvent = (
   return from === 'human-review'
     ? { event: 'unlabeled', labels: statusLabelNames('human-review') }
     : { event: 'unlabeled', labels: statusLabelNames('in-progress') }
-}
-
-const defaultGitRunner: GhRunner = async (args) => {
-  const { stdout, stderr } = await execFileAsync('git', args, { maxBuffer: 1024 * 1024 })
-  return { stdout, stderr }
-}
-
-/**
- * Post a late attestation grant to the relay auth API so the session reference
- * rides through to the attestation ledger after the commit is pushed. The call
- * is a best-effort fire-and-forget: it requires RELAYAUTH_URL,
- * RELAY_ATTEST_API_KEY, and RELAY_ATTEST_AGENT_ID to be set in the agent
- * environment; when any of those are absent the function resolves immediately.
- * RELAY_ATTEST_SESSION_ID is optional — when set it threads the session
- * reference into the ledger entry so attestation records are linkable to the
- * Claude Code / Codex session that produced the commit.
- */
-async function postAttestationGrant(repo: string, sessionRef?: string): Promise<void> {
-  const baseUrl = process.env.RELAYAUTH_URL
-  const apiKey = process.env.RELAY_ATTEST_API_KEY
-  const agentId = process.env.RELAY_ATTEST_AGENT_ID
-  if (!baseUrl || !apiKey || !agentId) return
-
-  const url = new URL('v1/attestations/grants', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`).toString()
-  await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-    },
-    body: JSON.stringify({
-      agentId,
-      repo,
-      late: true,
-      ...(sessionRef ? { sessionRef } : {}),
-    }),
-    signal: AbortSignal.timeout(5000),
-  })
-}
-
-const githubPullRequestUrl = (value: string, repo: string): string | undefined => {
-  const escapedRepo = repo.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
-  return new RegExp(`https://github\\.com/${escapedRepo}/pull/[1-9][0-9]*`, 'iu').exec(value)?.[0]
 }
 
 const githubIssueRef = (issue: LinearIssue): { repo: string; number: number; url: string } => {

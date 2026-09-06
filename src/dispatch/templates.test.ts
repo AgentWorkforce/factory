@@ -47,8 +47,12 @@ describe('renderAgentTask', () => {
     expect(task).toContain(issue.description)
     expect(task).toContain('Create a branch for this issue before editing.')
     expect(task).toContain('Commit the implementation and tests.')
-    expect(task).toContain('Push the branch to origin.')
-    expect(task).toContain('Software Garden will open the PR targeting the repository default branch through the connected GitHub workspace.')
+    // relay#1654: telling the implementer to push made the branch arrive on
+    // origin under the operator's personal GitHub account. Software Garden
+    // pushes the branch and opens the PR as the workspace GitHub App.
+    expect(task).not.toContain('Push the branch to origin')
+    expect(task).toContain('Do NOT push the branch and do NOT run `git push`')
+    expect(task).toContain('Software Garden will push the branch and open the PR targeting the repository default branch through the connected GitHub workspace App.')
     expect(task).toContain('Do not run `gh pr create` or require local GitHub CLI authentication.')
     expect(task).toContain('Software Garden will hand the opened PR to reviewer `ar-123-review`.')
     expect(task).toContain('post one comment on AgentWorkforce/factory#123')
@@ -110,7 +114,7 @@ describe('renderAgentTask', () => {
     // open the PR, and must not be asked to DM the reviewer (the lead owns
     // publication and reviewer handoff).
     expect(task).not.toContain('Push the branch to origin')
-    expect(task).not.toContain('Software Garden will open the PR')
+    expect(task).not.toContain('Software Garden will push the branch and open the PR')
     expect(task).not.toMatch(/Send reviewer .* a concise branch and commit summary/)
   })
 
@@ -127,8 +131,8 @@ describe('renderAgentTask', () => {
     // Regression fence for the swarm-worker gate: single/team implementers
     // still receive the full commit/push/PR pipeline. Only role=worker in a
     // swarm is stripped.
-    expect(task).toContain('Push the branch to origin')
-    expect(task).toContain('Software Garden will open the PR')
+    expect(task).toContain('Do NOT push the branch and do NOT run `git push`')
+    expect(task).toContain('Software Garden will push the branch and open the PR')
   })
 
   it('omits swarm clauses entirely for non-swarm dispatch', () => {
@@ -239,6 +243,10 @@ describe('renderAgentTask', () => {
     expect(task).toContain('stop at Human Review')
     // It must NOT instruct opening a PR (one already exists).
     expect(task).not.toContain('Open a PR targeting `main` when done.')
+    // relay#1654 fence: a babysitter that opens its own PR does it as the
+    // local `gh` user. Publication is the App's job; the babysitter's writes
+    // stop at the head of the PR it was handed.
+    expect(task).toContain('Never create a new branch and never open a pull request.')
     // Human-chat affordance.
     expect(task).toContain('discuss the PR with the human')
   })
@@ -287,6 +295,7 @@ describe('renderAgentTask', () => {
     expect(task).toContain('re-read the live merge state and fresh checks')
     expect(task).toContain('never merge it yourself')
     expect(task).toContain('Never search for, read, or substitute credentials or tokens')
+    expect(task).toContain('Never create a new branch and never open a pull request.')
     expect(task).toContain('output `/exit` on its own line')
     expect(task).not.toContain('DM `broker`')
     expect(task).not.toContain('[factory-pr-ready]')

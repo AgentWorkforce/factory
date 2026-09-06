@@ -1629,92 +1629,24 @@ describe('GhCliGithubWriteback', () => {
     '.[] | select(.event == "closed" or .event == "reopened") | [.id, .event, .actor.login] | @tsv',
   ]
 
-  it('pushes a local branch and returns the gh-authenticated PR author', async () => {
-    const ghCalls: string[][] = []
-    const gitCalls: string[][] = []
+  /**
+   * `GhCliGithubWriteback` used to own the ONLY non-App publish path in the
+   * product: `git push origin HEAD:refs/heads/<branch>` followed by
+   * `gh pr create`, both authenticated as whatever GitHub account is logged in
+   * locally. That is how relay#1654 got five branches attributed to a person.
+   *
+   * Publishing agent work is App-only now. The compatibility gh writeback
+   * keeps its ISSUE lifecycle operations (comments, labels, state, author
+   * lookups) and no longer carries a publication capability at all, so there
+   * is nothing left for factory to silently fall back to.
+   */
+  it('exposes no pull-request publication capability', () => {
     const github = new GhCliGithubWriteback({
-      runner: async (args) => {
-        ghCalls.push(args)
-        if (args[1] === 'create') {
-          return { stdout: 'https://github.com/AgentWorkforce/factory/pull/124\n' }
-        }
-        return {
-          stdout: JSON.stringify({
-            number: 124,
-            url: 'https://github.com/AgentWorkforce/factory/pull/124',
-            headRefName: 'factory/124-configurable-pr-author',
-            headRefOid: 'commit-124',
-            author: { login: 'operator-user' },
-          }),
-        }
-      },
-      gitRunner: async (args) => {
-        gitCalls.push(args)
-        if (args.includes('symbolic-ref')) return { stdout: 'factory/124-configurable-pr-author\n' }
-        if (args.includes('rev-parse')) return { stdout: 'commit-124\n' }
-        return { stdout: '' }
-      },
+      runner: async () => { throw new Error('gh must not run on the publish path') },
+      gitRunner: async () => { throw new Error('git must not run on the publish path') },
     })
 
-    await expect(github.publishPullRequest({
-      repo: 'AgentWorkforce/factory',
-      clonePath: '/work/factory',
-      baseRef: 'main',
-      title: '124: configurable PR author',
-      body: 'Factory issue 124',
-    })).resolves.toEqual({
-      repo: 'AgentWorkforce/factory',
-      number: 124,
-      url: 'https://github.com/AgentWorkforce/factory/pull/124',
-      headRef: 'factory/124-configurable-pr-author',
-      headSha: 'commit-124',
-      author: 'operator-user',
-    })
-    expect(gitCalls).toEqual([
-      ['-C', '/work/factory', 'symbolic-ref', '--short', 'HEAD'],
-      ['-C', '/work/factory', 'rev-parse', 'HEAD'],
-      ['-C', '/work/factory', 'push', 'origin', 'HEAD:refs/heads/factory/124-configurable-pr-author'],
-    ])
-    expect(ghCalls).toEqual([
-      [
-        'pr', 'create', '--repo', 'AgentWorkforce/factory',
-        '--head', 'factory/124-configurable-pr-author', '--base', 'main',
-        '--title', '124: configurable PR author', '--body', 'Factory issue 124',
-      ],
-      [
-        'pr', 'view', 'https://github.com/AgentWorkforce/factory/pull/124',
-        '--repo', 'AgentWorkforce/factory', '--json',
-        'number,url,headRefName,headRefOid,author',
-      ],
-    ])
-  })
-
-  it('refuses a mismatched local head before push or PR creation', async () => {
-    const ghCalls: string[][] = []
-    const gitCalls: string[][] = []
-    const github = new GhCliGithubWriteback({
-      runner: async (args) => {
-        ghCalls.push(args)
-        return { stdout: '' }
-      },
-      gitRunner: async (args) => {
-        gitCalls.push(args)
-        return { stdout: 'factory/3022-chief-org-live-population\n' }
-      },
-    })
-
-    await expect(github.publishPullRequest({
-      repo: 'AgentWorkforce/cloud',
-      clonePath: '/work/cloud',
-      expectedHeadRef: 'factory/3021-agentworkforce-cloud-12345678',
-      baseRef: 'main',
-      title: '3021: repair deployment objective CI',
-      body: 'Fixes #3021',
-    })).rejects.toThrow(
-      'Refusing to publish GitHub PR: expected head branch factory/3021-agentworkforce-cloud-12345678, found factory/3022-chief-org-live-population',
-    )
-    expect(gitCalls).toEqual([['-C', '/work/cloud', 'symbolic-ref', '--short', 'HEAD']])
-    expect(ghCalls).toEqual([])
+    expect((github as GithubWriteback).publishPullRequest).toBeUndefined()
   })
 
   it('resolves the issue reporter from GitHub when the mounted payload omits it', async () => {
@@ -2304,22 +2236,24 @@ describe('postAttestationGrant session ref forwarding', () => {
     vi.unstubAllGlobals()
   })
 
+  // The attestation grant rides the PUBLISH path, and the publish path is the
+  // workspace GitHub App now. It used to live on `GhCliGithubWriteback`, which
+  // no longer publishes anything; retiring that publisher without moving the
+  // grant would have silently stopped feeding the attestation ledger.
+  const pullRequestPath =
+    '/github/repos/AgentWorkforce/factory/pull-requests/factory-feat-attest-test-sha-attest.json'
+
   function makeGithubWriteback() {
-    return new GhCliGithubWriteback({
-      runner: async (args) => {
-        if (args[1] === 'create') {
-          return { stdout: 'https://github.com/AgentWorkforce/factory/pull/1\n' }
+    class ReceiptMount extends FakeMountClient {
+      override async writeFile(path: string, content: unknown, opts?: { guarded?: boolean }): Promise<void> {
+        await super.writeFile(path, content, opts)
+        if (path === pullRequestPath) {
+          this.files.set(path, { content: { created: 1, url: 'https://github.com/AgentWorkforce/factory/pull/1' } })
         }
-        return {
-          stdout: JSON.stringify({
-            number: 1,
-            url: 'https://github.com/AgentWorkforce/factory/pull/1',
-            headRefName: 'feat/attest-test',
-            headRefOid: 'sha-attest',
-            author: { login: 'bot-user' },
-          }),
-        }
-      },
+      }
+    }
+    return new RelayfileGithubConnectionWrite({
+      mount: new ReceiptMount(),
       gitRunner: async (args) => {
         if (args.includes('symbolic-ref')) return { stdout: 'feat/attest-test\n' }
         if (args.includes('rev-parse')) return { stdout: 'sha-attest\n' }

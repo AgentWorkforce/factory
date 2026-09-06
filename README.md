@@ -71,11 +71,13 @@ something is missing, it explains what to do and writes no partial config. Use
 After init, add the `garden` label to an open issue (the legacy `factory` label also works during the rename transition) and run a dry run below.
 
 1. **Connect GitHub to your relay workspace** with push access for the target
-   repositories. Software Garden uses that workspace connection to publish branches and
-   open pull requests by default. A local `gh` installation and `gh auth login`
-   are required when `github.identity` is `"user"`, or when the default
-   `"auto"` mode uses the compatibility GitHub issue lifecycle path. Exact
-   `"app"` mode needs no local GitHub credential. If a required
+   repositories. Software Garden uses that workspace connection — and only that
+   connection — to publish branches and open pull requests, for every value of
+   `github.identity`. Publication has no local-`gh` fallback: without a
+   connected App write path it refuses. A local `gh` installation and
+   `gh auth login` are required only when `github.identity` is `"user"`, or when
+   the default `"auto"` mode uses the compatibility GitHub *issue lifecycle*
+   path. Exact `"app"` mode needs no local GitHub credential. If a required
    connection is missing, an interactive Software Garden command offers to open the
    Relayfile connection flow and waits for it to finish. Linear-backed operations
    require both Linear and GitHub; GitHub-native operations require GitHub.
@@ -841,21 +843,37 @@ Software Garden GitHub write attribution is controlled explicitly with `github.i
 }
 ```
 
-- `"app"` publishes pull requests and performs GitHub issue lifecycle writes
-  through the connected workspace GitHub App. Status transitions provision the
+**`github.identity` does not govern publication.** Publishing agent work — the
+branch push *and* the pull request — is always performed by the connected
+workspace GitHub App, resolved from the workspace id through the Nango-backed
+connection. No installation id is configured here. When no connected App write
+path is available, Software Garden refuses with a distinct, non-retryable
+`Refusing to publish …` error and abandons the dispatch; it never falls back to
+the local `gh` CLI or to an operator credential. The setting selects the GitHub
+**issue lifecycle** writeback — comments, status labels, closure:
+
+- `"app"` performs issue lifecycle writes through the connected workspace GitHub
+  App. Status transitions provision the
   target `garden:*` lifecycle label, add only that label, and remove only the prior
   lifecycle label (in either its `garden` or legacy `factory` spelling), so labels applied by people are never replaced from a stale mount
   projection. If any required write capability is unavailable, Software Garden fails
   loudly and never falls back to a personal account.
-- `"user"` publishes pull requests and performs issue lifecycle writes with the
-  account authenticated by the local `gh` CLI, even when the app path is
-  available.
-- `"auto"` is the default. Pull requests and issue lifecycle writes prefer the
-  connected App when their complete capability is available. A non-cloud host
-  can fall back to its local `gh` user; the gh-less cloud container instead
-  fails loudly when the connected lifecycle capability is incomplete.
+- `"user"` performs issue lifecycle writes with the account authenticated by the
+  local `gh` CLI, even when the app path is available.
+- `"auto"` is the default. Issue lifecycle writes prefer the connected App when
+  their complete capability is available. A non-cloud host can fall back to its
+  local `gh` user; the gh-less cloud container instead fails loudly when the
+  connected lifecycle capability is incomplete.
 
-Each successful publication log includes `identity` (`app` or `user`) and the
+Implementer agents are instructed not to push. They commit locally and Software
+Garden publishes both halves as the App: under cloud placement through the
+host-side sandbox push port, under local placement from the prepared worktree.
+A remote implementer whose commits can only leave its sandbox through that port,
+running against a Factory with no such port wired, is a loud refusal rather than
+a silent skip — that silence is what produced branches attributed to the
+operator and no pull requests.
+
+Each successful publication log includes `identity` (always `app`) and the
 confirmed `author`. App writes are not reported complete until the connected
 mount acknowledges the provider mutation. Provider-authoritative issue reads
 remain optional on the writeback interface; when unavailable, their existing
@@ -863,16 +881,24 @@ call sites keep their conservative fallback behavior.
 
 #### Writes that still shell out to `gh`
 
-Two Software Garden GitHub mutations are not represented on the connected App surface
-and therefore cannot be performed as the app today. Under `"app"` they refuse
-rather than writing as the operator, so an explicit app identity never produces
-a human-attributed write:
+Some Software Garden GitHub mutations are not represented on the connected App
+surface and therefore cannot be performed as the app today. None of them is on
+the publication path. Under `"app"` they refuse rather than writing as the
+operator, so an explicit app identity never produces a human-attributed write:
 
 | Write | Built-in CLI identity gate | Missing connected capability |
 |---|---|---|
 | Guarded squash merge (`mergePolicy: "on-green-with-review"`) | `"app"` declines and logs; nothing is merged | `mergePullRequest` |
 | Notion intake issue create | only exact `"user"`; `"auto"` and `"app"` block before any durable claim | `createIssue` |
 | Notion intake issue edit | only exact `"user"`; `"auto"` and `"app"` block before any CLI access | `updateIssue` |
+
+One write remains outside this table and outside the App: a PR babysitter pushes
+its repair commits to the head of the PR it was handed, using the credential in
+its own environment. The connected surface exposes no "update an existing pull
+request head" capability, so there is nothing to route it to yet. The babysitter
+is explicitly forbidden from creating a branch or opening a pull request, so it
+cannot publish agent work under a personal account — but its head updates are
+still attributed to whoever runs it.
 
 The merge refusal names `"user"` or `"auto"` as its local-user recovery path.
 The built-in Notion publisher is stricter: its local-host opt-in is exact
