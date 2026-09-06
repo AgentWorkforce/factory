@@ -9,11 +9,40 @@ import {
   DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
   FleetControlPlaneCircuit,
   FleetControlPlaneCircuitOpenError,
+  describeControlPlaneError,
   guardFleetControlPlane,
   isFleetControlPlaneFailure,
 } from './control-plane-circuit'
 
 const roster: RosterEntry = { agents: [], nodes: [] }
+
+describe('describeControlPlaneError', () => {
+  it.each([
+    'request failed for https://relay.example.test/connect?key=definitely-not-a-real-key',
+    'authorization failed: Bearer definitely-not-a-real-token',
+    'could not connect to postgres://example:fake-password@database.example.test/factory',
+  ])('redacts transport text from the error message', (message) => {
+    const error = new TypeError(message)
+
+    expect(describeControlPlaneError(error)).toBe('TypeError')
+  })
+
+  it('appends a well-formed error code', () => {
+    const error = Object.assign(new Error('transport detail'), { code: 'ECONNREFUSED' })
+
+    expect(describeControlPlaneError(error)).toBe('Error (ECONNREFUSED)')
+  })
+
+  it.each([
+    'connection_refused',
+    'ECONN-REFUSED',
+    'A'.repeat(81),
+  ])('drops a malformed error code', (code) => {
+    const error = Object.assign(new Error('transport detail'), { code })
+
+    expect(describeControlPlaneError(error)).toBe('Error')
+  })
+})
 
 describe('FleetControlPlaneCircuit', () => {
   afterEach(() => {
