@@ -85,7 +85,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json && node scripts/write-build-info.mjs",
     "featuremap:check": "node bin/factory.mjs featuremap check",
     "test": "vitest run",
     "test:e2e:kubernetes": "bash scripts/test-kubernetes-provider-e2e.sh",

@@ -113,6 +113,181 @@ describe('packed payload comparison', () => {
   })
 })
 
+describe('build stamp in the packed payload (#446)', () => {
+  /**
+   * `dist/build-info.json` is the one file whose content is SUPPOSED to differ
+   * between two builds of the same code, and the release-recovery path in
+   * `publish.yml` rebuilds a tagged commit and compares its payload to npm's.
+   * Byte comparison would make that recovery impossible by construction (see
+   * the 0.1.58 incident note in `compare-package-trees.mjs`), so the stamp is
+   * compared as a stamp — and the exemption is exactly one field wide.
+   */
+  const withTrees = async (
+    run: (left: string, right: string) => Promise<void>,
+  ): Promise<void> => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-build-stamp-payload-'))
+    const left = join(root, 'left')
+    const right = join(root, 'right')
+    try {
+      await Promise.all([mkdir(join(left, 'dist'), { recursive: true }), mkdir(join(right, 'dist'), { recursive: true })])
+      await run(left, right)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  }
+  const stampPath = (root: string) => join(root, 'dist', 'build-info.json')
+  const a = 'a'.repeat(40)
+  const b = 'b'.repeat(40)
+
+  it('accepts two builds of the same code and names both commits', async () => {
+    await withTrees(async (left, right) => {
+      await writeFile(stampPath(left), JSON.stringify({ schemaVersion: 1, commit: a }))
+      await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1, commit: b }))
+      const notes: string[] = []
+      expect(await comparePackageTrees(left, right, { notes })).toEqual([])
+      // Tolerated, not silent: the recovery reader gets the provenance fact.
+      expect(notes).toEqual([
+        `dist/build-info.json: build commit differs (${a} vs ${b}); exempt from byte comparison`,
+      ])
+    })
+  })
+
+  it('never lets the note claim an equivalence the comparison refutes', async () => {
+    // Review follow-up (#468, P2, codex). The note is emitted mid-traversal, by
+    // a function that has seen ONE file. Wording like "same code" would print
+    // immediately above `package.json: content differs` and certify an
+    // equivalence the comparison goes on to refute. It states a fact about the
+    // stamp; the verdict is the caller's.
+    await withTrees(async (left, right) => {
+      await writeFile(stampPath(left), JSON.stringify({ schemaVersion: 1, commit: a }))
+      await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1, commit: b }))
+      await writeFile(join(left, 'package.json'), JSON.stringify({ version: '0.1.86' }))
+      await writeFile(join(right, 'package.json'), JSON.stringify({ version: '0.1.87' }))
+
+      const notes: string[] = []
+      const differences = await comparePackageTrees(left, right, { notes })
+
+      // The payload does NOT match…
+      expect(differences).toContain('package.json: content differs')
+      // …and the note still names both commits, because a recovery failure is
+      // exactly when a reader needs to know which two builds were compared…
+      expect(notes).toEqual([
+        `dist/build-info.json: build commit differs (${a} vs ${b}); exempt from byte comparison`,
+      ])
+      // …while claiming nothing about the tree it has not finished walking.
+      expect(notes.join('\n')).not.toMatch(/same code|identical|equivalent|matches/u)
+    })
+  })
+
+  it('says nothing when the two builds are the same build', async () => {
+    await withTrees(async (left, right) => {
+      await writeFile(stampPath(left), JSON.stringify({ schemaVersion: 1, commit: a }))
+      await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1, commit: a }))
+      const notes: string[] = []
+      expect(await comparePackageTrees(left, right, { notes })).toEqual([])
+      expect(notes).toEqual([])
+    })
+  })
+
+  it('validates the stamp even when the two are byte-identical', async () => {
+    // Review follow-up (#468, P1, cubic). Equality is not validity. A
+    // short-circuit on equal bytes would exempt a stamp that is malformed on
+    // BOTH sides, letting release recovery certify an artifact whose runtime
+    // loader reports `commit: "unknown"` — every other file in the payload is
+    // safe to skip on equal bytes, but this one is validated, not just diffed.
+    await withTrees(async (left, right) => {
+      for (const identical of [
+        JSON.stringify({ schemaVersion: 1, commit: 'HEAD' }),
+        JSON.stringify({ schemaVersion: 1 }),
+        JSON.stringify({ schemaVersion: 1, commit: a.slice(0, 12) }),
+        'not json',
+      ]) {
+        await writeFile(stampPath(left), identical)
+        await writeFile(stampPath(right), identical)
+        expect(await comparePackageTrees(left, right)).not.toEqual([])
+      }
+
+      // …and an identical WELL-FORMED stamp still passes silently.
+      const good = JSON.stringify({ schemaVersion: 1, commit: a })
+      await writeFile(stampPath(left), good)
+      await writeFile(stampPath(right), good)
+      const notes: string[] = []
+      expect(await comparePackageTrees(left, right, { notes })).toEqual([])
+      expect(notes).toEqual([])
+    })
+  })
+
+  it('exempts the commit and nothing else', async () => {
+    await withTrees(async (left, right) => {
+      // A second field that differs is a real payload difference. The exemption
+      // must not widen into "this file is not compared".
+      await writeFile(stampPath(left), JSON.stringify({ schemaVersion: 1, commit: a }))
+      await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 2, commit: b }))
+      expect(await comparePackageTrees(left, right))
+        .toContain('dist/build-info.json: build stamp field schemaVersion differs')
+
+      // An added field is a difference too, in either direction.
+      await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1, commit: b, extra: 1 }))
+      expect(await comparePackageTrees(left, right))
+        .toContain('dist/build-info.json: build stamp field extra differs')
+    })
+  })
+
+  it('refuses a payload whose stamp is not a stamp', async () => {
+    await withTrees(async (left, right) => {
+      await writeFile(stampPath(left), JSON.stringify({ schemaVersion: 1, commit: a }))
+
+      await writeFile(stampPath(right), 'not json')
+      expect(await comparePackageTrees(left, right))
+        .toContain('dist/build-info.json: content differs (unparseable build stamp)')
+
+      await writeFile(stampPath(right), JSON.stringify([{ commit: b }]))
+      expect(await comparePackageTrees(left, right))
+        .toContain('dist/build-info.json: content differs (build stamp is not an object)')
+
+      await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1 }))
+      expect(await comparePackageTrees(left, right))
+        .toContain('dist/build-info.json: right build stamp carries no full commit SHA (undefined)')
+    })
+  })
+
+  it('grants the exemption to a commit, not to a string in the commit slot', async () => {
+    // Review follow-up (#468, P2, codex). A type-only check would let a
+    // CORRUPT registry stamp — `"HEAD"`, `"corrupt"`, an abbreviated SHA —
+    // pass as a provenance difference, so `verify-release-payload.sh` would
+    // return success for an artifact whose runtime loader reports
+    // `commit: "unknown"`. That is the silent lie this change exists to
+    // remove, re-entering through the check meant to catch it.
+    await withTrees(async (left, right) => {
+      await writeFile(stampPath(left), JSON.stringify({ schemaVersion: 1, commit: a }))
+      for (const corrupt of ['HEAD', 'corrupt', a.slice(0, 12), a.toUpperCase(), '', 42, null]) {
+        await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1, commit: corrupt }))
+        const notes: string[] = []
+        expect(await comparePackageTrees(left, right, { notes })).toContain(
+          `dist/build-info.json: right build stamp carries no full commit SHA (${JSON.stringify(corrupt)})`,
+        )
+        // …and it is never reported as a tolerated provenance difference.
+        expect(notes).toEqual([])
+      }
+
+      // The same rule applies to the locally rebuilt side, not just the registry's.
+      await writeFile(stampPath(left), JSON.stringify({ schemaVersion: 1, commit: 'HEAD' }))
+      await writeFile(stampPath(right), JSON.stringify({ schemaVersion: 1, commit: b }))
+      expect(await comparePackageTrees(left, right))
+        .toContain('dist/build-info.json: left build stamp carries no full commit SHA ("HEAD")')
+    })
+  })
+
+  it('gives no other JSON file in the payload the same exemption', async () => {
+    await withTrees(async (left, right) => {
+      // Same shape, same field name, different path: still a payload mismatch.
+      await writeFile(join(left, 'dist', 'other.json'), JSON.stringify({ commit: a }))
+      await writeFile(join(right, 'dist', 'other.json'), JSON.stringify({ commit: b }))
+      expect(await comparePackageTrees(left, right)).toContain('dist/other.json: content differs')
+    })
+  })
+})
+
 describe('require-current-main.sh argument validation', () => {
   const run = (args) =>
     execFileSync('bash', ['scripts/require-current-main.sh', ...args], {

@@ -27,6 +27,53 @@ cannot show the free-text `lastError`, and says so.
 Exit codes follow `factory canary`: `0` when the instance is dispatching, `1` when it is not or
 cannot be reached.
 
+## Which build is answering
+
+`/healthz` names the running build (#446). Two facts, and no credential:
+
+```sh
+curl -fsS https://<factory-host>/healthz | jq '.heartbeat.health.build'
+# { "version": "0.1.86", "commit": "23e97cadc24f3e239879671975a962b577cf4979" }
+```
+
+`factory diagnose --deployed <url>` renders the same pair as the first line of its health
+block — after the `factory diagnose — <url>` header, `reachable`, and any `phase` /
+`instance liveness` lines — and `--json` carries it at `.health.build`.
+
+That answers the first question of every outage — *is the fix I merged actually running?* — as a
+lookup. It used to be an argument: compare `heartbeat.startedAt` against a merge time and infer that
+a deploy must have happened in between. The inference is only sound if a deploy did happen, which
+the endpoint could not say either. It matters more than it looks, because the container rolls
+roughly hourly: which build is up changes with no one deploying.
+
+`version` is the published `@agent-relay/factory` version — the same string `factory-version.json`
+pins in factory-cloud, read back from the image instead of from the repo that built it. `commit` is
+the Git commit that produced the artifact, stamped into `dist/build-info.json` by
+`scripts/write-build-info.mjs` during `npm run build`.
+
+Three readings, three different remedies:
+
+| what you see | what it means |
+|---|---|
+| `"commit": "<40 hex>"` | that commit is running. `git log <commit>..main` is the gap. |
+| `"commit": "unknown"` | the instance answered, and its artifact carries no stamp — it is a release older than #446. |
+| no `build` key at all | the instance is older still: it predates the field. Never read this as `unknown`. |
+
+Nothing synthesises a stand-in for a missing stamp. The build itself refuses to emit one — no SHA,
+no build — so `unknown` in a released artifact means "published before this existed", never "the
+stamp failed quietly". `src/orchestrator/build-identity.ts` carries the reasoning; the guarantee is
+tested against the packed tarball in `scripts/verify-packed-e2e.mjs`, which reads the stamp out of
+the installed consumer copy and requires it to be the commit under test.
+
+Two places it is not reachable, both in `factory-cloud`'s `container/entrypoint.mjs` and both
+fixable there rather than here:
+
+- **`/evidence`** assembles its own projection (`detailedHeartbeat()`) and drops the `health` block,
+  so it carries no build. `/healthz` is unauthenticated, so the readback above needs no token anyway.
+- **Before the daemon's first heartbeat write** the container has no `health` block to pass through,
+  so `/healthz` names no build during cold start — which is also when it answers 503. Ask again once
+  it is up; "no build key" from a *live* instance means an image older than #446, not a boot.
+
 ## Why the other routes do not work
 
 | route | why not |
@@ -50,6 +97,9 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
 // whoever serves it. Here now = 1787229155805 (2026-08-20T12:32:35.805Z).
 {
   "schemaVersion": 1,
+  // Identity, not health (#446). It rides here because `health` is the one
+  // part of the heartbeat the container passes through to /healthz verbatim.
+  "build": { "version": "0.1.86", "commit": "23e97ca…4979" },
   "ok": true,                       // process liveness — see below
   "status": "degraded",             // the amber
   "stale": false,

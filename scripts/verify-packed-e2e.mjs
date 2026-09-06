@@ -49,6 +49,28 @@ try {
   ], consumer)
   checks.push('packed-consumer-install')
 
+  // #446. The strongest available proof that `/healthz` will report the truth:
+  // read the build stamp out of the TARBALL that was just packed and installed
+  // as a consumer, and require it to be the commit this run was bound to.
+  //
+  // Nothing here reads the source tree. A stamp that was hardcoded, defaulted,
+  // synthesised from the reader's environment, or simply omitted from `files`
+  // fails at this line rather than shipping and being discovered during an
+  // outage — which is where the absence was discovered the first time.
+  const installedRoot = join(consumer, 'node_modules', '@agent-relay', 'factory')
+  const buildInfoPath = join(installedRoot, 'dist', 'build-info.json')
+  const buildInfo = JSON.parse(readFileSync(buildInfoPath, 'utf8'))
+  assert.equal(
+    buildInfo.commit,
+    headSha,
+    `packed build stamp must name the commit under test (got ${buildInfo.commit})`,
+  )
+  // The version is deliberately NOT in the stamp: `npm version` runs after the
+  // build, so the package's own manifest is the only place it cannot go stale.
+  const installedManifest = JSON.parse(readFileSync(join(installedRoot, 'package.json'), 'utf8'))
+  assert.equal(installedManifest.version, pack[0].version)
+  checks.push('packed-build-identity')
+
   const cli = join(consumer, 'node_modules', '.bin', process.platform === 'win32' ? 'factory.cmd' : 'factory')
   const cliResult = spawnSync(cli, ['--help'], { cwd: consumer, encoding: 'utf8' })
   assert.equal(cliResult.status, 0, `packed CLI failed: ${cliResult.stderr || cliResult.stdout}`)

@@ -532,6 +532,14 @@ export function renderDeployedDiagnosis(diagnosis: DeployedFactoryDiagnosis): st
 
   const health = diagnosis.health
   if (health) {
+    // First, because it is the first question of every outage: is the fix I
+    // merged actually running? (#446). An instance older than that change
+    // publishes no `build` at all, and saying so is the answer — not a gap.
+    lines.push(
+      health.build
+        ? `  build                : ${health.build.version} @ ${health.build.commit}`
+        : '  build                : not reported (instance predates the build identity field)',
+    )
     lines.push(`  liveness (ok)        : ${health.ok} (as of the last heartbeat write)`)
     lines.push(`  status               : ${health.status}`)
     lines.push(
