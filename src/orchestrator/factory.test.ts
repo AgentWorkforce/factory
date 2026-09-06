@@ -25909,7 +25909,7 @@ describe('FactoryLoop', () => {
     })
 
     await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
-    expect(factory.status().counters.githubAgentQuestionsTrustedByWriteAccess).toBe(1)
+    expect(factory.status().counters.githubAgentQuestionsTrustedByAssociation).toBe(1)
     expect(factory.status().counters.githubAgentQuestionsIgnoredUntrustedAuthor).toBe(1)
     // The whole team is released at once; the slot is not held to a timeout.
     expect(fleet.releases).toEqual([
@@ -25988,7 +25988,7 @@ describe('FactoryLoop', () => {
     })
     await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
     expect(factory.status().counters.githubAgentQuestionsTrustedByAllowlist).toBe(1)
-    expect(factory.status().counters.githubAgentQuestionsTrustedByWriteAccess).toBeUndefined()
+    expect(factory.status().counters.githubAgentQuestionsTrustedByAssociation).toBeUndefined()
     expect(fleet.releases).toHaveLength(2)
     await factory.stop()
   })

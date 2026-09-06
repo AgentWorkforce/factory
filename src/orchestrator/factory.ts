@@ -14217,9 +14217,18 @@ export class FactoryLoop implements Factory {
         // release is still in flight could have that release tear the *new*
         // worker down. `#awaitAbandonedClarificationRelease` fences the respawn
         // on this promise.
-        this.#abandonedClarificationReleases.set(name, observed)
-        void observed.then(() => {
-          if (this.#abandonedClarificationReleases.get(name) === observed) {
+        // Chain rather than overwrite. The forced teardown starts a second
+        // release for the same name, and if that one also expires it must not
+        // replace a fence the first release still owns — clearing on the newer
+        // promise alone would free the name while the older release is still
+        // able to tear down whatever holds it next.
+        const previous = this.#abandonedClarificationReleases.get(name)
+        const outstanding: Promise<unknown> = previous
+          ? Promise.all([previous, observed])
+          : observed
+        this.#abandonedClarificationReleases.set(name, outstanding)
+        void outstanding.then(() => {
+          if (this.#abandonedClarificationReleases.get(name) === outstanding) {
             this.#abandonedClarificationReleases.delete(name)
           }
         })
@@ -14242,6 +14251,15 @@ export class FactoryLoop implements Factory {
    * worker. This fails closed: if the abandoned call still has not settled
    * after another grace, the wake aborts and its durable record schedules a
    * retry, which is strictly better than respawning into a pending teardown.
+   *
+   * Scope: this is a same-process backstop, not the primary invariant. The
+   * primary invariant is in `#releaseAgentsForClarification` — the park does
+   * not advance, and `markClarificationParked` never opens the wake gate,
+   * until the fleet roster reports every team member absent. A restart drops
+   * this map, so a replacement process leans on the roster gate alone; closing
+   * that last window means persisting the outstanding release invocation in
+   * the durable clarification record, which is deliberately left for its own
+   * change rather than bundled into an outage fix.
    */
   async #awaitAbandonedClarificationRelease(name: string): Promise<void> {
     const outstanding = this.#abandonedClarificationReleases.get(name)
@@ -14891,7 +14909,7 @@ export class FactoryLoop implements Factory {
   #agentQuestionAuthorTrust(
     comment: GithubIssueComment,
   ): 'githubAgentQuestionsTrustedByBot'
-    | 'githubAgentQuestionsTrustedByWriteAccess'
+    | 'githubAgentQuestionsTrustedByAssociation'
     | 'githubAgentQuestionsTrustedByAllowlist'
     | undefined {
     if (comment.isBot) return 'githubAgentQuestionsTrustedByBot'
@@ -14899,7 +14917,7 @@ export class FactoryLoop implements Factory {
       !this.#agentQuestionRequireAllowlist
       && comment.authorAssociation
       && GITHUB_AFFILIATED_AUTHOR_ASSOCIATIONS.has(comment.authorAssociation)
-    ) return 'githubAgentQuestionsTrustedByWriteAccess'
+    ) return 'githubAgentQuestionsTrustedByAssociation'
     const author = comment.author?.trim().toLowerCase()
     if (author && this.#agentQuestionAuthors.has(author)) {
       return 'githubAgentQuestionsTrustedByAllowlist'
