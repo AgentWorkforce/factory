@@ -11,33 +11,22 @@ name: Review at head
 # never a check run) and `/commits/{sha}/check-runs`, so a vacuous bot green is
 # reported as vacuous from either source.
 #
-# TWO JOBS, DELIBERATELY. A check that can be edited by the pull request it
-# judges is not a gate:
+# ADVISORY ONLY — never make this a required check.
 #
-#   advisory  runs the PULL REQUEST'S copy of the predicate. A change to the
-#             merge rule has to be exercised by the change that makes it, so
-#             this is the job that proves a predicate edit works. It must
-#             never be a required check — a PR can rewrite it.
-#   enforced  runs the BASE BRANCH'S copy, under `pull_request_target`, so the
-#             code deciding the verdict is code that already passed review.
-#             This is the job to require. It cannot be altered by the PR it is
-#             judging, and it never checks out or executes contributor code.
+# It runs the PULL REQUEST'S copy of the predicate, so a change to the merge
+# rule is exercised by the change that makes it. That is exactly why it cannot
+# be the enforcement point: a pull request can rewrite the rule it is judged
+# by. The trusted counterpart lives in `review-at-head-enforced.yml`, runs the
+# base branch's copy, and is the one to require.
 #
-# ROLLOUT: keep both non-required and measure for a week; then require only
-# `enforced`. On the audited data the correct predicate blocks the large
-# majority of recent merges, so requiring it before the cubic seat, CodeRabbit
-# public-repo and Devin trial repairs land would only train people to bypass
-# it. Those repairs are configuration and are tracked on #432.
+# These are separate FILES, not two jobs in one file. A job skipped by an `if`
+# is reported to branch protection as a SUCCESS, so an `enforced` job sitting
+# in this file would report green on every advisory event without the trusted
+# predicate ever running — a vacuous green in the very gate meant to remove
+# them.
 
 on:
   pull_request:
-    types:
-      - opened
-      - reopened
-      - ready_for_review
-      - synchronize
-  # Runs from the base branch and never checks out contributor code.
-  pull_request_target:
     types:
       - opened
       - reopened
@@ -74,20 +63,19 @@ on:
 permissions: {}
 
 concurrency:
-  # Keyed by role, not by event. Every advisory trigger — push, review,
-  # inline comment — shares one group, so a review that arrives as a burst of
-  # comment events collapses to a single run instead of queueing one per
-  # comment. `enforced` is keyed separately so the two never cancel each
-  # other. The repository is part of the key because a reusable caller can
-  # evaluate the same PR number in two different repositories.
+  # One group for every advisory trigger — push, review, inline comment — so a
+  # review arriving as a burst of comment events collapses to a single run
+  # instead of queueing one per comment. The repository is part of the key
+  # because a reusable caller can evaluate the same PR number in two different
+  # repositories.
   group: >-
-    review-at-head-${{ github.event_name == 'pull_request_target' && 'enforced' || 'advisory' }}-${{ inputs.repository || github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}
+    review-at-head-advisory-${{ inputs.repository || github.repository }}-${{ inputs.pr_number || github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   # Advisory. Runs the PR's own copy of the predicate — never require this.
   advisory:
-    if: ${{ inputs.pr_number || (github.event_name != 'pull_request_target' && !github.event.pull_request.draft) }}
+    if: ${{ inputs.pr_number || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -131,39 +119,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET_REPO: ${{ inputs.repository || github.repository }}
           TARGET_PR: ${{ inputs.pr_number || github.event.pull_request.number }}
-        run: npx tsx src/github/review-at-head-cli.ts "$TARGET_REPO" "$TARGET_PR"
-
-  # Enforced. Runs the base branch's copy, which the PR cannot edit. Require
-  # this one.
-  enforced:
-    if: ${{ github.event_name == 'pull_request_target' && !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-      checks: read
-      statuses: read
-    steps:
-      # Default checkout under `pull_request_target` is the base branch, which
-      # is exactly the point: reviewed code decides the verdict. The PR's own
-      # source is never fetched or executed here.
-      - name: Check out the base branch predicate
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: '22.14.0'
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Require a substantive review of the commit that would merge
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET_REPO: ${{ github.repository }}
-          TARGET_PR: ${{ github.event.pull_request.number }}
         run: npx tsx src/github/review-at-head-cli.ts "$TARGET_REPO" "$TARGET_PR"

@@ -1,0 +1,92 @@
+name: Review at head (enforced)
+
+# The trusted half of AgentWorkforce/factory#432 part (c). This is the check to
+# require; `review-at-head.yml` is advisory and must never be required.
+#
+# It runs the BASE BRANCH'S copy of the predicate, so the code deciding the
+# verdict is code that already passed review. A pull request cannot alter the
+# rule it is judged by, and contributor source is never fetched or executed
+# here.
+#
+# WHY A SEPARATE FILE. A job skipped by an `if` is reported to branch
+# protection as a SUCCESS. Keeping this job beside the advisory one meant every
+# advisory event produced a skipped — therefore green — `enforced` check
+# without the trusted predicate ever running. A required check that passes
+# because it did not run is precisely the vacuous green #432 exists to remove,
+# so the enforced job lives in a file whose only triggers are ones it should
+# actually run on. It carries no `if` for the same reason: nothing here may
+# report success by being skipped.
+#
+# The review and comment triggers matter as much as the push one. The predicate
+# reads reviews and inline comments, so its answer changes when a review is
+# submitted, edited or dismissed — not only when the head moves. Without them a
+# required check would keep a stale green after the trusted predicate had
+# become false.
+#
+# ROLLOUT: keep non-required and measure for a week first. On the audited data
+# the correct predicate blocks the large majority of recent merges, so
+# requiring it before the cubic seat, CodeRabbit public-repo and Devin trial
+# repairs land would only train people to bypass it. Those repairs are
+# configuration and are tracked on #432.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
+  pull_request_review_comment:
+    types:
+      - created
+      - edited
+      - deleted
+
+permissions: {}
+
+concurrency:
+  group: review-at-head-enforced-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  enforced:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      # `/commits/{sha}/status` and `/commits/{sha}/check-runs` are gated by
+      # their own scopes; without these a private repository would 403 and the
+      # check would error instead of returning a verdict.
+      checks: read
+      statuses: read
+    steps:
+      # Explicitly the base branch, not the default checkout. Under
+      # `pull_request_target` the default is already the base, but the review
+      # and comment events resolve differently, and the trusted predicate must
+      # not depend on which event happened to fire.
+      - name: Check out the base branch predicate
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Require a substantive review of the commit that would merge
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ github.repository }}
+          TARGET_PR: ${{ github.event.pull_request.number }}
+        run: npx tsx src/github/review-at-head-cli.ts "$TARGET_REPO" "$TARGET_PR"
