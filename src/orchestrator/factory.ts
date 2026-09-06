@@ -10925,6 +10925,14 @@ export class FactoryLoop implements Factory {
       maxIterations,
       startedAt: new Date(this.#heartbeatStartedAtMs).toISOString(),
       startedAtMs: this.#heartbeatStartedAtMs,
+      questionCounters: {
+        githubAgentQuestionsReceived: this.#counters.githubAgentQuestionsReceived ?? 0,
+        githubAgentQuestionsDetected: this.#counters.githubAgentQuestionsDetected ?? 0,
+        githubAgentQuestionsIgnoredUntrustedAuthor: this.#counters.githubAgentQuestionsIgnoredUntrustedAuthor ?? 0,
+        githubAgentQuestionsIgnoredNoInFlight: this.#counters.githubAgentQuestionsIgnoredNoInFlight ?? 0,
+        githubAgentQuestionsIgnoredUnknownAgent: this.#counters.githubAgentQuestionsIgnoredUnknownAgent ?? 0,
+        githubAgentQuestionsIgnoredMissingAuthorizedAuthor: this.#counters.githubAgentQuestionsIgnoredMissingAuthorizedAuthor ?? 0,
+      },
       progressContract: 'discovery-sweep-v1',
       updatedAt: new Date(updatedAtMs).toISOString(),
       updatedAtMs,
@@ -15185,6 +15193,7 @@ export class FactoryLoop implements Factory {
     comment: GithubIssueComment,
     request: GithubHumanInputRequest,
   ): Promise<void> {
+    this.#increment('githubAgentQuestionsReceived')
     const record = (await this.#batch()).getIssue(watch.issue)
     if (!record || record.dryRun || request.issueKey.toLowerCase() !== record.issue.key.toLowerCase()) {
       this.#increment('githubAgentQuestionsIgnoredNoInFlight')

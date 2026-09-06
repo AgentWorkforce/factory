@@ -200,6 +200,21 @@ export interface FactoryLoopHeartbeat {
   /** Stable for this loop lifetime; lets readers apply a cold-start grace. */
   startedAt?: string
   startedAtMs?: number
+  /**
+   * Process-local GitHub question diagnostics for authenticated evidence.
+   * Absent on older producers; only the live daemon may supply zero defaults.
+   * Received counts handler entries, detected counts completed parking; the
+   * rejection counts are not an exhaustive partition (e.g. deduplication).
+   * Read with startedAt to identify daemon lifetimes, not individual issues.
+   */
+  questionCounters?: {
+    githubAgentQuestionsReceived: number
+    githubAgentQuestionsDetected: number
+    githubAgentQuestionsIgnoredUntrustedAuthor: number
+    githubAgentQuestionsIgnoredNoInFlight: number
+    githubAgentQuestionsIgnoredUnknownAgent: number
+    githubAgentQuestionsIgnoredMissingAuthorizedAuthor: number
+  }
   /** Explicit capability marker for consumers of the progress receipt below. */
   progressContract?: 'discovery-sweep-v1'
   updatedAt: string
