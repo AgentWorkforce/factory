@@ -38,7 +38,6 @@ import {
 } from '../github/writeback-paths'
 import { VerificationPipeline, type VerificationGate } from '../environments/verification-pipeline'
 import type {
-  AllowedDraftPredicateDiagnostics,
   AgentMessage,
   AgentLifecycleSignal,
   AgentPidResolution,
@@ -101,6 +100,7 @@ import {
 import { ISSUE_KEY_PARTS, branchImplementsIssue, containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue, prBodyDisclaimsClosing, prClosureAuthority } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
 import { isInFactoryScope } from '../safety/factory-scope'
+import { rejectDraft, type AllowedDraftPredicateDiagnostics } from '../safety/draft-predicate'
 import { dispatchRelayflowForChangeEvent } from '../dispatch/relayflow-registry'
 import { dispatchAgentIdentityKey, dispatchIssueIdentity, mirrorWorkUnitOrigin } from '../dispatch/work-unit-identity'
 import {
@@ -23358,16 +23358,12 @@ const isAllowedFactoryDraft = async (
     return true
   }
 
-  if (await isAllowedFactoryGithubDraft(path, content, opts, mount, config, diagnostics)) return true
+  if (path.startsWith('/github/')) {
+    return isAllowedFactoryGithubDraft(path, content, opts, mount, config, diagnostics)
+  }
 
   return rejectDraft(diagnostics, 'provider-path', 'path is not an allowed Linear, Slack, or GitHub draft')
 }
-
-const rejectDraft = (
-  diagnostics: AllowedDraftPredicateDiagnostics | undefined,
-  branch: string,
-  detail?: string,
-): false => diagnostics?.reject(branch, detail) ?? false
 
 const isFactoryGithubAuthoredArtifactPath = (path: string): boolean =>
   /^\/github\/repos\/[^/]+\/[^/]+\/(?:pull-requests\/factory-[^/]+\.json|refs\/(?:factory\.json|refs%2Fheads%2Ffactory%2F[^/]+\.json)|pulls\/[1-9]\d*\/close\.json)$/iu.test(path)

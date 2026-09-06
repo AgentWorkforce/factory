@@ -87,7 +87,8 @@ import {
   openIntegrationUrl,
   type FactoryIntegrationObservation,
 } from '../mount/relayfile-integration-preflight'
-import type { AllowedDraftPredicateDiagnostics, FactoryIntegrationProvider, SandboxPush } from '../ports'
+import type { FactoryIntegrationProvider, SandboxPush } from '../ports'
+import { rejectDraft, type AllowedDraftPredicateDiagnostics } from '../safety/draft-predicate'
 import type { StateStore } from '../ports/state'
 import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
@@ -2344,16 +2345,12 @@ async function isAllowedFactoryDraft(
     return true
   }
 
-  if (await isAllowedFactoryGithubDraft(path, content, opts, mount, config, diagnostics)) return true
+  if (path.startsWith('/github/')) {
+    return isAllowedFactoryGithubDraft(path, content, opts, mount, config, diagnostics)
+  }
 
   return rejectDraft(diagnostics, 'provider-path', 'path is not an allowed Linear, Slack, or GitHub draft')
 }
-
-const rejectDraft = (
-  diagnostics: AllowedDraftPredicateDiagnostics | undefined,
-  branch: string,
-  detail?: string,
-): false => diagnostics?.reject(branch, detail) ?? false
 
 const scopeIssueFromDraftContent = (content: unknown) => ({
   title: typeof asRecord(content)?.title === 'string' ? asRecord(content)?.title as string : '',
