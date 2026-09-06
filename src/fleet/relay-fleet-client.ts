@@ -688,12 +688,24 @@ export class RelayFleetClient implements FleetClient {
       messaging.nodes.list(),
     ])
     const agentsByName = new Map(agents.map((agent) => [agent.name, agent]))
+    const nodeNamesById = new Map<string, string>()
+    for (const node of nodes) {
+      if (node.id) nodeNamesById.set(node.id, node.name)
+      if (node.nodeId) nodeNamesById.set(node.nodeId, node.name)
+    }
     return {
       agents: presence
         .filter((agent) => agent.status === 'online')
         .map((agent) => {
           const record = asRecord(agentsByName.get(agent.agentName))
-          const node = readString(record, 'node', 'node_id', 'nodeId')
+          // The SDK preserves placement in metadata.fleet, whose node ID is
+          // distinct from the name returned by placement.spawn. Resolve it
+          // against this roster before comparing registration to placement.
+          const fleet = asRecord(asRecord(record?.metadata)?.fleet)
+          const nodeId = readString(fleet, 'node_id', 'nodeId')
+          const node = nodeId
+            ? nodeNamesById.get(nodeId)
+            : readString(record, 'node', 'node_id', 'nodeId')
           return { name: agent.agentName, ...(node ? { node } : {}) }
         }),
       nodes: nodes.map((node) => ({
