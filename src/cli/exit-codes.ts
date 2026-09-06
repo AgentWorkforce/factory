@@ -94,10 +94,17 @@ export function exitCodeForRelayDispatch(
  * `skipped` entries are ordinary: a sweep that examines issues and dispatches
  * none of them still did what it was asked. A recorded `error` is a failed
  * cycle, and a deferred discovery means the sweep never ran at all.
+ *
+ * A discovery *failure* joins the deferral rather than the error (#406). The
+ * sweep is still standing -- the backend fault was absorbed so one bad
+ * repository could not abort it -- but it enumerated nothing, so reporting OK
+ * would hand a caller reading only `$?` the same false success this contract
+ * exists to remove. RETRYABLE is the honest reading, and it is what RETRYABLE
+ * already describes: a dependency hold that clears on its own.
  */
 export function exitCodeForIterationReport(report: IterationReport): FactoryExitCode {
   if (report.error) return FACTORY_EXIT.FAILED
-  if (report.discoveryDeferred) return FACTORY_EXIT.RETRYABLE
+  if (report.discoveryDeferred || report.discoveryFailed) return FACTORY_EXIT.RETRYABLE
   return FACTORY_EXIT.OK
 }
 
@@ -117,7 +124,13 @@ export function exitCodeForLoopReports(reports: readonly IterationReport[]): Fac
   // sweep means the loop performed nothing at all — a shared daemon can hold
   // the workspace sweep lease for the loop's whole duration — and reporting
   // that as success is the exact false signal this contract exists to remove.
-  if (reports.length > 0 && reports.every((report) => report.discoveryDeferred)) {
+  //
+  // An absorbed discovery failure counts toward the same "performed nothing"
+  // test (#406) and on the same terms: one sweep losing its enumeration to a
+  // backend fault is ordinary, every sweep losing it means the loop never
+  // enumerated at all.
+  if (reports.length > 0 &&
+    reports.every((report) => report.discoveryDeferred || report.discoveryFailed)) {
     return FACTORY_EXIT.RETRYABLE
   }
   return FACTORY_EXIT.OK

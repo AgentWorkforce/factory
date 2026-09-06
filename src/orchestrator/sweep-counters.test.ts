@@ -16,6 +16,7 @@ import { FakeFleetClient, FakeMountClient } from '../testing'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
 import type { DiscoverySweepClaim } from '../ports/state'
 import { normalizePublicHealth } from './public-health'
+import type { ChangeEvent } from '../ports'
 import type { FactoryPublicReadinessReconcileHealth, FactoryReadinessReconcileStatus } from '../types'
 
 /**
@@ -107,6 +108,48 @@ class StaticTriage implements TriageEngine {
   }
 }
 
+class RemoteLifecycleFleetClient extends FakeFleetClient {
+  override readonly placementLocality = 'remote' as const
+  override readonly lifecycleActionName = 'factory.lifecycle'
+}
+
+/**
+ * Fails GitHub issue enumeration the way an ordinary backend outage does.
+ *
+ * Deliberately neither a 429 nor an operation timeout: `isPassWideRelayfileFault`
+ * must be false for this error, because that is the branch `#githubIssuePaths`
+ * absorbs instead of rethrowing, and the absorbed branch is the #406 shape.
+ */
+class ToggleableGithubIssueMount extends FakeMountClient {
+  failing = false
+
+  override async listTree(prefix: string): Promise<string[]> {
+    if (this.failing && prefix.startsWith('/github/repos/')) {
+      throw new Error('github issue tree unavailable: 500 Internal Server Error')
+    }
+    return super.listTree(prefix)
+  }
+}
+
+class CountingListTreeMount extends FakeMountClient {
+  readonly listTreePrefixes: string[] = []
+
+  override async listTree(prefix: string): Promise<string[]> {
+    this.listTreePrefixes.push(prefix)
+    return super.listTree(prefix)
+  }
+}
+
+const changeEvent = (path: string): ChangeEvent => ({
+  id: 'silent-cache-watermark',
+  workspace: 'factory-sweep-counters',
+  type: 'relayfile.changed',
+  occurredAt: new Date().toISOString(),
+  resource: { path, kind: 'file', id: path, provider: 'github' },
+  summary: {},
+  expand: async () => ({ level: 'summary', path, summary: {} }),
+}) as unknown as ChangeEvent
+
 /**
  * Run one live daemon over `files` and return the readiness record its own
  * startup sweep produced.
@@ -175,6 +218,399 @@ const expectSweptNothing = (readiness: FactoryPublicReadinessReconcileHealth): v
 }
 
 describe('readiness sweep counters (#355)', () => {
+  it('distinguishes index-backed empty discovery from a tree that served non-candidate content', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-empty-kinds-'))
+    const create = (mount: FakeMountClient, workspaceId: string) => createFactory(config({
+      workspaceId,
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, `${workspaceId}.json`) },
+    }), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      triage: new StaticTriage(),
+      logger: {},
+    })
+
+    try {
+      const indexFactory = create(new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/_index.json': [],
+      }), 'index-empty')
+      const indexEmpty = await indexFactory.runOnce()
+      expect(indexEmpty.pulled).toEqual([])
+      expect(indexEmpty.treeReads).toBe(0)
+      expect(indexEmpty.emptyTreeReads).toBe(0)
+      expect(indexEmpty.discoverySources).toEqual({
+        configuredRepos: 1,
+        indexBackedRepos: 1,
+        indexBackedEmptyRepos: 1,
+        cacheBackedRepos: 0,
+        cacheBackedEmptyRepos: 0,
+        treeBackedRepos: 0,
+        treeBackedEmptyRepos: 0,
+        paths: 0,
+      })
+      await indexFactory.stop()
+
+      const contentFactory = create(new FakeMountClient({
+        '/github/repos/AgentWorkforce/pear/issues/README.json': { note: 'no ready issues' },
+      }), 'content-no-candidates')
+      const genuinelyEmpty = await contentFactory.runOnce()
+      expect(genuinelyEmpty.pulled).toEqual([])
+      expect(genuinelyEmpty.treeReads).toBe(2)
+      expect(genuinelyEmpty.emptyTreeReads).toBe(1)
+      expect(genuinelyEmpty.discoverySources).toEqual({
+        configuredRepos: 1,
+        indexBackedRepos: 0,
+        indexBackedEmptyRepos: 0,
+        cacheBackedRepos: 0,
+        cacheBackedEmptyRepos: 0,
+        treeBackedRepos: 1,
+        treeBackedEmptyRepos: 0,
+        paths: 1,
+      })
+      await contentFactory.stop()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('alarms once after three cache-backed zero-candidate sweeps that issue zero tree reads', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-silent-cache-'))
+    const mount = new CountingListTreeMount()
+    mount.emit(changeEvent('/factory/observability/mount-health/current.json'))
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const create = (logger: { warn?: ReturnType<typeof vi.fn> } = {}) => createFactory(config({
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') },
+    }), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      logger,
+    })
+
+    let seedFactory: ReturnType<typeof create> | undefined
+    let factory: ReturnType<typeof create> | undefined
+    // `stop()` has no early-return guard, so an unconditional second call
+    // would make every passing run pay a full extra shutdown on both
+    // factories. These flags keep the guarded net for the failure path only.
+    let seedStopped = false
+    let stopped = false
+    try {
+      seedFactory = create()
+      const seed = await seedFactory.runOnce()
+      expect(seed.discoverySources).toMatchObject({
+        configuredRepos: 1,
+        treeBackedRepos: 1,
+        treeBackedEmptyRepos: 1,
+        paths: 0,
+      })
+      expect(seed.treeReads).toBe(2)
+      expect(seed.emptyTreeReads).toBe(2)
+      await seedFactory.stop()
+      seedStopped = true
+      const readsAfterSeed = mount.listTreePrefixes.length
+
+      const warn = vi.fn()
+      factory = create({ warn })
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 25 },
+      })
+
+      await vi.waitFor(() => {
+        expect(factory.status().readinessReconcile).toMatchObject({
+          zeroCandidateAlarmActive: true,
+        })
+      }, { timeout: 5_000 })
+      const snapshot = factory.status()
+      expect(snapshot.readinessReconcile).toMatchObject({
+          candidates: 0,
+          treeReads: 0,
+          emptyTreeReads: 0,
+          configuredRepos: 1,
+          indexBackedRepos: 0,
+          indexBackedEmptyRepos: 0,
+          cacheBackedRepos: 1,
+          cacheBackedEmptyRepos: 1,
+          treeBackedRepos: 0,
+          treeBackedEmptyRepos: 0,
+          discoveryPaths: 0,
+          zeroCandidateAlarmThreshold: 3,
+          zeroCandidateAlarmActive: true,
+      })
+      const emptySweeps = snapshot.readinessReconcile?.zeroCandidateSweeps
+      expect(emptySweeps).toBeGreaterThanOrEqual(3)
+      expect(snapshot.counters.readinessPersistentZeroCandidateSignals).toBe(1)
+      expect(snapshot.counters.readinessZeroCandidateSweeps).toBe(emptySweeps)
+      expect(snapshot.counters.readinessZeroTreeReadSweeps).toBe(emptySweeps)
+      expect(snapshot.counters.githubIssueDiscoveryCacheEmptyRepos).toBe(emptySweeps)
+      expect(snapshot.counters.githubIssueIndexEmptyRepos).toBeUndefined()
+      expect(snapshot.counters.githubIssueTreeEmptyRepos).toBeUndefined()
+
+      // The exact #402 failure shape: both durable repository roots are
+      // present-but-empty, so fallback uses cache, yields no paths, and issues
+      // no listTree. The fleet is explicitly remote, matching production.
+      expect(mount.listTreePrefixes).toHaveLength(readsAfterSeed)
+      expect(warn.mock.calls.filter(([message]) =>
+        message === '[factory] discovery has persistently produced zero candidates')).toHaveLength(1)
+      expect(warn.mock.calls.find(([message]) =>
+        message === '[factory] discovery has persistently produced zero candidates')?.[1]).toMatchObject({
+        consecutiveSweeps: 3,
+        threshold: 3,
+        configuredRepos: 1,
+        cacheBackedRepos: 1,
+        cacheBackedEmptyRepos: 1,
+        discoveryPaths: 0,
+        treeReads: 0,
+        emptyTreeReads: 0,
+      })
+
+      await vi.waitFor(() => {
+        expect(factory.status().readinessReconcile?.zeroCandidateSweeps).toBeGreaterThan(3)
+      }, { timeout: 5_000 })
+      expect(warn.mock.calls.filter(([message]) =>
+        message === '[factory] discovery has persistently produced zero candidates')).toHaveLength(1)
+      await factory.stop()
+      stopped = true
+    } finally {
+      // Guarded, and in the `finally`: every assertion above runs against a
+      // started daemon holding a 25ms reconcile timer, so a failing one left
+      // that timer running for the rest of the worker's life while this block
+      // removed the temp dir out from under it. Swallowing is deliberate --
+      // a throwing teardown replaces the real assertion failure in the report
+      // with its own stack. The happy-path `stop()` above stays unguarded, so
+      // a genuine shutdown fault still fails this test; this runs only when
+      // the try did not get that far.
+      if (!seedStopped) await seedFactory?.stop().catch(() => {})
+      if (!stopped) await factory?.stop().catch(() => {})
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  /**
+   * #406: a failed enumeration is not an empty one.
+   *
+   * `#githubIssuePaths` absorbs an ordinary backend error -- it rethrows only
+   * a pass-wide relayfile fault -- and returns no paths, after the per-repo
+   * `configuredRepos` counter has already been incremented. That settles the
+   * sweep in exactly the shape the zero-candidate alarm watches for. The pair
+   * below differs in one variable, `mount.failing`, so the guard is shown to
+   * be scoped to the failure rather than disabling the alarm.
+   */
+  const discoveryFailureHarness = async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-github-discovery-failure-'))
+    const mount = new ToggleableGithubIssueMount()
+    mount.emit(changeEvent('/factory/observability/mount-health/current.json'))
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const warn = vi.fn()
+    const create = () => createFactory(config({
+      issueSource: 'github',
+      safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+      loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') },
+    }), {
+      mount,
+      fleet: new RemoteLifecycleFleetClient(),
+      stateStore,
+      triage: new StaticTriage(),
+      logger: { warn },
+    })
+    const alarms = () => warn.mock.calls.filter(([message]) =>
+      message === '[factory] discovery has persistently produced zero candidates')
+    return { root, mount, create, warn, alarms }
+  }
+
+  it('does not count a failed GitHub enumeration as a zero-candidate sweep (#406)', async () => {
+    const { root, mount, create, alarms } = await discoveryFailureHarness()
+    mount.failing = true
+    let factory: ReturnType<typeof create> | undefined
+    let stopped = false
+    try {
+      factory = create()
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 25 },
+      })
+
+      // Four absorbed failures: one more than the alarm threshold, so a sweep
+      // miscounted as empty would already have raised it.
+      await vi.waitFor(() => {
+        expect(factory!.status().counters.githubIssueListFailures ?? 0).toBeGreaterThanOrEqual(4)
+      }, { timeout: 5_000 })
+
+      const snapshot = factory.status()
+      expect(snapshot.counters.githubIssueListFailures).toBeGreaterThanOrEqual(4)
+      // The defect first, so this test fails on the behaviour it exists to
+      // pin rather than on the marker that implements it: a failed pass is
+      // never laundered into a zero-candidate measurement, and so can never
+      // raise the persistent-empty-discovery alarm.
+      expect(alarms()).toHaveLength(0)
+      expect(snapshot.counters.readinessPersistentZeroCandidateSignals).toBeUndefined()
+      expect(snapshot.counters.readinessZeroCandidateSweeps).toBeUndefined()
+      expect(snapshot.readinessReconcile?.zeroCandidateAlarmActive).toBeFalsy()
+      expect(snapshot.readinessReconcile?.zeroCandidateSweeps ?? 0).toBe(0)
+      // Then the marker that preserves it as a failure.
+      expect(snapshot.readinessReconcile?.discoveryFailed).toBe('issue-listing-failed')
+      await factory.stop()
+      stopped = true
+    } finally {
+      if (!stopped) await factory?.stop().catch(() => {})
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it('still alarms when the same harness enumerates successfully and finds nothing (#406 control)', async () => {
+    const { root, mount, create, alarms } = await discoveryFailureHarness()
+    // The single variable: discovery now succeeds and genuinely finds nothing.
+    mount.failing = false
+    let factory: ReturnType<typeof create> | undefined
+    let stopped = false
+    try {
+      factory = create()
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 25 },
+      })
+
+      await vi.waitFor(() => {
+        expect(factory!.status().readinessReconcile).toMatchObject({
+          zeroCandidateAlarmActive: true,
+        })
+      }, { timeout: 5_000 })
+
+      const snapshot = factory.status()
+      expect(snapshot.counters.githubIssueListFailures).toBeUndefined()
+      expect(snapshot.readinessReconcile?.discoveryFailed).toBeUndefined()
+      expect(snapshot.readinessReconcile?.zeroCandidateSweeps ?? 0).toBeGreaterThanOrEqual(3)
+      expect(snapshot.counters.readinessPersistentZeroCandidateSignals).toBe(1)
+      expect(alarms()).toHaveLength(1)
+      await factory.stop()
+      stopped = true
+    } finally {
+      if (!stopped) await factory?.stop().catch(() => {})
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it('does not mark the sweep failed when only the GitHub mirror ingest failed (#406 review)', async () => {
+    // cubic, P2. `#githubIssuePaths` serves two roles. On a LINEAR-source
+    // workspace it is reached from `#ingestGithubIssues`, which only hydrates
+    // the GitHub mirror -- the sink enumeration is the Linear tree and can
+    // still return candidates. Marking the sweep failed from the mirror path
+    // stranded a sweep that DID find work: `#recordReadinessSweepOutcome`
+    // returned early, so its counts were never recorded and the
+    // zero-candidate streak was never reset.
+    const root = await mkdtemp(join(tmpdir(), 'factory-mirror-ingest-failure-'))
+    // Linear source (the config default), so the mirror ingest runs and fails
+    // while the Linear tree below still serves a ready issue.
+    const mount = new ToggleableGithubIssueMount({ [issuePath(971)]: issueFile(971) })
+    mount.failing = true
+    let factory: ReturnType<typeof createFactory> | undefined
+    let stopped = false
+    try {
+      factory = createFactory(
+        config({ loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') } }),
+        { mount, fleet: new FakeFleetClient(), stateStore: new InMemoryStateStore({ batchSize: 4 }), triage: new StaticTriage(), logger: {} },
+      )
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 },
+      })
+
+      // The sweep found and dispatched real work, so it MUST be recorded.
+      await vi.waitFor(() => {
+        expect(factory!.status().readinessReconcile).toMatchObject({
+          candidates: 1,
+          dispatched: 1,
+        })
+      }, { timeout: 5_000 })
+
+      const status = factory.status().readinessReconcile
+      // The mirror failure is not this sweep's enumeration failing.
+      expect(status?.discoveryFailed).toBeUndefined()
+      expect(status?.zeroCandidateSweeps ?? 0).toBe(0)
+      expect(status?.zeroCandidateAlarmActive).toBeFalsy()
+      await factory.stop()
+      stopped = true
+    } finally {
+      if (!stopped) await factory?.stop().catch(() => {})
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it('retires the discovery-failure marker when the next pass defers (#406 review)', async () => {
+    // CodeRabbit, minor. Both markers describe THE most recent pass, so they
+    // must never be publishable together: a sweep cannot simultaneously have
+    // failed to enumerate and have deferred to another owner's lease.
+    class DeferrableStateStore extends InMemoryStateStore {
+      deferClaims = false
+
+      override async claimDiscoverySweep(
+        workspaceId: string,
+        owner: string,
+        nowMs: number,
+        leaseMs: number,
+      ): Promise<DiscoverySweepClaim> {
+        const claim = await super.claimDiscoverySweep(
+          workspaceId,
+          this.deferClaims ? 'another-process' : owner,
+          nowMs,
+          leaseMs,
+        )
+        return this.deferClaims ? { ...claim, acquired: false, lease: undefined } : claim
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'factory-discovery-failure-then-defer-'))
+    const mount = new ToggleableGithubIssueMount()
+    mount.failing = true
+    const stateStore = new DeferrableStateStore({ batchSize: 2 })
+    let factory: ReturnType<typeof createFactory> | undefined
+    let stopped = false
+    try {
+      factory = createFactory(config({
+        issueSource: 'github',
+        safety: { requireLabel: 'factory', requireTitlePrefix: '[factory]' },
+        loop: { registryPath: join(root, 'registry.json'), heartbeatPath: join(root, 'heartbeat.json') },
+      }), {
+        mount,
+        fleet: new RemoteLifecycleFleetClient(),
+        stateStore,
+        triage: new StaticTriage(),
+        logger: {},
+      })
+      await factory.start({
+        mode: 'live',
+        liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 25 },
+      })
+
+      // A failing enumeration first, so the marker is genuinely set.
+      await vi.waitFor(() => {
+        expect(factory!.status().readinessReconcile?.discoveryFailed).toBe('issue-listing-failed')
+      }, { timeout: 5_000 })
+
+      stateStore.deferClaims = true
+
+      await vi.waitFor(() => {
+        expect(factory!.status().readinessReconcile?.discoveryDeferred).toBe('sweep-in-flight')
+      }, { timeout: 5_000 })
+
+      const status = factory.status().readinessReconcile
+      expect(status?.discoveryDeferred).toBe('sweep-in-flight')
+      // The point of the test: the older pass's failure is retired, not
+      // published alongside the deferral it did not cause.
+      expect(status?.discoveryFailed).toBeUndefined()
+      await factory.stop()
+      stopped = true
+    } finally {
+      if (!stopped) await factory?.stop().catch(() => {})
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
   it('publishes a non-zero candidate count for a sweep that found and dispatched ready work', async () => {
     const { status, spawns } = await sweepReadiness({
       [issuePath(901)]: issueFile(901),

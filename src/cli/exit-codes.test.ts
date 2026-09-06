@@ -140,6 +140,41 @@ describe('exitCodeForIterationReport', () => {
       .toBe(FACTORY_EXIT.RETRYABLE)
   })
 
+  it('is retryable when discovery failed and was absorbed (#406)', () => {
+    // The sweep survived -- no `error` is recorded, because absorbing the
+    // fault is what keeps one bad repository from aborting the pass -- so
+    // without this the caller reads exit 0 for a sweep that enumerated
+    // nothing. FAILED would overstate it: nothing refused, and a backend
+    // fault clears on its own.
+    expect(exitCodeForIterationReport(iterationReport({ discoveryFailed: 'issue-listing-failed' })))
+      .toBe(FACTORY_EXIT.RETRYABLE)
+    // Control: an ordinary empty sweep is still OK, so this is scoped to the
+    // failure and is not "zero candidates now means retry".
+    expect(exitCodeForIterationReport(iterationReport())).toBe(FACTORY_EXIT.OK)
+    // Control: a recorded error still outranks it.
+    expect(exitCodeForIterationReport(iterationReport({
+      discoveryFailed: 'issue-listing-failed',
+      error: { message: 'boom' },
+    }))).toBe(FACTORY_EXIT.FAILED)
+  })
+
+  it('is retryable only when EVERY iteration failed discovery (#406)', () => {
+    expect(exitCodeForLoopReports([
+      iterationReport({ discoveryFailed: 'issue-listing-failed' }),
+      iterationReport({ discoveryFailed: 'issue-listing-failed' }),
+    ])).toBe(FACTORY_EXIT.RETRYABLE)
+    // Mixed with a deferral: the loop still enumerated nothing.
+    expect(exitCodeForLoopReports([
+      iterationReport({ discoveryDeferred: 'sweep-in-flight' }),
+      iterationReport({ discoveryFailed: 'issue-listing-failed' }),
+    ])).toBe(FACTORY_EXIT.RETRYABLE)
+    // Control: one failed sweep among healthy ones is ordinary, not a retry.
+    expect(exitCodeForLoopReports([
+      iterationReport(),
+      iterationReport({ discoveryFailed: 'issue-listing-failed' }),
+    ])).toBe(FACTORY_EXIT.OK)
+  })
+
   it('fails a bounded loop when any iteration recorded an error', () => {
     expect(exitCodeForLoopReports([])).toBe(FACTORY_EXIT.OK)
     expect(exitCodeForLoopReports([iterationReport(), iterationReport()])).toBe(FACTORY_EXIT.OK)

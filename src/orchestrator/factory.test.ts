@@ -5796,6 +5796,16 @@ describe('FactoryLoop', () => {
       expect(mount.reads).toContain(indexPath)
       expect(factory.status().counters.githubIssueIndexReposUsed).toBe(1)
       expect(factory.status().counters.githubIssueDiscoveryCacheReposUsed).toBeUndefined()
+      expect(report.discoverySources).toEqual({
+        configuredRepos: 1,
+        indexBackedRepos: 1,
+        indexBackedEmptyRepos: 0,
+        cacheBackedRepos: 0,
+        cacheBackedEmptyRepos: 0,
+        treeBackedRepos: 0,
+        treeBackedEmptyRepos: 0,
+        paths: 1,
+      })
       await factory.stop()
     } finally {
       await rm(root, { recursive: true, force: true })

@@ -331,6 +331,25 @@ export interface FactoryReadinessReconcileStatus {
    */
   treeReads?: number
   emptyTreeReads?: number
+  /** Configured GitHub repositories examined by the last enumerating sweep. */
+  configuredRepos?: number
+  /** Repositories whose candidate paths came from the issue index. */
+  indexBackedRepos?: number
+  indexBackedEmptyRepos?: number
+  /** Repositories whose candidate paths came entirely from the durable cache. */
+  cacheBackedRepos?: number
+  cacheBackedEmptyRepos?: number
+  /** Repositories whose candidate paths required fresh tree reads. */
+  treeBackedRepos?: number
+  treeBackedEmptyRepos?: number
+  /** Candidate paths produced by all configured repository sources. */
+  discoveryPaths?: number
+  /** Consecutive successful enumerating sweeps that found zero candidates. */
+  zeroCandidateSweeps?: number
+  /** Number of consecutive empty sweeps required before the warn signal fires. */
+  zeroCandidateAlarmThreshold?: number
+  /** True once the current empty streak has reached the alarm threshold. */
+  zeroCandidateAlarmActive?: boolean
   /** Work units the last enumerating sweep actually dispatched. */
   dispatched?: number
   /** Work units the last enumerating sweep saw and declined. */
@@ -385,6 +404,18 @@ export interface FactoryReadinessReconcileStatus {
    * nothing has enumerated yet.
    */
   discoveryDeferred?: 'sweep-in-flight'
+  /**
+   * The MOST RECENT pass failed to enumerate GitHub issues, so it produced no
+   * candidates because it never finished looking (#406).
+   *
+   * The counterpart to `discoveryDeferred`, for the same reason: a failed pass
+   * publishes `candidates: 0` and is otherwise indistinguishable from a sweep
+   * that queried the provider and legitimately found no ready work. Its zeroes
+   * measure nothing, so they must not overwrite a real sweep's numbers, and
+   * they must not feed the persistent-zero-candidate alarm — which exists to
+   * report discovery finding nothing, not discovery failing.
+   */
+  discoveryFailed?: 'issue-listing-failed'
   /** Free text; authenticated surfaces only. */
   lastError?: string
   /** Allowlisted class name of `lastError`; publishable. */
@@ -894,8 +925,24 @@ export interface IterationReport {
    */
   treeReads?: number
   emptyTreeReads?: number
+  discoverySources?: {
+    configuredRepos: number
+    indexBackedRepos: number
+    indexBackedEmptyRepos: number
+    cacheBackedRepos: number
+    cacheBackedEmptyRepos: number
+    treeBackedRepos: number
+    treeBackedEmptyRepos: number
+    paths: number
+  }
   /** A cross-process owner was already enumerating this workspace. */
   discoveryDeferred?: 'sweep-in-flight'
+  /**
+   * GitHub issue enumeration failed on this pass and was absorbed rather than
+   * thrown (#406), so `pulled` is empty because the sweep never finished
+   * looking — not because there was nothing to find.
+   */
+  discoveryFailed?: 'issue-listing-failed'
   error?: { message: string; stack?: string }
 }
 
