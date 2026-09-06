@@ -35,6 +35,7 @@ import { existsSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 
 import type {
+  AllowedDraftPredicate,
   EventPage,
   FactoryIntegrationConnections,
   FactoryIntegrationProvider,
@@ -268,7 +269,7 @@ export interface RelayfileCloudMountClientConfig {
   workspaceMirrorResolver?: (workspaceIds: readonly string[]) => string | undefined
   /** Internal: fromConfig already attempted the registration lookup, including no-match. */
   skipRegisteredMirrorLookup?: boolean
-  isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
+  isAllowedDraft?: AllowedDraftPredicate
   isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
   /**
    * Deadline for one relayfile read, in milliseconds (#351).
@@ -359,7 +360,7 @@ export class RelayfileCloudMountClient implements MountClient {
   readonly #authDegradedLocalMounts = new Set<string>()
   #activeLocalMountOperations = 0
   #disposed = false
-  #isAllowedDraft?: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>
+  #isAllowedDraft?: AllowedDraftPredicate
   readonly #isAllowedDelete?: (path: string, currentContent: unknown) => boolean | Promise<boolean>
   readonly #operationTimeoutMs: number
   readonly #lastOpByPath = new Map<string, string>()
@@ -430,7 +431,7 @@ export class RelayfileCloudMountClient implements MountClient {
   }
 
   setDefaultAllowedDraftPredicate(
-    predicate: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>,
+    predicate: AllowedDraftPredicate,
   ): void {
     this.#isAllowedDraft ??= predicate
   }
@@ -702,8 +703,23 @@ export class RelayfileCloudMountClient implements MountClient {
     content: unknown,
     opts?: { guarded?: boolean; baseRevision?: string },
   ): Promise<{ targetRevision: string }> {
-    if (isProviderWritebackPath(path) && await this.#isAllowedDraft?.(path, content, opts) !== true) {
-      throw new Error(`Refusing provider writeback draft for ${path}: draft predicate rejected or is unset`)
+    if (isProviderWritebackPath(path)) {
+      if (!this.#isAllowedDraft) {
+        throw new Error(`Refusing provider writeback draft for ${path}: draft predicate is unset`)
+      }
+      let rejection: { branch: string; detail?: string } | undefined
+      const allowed = await this.#isAllowedDraft(path, content, opts, {
+        reject: (branch, detail) => {
+          rejection ??= { branch, ...(detail ? { detail } : {}) }
+          return false
+        },
+      })
+      if (allowed !== true) {
+        const reason = rejection
+          ? `draft predicate rejected at ${rejection.branch}${rejection.detail ? `: ${rejection.detail}` : ''}`
+          : 'draft predicate rejected without branch detail'
+        throw new Error(`Refusing provider writeback draft for ${path}: ${reason}`)
+      }
     }
 
     const serialized = serializeContent(content)

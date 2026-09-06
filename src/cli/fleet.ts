@@ -88,6 +88,7 @@ import {
   type FactoryIntegrationObservation,
 } from '../mount/relayfile-integration-preflight'
 import type { FactoryIntegrationProvider, SandboxPush } from '../ports'
+import { rejectDraft, type AllowedDraftPredicateDiagnostics } from '../safety/draft-predicate'
 import type { StateStore } from '../ports/state'
 import { checkMountStaleness } from '../mount/relayfile-binary'
 import { MountAuthScopeError } from '../mount/mount-auth-error'
@@ -2281,7 +2282,8 @@ async function buildMount(
     operationTimeoutMs: loaded.config.liveSubscription.relayfileOperationTimeoutMs,
     logger: observability.logger,
     onLocalMountHealth: observability.onLocalMountHealth,
-    isAllowedDraft: (path, content, opts) => isAllowedFactoryDraft(path, content, opts, mount, loaded.config),
+    isAllowedDraft: (path, content, opts, diagnostics) =>
+      isAllowedFactoryDraft(path, content, opts, mount, loaded.config, diagnostics),
   })
   return mount
 }
@@ -2311,8 +2313,9 @@ async function isAllowedFactoryDraft(
   opts: { guarded?: boolean } | undefined,
   mount: MountClient,
   config: FactoryConfig,
+  diagnostics?: AllowedDraftPredicateDiagnostics,
 ): Promise<boolean> {
-  if (!opts?.guarded) return false
+  if (!opts?.guarded) return rejectDraft(diagnostics, 'guarded', 'writeFile opts.guarded must be true')
 
   // Comment writeback nested under its issue: /linear/issues/<ref>/comments/<draft>.json.
   // Scope-check the owning issue (the draft content is a comment, not an issue).
@@ -2321,9 +2324,10 @@ async function isAllowedFactoryDraft(
     const issuePath = `/linear/issues/${nestedComment[1]}.json`
     try {
       const issue = await readLinearIssueWithCanonicalFallback(mount, issuePath)
-      return isInFactoryScope(issue, config.safety)
+      return isInFactoryScope(issue, config.safety) ||
+        rejectDraft(diagnostics, 'linear.nested-comment-scope')
     } catch {
-      return false
+      return rejectDraft(diagnostics, 'linear.nested-comment-scope')
     }
   }
 
@@ -2331,9 +2335,9 @@ async function isAllowedFactoryDraft(
     if (isInFactoryScope(scopeIssueFromDraftContent(content), config.safety)) return true
     try {
       const issue = await readLinearIssueWithCanonicalFallback(mount, path)
-      return isInFactoryScope(issue, config.safety)
+      return isInFactoryScope(issue, config.safety) || rejectDraft(diagnostics, 'linear.issue-scope')
     } catch {
-      return false
+      return rejectDraft(diagnostics, 'linear.issue-scope')
     }
   }
 
@@ -2341,9 +2345,11 @@ async function isAllowedFactoryDraft(
     return true
   }
 
-  if (await isAllowedFactoryGithubDraft(path, content, opts, mount, config)) return true
+  if (path.startsWith('/github/')) {
+    return isAllowedFactoryGithubDraft(path, content, opts, mount, config, diagnostics)
+  }
 
-  return false
+  return rejectDraft(diagnostics, 'provider-path', 'path is not an allowed Linear, Slack, or GitHub draft')
 }
 
 const scopeIssueFromDraftContent = (content: unknown) => ({

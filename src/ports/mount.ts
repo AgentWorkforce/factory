@@ -171,6 +171,23 @@ export type GithubConnectionIssueUpdateInput = GithubConnectionIssueUpdateTarget
   | { labels?: never; state: 'open' | 'closed' }
 )
 
+/**
+ * Optional single-pass diagnostics for a fail-closed provider draft predicate.
+ * Predicates remain boolean for compatibility; a rejecting branch can name
+ * itself without throwing or re-running provider reads solely to explain the
+ * refusal.
+ */
+export interface AllowedDraftPredicateDiagnostics {
+  reject(branch: string, detail?: string): false
+}
+
+export type AllowedDraftPredicate = (
+  path: string,
+  content: unknown,
+  opts?: { guarded?: boolean },
+  diagnostics?: AllowedDraftPredicateDiagnostics,
+) => boolean | Promise<boolean>
+
 export interface MountClient {
   readonly writebackTransport?: 'relayfile-cloud' | 'test'
   readonly githubRead?: GithubConnectionRead
@@ -206,7 +223,7 @@ export interface MountClient {
   }): Promise<{ targetRevision: string } | void>
   deleteFile(path: string): Promise<void>
   setDefaultAllowedDraftPredicate?(
-    predicate: (path: string, content: unknown, opts?: { guarded?: boolean }) => boolean | Promise<boolean>,
+    predicate: AllowedDraftPredicate,
   ): void
   listTree(prefix: string): Promise<string[]>
   subscribe(globs: string[], onChange: (event: ChangeEvent) => void, opts?: SubscribeOptions): Subscription

@@ -20642,6 +20642,7 @@ describe('FactoryLoop', () => {
       path: string,
       content: unknown,
       opts?: { guarded?: boolean },
+      diagnostics?: { reject: (branch: string, detail?: string) => false },
     ) => boolean | Promise<boolean>
     class PredicateMount extends FakeMountClient {
       predicate?: DraftPredicate
@@ -20684,6 +20685,19 @@ describe('FactoryLoop', () => {
       { state: 'closed' },
       { guarded: true },
     )).resolves.toBe(false)
+    let rejectionBranch: string | undefined
+    await expect(mount.predicate!(
+      '/notion/pages/unsafe.json',
+      { title: 'unsupported provider write' },
+      { guarded: true },
+      {
+        reject: (branch): false => {
+          rejectionBranch ??= branch
+          return false
+        },
+      },
+    )).resolves.toBe(false)
+    expect(rejectionBranch).toBe('provider-path')
   })
 
   it.each([
