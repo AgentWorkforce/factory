@@ -634,6 +634,24 @@ const NON_RETRYABLE_WRITEBACK_ERROR_PATTERN =
 const isNonRetryablePublishError = (error: unknown): boolean =>
   NON_RETRYABLE_WRITEBACK_ERROR_PATTERN.test(describeError(error).errorMessage)
 /**
+ * The single refusal for a publish that cannot be performed as the workspace
+ * GitHub App.
+ *
+ * Deliberately NOT worded to match `NON_RETRYABLE_WRITEBACK_ERROR_PATTERN`
+ * above (which anchors on a leading `Refusing to publish`). `github.identity:
+ * "app"` with no connected write path already threw a retryable error here,
+ * and the mount's `githubWrite` can be absent because the connection has not
+ * finished attaching rather than because it will never exist. Widening the
+ * refusal to every identity is the fix; silently reclassifying a whole error
+ * class as terminal is not, and it would abandon work units that the retry
+ * loop recovers today. Loud and non-falling-back is what was asked for — the
+ * publish budget still terminalizes it once the retries are spent.
+ */
+const APP_PUBLISH_UNAVAILABLE =
+  'GitHub pull request publication requires the workspace GitHub App. Software Garden publishes agent work only through the ' +
+  'Nango-backed workspace GitHub connection, and no connected App write path is available on this mount; ' +
+  'refusing to publish rather than falling back to the local gh CLI or to an operator credential.'
+/**
  * Separator for the per-repository publish budget key. `::` cannot appear in a
  * dispatch lifecycle key (`github:owner/repo#n` or `linear:uuid`), so the
  * prefix scan in `#clearPublishAttempts` cannot match a neighbouring work unit.
@@ -12315,27 +12333,13 @@ export class FactoryLoop implements Factory {
       // Re-create its deterministic worktree from the retained local branch so
       // publication can still push/read the completed commit.
       await this.#prepareAgentWorktree(record, implementer.spec)
-      // A remote implementer's commits are inside its sandbox and have never
-      // reached GitHub: the box holds no push credential by design, so the
-      // branch `#publishImplementerPullRequest` is about to ask for does not
-      // exist yet. Publish it from the host first. Best-effort — on any
-      // outcome but a push we fall through to the existing path, which is
-      // still correct for a run whose branch did somehow arrive.
-      const pushAttempted = await this.#tryPushImplementerSandbox(record, implementer)
-      const published = await this.#publishImplementerPullRequest(
-        record,
-        implementer,
-        // Reconcile whenever the push path was APPLICABLE, not only when this
-        // attempt pushed. A push opens the PR on its way through, and under
-        // relayfile-cloud the mounted snapshot can lag that creation — so a
-        // single scan can miss a PR that exists, fall through to creation, and
-        // fail on a duplicate head. Worse, the retry then finds the sandbox
-        // already pushed and answers `no-changes`, which under a
-        // pushed-only condition would disable reconciliation for good and
-        // strand a perfectly valid PR unrecorded. The lookup is cheap and
-        // returns undefined when there is genuinely nothing to reconcile.
-        pushAttempted ? { reconcileExisting: true } : {},
-      )
+      // The App sandbox push now runs inside `#publishImplementerPullRequest`
+      // itself, so the completion path reaches it too. It used to run only
+      // here, on the exit-recovery path, which meant a remote implementer that
+      // reported `issue-done` was published from a branch this factory had
+      // never pushed — i.e. from whatever the agent's own `git push` had put
+      // on origin.
+      const published = await this.#publishImplementerPullRequest(record, implementer)
       if (published) {
         this.#increment('implementerPrsPublishedOnExit')
         this.#logger.info?.('[factory] published PR from implementer clone after it exited without opening one', {
@@ -12358,7 +12362,8 @@ export class FactoryLoop implements Factory {
   }
 
   /**
-   * Publish a remote implementer's sandbox commits as a branch and a PR.
+   * Publish a remote implementer's sandbox commits as a branch and a PR,
+   * through the workspace GitHub App.
    *
    * Returns whether this path was APPLICABLE — a remote implementer with a
    * sandbox to push from — rather than whether this particular attempt pushed.
@@ -12367,25 +12372,42 @@ export class FactoryLoop implements Factory {
    * the sandbox was already pushed must still reconcile rather than try to
    * create a duplicate.
    *
-   * Everything here is best-effort and non-throwing. A dispatch whose work
-   * cannot be published is not a dispatch that should be failed — the existing
-   * publish path still runs behind this, and its own error handling is what
-   * decides the record's fate. The one thing this must never do is make a
-   * local-placement dispatch worse, so it is gated on remote locality.
+   * A push that was ATTEMPTED and failed stays best-effort and non-throwing:
+   * the existing publish path still runs behind this, and its own error
+   * handling decides the record's fate.
    *
-   * No credential passes through here. `SandboxPush` names the sandbox, the
-   * clone path and the branch; the host mints a GitHub App installation token
-   * on its own side and the sandbox never sees one.
+   * A missing `sandboxPush` port is a different thing entirely, and is the
+   * relay#1654 defect. `sandboxPush` is optional and is injected by
+   * factory-cloud's container; when it was absent this method returned `false`
+   * silently — no counter, no log, no error — and publication carried on as if
+   * "a remote implementer already pushed its branch" were still true. Nothing
+   * in this process had pushed it, so the only branch that could be on origin
+   * was one the agent pushed itself, carrying the operator's own GitHub
+   * credential. That produced five `factory/1654-agentworkforce-relay-*`
+   * branches authored by a person and zero pull requests, with no signal
+   * anywhere that the App had never been involved.
+   *
+   * So: applicable-but-unwired throws, loudly and distinctly. The message
+   * opens with `Refusing to publish`, which makes it non-retryable — a port
+   * that is not wired into this runtime will not be wired on the next scan
+   * either — so the dispatch is abandoned with a real reason instead of
+   * publishing work under a human's name or spinning in the retry loop.
+   *
+   * No credential passes through here either way. `SandboxPush` names the
+   * sandbox, the clone path and the branch; the host mints a GitHub App
+   * installation token on its own side and the sandbox never sees one. No
+   * installation id is named on this interface: the workspace connection
+   * resolves the App from the workspace id.
    */
   async #tryPushImplementerSandbox(
     record: InFlightIssue,
     implementer: TrackedAgent,
+    repo: string,
+    issue: LinearIssue,
   ): Promise<boolean> {
-    const push = this.#sandboxPush
     const sandboxId = implementer.result?.sandboxId
     const branch = implementer.spec.branch
     if (
-      !push ||
       !sandboxId ||
       !branch ||
       implementer.result?.locality !== 'remote' ||
@@ -12393,17 +12415,23 @@ export class FactoryLoop implements Factory {
     ) {
       return false
     }
-    // Both the issue read and the repo normalization run INSIDE the try:
-    // `#readIssue` can rethrow a pass-wide relayfile fault and
-    // `normalizeGithubRepo` throws for a bare repo name with no configured
-    // org. Outside, those failures would be counted as a skipped publish and
-    // never as a push failure, which hides a broken push behind the wrong
-    // counter.
-    let repo = implementer.spec.repo
+    const push = this.#sandboxPush
+    if (!push) {
+      this.#increment('sandboxPushesUnavailable')
+      const message = `Refusing to publish ${record.issue.key} from sandbox ${sandboxId}: ` +
+        'a remote implementer\'s commits can only reach GitHub through the workspace GitHub App push port, ' +
+        'and no such port is wired into this Factory runtime. Software Garden will not publish a pull request ' +
+        'from a branch it did not push, and will not fall back to a git push carrying an operator credential.'
+      this.#logger.error?.('[factory] no GitHub App push port for a remote implementer', {
+        issue: record.issue.key,
+        repo,
+        branch,
+        sandboxId,
+        error: message,
+      })
+      throw new Error(message)
+    }
     try {
-      const issue = await this.#readIssue(record.issue.path)
-      if (!issue) return true
-      repo = normalizeGithubRepo(implementer.spec.repo, this.#config.repos.org)
       const result = await push.push({
         sandboxId,
         repoPath: implementer.spec.clonePath,
@@ -12508,7 +12536,22 @@ export class FactoryLoop implements Factory {
       }
       return durableReceipt
     }
-    if (opts.reconcileExisting) {
+    // A remote implementer's commits are inside its sandbox and have never
+    // reached GitHub: the box holds no push credential by design, so the
+    // branch we are about to open a PR from does not exist yet. Push it as the
+    // App first. Runs here, on the single publish chokepoint, so the
+    // completion path gets it as well as exit recovery.
+    const sandboxPushApplicable = await this.#tryPushImplementerSandbox(record, implementer, repo, issue)
+    // Reconcile whenever the push path was APPLICABLE, not only when this
+    // attempt pushed. A push opens the PR on its way through, and under
+    // relayfile-cloud the mounted snapshot can lag that creation — so a
+    // single scan can miss a PR that exists, fall through to creation, and
+    // fail on a duplicate head. Worse, the retry then finds the sandbox
+    // already pushed and answers `no-changes`, which under a pushed-only
+    // condition would disable reconciliation for good and strand a perfectly
+    // valid PR unrecorded. The lookup is cheap and returns undefined when
+    // there is genuinely nothing to reconcile.
+    if (opts.reconcileExisting || sandboxPushApplicable) {
       const existing = await this.#openPullRequestByHead(repo, expectedHeadRef)
       if (existing) {
         this.#publishedPullRequests.set(key, existing)
@@ -12560,37 +12603,51 @@ export class FactoryLoop implements Factory {
     return published
   }
 
+  /**
+   * The one publisher for agent work, and it is always the workspace GitHub
+   * App reached through the Nango-backed connection.
+   *
+   * `github.identity` does NOT participate. It selects the ISSUE LIFECYCLE
+   * writeback — comments, status labels, closure — and it used to select this
+   * too: `user`, and `auto` with no connected App, both returned the local
+   * `gh` publisher, which pushed the branch and opened the PR as whatever
+   * human account was logged in on the host. relay#1654 is the receipt for
+   * that: five branches attributed to a person and no pull request anywhere.
+   *
+   * An identity is not a property a caller gets to choose per operation.
+   * Publishing agent work is the App's job, so a missing App write path is a
+   * loud, distinct, non-retryable refusal (the message opens with "Refusing to
+   * publish", which `isNonRetryablePublishError` matches) rather than a
+   * fallback nobody can see in the logs.
+   *
+   * No `installationId` is required or accepted here: the workspace connection
+   * resolves the installation on the Relayfile side from the workspace id.
+   */
   #githubPullRequestPublisher(): {
     identity: GithubPullRequestIdentity
     publisher: GithubPullRequestPublisher
   } {
-    const configured = this.#config.github.identity
-    if (configured !== 'user' && this.#mount.githubWrite) {
+    if (this.#mount.githubWrite) {
       return { identity: 'app', publisher: this.#mount.githubWrite }
     }
-    if (configured === 'app') {
-      throw new Error(
-        'GitHub PR identity "app" requires a connected workspace GitHub App write path; refusing to fall back to the local gh user',
-      )
-    }
-    const publishPullRequest = this.#githubWriteback.publishPullRequest
-    if (!publishPullRequest) {
-      throw new Error(
-        `GitHub PR identity "${configured}" requires local gh user publication, but the configured GitHub writeback does not support it`,
-      )
-    }
-    return {
-      identity: 'user',
-      publisher: { publishPullRequest: publishPullRequest.bind(this.#githubWriteback) },
-    }
+    throw new Error(APP_PUBLISH_UNAVAILABLE)
   }
 
+  /**
+   * Whether to DRIVE publication at all — not which identity performs it.
+   * `#githubPullRequestPublisher` answers that, and its answer is always the
+   * App.
+   *
+   * The only case that declines is a fake mount with no injected publisher.
+   * `writebackTransport === 'test'` is set by `src/testing/fakes.ts` and by
+   * nothing else, so this carve-out is unreachable in production: every real
+   * transport attempts, and a real transport with no connected App write path
+   * reaches the loud `APP_PUBLISH_UNAVAILABLE` refusal rather than skipping.
+   * That is the point — a publish that cannot use the App has to be visible.
+   */
   #shouldAttemptPullRequestPublication(): boolean {
     if (this.#config.github.identity !== 'auto') return true
     if (this.#mount.githubWrite) return true
-    // Fake mounts deliberately avoid invoking the host's real gh binary unless
-    // a publisher was injected. Every production mount (cloud or custom) still
-    // gets the configured auto fallback.
     if (this.#mount.writebackTransport === 'test') {
       return Boolean(this.#githubWritebackProvided && this.#githubWriteback.publishPullRequest)
     }

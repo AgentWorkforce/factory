@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
+import { postAttestationGrant } from '../github/attestation-grant'
 import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import { assertRoutedGithubWritebackPath } from '../github/writeback-routes'
 import type {
@@ -128,6 +129,16 @@ export class RelayfileGithubConnectionWrite implements GithubConnectionWrite {
       // Confirm the ref exists first, so the failure names the real cause.
       await this.#assertHeadRefPushed(owner, repo, fullHeadRef, headRef)
     }
+
+    // Best-effort: record a late attestation grant so the session reference
+    // rides through to the attestation ledger. Silently omits when the relay
+    // auth env vars are absent (operator key path, no workspace token). This
+    // moved here from the retired local-`gh` publisher, which was the only
+    // caller before publication became App-only; prefer the per-agent
+    // sessionRef over the process-wide env var so concurrent implementers each
+    // record their own session.
+    const sessionRef = input.sessionRef ?? (process.env.RELAY_ATTEST_SESSION_ID || undefined)
+    await postAttestationGrant(input.repo, sessionRef).catch(() => undefined)
 
     const pullRequestPath = `${repoRoot}/pull-requests/${draftName}.json`
     const confirmedPullRequestId = await this.#writeAndConfirm(pullRequestPath, {

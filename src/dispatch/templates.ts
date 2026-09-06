@@ -137,11 +137,11 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
   const branchLine = input.branchName && input.branchPrepared
     ? isSwarmWorker
       ? `Software Garden already prepared this isolated checkout on branch \`${input.branchName}\`. Do not reset it, switch branches, or recreate it; the lead commits and pushes the integrated result.`
-      : `Software Garden already prepared this isolated checkout on branch \`${input.branchName}\`. Do not reset it, switch branches, or recreate it; commit and push only this branch.`
+      : `Software Garden already prepared this isolated checkout on branch \`${input.branchName}\`. Do not reset it, switch branches, or recreate it; commit only to this branch and leave publication to Software Garden.`
     : input.branchName
     ? isSwarmWorker
       ? `Continue on the exact branch \`${input.branchName}\` in this shared checkout. Do not reset it, switch branches, or push it — the lead publishes.`
-      : `Create a branch for this issue before editing. Create or reset the exact branch \`${input.branchName}\` from the repository default branch, then commit and push only this branch.`
+      : `Create a branch for this issue before editing. Create or reset the exact branch \`${input.branchName}\` from the repository default branch, then commit only to this branch and leave publication to Software Garden.`
     : 'Create a branch for this issue before editing.'
   const publicationInstructions = isSwarmWorker
     ? [
@@ -164,8 +164,15 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       ]
     : [
         'Commit the implementation and tests.',
-        'Push the branch to origin.',
-        'When implementation is complete, Software Garden will open the PR targeting the repository default branch through the connected GitHub workspace.',
+        // relay#1654: this used to read "Push the branch to origin." An agent
+        // following it pushes with whatever git credential its environment
+        // holds — the operator's — so the branch landed on GitHub under a
+        // human's account while Factory's PRs are authored by the App. Five
+        // branches, one person's name on all of them, zero pull requests.
+        // Software Garden publishes both halves (branch push AND PR) as the
+        // workspace GitHub App; the agent's job ends at the local commit.
+        'Do NOT push the branch and do NOT run `git push`. Leave the commits on the local branch.',
+        'When implementation is complete, Software Garden will push the branch and open the PR targeting the repository default branch through the connected GitHub workspace App.',
         'Do not run `gh pr create` or require local GitHub CLI authentication.',
         `Software Garden will hand the opened PR to reviewer \`${input.reviewerName}\`.`,
         `Send reviewer \`${input.reviewerName}\` a concise branch and commit summary. If that direct delivery fails, do not fall back to a shared channel; Software Garden completion does not depend on this coordination message.`,
@@ -284,6 +291,10 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
         'Fix failing CI — change the code and tests as needed until the checks pass. A red check is not done.',
         'After every push, wait for the checks on the newly pushed head commit. Never reuse green results from an older commit when declaring the PR ready.',
         'Commit and push fixes only to the existing PR head branch. Use a normal push when possible; if rebasing requires rewriting the PR head, use `--force-with-lease`, never an unconditional force push.',
+        // The publication boundary, stated rather than assumed. A babysitter
+        // that opens its own PR does it with the local `gh` user's identity,
+        // reintroducing exactly the split audit trail relay#1654 exposed.
+        'Never create a new branch and never open a pull request. Publishing agent work — the branch AND the pull request — belongs to Software Garden and is performed as the workspace GitHub App; your writes are limited to the head of this existing PR.',
         'If the push is denied, stop and report the access blocker. Never search for, read, or substitute credentials or tokens, and never modify Git/GitHub authentication configuration.',
         'If a human can be reached, proactively offer to discuss the PR status, trade-offs, and open questions.',
         'When the PR is green — no failing CI, no merge conflicts, and every review comment addressed — report a concise completion summary and output `/exit` on its own line so the Agent Relay task-exit lifecycle closes cleanly.',
@@ -314,6 +325,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
       'After every push, wait for the checks on the newly pushed head commit. Never reuse green results from an older commit when declaring the PR ready.',
       `Coordinate the team when it helps: DM the implementer(s) (${implementers}) or the reviewer \`${input.reviewerName}\` to delegate or pull context. Prefer fixing it yourself; loop them in when you are stuck or it is clearly their area.`,
       'Commit and push your fixes to the PR branch.',
+      'Never create a new branch and never open a pull request. Publishing agent work — the branch AND the pull request — belongs to Software Garden and is performed as the workspace GitHub App; your writes are limited to the head of this existing PR.',
       chatLine,
       `Only when the PR is green — no failing CI, no merge conflicts, every review comment addressed — report readiness so Software Garden can move the issue to ${destination}.`,
       ...lifecycleInstructions(input, 'ready'),

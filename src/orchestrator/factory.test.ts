@@ -20291,11 +20291,14 @@ describe('FactoryLoop', () => {
     await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
   })
 
+  // Publishing agent work is App-only, for EVERY value of `github.identity`.
+  // `identity` still selects the ISSUE LIFECYCLE writeback (comments, labels,
+  // closure); it has never been a licence to attribute a branch push or a pull
+  // request to the operator's personal GitHub account.
   it.each([
     { identity: 'app' as const, appAvailable: true, expectedIdentity: 'app' as const },
-    { identity: 'user' as const, appAvailable: true, expectedIdentity: 'user' as const },
+    { identity: 'user' as const, appAvailable: true, expectedIdentity: 'app' as const },
     { identity: 'auto' as const, appAvailable: true, expectedIdentity: 'app' as const },
-    { identity: 'auto' as const, appAvailable: false, expectedIdentity: 'user' as const },
   ])(
     'publishes with the $expectedIdentity identity when github.identity=$identity and appAvailable=$appAvailable',
     async ({ identity, appAvailable, expectedIdentity }) => {
@@ -20350,6 +20353,47 @@ describe('FactoryLoop', () => {
       ])
     },
   )
+
+  /**
+   * The other half of the #1654 defect. `github.identity: "auto"` used to fall
+   * back to `GhCliGithubWriteback`, which runs `git push` and `gh pr create`
+   * with whatever GitHub account happens to be logged in locally — silently,
+   * with a `published PR` success log naming the operator as the author. A
+   * publish that cannot use the App must fail loudly instead.
+   */
+  it('refuses to publish through the local gh user when no App write path is connected', async () => {
+    const number = 523
+    const mount = new FakeMountClient({
+      [issuePath(number)]: issueFile(number),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    })
+    const userWriteback = new PublishingGithubWriteback({ number, author: 'operator-user' })
+    const warnLogs: unknown[][] = []
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ github: { identity: 'auto' } }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      githubWriteback: userWriteback,
+      probePrResolver: async () => undefined,
+      logger: {
+        info: () => undefined,
+        warn: (...args: unknown[]) => warnLogs.push(args),
+        error: (...args: unknown[]) => warnLogs.push(args),
+      },
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issueFile(number))))
+    fleet.emitAgentExit(`ar-${number}-impl-pear`, 'issue-done')
+
+    await vi.waitFor(() =>
+      expect(JSON.stringify(warnLogs)).toContain(
+        'GitHub pull request publication requires the workspace GitHub App',
+      )
+    )
+    expect(userWriteback.publishInputs).toEqual([])
+    expect(factory.status().counters.githubPullRequestsPublished ?? 0).toBe(0)
+  })
 
   it('publishes an implementer PR through the mount connection on successful completion', async () => {
     class OrderedPreviewFleetClient extends FakeFleetClient {
@@ -21460,6 +21504,55 @@ describe('FactoryLoop', () => {
       await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
 
       expect(calls).toEqual([])
+    })
+
+    /**
+     * The #1654 defect, as a fence.
+     *
+     * `sandboxPush` is OPTIONAL and is injected by factory-cloud's container.
+     * When it is not wired, the remote publish path used to return `false`
+     * silently — no counter, no log, no error — and fall straight through to
+     * PR publication on the assumption that "a remote implementer already
+     * pushed its branch". The only thing that could have put that branch on
+     * origin is the agent's own `git push`, carrying the operator's personal
+     * credential. That is exactly how relay#1654 produced five
+     * `factory/1654-agentworkforce-relay-*` branches authored by a person and
+     * zero pull requests.
+     *
+     * Publishing agent work is App-only. A remote implementer whose commits
+     * can only reach GitHub through the App push port, with no App push port
+     * available, must fail loudly and must NOT publish a PR from a branch this
+     * factory did not push.
+     */
+    it('refuses to publish a remote implementer when the App push port is not wired', async () => {
+      const publishInputs: GithubPublishPullRequestInput[] = []
+      const warnLogs: unknown[][] = []
+      const fleet = new RemoteFleetClient()
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount: publishingMount(publishInputs),
+        fleet,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        // No `sandboxPush`: exactly the production shape that shipped #1654.
+        logger: {
+          info: () => undefined,
+          warn: (...args: unknown[]) => warnLogs.push(args),
+          error: (...args: unknown[]) => warnLogs.push(args),
+        },
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+
+      await vi.waitFor(() =>
+        expect(factory.status().counters.sandboxPushesUnavailable).toBe(1)
+      )
+      // The branch was never pushed by us, so no PR may be opened from it.
+      expect(publishInputs).toEqual([])
+      expect(JSON.stringify(warnLogs)).toContain(
+        'Refusing to publish AR-93 from sandbox sandbox-abc',
+      )
     })
 
     /**
