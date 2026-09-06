@@ -17338,6 +17338,16 @@ export class FactoryLoop implements Factory {
     await this.#ensureBabysitter(record, { repo: pr.repo, prNumber: pr.prNumber })
   }
 
+  #babysitterActivationExcluded(repo: string, prNumber: number, labels: string[] = []): boolean {
+    const config = this.#config.babysitter
+    const identity = githubPrIdentity(repo, prNumber)
+    const excludedLabels = new Set(config.excludeLabels.flatMap(gardenLabelAliases))
+    const excluded = config.excludePullRequests.some((value) => value.toLowerCase() === identity) ||
+      labels.some((label) => excludedLabels.has(label.trim().toLowerCase()))
+    if (excluded) this.#increment('babysitterActivationExcluded')
+    return excluded
+  }
+
   async #ensureBabysitter(record: InFlightIssue, prRef: {
     repo: string
     prNumber: number
@@ -17346,6 +17356,10 @@ export class FactoryLoop implements Factory {
     headRef?: string
     authoritative?: boolean
   }): Promise<void> {
+    if (!this.#config.babysitter.enabled || record.dryRun) return
+    const prIdentity = githubPrIdentity(prRef.repo, prRef.prNumber)
+    if (!prIdentity) return
+    if (this.#babysitterActivationExcluded(prRef.repo, prRef.prNumber)) return
     const babysitterKey = babysitterOwnershipKey(record.issue, prRef)
     if (!await this.#assertIssueDispatchLifecycleOwner(record.issue)) {
       this.#increment('babysitterLifecycleOwnershipRejected')
@@ -17414,6 +17428,15 @@ export class FactoryLoop implements Factory {
     this.#babysitterSpawnInFlight.set(babysitterKey, spawnFinished)
 
     try {
+      const snapshot = await this.#readPrSnapshot(prRef)
+      if (snapshot && (this.#babysitterActivationExcluded(prRef.repo, prRef.prNumber, snapshot.labels) ||
+        prMetaShowsMerged(snapshot) || snapshot.draft ||
+        (snapshot.state && snapshot.state.toUpperCase() !== 'OPEN'))) {
+        this.#babysitterSpawned.delete(babysitterKey)
+        this.#babysitterPr.delete(babysitterKey)
+        this.#babysitterIssueRefs.delete(babysitterKey)
+        return
+      }
       const issue = await this.#readIssue(record.issue.path)
       if (!issue) {
         this.#babysitterSpawned.delete(babysitterKey)
@@ -17440,7 +17463,7 @@ export class FactoryLoop implements Factory {
         .map((agent) => agent.spec)
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.preview)?.preview
         ?? record.decision.implementers.find((candidate) => candidate.repo === initialSpec.repo)?.preview
-      const implementerBranch = prRef.headRef ?? record.decision.implementers
+      const implementerBranch = prRef.headRef ?? snapshot?.headRef ?? record.decision.implementers
         .find((candidate) => candidate.repo === initialSpec.repo && candidate.branch)?.branch
       const checkoutSpec: AgentSpec = sharedCheckout
         ? {
@@ -17451,7 +17474,10 @@ export class FactoryLoop implements Factory {
             ...(sharedCheckout.existingPullRequestBranch ? { existingPullRequestBranch: true } : {}),
           }
         : initialSpec
-      const spec = specWithPreview(checkoutSpec, preview)
+      const spec = specWithPreview({
+        ...checkoutSpec,
+        ...(implementerBranch ? { branch: implementerBranch, existingPullRequestBranch: true } : {}),
+      }, preview)
       const reviewer = [...record.agents.values()].find((agent) => agent.spec.role === 'reviewer')
       const reviewerName = reviewer?.result?.name ?? reviewer?.spec.name
         ?? agentNameForRole(issue, 'review', { repo: route?.repo ?? prRef.repo })
@@ -17492,6 +17518,31 @@ export class FactoryLoop implements Factory {
         ...(this.#fleet.lifecycleActionName ? { lifecycleActionName: this.#fleet.lifecycleActionName } : {}),
       })
 
+      // A PR is the work unit, regardless of how many issue records point at it.
+      // Persist before placement and never force/clear this claim on timeout,
+      // exit or failed acknowledgement: none proves that a worker was not
+      // created. Existing tracked placements recover above without re-dispatch.
+      // An uncertain, untracked placement requires operator reconciliation.
+      const priorSessions = await this.#state.listBabysitterSessions(this.#workspaceId)
+      if (priorSessions.some(([, session]) =>
+        githubPrIdentity(session.repo, session.prNumber) === prIdentity)) {
+        this.#increment('babysitterActivationClaimRejected')
+        this.#babysitterSpawned.delete(babysitterKey)
+        this.#babysitterPr.delete(babysitterKey)
+        this.#babysitterIssueRefs.delete(babysitterKey)
+        return
+      }
+      const claim = await this.#state.markRunning(
+        this.#workspaceId, `factory-created:${prIdentity}`, spec.name,
+        this.#clock.now(), DISPATCH_LIFECYCLE_LEASE_MS,
+      )
+      if (!claim) {
+        this.#increment('babysitterActivationClaimRejected')
+        this.#babysitterSpawned.delete(babysitterKey)
+        this.#babysitterPr.delete(babysitterKey)
+        this.#babysitterIssueRefs.delete(babysitterKey)
+        return
+      }
       const spawned = await this.#spawnAgent(record, {
         ...spec,
         task,
@@ -23423,6 +23474,7 @@ type PullSnapshot = {
   mergeStateStatus?: string
   reviewDecision?: string
   statusCheckRollup?: Array<{ status?: string; conclusion?: string | null }>
+  labels?: string[]
 }
 
 const parsePullSnapshot = (content: unknown, fallbackNumber: number): PullSnapshot | undefined => {
@@ -23440,6 +23492,12 @@ const parsePullSnapshot = (content: unknown, fallbackNumber: number): PullSnapsh
     title: stringValue(payload.title),
     body: stringValue(payload.body),
     merged: booleanValue(payload.merged),
+    labels: Array.isArray(payload.labels)
+      ? payload.labels.flatMap((label) => {
+          const name = typeof label === 'string' ? label : stringValue(asRecord(label)?.name)
+          return name ? [name] : []
+        })
+      : undefined,
     // GraphQL materializations expose enum strings (`MERGEABLE` /
     // `CONFLICTING`), while the GitHub REST payload written by adapter-github
     // exposes a boolean plus `mergeable_state` (`clean` / `dirty`). Preserve
