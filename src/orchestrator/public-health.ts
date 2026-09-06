@@ -303,6 +303,7 @@ const sweepOutcome = (
     skipReasons?: unknown
     dispatchFailures?: unknown
     dispatchFailureReasons?: unknown
+    staleTerminalReopens?: unknown
     treeReads?: unknown
     emptyTreeReads?: unknown
     discoveryDeferred?: unknown
@@ -317,6 +318,7 @@ const sweepOutcome = (
   | 'skipReasons'
   | 'dispatchFailures'
   | 'dispatchFailureReasons'
+  | 'staleTerminalReopens'
   | 'treeReads'
   | 'emptyTreeReads'
   | 'discoveryDeferred'
@@ -331,6 +333,13 @@ const sweepOutcome = (
   const deferred = status.discoveryDeferred === 'sweep-in-flight'
     ? { discoveryDeferred: 'sweep-in-flight' as const }
     : {}
+  // Computed BEFORE the enumeration gate below, and returned on BOTH paths.
+  // These counters are cumulative and independent of any sweep's arithmetic, so
+  // gating them on a completed trio would hide them in exactly the outage they
+  // exist to diagnose: a sweep that never completes publishes no trio, takes
+  // the early return, and the reconcile's own outcome would vanish with it
+  // (chatgpt-codex-connector P1 and coderabbitai, independently, #444 review).
+  const staleTerminalReopens = staleTerminalReopenCounts(status.staleTerminalReopens)
   const candidates = optionalCount('candidates', status.candidates)
   const dispatched = optionalCount('dispatched', status.dispatched)
   const skipped = optionalCount('skipped', status.skipped)
@@ -345,6 +354,7 @@ const sweepOutcome = (
       dispatched.dispatched === undefined ||
       skipped.skipped === undefined) {
     return {
+      ...staleTerminalReopens,
       ...deferred,
       ...(suppliedCounts ? { enumerationCountsInvalid: true as const } : {}),
     }
@@ -376,6 +386,11 @@ const sweepOutcome = (
     // optional, like `dispatchFailures`: a 0.1.73 daemon publishes the trio and
     // knows nothing about this pair, and requiring it would drop that
     // producer's whole sweep block.
+    // Cumulative since process start, unlike everything above it, and so
+    // independently optional for the same reason `dispatchFailures` is: an
+    // older daemon publishes the trio and knows nothing about this field, and
+    // requiring it would drop that producer's whole sweep block.
+    ...staleTerminalReopens,
     ...treeReadOutcome(status),
     // Part of the same atomic snapshot as the counts: it is what dates them,
     // and without it retained counts have no freshness a reader can recover
@@ -383,6 +398,32 @@ const sweepOutcome = (
     ...optionalTimestamp('lastEnumeratedAtMs', status.lastEnumeratedAtMs),
     ...deferred,
   }
+}
+
+/**
+ * The stale-terminal reconcile's cumulative outcome counts, or nothing.
+ *
+ * Whole or not at all: a reader seeing `cleared` without `failures` would take
+ * the missing field for a zero and conclude the repair is healthy, when the
+ * producer may simply not have it. The three are only a diagnosis together —
+ * see the field's own doc comment for the four readings they separate.
+ *
+ * Non-negative integers only. A malformed member drops the whole group rather
+ * than publishing a partial one, on the same reasoning as the enumeration trio.
+ */
+const staleTerminalReopenCounts = (
+  value: unknown,
+): { staleTerminalReopens: NonNullable<FactoryPublicReadinessReconcileHealth['staleTerminalReopens']> } | Record<string, never> => {
+  if (value === null || typeof value !== 'object') return {}
+  const record = value as Record<string, unknown>
+  const counts: number[] = []
+  for (const key of ['cleared', 'conflicts', 'failures'] as const) {
+    const count = record[key]
+    if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) return {}
+    counts.push(count)
+  }
+  const [cleared, conflicts, failures] = counts as [number, number, number]
+  return { staleTerminalReopens: { cleared, conflicts, failures } }
 }
 
 const DISPATCH_CAPACITY_STATES: readonly FactoryPublicDispatchCapacityHealth['state'][] = [

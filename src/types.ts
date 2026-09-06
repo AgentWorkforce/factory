@@ -353,6 +353,25 @@ export interface FactoryReadinessReconcileStatus {
    */
   dispatchFailureReasons?: Partial<Record<FactoryDispatchFailureReasonCode, number>>
   /**
+   * The stale-terminal reconcile's cumulative outcome (#410, #412).
+   *
+   * Declared here as well as on the public health type: `#readinessReconcileStatus()`
+   * returns this interface, and a conditional spread bypasses excess-property
+   * checking — so without it the field exists at runtime while every
+   * `FactoryStatus` and `FactoryLoopHeartbeat` consumer would need a cast to
+   * reach it (chatgpt-codex-connector P2, #444 review).
+   *
+   * Only interpretable ALONGSIDE the sweep trio above it. All zeroes with
+   * `candidates` present means the reconcile ran and its preconditions were
+   * never met; all zeroes with no trio, or with `candidates: 0`, means it never
+   * had a ready issue to run against (coderabbitai, #444 review).
+   */
+  staleTerminalReopens?: {
+    cleared: number
+    conflicts: number
+    failures: number
+  }
+  /**
    * When the pass the counts above describe finished enumerating (#359 review).
    *
    * NOT `lastCompletedAtMs`, and the difference is the point. That timestamp
@@ -458,6 +477,41 @@ export interface FactoryPublicReadinessReconcileHealth {
    * to a genuine first-pass deferral with no enumeration evidence.
    */
   enumerationCountsInvalid?: true
+  /**
+   * What the stale-terminal reconcile (#410, #412) has actually done, CUMULATIVE
+   * SINCE PROCESS START — deliberately not per-sweep like the counts above.
+   *
+   * A clear is a rare one-shot event: the repair happens once per work unit and
+   * then that row is gone. Reported per sweep it would read zero on almost
+   * every sweep, and the one sweep that mattered would have to be caught live.
+   * Cumulative answers the question an operator actually has — "has this fired
+   * at all since boot, and how often" — which no per-sweep view of a one-shot
+   * repair can.
+   *
+   * Counts only, no keys. The three separate diagnoses that otherwise look
+   * identical from outside, because the reconcile is silent by design and
+   * `lifecycle-terminal` persisting looks the same in all four cases:
+   *
+   * - `cleared > 0`   — the repair is firing and removing rows.
+   * - `failures > 0`  — its durable reads are throwing and being swallowed by
+   *                     the never-throw boundary. A silent, permanent no-op on
+   *                     a shedding store.
+   * - `conflicts > 0` — another owner reclaimed the row between read and
+   *                     compare-and-delete; the repair correctly stood down.
+   * - all absent/zero — the reconcile ran and its PRECONDITIONS were never met.
+   *                     That is the reading that says the refused rows are not
+   *                     the shape this repair targets (`complete` rather than
+   *                     `abandoned`, or carrying no lease), which is otherwise
+   *                     indistinguishable from the repair being broken.
+   *
+   * Published whole or not at all, so a reader can never see a subset and infer
+   * a zero for a field the producer simply does not have.
+   */
+  staleTerminalReopens?: {
+    cleared: number
+    conflicts: number
+    failures: number
+  }
   /**
    * The most recent pass deferred to another process's discovery lease. Present
    * alongside the counts it means they are from an earlier pass. Present alone

@@ -1248,6 +1248,96 @@ describe('sweep counters on the public surface (#355)', () => {
     expect(readiness?.dispatchFailures).toBe(readiness?.skipReasons?.['dispatch-failed'])
   })
 
+  // #410/#412 follow-up. The stale-terminal reconcile is silent by design — it
+  // answers every uncertainty by leaving the row alone — so from outside, "the
+  // repair is firing", "its reads are throwing and being swallowed", "it is
+  // losing a race" and "its preconditions are never met" all look identical:
+  // `lifecycle-terminal` simply persists. These three counts are what separate
+  // them, which is why they are published whole or not at all.
+  it('publishes the stale-terminal reconcile outcome as a whole group', () => {
+    const readiness = swept({
+      candidates: 20,
+      dispatched: 0,
+      skipped: 20,
+      staleTerminalReopens: { cleared: 0, conflicts: 0, failures: 0 },
+    })
+
+    // An all-zero group is a DIAGNOSIS, not an absence: the reconcile ran and
+    // its preconditions were never met. Coercing it away would delete exactly
+    // the reading that says the refused rows are not the shape it targets.
+    expect(readiness?.staleTerminalReopens).toEqual({ cleared: 0, conflicts: 0, failures: 0 })
+  })
+
+  it('drops the stale-terminal group rather than publishing a partial one', () => {
+    // A reader seeing `cleared` without `failures` would take the missing field
+    // for a zero and call a silently-erroring repair healthy.
+    // Every case asserts the SWEEP BLOCK SURVIVES as well as the group being
+    // dropped. Without that, these assertions also pass when `swept()` returns
+    // `undefined` and the whole `readinessReconcile` block is gone — which
+    // would be a far worse bug than the one under test (coderabbitai, #444).
+    for (const malformed of [
+      // Each member missing in turn, not just one.
+      { conflicts: 0, failures: 0 },
+      { cleared: 8, failures: 0 },
+      { cleared: 8, conflicts: 0 },
+      // ...and each member invalid in turn.
+      { cleared: -1, conflicts: 0, failures: 0 },
+      { cleared: 8, conflicts: -1, failures: 0 },
+      { cleared: 8, conflicts: 0, failures: -1 },
+      { cleared: 1.5, conflicts: 0, failures: 0 },
+      { cleared: 8, conflicts: 1.5, failures: 0 },
+      { cleared: 8, conflicts: 0, failures: Number.NaN },
+      { cleared: '8', conflicts: 0, failures: 0 },
+      { cleared: 8, conflicts: null, failures: 0 },
+      null,
+      'nope',
+      42,
+    ]) {
+      const rejected = swept({
+        candidates: 20,
+        dispatched: 0,
+        skipped: 20,
+        staleTerminalReopens: malformed,
+      })
+      expect(Object.hasOwn(rejected ?? {}, 'staleTerminalReopens')).toBe(false)
+      expect(rejected?.candidates).toBe(20)
+      expect(rejected?.dispatched).toBe(0)
+      expect(rejected?.skipped).toBe(20)
+    }
+  })
+
+  // #444 review, chatgpt-codex-connector P1 and coderabbitai. The group is
+  // cumulative and independent of any sweep's arithmetic, so it must survive
+  // the enumeration gate — a sweep that never completes publishes no trio and
+  // would otherwise take the early return with the reconcile's outcome inside
+  // it. That is precisely the wedged-sweep outage this field exists to
+  // diagnose, so gating it on the trio would hide it exactly when it is needed.
+  it('publishes the stale-terminal group even when no enumerating sweep completed', () => {
+    const noSweep = swept({ staleTerminalReopens: { cleared: 0, conflicts: 0, failures: 4 } })
+    expect(noSweep?.staleTerminalReopens).toEqual({ cleared: 0, conflicts: 0, failures: 4 })
+    // ...and it does not fabricate a sweep that never happened.
+    expect(Object.hasOwn(noSweep ?? {}, 'candidates')).toBe(false)
+
+    // Same on the invalid-trio path, which returns `enumerationCountsInvalid`.
+    const brokenTrio = swept({ candidates: 20, staleTerminalReopens: { cleared: 8, conflicts: 0, failures: 0 } })
+    expect(brokenTrio?.staleTerminalReopens).toEqual({ cleared: 8, conflicts: 0, failures: 0 })
+    expect(brokenTrio?.enumerationCountsInvalid).toBe(true)
+  })
+
+  it('keeps the sweep block when a producer does not know the stale-terminal group', () => {
+    // Independently optional, for the reason `dispatchFailures` is: an older
+    // daemon publishes the trio and nothing else, and requiring this field
+    // would drop its whole sweep block — deleting the counters that are
+    // currently the only view of the outage.
+    const older = swept({ candidates: 20, dispatched: 0, skipped: 20 })
+    // The WHOLE trio, not just `candidates`: asserting one field passes even if
+    // the other two were dropped for this producer (coderabbitai, #444).
+    expect(older?.candidates).toBe(20)
+    expect(older?.dispatched).toBe(0)
+    expect(older?.skipped).toBe(20)
+    expect(Object.hasOwn(older ?? {}, 'staleTerminalReopens')).toBe(false)
+  })
+
   // THE CONTROL. `skipReasons` omits zero counts, so on that field alone
   // "every dispatch succeeded" is the same absence as "this producer has never
   // heard of dispatch failures" — and 0.1.72 is in production right now being

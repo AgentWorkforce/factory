@@ -6511,6 +6511,32 @@ export class FactoryLoop implements Factory {
       ...(this.#readinessReconcileLastSweepDeferred
         ? { discoveryDeferred: this.#readinessReconcileLastSweepDeferred }
         : {}),
+      // Cumulative since process start, not per-sweep like the block above:
+      // a stale-terminal clear is a one-shot repair per work unit, so a
+      // per-sweep view would read zero on nearly every sweep and the sweep that
+      // mattered would have to be caught live. Published whole and always once
+      // the reconcile can run at all, so that an all-zero reading is itself a
+      // diagnosis rather than an absence a reader has to guess about
+      // (#410, #412).
+      //
+      // `#counters` starts empty and `#increment` only creates a key when its
+      // branch runs, so an all-zero group does NOT on its own prove the
+      // reconcile executed — it is read against the sweep trio beside it, which
+      // is why both live on this same block. All zeroes with `candidates > 0`
+      // means the reconcile ran and its preconditions were never met; all
+      // zeroes with `candidates: 0` or no trio at all means it never had a
+      // ready issue to run against. Defaulting the three to 0 rather than
+      // tracking a separate "has run" flag keeps that distinction in the
+      // fields that already carry it (coderabbitai, #444 review).
+      ...(this.#usesDurableDispatchLifecycle()
+        ? {
+            staleTerminalReopens: {
+              cleared: this.#counters.dispatchTerminalStaleReopened ?? 0,
+              conflicts: this.#counters.dispatchTerminalStaleReopenConflicts ?? 0,
+              failures: this.#counters.dispatchTerminalStaleReopenFailures ?? 0,
+            },
+          }
+        : {}),
       ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
       ...(this.#readinessReconcileLastErrorClass
         ? { lastErrorClass: this.#readinessReconcileLastErrorClass }
