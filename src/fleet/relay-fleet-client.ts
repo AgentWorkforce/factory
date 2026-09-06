@@ -5,6 +5,7 @@ import { AgentRelay } from '@agent-relay/sdk'
 import { describeControlPlaneError } from './control-plane-circuit'
 import { resolveRelayAgentToken, resolveRelayWorkspaceKey } from './relay-workspace-key'
 
+import { FleetSpawnNotCreatedError } from '../ports/fleet'
 import type { AgentLifecycleSignal, AgentMessage, AgentUsage, Capability, FleetClient, FleetConnectStatus, NodeCapability, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult, TeammateAgent, TeammateQuery } from '../ports/fleet'
 import { RelaycastTeammateDirectory, type TeammateDirectory } from './teammates'
 import type {
@@ -368,6 +369,16 @@ export class RelayFleetClient implements FleetClient {
   }
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
+    let placementAttempted = false
+    try {
+      return await this.#spawn(input, () => { placementAttempted = true })
+    } catch (error) {
+      if (!placementAttempted) throw new FleetSpawnNotCreatedError(error)
+      throw error
+    }
+  }
+
+  async #spawn(input: SpawnInput, onPlacementAttempt: () => void): Promise<SpawnResult> {
     // One budget for the whole placement: bootstrap, lifecycle registration,
     // the placement call and every poll after it share it (#306). Anchoring it
     // here rather than inside `#awaitInvocation` is what stops the time already
@@ -432,26 +443,29 @@ export class RelayFleetClient implements FleetClient {
     // means "no placement preference".
     const resolvedNode = sandboxTargetNode
       ?? (input.node && input.node !== 'self' ? input.node : undefined)
-    const ack = await this.#withinDeadline('placement.spawn', deadlineAtMs, () => messaging.placement.spawn({
-      capability: input.capability,
-      ...(resolvedNode ? { node: resolvedNode } : {}),
-      ...(input.repo ? { repo: input.repo } : {}),
-      input: spawnActionInput(input),
-      ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
-      // An ack proves the engine accepted the dispatch, not that the node
-      // launched anything: a node advertising `spawn:<harness>` on an obsolete
-      // broker acks and launches nothing, and that is indistinguishable from a
-      // real spawn until someone reads the invocation back. `confirm` makes the
-      // SDK do that read, bounded, and fail as `spawn_unconfirmed` instead of
-      // handing us an ack we would wait on forever (#306).
-      confirm: true,
-      confirmTimeoutMs: Math.max(1, deadlineAtMs - this.#now()),
-      confirmPollIntervalMs: this.#pollIntervalMs,
-      log: this.#log,
-      // Giving up on the wait does not cancel the placement. If Relay accepts
-      // it after we have already reported failure, a worker is live that
-      // nothing is tracking — so release it (#307 review, cubic).
-    }), (inFlight) => this.#releaseAbandonedPlacement(input.name, inFlight))
+    const ack = await this.#withinDeadline('placement.spawn', deadlineAtMs, () => {
+      onPlacementAttempt()
+      return messaging.placement.spawn({
+        capability: input.capability,
+        ...(resolvedNode ? { node: resolvedNode } : {}),
+        ...(input.repo ? { repo: input.repo } : {}),
+        input: spawnActionInput(input),
+        ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
+        // An ack proves the engine accepted the dispatch, not that the node
+        // launched anything: a node advertising `spawn:<harness>` on an obsolete
+        // broker acks and launches nothing, and that is indistinguishable from a
+        // real spawn until someone reads the invocation back. `confirm` makes the
+        // SDK do that read, bounded, and fail as `spawn_unconfirmed` instead of
+        // handing us an ack we would wait on forever (#306).
+        confirm: true,
+        confirmTimeoutMs: Math.max(1, deadlineAtMs - this.#now()),
+        confirmPollIntervalMs: this.#pollIntervalMs,
+        log: this.#log,
+        // Giving up on the wait does not cancel the placement. If Relay accepts
+        // it after we have already reported failure, a worker is live that
+        // nothing is tracking — so release it (#307 review, cubic).
+      })
+    }, (inFlight) => this.#releaseAbandonedPlacement(input.name, inFlight))
     // A confirmed placement already carries the terminal invocation. Polling
     // for it again would spend the same budget twice over on a spawn that has
     // already proven it launched.

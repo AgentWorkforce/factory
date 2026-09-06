@@ -1,3 +1,5 @@
+import { isTelemetryErrorClassName } from '../observability/error-class'
+
 // `workflow:run` is a fleet node capability. The node-side Phase 4 handler
 // invokes the Relayflows SDK in that node's repo checkout; the
 // factory only emits the workflow path and inputs through the relay fleet.
@@ -149,6 +151,46 @@ export type SendInput = {
   from?: string
   data?: Record<string, unknown>
   mode?: 'wait' | 'steer'
+}
+
+/**
+ * Positive adapter evidence that spawn failed before any worker placement.
+ *
+ * The extra bit this carries — "no worker was created" — has exactly one
+ * reader, and it reads it by `instanceof`. Every *other* reader of a dispatch
+ * failure reads a class NAME off the outermost error: `perItemDispatchSkipReason`
+ * renders `dispatch failed (<class>)`, the hosted orchestrator publishes
+ * `errorClass`, and the #355 vocabulary maps allowlisted class names onto
+ * failure codes. A wrapper that stamped its own name over the cause's would
+ * therefore buy one bit by destroying the identity of the failure on every
+ * surface an operator actually has: an enrolment refusal
+ * (`FactoryAgentRegistrationError`), a read-only identity
+ * (`ReadOnlyFleetIdentityError`) and a bootstrap ack timeout
+ * (`RelaySpawnAckTimeoutError`) would all read as one indistinguishable
+ * "pre-placement failure".
+ *
+ * So the wrapper adopts the cause's class name as its own and keeps the bit in
+ * its type. `isTelemetryErrorClassName` is the guard: `name` is writable and a
+ * cause may come from a dependency, so only a string the publication allowlist
+ * would admit anyway may be adopted — anything else falls back to this class's
+ * own name. Nothing crosses a boundary here that `telemetryErrorClass` would
+ * not have let across one frame further down the cause chain.
+ */
+export class FleetSpawnNotCreatedError extends Error {
+  /**
+   * The class name of the pre-placement cause, or this class's own when the
+   * cause named none the telemetry allowlist admits. Always equal to `name`;
+   * exposed so a reader that wants the cause's identity does not have to know
+   * that `name` was reassigned.
+   */
+  readonly causeClass: string
+
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause })
+    const causeName = cause instanceof Error ? cause.name : ''
+    this.causeClass = isTelemetryErrorClassName(causeName) ? causeName : 'FleetSpawnNotCreatedError'
+    this.name = this.causeClass
+  }
 }
 
 /**

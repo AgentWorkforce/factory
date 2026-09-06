@@ -10,7 +10,7 @@ import type { BrokerEvent, ListAgent, SendMessageInput, SpawnPtyInput } from '@a
 
 import type { PreviewConfig } from '../config/schema'
 import type { AgentMessage, AgentPidResolution, AgentUsage, Capability, FleetClient, FleetTrackedAgent, PreviewReference, PreviewStartInput, PreviewSweepInput, PreviewSweepResult, RosterEntry, SendInput, SpawnInput, SpawnResult, TeammateAgent, TeammateQuery } from '../ports/fleet'
-import { FleetDeliveryRejectedError } from '../ports/fleet'
+import { FleetDeliveryRejectedError, FleetSpawnNotCreatedError } from '../ports/fleet'
 import type { Logger } from '../ports/system'
 import { normalizeLogger } from '../logging'
 import { TailscalePreviewManager, type PreviewManager } from '../node/tailscale-preview'
@@ -265,6 +265,16 @@ export class InternalFleetClient implements FleetClient {
   }
 
   async spawn(input: SpawnInput): Promise<SpawnResult> {
+    let placementAttempted = false
+    try {
+      return await this.#spawn(input, () => { placementAttempted = true })
+    } catch (error) {
+      if (!placementAttempted) throw new FleetSpawnNotCreatedError(error)
+      throw error
+    }
+  }
+
+  async #spawn(input: SpawnInput, onPlacementAttempt: () => void): Promise<SpawnResult> {
     assertSelfNode(input.node)
     // The broker has no delivery-target registration event. Subscribe before
     // spawn so worker_ready can act as a bounded re-send trigger if the child's
@@ -288,6 +298,7 @@ export class InternalFleetClient implements FleetClient {
     this.#tracked.set(input.name, { invocationId: input.invocationId })
     let handle: SpawnedHandleLike
     try {
+      onPlacementAttempt()
       handle = await this.#callBroker('spawnPty', (client) => client.spawnPty(spawnInput))
     } catch (error) {
       this.#trackAgentExit(input.name)

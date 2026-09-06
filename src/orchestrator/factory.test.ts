@@ -30,6 +30,7 @@ import {
 } from '../index'
 import { LatePlacementReleasedError, changeEventPath, defaultMergeGate } from './factory'
 import type { GhRunner } from '../github'
+import { FleetSpawnNotCreatedError } from '../ports/fleet'
 import { RelaySpawnAckTimeoutError } from '../fleet/relay-fleet-client'
 import { RelayfileOperationTimeoutError } from '../mount/relayfile-operation-timeout'
 import type { AgentSpec, AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubIssueCloseWriteResult, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SandboxPushInput, SandboxPushResult, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
@@ -6810,6 +6811,7 @@ describe('FactoryLoop', () => {
           body: 'No issue number is required outside the verified legacy head.',
           state: 'open',
           draft: false,
+          labels: [],
           html_url: 'https://github.com/AgentWorkforce/pear/pull/153',
           head: {
             ref: '53-legacy-schedule-repair',
@@ -6913,6 +6915,9 @@ describe('FactoryLoop', () => {
       const mount = new FakeMountClient({
         [path]: githubIssueFile(53, { labels: ['factory', 'pear', 'factory:in-progress'] }),
       })
+      mount.files.set('/github/repos/AgentWorkforce/pear/pulls/153/metadata.json', { content: {
+        number: 153, state: 'open', draft: false, labels: [], head_ref: 'factory/53-agentworkforce-pear-proof',
+      } })
       const fleet = new RemoteLifecycleFleetClient()
       const worktrees = new RecordingWorktreeManager()
       const factory = createFactory(config({
@@ -7041,6 +7046,9 @@ describe('FactoryLoop', () => {
         updatedAt: '2026-07-18T11:00:00.000Z',
       }),
     })
+    mount.files.set('/github/repos/AgentWorkforce/pear/pulls/153/metadata.json', { content: {
+      number: 153, state: 'open', draft: false, labels: [], head_ref: '53-agentworkforce-pear-proof',
+    } })
     const firstFleet = new RemoteLifecycleFleetClient()
     const worktrees = new RecordingWorktreeManager()
     const githubWriteback = new RecordingGithubWriteback()
@@ -10806,6 +10814,7 @@ describe('FactoryLoop', () => {
       head_ref: branch,
       state: 'open',
       draft: false,
+      labels: [],
     } })
     fleet.emitAgentExit('ar-591-impl-pear', 'reconciled-missing')
 
@@ -10857,6 +10866,7 @@ describe('FactoryLoop', () => {
       head_ref: branch,
       state: 'open',
       draft: false,
+      labels: [],
     } })
     fleet.emitAgentExit('ar-597-impl-pear', 'reconciled-missing')
 
@@ -11292,6 +11302,7 @@ describe('FactoryLoop', () => {
           number: 1186,
           state: 'open',
           draft: false,
+          labels: [],
           head_ref: branch,
           url: 'https://github.com/AgentWorkforce/pear/pull/1186',
         } })
@@ -20263,6 +20274,7 @@ describe('FactoryLoop', () => {
             url: `https://github.com/${input.repo}/pull/${prNumber}`,
             state: 'open',
             draft: false,
+            labels: [],
           },
         })
         return {
@@ -21691,6 +21703,7 @@ describe('FactoryLoop', () => {
         head_ref: branch,
         state: 'open',
         draft: false,
+        labels: [],
       } })
 
       fleet.emitAgentExit('ar-93-impl-pear', 'crash')
@@ -28082,7 +28095,7 @@ describe('FactoryLoop PR babysitter', () => {
   // open/draft/merged, never calls gh.
   const seedPrMeta = (mount: FakeMountClient, repo: string, n: number, payload: Record<string, unknown>) => {
     mount.files.set(`/github/repos/${repo}/pulls/${n}/metadata.json`, {
-      content: { number: n, head_ref: `ar-${n}-fix`, url: `https://github.com/${repo}/pull/${n}`, ...payload },
+      content: { state: 'open', draft: false, labels: [], number: n, head_ref: `ar-${n}-fix`, url: `https://github.com/${repo}/pull/${n}`, ...payload },
     })
   }
 
@@ -28630,6 +28643,7 @@ describe('FactoryLoop PR babysitter', () => {
       for (const repo of arrivalOrder) {
         const path = `/github/repos/${repo}/pulls/${number}/metadata.json`
         mount.files.set(path, { content: {
+          labels: [],
           number,
           state: 'open',
           head_ref: `factory/${number}`,
@@ -28744,6 +28758,242 @@ describe('FactoryLoop PR babysitter', () => {
     }
   })
 
+  it.each(['absent', 'unreadable', 'malformed'])('defers factory-created activation when PR metadata is %s and retries after recovery', async (mode) => {
+    const issue = realIssueFile(401, ready, { title: 'Real metadata recovery' })
+    const mount = new FakeMountClient({ [issuePath(401)]: issue })
+    const path = '/github/repos/AgentWorkforce/pear/pulls/401/metadata.json'
+    if (mode !== 'absent') mount.files.set(path, { content: mode === 'malformed' ? {} : {
+      number: 401, state: 'open', draft: false, labels: [],
+    } })
+    const read = mount.readFile.bind(mount)
+    let unavailable = true
+    vi.spyOn(mount, 'readFile').mockImplementation(async (candidate) => {
+      if (mode === 'unreadable' && unavailable && candidate === path) throw new Error('mount unavailable')
+      return read(candidate)
+    })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const claim = vi.spyOn(stateStore, 'markRunning')
+    const factory = createFactory(babysitterConfig(), {
+      mount, fleet, stateStore, triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(401), issue)))
+      fleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect((factory.status().counters.babysitterActivationDeferred ?? 0) +
+        fleet.spawns.filter((spawn) => spawn.name.includes('babysit')).length).toBeGreaterThan(0))
+      expect(fleet.spawns.filter((spawn) => spawn.name.includes('babysit'))).toEqual([])
+      expect(claim).not.toHaveBeenCalled()
+      unavailable = false
+      seedPrMeta(mount, 'AgentWorkforce/pear', 401, { state: 'open', draft: false, labels: [] })
+      fleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(fleet.spawns.filter((spawn) => spawn.name.includes('babysit'))).toHaveLength(1))
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it.each(['roster', 'spawn-preflight'])('releases the factory-created claim after a %s failure and retries', async (mode) => {
+    const issue = realIssueFile(401, ready, { title: 'Real pre-placement retry' })
+    const mount = new FakeMountClient({ [issuePath(401)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 401, { state: 'open', draft: false, labels: [] })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const mark = stateStore.markRunning.bind(stateStore)
+    const roster = vi.spyOn(fleet, 'roster')
+    vi.spyOn(stateStore, 'markRunning').mockImplementationOnce(async (...args) => {
+      const claim = await mark(...args)
+      if (mode === 'roster') roster.mockRejectedValueOnce(new Error('temporary roster failure'))
+      else vi.spyOn(fleet, 'spawn').mockRejectedValueOnce(new FleetSpawnNotCreatedError(new Error('temporary spawn preflight failure')))
+      return claim
+    })
+    const factory = createFactory(babysitterConfig(), {
+      mount, fleet, stateStore, triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(401), issue)))
+      fleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(factory.status().counters.babysitterSpawnFailures).toBe(1))
+      expect(fleet.spawns.filter((spawn) => spawn.name.includes('babysit'))).toEqual([])
+      expect(await stateStore.getBabysitterGeneration('factory-test', 'factory-created:agentworkforce/pear#401')).toBeUndefined()
+      fleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(fleet.spawns.filter((spawn) => spawn.name.includes('babysit'))).toHaveLength(1))
+      expect(await stateStore.getBabysitterGeneration('factory-test', 'factory-created:agentworkforce/pear#401')).toBeDefined()
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it.each(['uncertain-spawn', 'session-persist', 'injection', 'release-error', 'release-denied'])('retains and identifies the factory-created claim after %s failure', async (mode) => {
+    const issue = realIssueFile(401, ready, { title: 'Real uncertain placement' })
+    const mount = new FakeMountClient({ [issuePath(401)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 401, { state: 'open', draft: false, labels: [] })
+    const fleet = mode === 'injection' ? new RemoteLifecycleFleetClient() : new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const spawn = fleet.spawn.bind(fleet)
+    const calls = vi.spyOn(fleet, 'spawn').mockImplementation(async (input) => {
+      if (mode.startsWith('release-') && input.name.includes('babysit')) throw new FleetSpawnNotCreatedError(new Error('spawn preflight failed'))
+      if (mode === 'uncertain-spawn' && input.name.includes('babysit')) throw new Error('placement acknowledgement lost')
+      return spawn(input)
+    })
+    if (mode === 'session-persist') vi.spyOn(stateStore, 'setBabysitterSession').mockRejectedValueOnce(new Error('session storage unavailable'))
+    if (mode === 'release-error') vi.spyOn(stateStore, 'clearBabysitterGeneration').mockRejectedValue(new Error('claim storage unavailable'))
+    if (mode === 'release-denied') vi.spyOn(stateStore, 'clearBabysitterGeneration').mockResolvedValue(false)
+    const warn = vi.fn()
+    const factory = createFactory(babysitterConfig(), {
+      mount, fleet, stateStore, logger: { warn }, triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    try {
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(401), issue)))
+      if (mode === 'injection') vi.spyOn(fleet, 'waitForInjected').mockRejectedValueOnce(new Error('transport acknowledgement unavailable'))
+      fleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(factory.status().counters.babysitterSpawnFailures).toBe(1))
+      expect(await stateStore.getBabysitterGeneration('factory-test', 'factory-created:agentworkforce/pear#401')).toBeDefined()
+      expect(warn).toHaveBeenCalledWith('[factory] babysitter activation claim retained after failure', expect.objectContaining({
+        repo: 'AgentWorkforce/pear', prNumber: 401,
+        ownershipKey: 'factory-created:agentworkforce/pear#401',
+        generationId: expect.any(String),
+      }))
+      fleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(async () => {
+        if (mode === 'uncertain-spawn' || mode.startsWith('release-')) expect(factory.status().counters.babysitterActivationClaimRejected).toBeGreaterThan(0)
+        else expect(await stateStore.listBabysitterSessions('factory-test')).toHaveLength(1)
+      })
+      expect(calls.mock.calls.filter(([input]) => input.name.includes('babysit'))).toHaveLength(1)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('does not replay an uncertain babysitter plan during durable dispatch recovery', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'babysitter-uncertain-recovery-'))
+    const issue = realIssueFile(401, ready, { title: 'Real uncertain dispatch recovery' })
+    const mount = new FakeMountClient({ [issuePath(401)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 401, { state: 'open', draft: false, labels: [] })
+    class DurableFleet extends FakeFleetClient { readonly durableOwnership = true }
+    const firstFleet = new DurableFleet()
+    const realSpawn = firstFleet.spawn.bind(firstFleet)
+    vi.spyOn(firstFleet, 'spawn').mockImplementation(async (input) => {
+      if (input.name.includes('babysit')) throw new Error('placement acknowledgement lost')
+      return realSpawn(input)
+    })
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const first = createFactory(babysitterConfig(), {
+      mount, fleet: firstFleet, stateStore: state(), triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    const nextFleet = new DurableFleet()
+    // Hydration restores observation metadata; it cannot prove a live worker.
+    vi.spyOn(nextFleet, 'hydrateTracked').mockImplementation(() => {})
+    const next = createFactory(babysitterConfig(), {
+      mount, fleet: nextFleet, stateStore: state(), triage: new StaticTriage(), dispatchLifecycleRetryMs: 10,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    try {
+      await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(401), issue)))
+      firstFleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(first.status().counters.babysitterSpawnFailures).toBe(1))
+      expect((await state().listDispatchLifecycles('factory-test'))[0]?.[1].phase).toBe('dispatching')
+      await first.stop()
+      await next.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() => expect((next.status().counters.babysitterActivationClaimRejected ?? 0) +
+        nextFleet.spawns.filter((input) => input.name.includes('babysit')).length).toBeGreaterThan(0))
+      expect(nextFleet.spawns.filter((input) => input.name.includes('babysit'))).toEqual([])
+    } finally {
+      await first.stop()
+      await next.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * Recovery admits a factory-created babysitter through TWO calls into
+   * `#spawnAgent`: an adoptOnly pass that can only adopt a live roster entry,
+   * then `#ensureBabysitter`'s real admission. Each of those reads the roster
+   * through `retryOnTimeout(..., { attempts: 3, delayMs: 2000 })`, so a
+   * recovery that has to place a worker used to pay for the same roster read
+   * twice — the second one asking a question the first had just answered.
+   *
+   * Counted rather than asserted structurally, because the cost IS the point:
+   * everything the successor does before the babysitter is placed is fixed,
+   * so one read per admission pass is directly visible in the total.
+   */
+  it('admits a recovered factory-created babysitter with one roster pass', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'babysitter-recovery-roster-'))
+    const issue = realIssueFile(401, ready, { title: 'Real recovery admission cost' })
+    const mount = new FakeMountClient({ [issuePath(401)]: issue })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 401, { state: 'open', draft: false, labels: [] })
+    class DurableFleet extends FakeFleetClient { readonly durableOwnership = true }
+    const firstFleet = new DurableFleet()
+    const realSpawn = firstFleet.spawn.bind(firstFleet)
+    // Positive non-placement evidence, so the first process releases its claim
+    // and recovery has to re-admit rather than fence itself out.
+    vi.spyOn(firstFleet, 'spawn').mockImplementation(async (input) => {
+      if (input.name.includes('babysit')) throw new FleetSpawnNotCreatedError(new Error('spawn preflight failed'))
+      return realSpawn(input)
+    })
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath: join(root, 'state.json') })
+    const first = createFactory(babysitterConfig(), {
+      mount, fleet: firstFleet, stateStore: state(), triage: new StaticTriage(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    const nextFleet = new DurableFleet()
+    // Hydration restores observation metadata; it cannot prove a live worker.
+    vi.spyOn(nextFleet, 'hydrateTracked').mockImplementation(() => {})
+    const nextState = state()
+    // Counted up to the placement, because after it the successor's ordinary
+    // loops read the roster on their own schedule and the number stops being
+    // about admission. Everything before it is fixed: the successor's startup
+    // and restore make ROSTER_READS_BEFORE_ADMISSION reads, and the recovery
+    // pass adds one per `#spawnAgent` that reaches the fleet.
+    const ROSTER_READS_BEFORE_ADMISSION = 2
+    const mark = nextState.markRunning.bind(nextState)
+    vi.spyOn(nextState, 'markRunning').mockImplementation(async (...args) => {
+      // Recovery's adoption pass and a reconciled agent exit both reach the
+      // babysitter admission, and either can get there first. Holding the PR
+      // claim back one beat pins the interleaving under test — adoption
+      // finishes, then admission runs — so what is measured is the cost of
+      // that pair, not which of them the event loop happened to schedule.
+      if (args[1] === 'factory-created:agentworkforce/pear#401') {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      return mark(...args)
+    })
+    let counting = true
+    let rosterReads = 0
+    const readRoster = nextFleet.roster.bind(nextFleet)
+    vi.spyOn(nextFleet, 'roster').mockImplementation(async () => {
+      if (counting) rosterReads += 1
+      return readRoster()
+    })
+    const nextSpawn = nextFleet.spawn.bind(nextFleet)
+    vi.spyOn(nextFleet, 'spawn').mockImplementation(async (input) => {
+      if (input.name.includes('babysit')) counting = false
+      return nextSpawn(input)
+    })
+    const next = createFactory(babysitterConfig(), {
+      mount, fleet: nextFleet, stateStore: nextState, triage: new StaticTriage(), dispatchLifecycleRetryMs: 10,
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
+    })
+    try {
+      await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(401), issue)))
+      firstFleet.emitAgentExit('ar-401-impl-pear', 'worker_exited')
+      await vi.waitFor(() => expect(first.status().counters.babysitterSpawnFailures).toBe(1))
+      expect((await state().listDispatchLifecycles('factory-test'))[0]?.[1].phase).toBe('dispatching')
+      await first.stop()
+      await next.start({ mode: 'dispatch-owner' })
+      await vi.waitFor(() => expect(nextFleet.spawns.filter((input) => input.name.includes('babysit'))).toHaveLength(1))
+      expect(rosterReads).toBe(ROSTER_READS_BEFORE_ADMISSION + 1)
+    } finally {
+      await first.stop()
+      await next.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it.each(['denied', 'unavailable', 'legacy-session'])('fails closed when the PR claim is %s', async (result) => {
     const issue = realIssueFile(401, ready, { title: 'Real babysitter durable claim' })
     const mount = new FakeMountClient({ [issuePath(401)]: issue })
@@ -28836,6 +29086,7 @@ describe('FactoryLoop PR babysitter', () => {
     const issue = realIssueFile(401, ready, { title: 'Real babysitter spawn' })
     const mount = new FakeMountClient({ [issuePath(401)]: issue })
     const fleet = new FakeFleetClient()
+    seedPrMeta(mount, 'AgentWorkforce/pear', 401, { state: 'open', draft: false, labels: [] })
     const factory = createFactory(babysitterConfig(), {
       mount,
       fleet,
@@ -28879,6 +29130,7 @@ describe('FactoryLoop PR babysitter', () => {
     const issue = realIssueFile(402, ready, { title: 'Real remote preview babysitter handoff' })
     const mount = new FakeMountClient({ [issuePath(402)]: issue })
     const fleet = new RemotePreviewFleetClient()
+    seedPrMeta(mount, 'AgentWorkforce/pear', 402, { state: 'open', draft: false, labels: [] })
     const factory = createFactory(babysitterConfig({
       preview: {
         provider: 'tailscale-serve',
@@ -28913,6 +29165,7 @@ describe('FactoryLoop PR babysitter', () => {
     fleet.setSessionRef('ar-404-impl-pear', 'session-ar-404-impl-pear')
     const slack = new RecordingSlack()
     const stateStore = new InMemoryStateStore({ batchSize: 10 })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 404, { state: 'open', draft: false, labels: [] })
     const factory = createFactory(babysitterConfig({ slack: slackConfig() }), {
       mount,
       fleet,
@@ -28959,6 +29212,7 @@ describe('FactoryLoop PR babysitter', () => {
     const fleet = new FakeFleetClient()
     const slack = new RecordingSlack()
     const stateStore = new InMemoryStateStore({ batchSize: 10 })
+    seedPrMeta(mount, 'AgentWorkforce/pear', 405, { state: 'open', draft: false, labels: [] })
     const factory = createFactory(babysitterConfig({ slack: slackConfig() }), {
       mount,
       fleet,
@@ -29015,6 +29269,7 @@ describe('FactoryLoop PR babysitter', () => {
     const firstFleet = new RemoteLifecycleFleetClient()
     firstFleet.setSessionRef('ar-406-impl-pear', 'session-ar-406-impl-pear')
     firstFleet.setSessionRef('ar-406-babysit', 'session-ar-406-babysit')
+    seedPrMeta(mount, 'AgentWorkforce/pear', 406, { state: 'open', draft: false, labels: [] })
     const first = createFactory(factoryConfig, {
       mount,
       fleet: firstFleet,
@@ -29847,6 +30102,7 @@ describe('FactoryLoop PR babysitter', () => {
     const mount = new FakeMountClient({
       [path]: issueFile,
       '/github/repos/AgentWorkforce__pear/pulls/by-id/5.json': prFile(5, {
+        labels: [],
         title: 'Unrelated observability work',
         body: 'tsc, eslint, and 52 tests all pass.',
         head_ref: 'claude/unrelated-observability',
@@ -29880,6 +30136,7 @@ describe('FactoryLoop PR babysitter', () => {
     const issue = realIssueFile(403, ready, { title: 'Real babysitter idempotent' })
     const mount = new FakeMountClient({ [issuePath(403)]: issue })
     const fleet = new FakeFleetClient()
+    seedPrMeta(mount, 'AgentWorkforce/pear', 403, { state: 'open', draft: false, labels: [] })
     const factory = createFactory(babysitterConfig(), {
       mount,
       fleet,
@@ -29911,7 +30168,7 @@ describe('FactoryLoop PR babysitter', () => {
     try {
       await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
-      mount.files.set(prPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.files.set(prPath, { content: { labels: [], number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
       mount.emit(changeEvent(prPath, 'durable-pr-open'))
       await flush()
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain(`ar-${number}-babysit`))
@@ -29969,7 +30226,7 @@ describe('FactoryLoop PR babysitter', () => {
       // A duplicate PR observation renews the same server identity rather than
       // making another subscription record. There is no claim, so no wake.
       const renamedPrPath = `/github/repos/AgentWorkforce/pear/pulls/${number}__renamed-after-review/metadata.json`
-      mount.files.set(renamedPrPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.files.set(renamedPrPath, { content: { labels: [], number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
       mount.emit(changeEvent(renamedPrPath, 'durable-pr-repeat'))
       await vi.waitFor(() => expect(subscriptions.createCalls).toHaveLength(2))
       expect(subscriptions.records).toHaveLength(1)
@@ -30034,7 +30291,7 @@ describe('FactoryLoop PR babysitter', () => {
     try {
       await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
-      mount.files.set(prPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.files.set(prPath, { content: { labels: [], number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
       mount.emit(changeEvent(prPath, 'fallback-pr-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain(`ar-${number}-babysit`))
 
@@ -30126,7 +30383,7 @@ describe('FactoryLoop PR babysitter', () => {
 
       const subscription = subscriptions.records[0]!
       subscriptions.claims = [subscriptions.claimFor(subscription, 'pull_request.closed', 'delivery-close')]
-      mount.files.set(prPath, { content: { number, state: 'closed', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.files.set(prPath, { content: { labels: [], number, state: 'closed', draft: false, head_ref: `ar-${number}-fix` } })
       mount.emit(changeEvent(prPath, 'terminal-close'))
 
       await vi.waitFor(() => expect(subscriptions.accepted.map((entry) => entry.deliveryId)).toEqual(['delivery-close']))
@@ -30176,7 +30433,7 @@ describe('FactoryLoop PR babysitter', () => {
     try {
       await first.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       await first.dispatch(await first.triageIssue(parseLinearIssue(issuePath(number), issue)))
-      mount.files.set(prPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.files.set(prPath, { content: { labels: [], number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
       mount.emit(changeEvent(prPath, 'acceptance-restart-open'))
       await flush()
       await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
@@ -30265,7 +30522,7 @@ describe('FactoryLoop PR babysitter', () => {
     try {
       await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(number), issue)))
-      mount.files.set(prPath, { content: { number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
+      mount.files.set(prPath, { content: { labels: [], number, state: 'open', draft: false, head_ref: `ar-${number}-fix` } })
       mount.emit(changeEvent(prPath, 'transient-pr-open'))
       await vi.waitFor(() => expect(subscriptions.records).toHaveLength(1))
       const subscription = subscriptions.records[0]!
@@ -30810,7 +31067,7 @@ describe('FactoryLoop PR babysitter', () => {
 
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/404/metadata.json'
       mount.files.set(prPath, {
-        content: { number: 404, state: 'open', head_ref: 'ar-404-fix', isDraft: false, url: 'https://github.com/AgentWorkforce/pear/pull/404' },
+        content: { labels: [], number: 404, state: 'open', head_ref: 'ar-404-fix', isDraft: false, url: 'https://github.com/AgentWorkforce/pear/pull/404' },
       })
       mount.emit(changeEvent(prPath, 'pr-404-open'))
 
@@ -30850,7 +31107,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(2404), issue)))
 
       mount.files.set(prPath, {
-        content: { number: 2404, state: 'open', head_ref: 'ar-2404-fix', isDraft: false, url: 'https://github.com/AgentWorkforce/pear/pull/2404' },
+        content: { labels: [], number: 2404, state: 'open', head_ref: 'ar-2404-fix', isDraft: false, url: 'https://github.com/AgentWorkforce/pear/pull/2404' },
       })
       mount.emit(changeEvent(prPath, 'pr-2404-open'))
 
@@ -30898,7 +31155,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(2405), issue)))
 
       mount.files.set(prPath, {
-        content: { number: 2405, state: 'open', head_ref: 'ar-2405-fix', isDraft: false, url: 'https://github.com/AgentWorkforce/pear/pull/2405' },
+        content: { labels: [], number: 2405, state: 'open', head_ref: 'ar-2405-fix', isDraft: false, url: 'https://github.com/AgentWorkforce/pear/pull/2405' },
       })
       mount.emit(changeEvent(prPath, 'pr-2405-open'))
 
@@ -31006,6 +31263,7 @@ describe('FactoryLoop PR babysitter', () => {
       const ownPr = '/github/repos/AgentWorkforce/pear/pulls/420/metadata.json'
       mount.files.set(ownPr, {
         content: {
+          labels: [],
           number: 420,
           state: 'open',
           head_ref: 'ar-420-fix',
@@ -31069,7 +31327,7 @@ describe('FactoryLoop PR babysitter', () => {
       // same-number PR in another repo can never replace exact ownership.
       const otherPr = '/github/repos/AgentWorkforce/pear/pulls/421/metadata.json'
       mount.files.set(otherPr, {
-        content: { number: 421, state: 'open', head_ref: 'unrelated', body: 'Fixes AR-420' },
+        content: { labels: [], number: 421, state: 'open', head_ref: 'unrelated', body: 'Fixes AR-420' },
       })
       mount.emit(changeEvent(otherPr, 'pr-421-malicious-reference'))
       mount.files.set('/github/repos/AgentWorkforce/hoopsheet/comments/9999.json', { content: {
@@ -31202,6 +31460,7 @@ describe('FactoryLoop PR babysitter', () => {
       }) })
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/436/metadata.json'
       mount.files.set(prPath, { content: {
+        labels: [],
         number: 436,
         state: 'open',
         head_ref: 'ar-436-fix',
@@ -31308,6 +31567,7 @@ describe('FactoryLoop PR babysitter', () => {
           objectType: 'pull_request',
           objectId: '435',
           payload: {
+            labels: [],
             number: 435,
             state: 'open',
             draft: false,
@@ -31340,6 +31600,7 @@ describe('FactoryLoop PR babysitter', () => {
           objectType: 'pull_request',
           objectId: '435',
           payload: {
+            labels: [],
             number: 435,
             state: 'open',
             draft: false,
@@ -31402,6 +31663,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(421), issue)))
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/421/metadata.json'
       mount.files.set(prPath, { content: {
+        labels: [],
         number: 421,
         state: 'open',
         head_ref: 'ar-421-fix',
@@ -31463,6 +31725,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(424), issue)))
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/424/metadata.json'
       mount.files.set(prPath, { content: {
+        labels: [],
         number: 424,
         state: 'open',
         head_ref: 'ar-424-fix',
@@ -31530,6 +31793,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.dispatch(await factory.triageIssue(parsedIssue))
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/426/metadata.json'
       mount.files.set(prPath, { content: {
+        labels: [],
         number: 426,
         state: 'open',
         head_ref: 'ar-426-fix',
@@ -31622,6 +31886,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(425), issue)))
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/425/metadata.json'
       mount.files.set(prPath, { content: {
+        labels: [],
         number: 425,
         state: 'open',
         head_ref: 'ar-425-fix',
@@ -31702,6 +31967,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(423), issue)))
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/423/metadata.json'
       mount.files.set(prPath, { content: {
+        labels: [],
         number: 423,
         state: 'open',
         head_ref: 'ar-423-fix',
@@ -31759,7 +32025,7 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(422), issue)))
-      mount.files.set(prPath, { content: { number: 422, state: 'open', head_ref: 'ar-422-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 422, state: 'open', head_ref: 'ar-422-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-422-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-422-babysit'))
       const inputsBefore = fleet.inputs.length
@@ -31816,7 +32082,7 @@ describe('FactoryLoop PR babysitter', () => {
     try {
       await factory.runOnce()
       mount.files.set(prPath, {
-        content: { number, state: 'open', head_ref: `factory/${number}`, draft: false },
+        content: { labels: [], number, state: 'open', head_ref: `factory/${number}`, draft: false },
       })
       mount.emit(changeEvent(prPath, 'github-pr-critical-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-31-babysit-pear'))
@@ -31871,7 +32137,7 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(427), issue)))
-      mount.files.set(prPath, { content: { number: 427, state: 'open', head_ref: 'ar-427-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 427, state: 'open', head_ref: 'ar-427-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-427-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-427-babysit'))
       const inputsBefore = fleet.inputs.length
@@ -31945,7 +32211,7 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(426), issue)))
-      mount.files.set(prPath, { content: { number: 426, state: 'open', head_ref: 'ar-426-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 426, state: 'open', head_ref: 'ar-426-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-426-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-426-babysit'))
 
@@ -32016,7 +32282,7 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(433), issue)))
-      mount.files.set(prPath, { content: { number: 433, state: 'open', head_ref: 'ar-433-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 433, state: 'open', head_ref: 'ar-433-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-433-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-433-babysit'))
       mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/pulls/433/comments/9903.json', 'comment-9903'))
@@ -32084,7 +32350,7 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(428), issue)))
-      mount.files.set(prPath, { content: { number: 428, state: 'open', head_ref: 'ar-428-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 428, state: 'open', head_ref: 'ar-428-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-428-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-428-babysit'))
       const inputsBefore = fleet.inputs.length
@@ -32129,6 +32395,7 @@ describe('FactoryLoop PR babysitter', () => {
     const commentPath = '/github/repos/AgentWorkforce/pear/comments/9301.json'
     const mount = new FakeMountClient({ [issuePath(423)]: issue })
     const firstFleet = new FakeFleetClient()
+    seedPrMeta(mount, 'AgentWorkforce/pear', 423, { state: 'open', draft: false })
     const first = createFactory(babysitterConfig(), {
       mount,
       fleet: firstFleet,
@@ -32160,7 +32427,7 @@ describe('FactoryLoop PR babysitter', () => {
       mount.emit(changeEvent(commentPath, 'pre-restart-comment'))
       await vi.waitFor(() => expect(first.status().counters.babysitterEventsQueued).toBe(1))
       expect(firstFleet.messages.filter((message) => message.text.startsWith('<integration-event'))).toEqual([])
-      mount.files.set(prPath, { content: { number: 423, state: 'open', head_ref: 'ar-423-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 423, state: 'open', head_ref: 'ar-423-fix', draft: false } })
       await first.stop()
 
       const restartedFleet = new FakeFleetClient()
@@ -32187,7 +32454,7 @@ describe('FactoryLoop PR babysitter', () => {
         restartedFleet.messages.filter((message) => message.text.startsWith('<integration-event')).length,
       ).toBe(1), { timeout: 3_000 })
 
-      mount.files.set(prPath, { content: { number: 423, state: 'open', head_ref: 'renamed-without-issue-key', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 423, state: 'open', head_ref: 'renamed-without-issue-key', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-423-after-restart'))
       await vi.waitFor(() => expect(
         restartedFleet.messages.filter((message) => message.text.startsWith('<integration-event')).length,
@@ -32269,6 +32536,7 @@ describe('FactoryLoop PR babysitter', () => {
     const mount = new FakeMountClient({
       [issue.path]: githubIssueFile(52, { labels: ['factory', 'pear', 'factory:in-progress'] }),
       '/github/repos/AgentWorkforce__pear/pulls/by-id/5.json': prFile(5, {
+        labels: [],
         title: 'Unrelated observability work',
         body: 'tsc, eslint, and 52 tests all pass.',
         head_ref: 'claude/unrelated-observability',
@@ -32318,7 +32586,7 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.start({ mode: 'live', liveSubscription })
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(424), issue)))
-      mount.files.set(prPath, { content: { number: 424, state: 'open', head_ref: 'ar-424-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 424, state: 'open', head_ref: 'ar-424-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'poll-pr-424-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-424-babysit'))
 
@@ -32377,7 +32645,7 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(425), issue)))
-      mount.files.set(prPath, { content: { number: 425, state: 'open', head_ref: 'ar-425-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 425, state: 'open', head_ref: 'ar-425-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-425-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-425-babysit'))
       mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/pulls/425/comments/9501.json', 'comment-9501'))
@@ -32421,7 +32689,7 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(429), issue)))
-      mount.files.set(prPath, { content: { number: 429, state: 'open', head_ref: 'ar-429-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 429, state: 'open', head_ref: 'ar-429-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-429-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-429-babysit'))
 
@@ -32449,14 +32717,14 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(427), issue)))
-      mount.files.set(prPath, { content: { number: 427, state: 'open', head_ref: 'ar-427-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 427, state: 'open', head_ref: 'ar-427-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-427-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-427-babysit'))
       const inputsBefore = fleet.inputs.length
 
       mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/pulls/427/comments/9701.json', 'comment-9701'))
       await vi.waitFor(() => expect(factory.status().counters.babysitterEventsQueued).toBe(1))
-      mount.files.set(prPath, { content: { number: 427, state: 'closed', merged: false, head_ref: 'renamed' } })
+      mount.files.set(prPath, { content: { labels: [], number: 427, state: 'closed', merged: false, head_ref: 'renamed' } })
       mount.emit(changeEvent(prPath, 'pr-427-closed'))
 
       await new Promise((resolve) => setTimeout(resolve, 900))
@@ -32492,14 +32760,14 @@ describe('FactoryLoop PR babysitter', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(432), issue)))
-      mount.files.set(prPath, { content: { number: 432, state: 'open', head_ref: 'ar-432-fix', draft: false } })
+      mount.files.set(prPath, { content: { labels: [], number: 432, state: 'open', head_ref: 'ar-432-fix', draft: false } })
       mount.emit(changeEvent(prPath, 'pr-432-open'))
       await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-432-babysit'))
       const inputsBefore = fleet.inputs.length
 
       mount.emit(changeEvent('/github/repos/AgentWorkforce/pear/pulls/432/comments/9902.json', 'comment-9902'))
       await vi.waitFor(() => expect(fleet.pendingWake).toBeDefined(), { timeout: 3_000 })
-      mount.files.set(prPath, { content: { number: 432, state: 'closed', merged: false, head_ref: 'renamed' } })
+      mount.files.set(prPath, { content: { labels: [], number: 432, state: 'closed', merged: false, head_ref: 'renamed' } })
       mount.emit(changeEvent(prPath, 'pr-432-closed'))
       await vi.waitFor(async () => expect(await stateStore.listBabysitterSessions('factory-test')).toEqual([]))
 
@@ -32535,6 +32803,7 @@ describe('FactoryLoop PR babysitter', () => {
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/408/metadata.json'
       mount.files.set(prPath, {
         content: {
+          labels: [],
           number: 408,
           state: 'open',
           head_ref: 'feature/fix-ci',
@@ -32566,7 +32835,7 @@ describe('FactoryLoop PR babysitter', () => {
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(430), issue)))
       const prPath = '/github/repos/AgentWorkforce/pear/pulls/430/metadata.json'
       mount.files.set(prPath, {
-        content: { number: 431, state: 'open', head_ref: 'ar-430-fix', draft: false },
+        content: { labels: [], number: 431, state: 'open', head_ref: 'ar-430-fix', draft: false },
       })
       mount.emit(changeEvent(prPath, 'pr-number-mismatch'))
 
@@ -32595,7 +32864,7 @@ describe('FactoryLoop PR babysitter', () => {
       // Flat <owner>__<repo>/pulls/by-id/<n>.json shape (githubPullRoot layout).
       const prPath = '/github/repos/AgentWorkforce__pear/pulls/by-id/409.json'
       mount.files.set(prPath, {
-        content: { number: 409, state: 'open', head_ref: 'ar-409-fix', isDraft: false },
+        content: { labels: [], number: 409, state: 'open', head_ref: 'ar-409-fix', isDraft: false },
       })
       mount.emit(changeEvent(prPath, 'pr-409-open'))
 
@@ -32618,6 +32887,7 @@ describe('FactoryLoop PR babysitter', () => {
       [issuePath(412)]: related,
       [issuePath(413)]: dependent,
       [prPath]: prFile(410, {
+        labels: [],
         title: 'Real merged after review',
         body: 'Linear: AR-412',
         head_ref: 'ar-410-fix',
@@ -32640,6 +32910,7 @@ describe('FactoryLoop PR babysitter', () => {
       ]))
       mount.files.set(prPath, {
         content: prFile(410, {
+          labels: [],
           title: 'Real merged after review',
           body: 'Linear: AR-412',
           head_ref: 'ar-410-fix',
@@ -32681,6 +32952,7 @@ describe('FactoryLoop PR babysitter', () => {
         labels: ['factory', 'factory:human-review'],
       }),
       [prPath]: prFile(414, {
+        labels: [],
         head_ref: 'issue-414-fix',
         state: 'MERGED',
         merged: true,
@@ -32722,6 +32994,7 @@ describe('FactoryLoop PR babysitter', () => {
         labels: ['factory', 'factory:human-review'],
       }),
       [cloudPrPath]: prFile(2891, {
+        labels: [],
         title: 'fix(relayauth): dormant emergency source mint gate',
         // The URL-form of a cloud#139 reference reproduces the observed
         // false positive: `containsExplicitIssueReference` matched any
@@ -32776,6 +33049,7 @@ describe('FactoryLoop PR babysitter', () => {
         labels: ['factory', 'factory:human-review'],
       }),
       [factoryPrPath]: prFile(250, {
+        labels: [],
         title: 'fix: address factory#222',
         body: 'Fixes #222',
         head_ref: 'factory/222-fix',
@@ -32834,6 +33108,7 @@ describe('FactoryLoop PR babysitter', () => {
         labels: ['factory', 'factory:human-review'],
       }),
       [prPath]: prFile(172, {
+        labels: [],
         title: 'chore: connection diagnostic',
         body: 'Diagnostic for #155. No credential behaviour changes — nothing about token minting,'
           + ' refresh, or connection selection moves here.',
@@ -32891,6 +33166,7 @@ describe('FactoryLoop PR babysitter', () => {
         labels: ['factory', 'factory:human-review'],
       }),
       [prPath]: prFile(174, {
+        labels: [],
         title: 'chore: unrelated cleanup',
         body: 'Background context lives in #155.',
         head_ref: 'chore/unrelated-cleanup',
@@ -32936,6 +33212,7 @@ describe('FactoryLoop PR babysitter', () => {
         labels: ['factory', 'incident', 'factory:human-review'],
       }),
       [prPath]: prFile(173, {
+        labels: [],
         title: 'fix: repoint installation',
         body: 'Fixes #155',
         head_ref: 'factory/155-repoint',
@@ -32976,6 +33253,7 @@ describe('FactoryLoop PR babysitter', () => {
     const mount = new FakeMountClient({
       [issuePath(411)]: issue,
       [prPath]: prFile(411, {
+        labels: [],
         title: 'Real merged before ready',
         body: 'Linear: AR-411',
         head_ref: 'ar-411-fix',
@@ -33015,6 +33293,7 @@ describe('FactoryLoop PR babysitter', () => {
     const mount = new FakeMountClient({
       [issuePath(415)]: issue,
       [prPath]: prFile(415, {
+        labels: [],
         title: 'Real merged but disclaimed',
         body: 'Linear: AR-415 — this does not fix AR-415, it is groundwork only.',
         head_ref: 'ar-415-fix',
@@ -33055,6 +33334,7 @@ describe('FactoryLoop PR babysitter', () => {
     const mount = new FakeMountClient({
       [issuePath(416)]: issue,
       [prPath]: prFile(416, {
+        labels: [],
         title: 'Real incident in flight',
         body: 'Linear: AR-416',
         head_ref: 'ar-416-fix',
