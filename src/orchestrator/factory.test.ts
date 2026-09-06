@@ -25940,6 +25940,59 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
+  it('drops association trust when the deployment requires the explicit allowlist', async () => {
+    // `MEMBER`/`COLLABORATOR` assert affiliation, not write permission. A
+    // deployment that will not accept an affiliated read-only account parking a
+    // team turns association trust off and names the agent identity instead.
+    const path = githubIssuePath('AgentWorkforce', 'pear', 418)
+    const issue = githubIssueFile(418, { labels: ['factory'], author: 'reporter' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(
+      config({
+        issueSource: 'github',
+        safety: { agentQuestionRequireAllowlist: true, agentQuestionAuthors: ['garden-operator'] },
+      }),
+      { mount, fleet, stateStore, triage: new StaticTriage(), githubWriteback: new RecordingGithubWriteback() },
+    )
+
+    await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    mount.files.set(path, {
+      content: githubIssueFile(418, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }),
+    })
+
+    // Affiliated, but not on the allowlist: no longer enough on its own.
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 418, 9420, {
+      body: [
+        '### Software Garden human input request',
+        'Agent: ar-418-impl-pear',
+        'Issue: 418',
+        'Question: Affiliation alone must not park this team here.',
+      ].join('\n'),
+      author: { login: 'read-only-member', type: 'User' },
+      author_association: 'MEMBER',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsIgnoredUntrustedAuthor).toBe(1))
+    expect(fleet.releases).toEqual([])
+
+    emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 418, 9421, {
+      body: [
+        '### Software Garden human input request',
+        'Agent: ar-418-impl-pear',
+        'Issue: 418',
+        'Question: Which mount should the canary use?',
+      ].join('\n'),
+      author: { login: 'garden-operator', type: 'User' },
+      author_association: 'NONE',
+    })
+    await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
+    expect(factory.status().counters.githubAgentQuestionsTrustedByAllowlist).toBe(1)
+    expect(factory.status().counters.githubAgentQuestionsTrustedByWriteAccess).toBeUndefined()
+    expect(fleet.releases).toHaveLength(2)
+    await factory.stop()
+  })
+
   it('parks and restarts from GitHub comments even when Slack is stale and has no dispatch thread', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 67)
     const issue = githubIssueFile(67, { labels: ['factory'], author: 'reporter' })

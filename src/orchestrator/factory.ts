@@ -483,6 +483,8 @@ const CLARIFICATION_PARK_RETRY_MS = 5_000
  * from waiting on a shutdown handshake it already knows will not come.
  */
 const CLARIFICATION_RELEASE_GRACE_MS = 15_000
+/** The release reason that marks a deliberate park, as opposed to a shutdown or a failed wake. */
+const CLARIFICATION_PARK_RELEASE_REASON = 'waiting-for-human'
 const CLARIFICATION_QUESTION_DELIVERY_LEASE_MS = 2 * 60_000
 const CLARIFICATION_QUESTION_DELIVERY_RETRY_MS = 5_000
 const CLARIFICATION_ESCALATION_LEASE_MS = 2 * 60_000
@@ -957,7 +959,14 @@ export class FactoryLoop implements Factory {
   readonly #readChildPids: ((pid: number) => Promise<number[]>) | undefined
   readonly #terminationGraceMs: number | undefined
   readonly #agentQuestionAuthors: ReadonlySet<string>
+  readonly #agentQuestionRequireAllowlist: boolean
   readonly #clarificationReleaseGraceMs: number
+  /**
+   * Clarification releases this process gave up waiting on, by agent name.
+   * Each entry is a promise that never rejects; it settles when the abandoned
+   * `fleet.release` finally lands.
+   */
+  readonly #abandonedClarificationReleases = new Map<string, Promise<unknown>>()
   readonly #babysitterWakeUnreachableEscalateMs: number
   readonly #babysitterWakeUnreachableRetryMs: number
   readonly #startupAgentExitDrainTimeoutMs: number
@@ -1466,6 +1475,7 @@ export class FactoryLoop implements Factory {
     this.#agentQuestionAuthors = new Set(
       (config.safety.agentQuestionAuthors ?? []).map((login) => login.trim().toLowerCase()).filter(Boolean),
     )
+    this.#agentQuestionRequireAllowlist = config.safety.agentQuestionRequireAllowlist === true
     this.#clarificationReleaseGraceMs = ports.clarificationReleaseGraceMs ?? CLARIFICATION_RELEASE_GRACE_MS
     this.#babysitterWakeUnreachableEscalateMs = ports.babysitterWakeUnreachableEscalateMs ?? BABYSITTER_WAKE_UNREACHABLE_ESCALATE_MS
     this.#babysitterWakeUnreachableRetryMs = ports.babysitterWakeUnreachableRetryMs ?? BABYSITTER_WAKE_UNREACHABLE_RETRY_MS
@@ -11042,10 +11052,14 @@ export class FactoryLoop implements Factory {
       }
 
       try {
-        // A clarification teardown is already past its graceful boundary, so it
+        // A deliberate park is already past its graceful boundary here, so it
         // must not spend the fleet client's placement-sized ack budget a second
-        // time; every other context keeps the unbounded call it had.
-        await (context === 'clarification'
+        // time. Keyed on the reason, not the context: the `clarification`
+        // context is also used by the shutdown (`factory-stopped`) and
+        // wake-recovery (`clarification-wake-failed`) paths, and truncating a
+        // shutdown's state flush at 15s is not what this fix is for. Every
+        // other release keeps the unbounded call it had.
+        await (reason === CLARIFICATION_PARK_RELEASE_REASON
           ? this.#releaseWithinClarificationGrace(agentName, reason)
           : this.#fleet.release(agentName, reason))
         // Invalidate the spawn memory the moment the release is confirmed, so a
@@ -14178,7 +14192,10 @@ export class FactoryLoop implements Factory {
    * reaper stays untouched and keeps its own, longer budget for agents nobody
    * deliberately parked.
    */
-  async #releaseWithinClarificationGrace(name: string, reason = 'waiting-for-human'): Promise<void> {
+  async #releaseWithinClarificationGrace(
+    name: string,
+    reason: string = CLARIFICATION_PARK_RELEASE_REASON,
+  ): Promise<void> {
     const graceMs = this.#clarificationReleaseGraceMs
     const released = this.#fleet.release(name, reason)
     if (!Number.isFinite(graceMs) || graceMs <= 0) return await released
@@ -14195,6 +14212,17 @@ export class FactoryLoop implements Factory {
       const outcome = await Promise.race([observed, graceExpired])
       if (outcome === 'grace-expired') {
         this.#increment('clarificationReleaseGraceExpired')
+        // Remember the call we walked away from. Agent names are deterministic
+        // per work unit, so a wake that respawns this name while the abandoned
+        // release is still in flight could have that release tear the *new*
+        // worker down. `#awaitAbandonedClarificationRelease` fences the respawn
+        // on this promise.
+        this.#abandonedClarificationReleases.set(name, observed)
+        void observed.then(() => {
+          if (this.#abandonedClarificationReleases.get(name) === observed) {
+            this.#abandonedClarificationReleases.delete(name)
+          }
+        })
         throw new Error(
           `graceful release for ${name} did not settle within the ${graceMs}ms clarification grace`,
         )
@@ -14203,6 +14231,42 @@ export class FactoryLoop implements Factory {
     } finally {
       if (expire) clearTimeout(expire)
     }
+  }
+
+  /**
+   * Refuse to reuse an agent name while a release we abandoned is still in
+   * flight for it.
+   *
+   * Relay releases by name and Factory's names are deterministic per work unit,
+   * so a late release landing after a wake respawn would tear down the new
+   * worker. This fails closed: if the abandoned call still has not settled
+   * after another grace, the wake aborts and its durable record schedules a
+   * retry, which is strictly better than respawning into a pending teardown.
+   */
+  async #awaitAbandonedClarificationRelease(name: string): Promise<void> {
+    const outstanding = this.#abandonedClarificationReleases.get(name)
+    if (!outstanding) return
+    const graceMs = this.#clarificationReleaseGraceMs
+    if (Number.isFinite(graceMs) && graceMs > 0) {
+      let expire: ReturnType<typeof setTimeout> | undefined
+      const graceExpired = new Promise<'grace-expired'>((resolve) => {
+        expire = setTimeout(() => resolve('grace-expired'), graceMs)
+        expire.unref?.()
+      })
+      try {
+        if (await Promise.race([outstanding.then(() => 'settled' as const), graceExpired]) === 'grace-expired') {
+          this.#increment('clarificationRespawnsDeferredByAbandonedRelease')
+          throw new Error(
+            `abandoned release for ${name} is still in flight; refusing to respawn the same name`,
+          )
+        }
+      } finally {
+        if (expire) clearTimeout(expire)
+      }
+    } else {
+      await outstanding
+    }
+    this.#abandonedClarificationReleases.delete(name)
   }
 
   async #releaseAgentsForClarification(key: string, agents: Array<[string, TrackedAgent]>): Promise<void> {
@@ -14219,11 +14283,21 @@ export class FactoryLoop implements Factory {
         // budget would hold this slot for five minutes per agent.
         await this.#releaseWithinClarificationGrace(name)
       } catch (error) {
+        // On a remote placement there is no local pid to kill, so "forced"
+        // teardown is really one more bounded release attempt. That is
+        // deliberate and sufficient: if the agent is still on the roster after
+        // it, the check below throws, the durable record stays release-pending,
+        // and the sweep retries. The issue is never declared parked while its
+        // team is still online.
         this.#logger.warn?.('[factory] graceful clarification release failed; forcing local teardown', {
           agentName: name,
           error,
         })
-        await this.#releaseAndTerminateAgents([[name, tracked]], 'waiting-for-human', 'clarification')
+        await this.#releaseAndTerminateAgents(
+          [[name, tracked]],
+          CLARIFICATION_PARK_RELEASE_REASON,
+          'clarification',
+        )
       }
       const onlineAfter = new Set((await this.#fleet.roster()).agents.map((agent) => agent.name))
       if (onlineAfter.has(name)) {
@@ -14802,9 +14876,17 @@ export class FactoryLoop implements Factory {
    *
    * Trust is anchored on the repository, never on the request body: every
    * structured field in a human-input request is public and forgeable, so the
-   * question is only honoured from a commenter GitHub itself reports as
-   * write-capable (`OWNER` / `MEMBER` / `COLLABORATOR`), from a provider bot
-   * record, or from an explicitly configured login.
+   * question is only honoured from a commenter GitHub reports as affiliated
+   * with the repository (`OWNER` / `MEMBER` / `COLLABORATOR`), from a provider
+   * bot record, or from an explicitly configured login.
+   *
+   * Known limit: `MEMBER` and `COLLABORATOR` assert affiliation, not write
+   * permission, so an affiliated read-only account can still forge a request.
+   * What that buys an attacker is a parked team a human comment un-parks — a
+   * denial of service, not privilege escalation — against a gate that
+   * previously rejected every genuine request. A deployment that will not take
+   * that trade sets `safety.agentQuestionRequireAllowlist`, which drops
+   * association trust and leaves bots plus `safety.agentQuestionAuthors`.
    */
   #agentQuestionAuthorTrust(
     comment: GithubIssueComment,
@@ -14814,8 +14896,9 @@ export class FactoryLoop implements Factory {
     | undefined {
     if (comment.isBot) return 'githubAgentQuestionsTrustedByBot'
     if (
-      comment.authorAssociation
-      && GITHUB_WRITE_ACCESS_AUTHOR_ASSOCIATIONS.has(comment.authorAssociation)
+      !this.#agentQuestionRequireAllowlist
+      && comment.authorAssociation
+      && GITHUB_AFFILIATED_AUTHOR_ASSOCIATIONS.has(comment.authorAssociation)
     ) return 'githubAgentQuestionsTrustedByWriteAccess'
     const author = comment.author?.trim().toLowerCase()
     if (author && this.#agentQuestionAuthors.has(author)) {
@@ -20390,6 +20473,7 @@ export class FactoryLoop implements Factory {
     tracked: TrackedAgent,
     waiting: WaitingClarification,
   ): Promise<SpawnResult> {
+    await this.#awaitAbandonedClarificationRelease(name)
     const task = clarificationResumeTask(tracked.spec.task, waiting)
     await this.#prepareAgentWorktree(waitingRecord(waiting), tracked.spec)
     if (tracked.sessionRef) {
@@ -22216,11 +22300,14 @@ const parseGithubIssueComment = (path: string, content: unknown): GithubIssueCom
 }
 
 /**
- * `author_association` values GitHub uses for a commenter that can write to the
- * repository. A `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `MANNEQUIN` or `NONE`
- * is an arbitrary commenter and may not park a live team.
+ * `author_association` values GitHub uses for a commenter affiliated with the
+ * repository or its organization. A `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`,
+ * `MANNEQUIN` or `NONE` is an arbitrary commenter and may not park a live team.
+ *
+ * Affiliation is weaker than write permission — see `#agentQuestionAuthorTrust`
+ * for why that trade is the default and how to opt out of it.
  */
-const GITHUB_WRITE_ACCESS_AUTHOR_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR'])
+const GITHUB_AFFILIATED_AUTHOR_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR'])
 
 const githubIssueSourceKey = (source: GithubIssueSourceRef): string =>
   `${source.owner.toLowerCase()}/${source.repo.toLowerCase()}#${source.number}`

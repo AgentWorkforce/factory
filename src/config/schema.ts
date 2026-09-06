@@ -507,6 +507,14 @@ const safetySchema = z.object({
   // user-scoped GitHub connection. An untrusted request is ignored, which is
   // what left software-garden#417 re-asking the same question 13 times.
   agentQuestionAuthors: z.array(z.string().trim().min(1).toLowerCase()).default([]),
+  // Ignore `author_association` when deciding whether a human-input request may
+  // park a team, leaving only provider bot records and `agentQuestionAuthors`.
+  // `MEMBER` and `COLLABORATOR` say the account is affiliated with the org or
+  // repository; neither proves it has *write* permission, so an affiliated
+  // read-only account can forge the structured fields. The blast radius is a
+  // denial of service a human comment undoes, not privilege escalation, so the
+  // default stays permissive — set this where that trade is unacceptable.
+  agentQuestionRequireAllowlist: z.boolean().default(false),
 }).default({})
 
 const environmentsSchema = z.object({
